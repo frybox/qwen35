@@ -1,0 +1,75 @@
+==============================================================================
+Q9  config.rope_parameters = {"mrope_interleaved": true, "mrope_section": [11, 11, 10], "partial_rotary_factor": 0.25, "rope_theta": 10000000, "rope_type": "default"}
+    head_dim = 256  num_attention_heads = 8
+    partial_rotary_factor = 0.25
+    rope_theta = 10000000  rope_type = default
+    mrope_section = [11, 11, 10]  mrope_interleaved = True
+    hidden_size = 1024 rms_norm_eps = 1e-06
+    num_key_value_heads = 2 vocab_size = 248320 tie_word_embeddings = True
+==============================================================================
+
+[Q9] MEASURED via the real module (not inferred):
+    rope.inv_freq.shape       = (32,)
+    rope.attention_scaling    = 1.0
+    rope.rope_type            = default
+    rope.mrope_section        = [11, 11, 10]
+    => rotational dim (2 * len(inv_freq)) =  64
+       check against head_dim*partial_rotary_factor = 64
+    => head_dim = 256  so UN-rotated tail length = 192
+    inv_freq[:6] = [1.0, 0.60429639, 0.36517414, 0.2206734, 0.13335215, 0.08058421]
+    inv_freq[-3:]=  [4.532e-07, 2.738e-07, 1.655e-07]
+
+[Q10] pure-text position_ids:
+    full position_ids shape = (4, 1, 3)  (4, bs, N)
+    text_position_ids shape = (1, 3)  values = [[0, 1, 2]]
+    given to rotary (=[1:]) shape = (3, 1, 3)  values (grid0/1/2) = [[0, 1, 2], [0, 1, 2], [0, 1, 2]]
+    returned cos.shape = (1, 3, 64)  sin.shape = (1, 3, 64)
+    NOTE cos.shape[-1] = 64 = 2 * rotary_dim = 128 (NOT head_dim): the cat((f,f)) duplication is the last step of
+         recomposition_frequencies (line 213).  cos[:, :, :64] is the half used for the
+         rotation,  cos[:, :, 64:] is its exact duplicate.  Here 2*rotary_dim==128 whereas
+         head_dim=256, so cos is NARROWER than the head and apply_rotary_pos_emb slices q,k to
+         cos.shape[-1]=64 anyway.
+
+[Q10] first 8 cos values for positions 0,1,2 (head 0):
+      pos | cos[0:8]
+       0  | [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+       1  | [0.54030234, 0.82290208, 0.93406159, 0.97575027, 0.99112177, 0.99675483, 0.99881452, 0.99956703]
+       2  | [-0.41614684, 0.35433567, 0.74494207, 0.90417719, 0.96464473, 0.98704046, 0.99526101, 0.99826854]
+      first 8 sin values for positions 0,1,2 (head 0):
+       0  | [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+       1  | [0.84147096, 0.56818324, 0.35711196, 0.21888675, 0.13295726, 0.08049703, 0.04867751, 0.02942303]
+       2  | [0.90929741, 0.93511832, 0.66712916, 0.42715758, 0.26355368, 0.1604716, 0.09723961, 0.05882058]
+
+[Q10] recomposition_frequencies ends with torch.cat((freqs_thw, freqs_thw), dim=-1)
+      so cos[..., :32] == cos[..., 32:64] ?  -> True
+      and for pure text all 3 mrope grids are identical, so the H/W overwrite
+      in recomposition_frequencies (lines 204-213) changes NOTHING numerically:
+      grid0==grid1==grid2 ? True
+      max|cos_real - plain_cat(cos,cos)| = 0.0
+      max|sin_real - plain_cat(sin,sin)| = 0.0
+      => for pure text the effective cos/sin are simply cos(pos*inv_freq) duplicated.
+
+[Q11] rotate_half (line 666-670): x1=x[...,:d/2], x2=x[...,d/2:], return cat(-x2, x1)
+      rotate_half [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0] = [-4.0, -5.0, -6.0, -7.0, 0.0, 1.0, 2.0, 3.0]
+      => PAIRS ACROSS THE HALVES: (i, i+d/2), NOT adjacent pairs (2i, 2i+1).
+      q_embed[..., 64:] == q[..., 64:] ? True
+      q_embed[..., :64] == q[..., :64] ? False  (must be False)
+      max|manual - real| on rotary block = 0.0
+      where c has shape (1, 1, 3, 64) (cos sliced to first 64 dims)
+
+      C recipe for dims 0..63 of q (per head):
+        y[i]   = q[i]*cos[i] - q[i+32]*sin[i]     for i in 0..31
+        y[i+32]= q[i]*sin[i] + q[i+32]*cos[i]     for i in 0..31
+      verify: max|y - real| = 0.0
+==============================================================================
+
+[Q13] numeric proof of the head->kv mapping
+      repeat_kv(kv where kvhead0=1, kvhead1=2, groups=4).reshape(-1)[per head] = [1.0, 1.0, 1.0, 1.0, 2.0, 2.0, 2.0, 2.0]
+      => head h uses kv head  floor(h / groups) = [0, 0, 0, 0, 1, 1, 1, 1]
+      (NOT h % nkv  -> [0, 1, 0, 1, 0, 1, 0, 1] )
+
+[Q11] cos used by apply_rotary_pos_emb (full-tensor case): rotary_dim = cos.shape[-1]
+      cos handed to apply_rotary_pos_emb is the WHOLE tensor of last-dim 64
+      -> rotary_dim = 64, q_rot = q[..., :64], q_pass = q[..., 64:256], so 192 dims pass through
+      (In exp_rotary's earlier calls I sliced cos to 64 manually; both give the same result
+       because cos[..., :64] == cos[..., 64:] for this duplicated layout.)

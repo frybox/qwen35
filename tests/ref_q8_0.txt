@@ -1,0 +1,379 @@
+file_size 811843840
+version 3
+tensor_count 320
+metadata_kv_count 46
+alignment 32
+data_offset 10961920
+
+=== metadata ===
+general.architecture | STRING "qwen35"
+general.base_model.0.name | STRING "Qwen3.5 0.8B"
+general.base_model.0.organization | STRING "Qwen"
+general.base_model.0.repo_url | STRING "https://huggingface.co/Qwen/Qwen3.5-0.8B"
+general.base_model.count | UINT32 1
+general.basename | STRING "Qwen3.5-0.8B"
+general.file_type | UINT32 7
+general.license | STRING "apache-2.0"
+general.license.link | STRING "https://huggingface.co/Qwen/Qwen3.5-0.8B/blob/main/LICENSE"
+general.name | STRING "Qwen3.5-0.8B"
+general.quantization_version | UINT32 2
+general.quantized_by | STRING "Unsloth"
+general.repo_url | STRING "https://huggingface.co/unsloth"
+general.size_label | STRING "0.8B"
+general.tags | ARRAY<STRING> len=1 ["image-text-to-text"]
+general.type | STRING "model"
+quantize.imatrix.chunks_count | UINT32 80
+quantize.imatrix.dataset | STRING "unsloth_calibration_Qwen3.5-0.8B.txt"
+quantize.imatrix.entries_count | UINT32 186
+quantize.imatrix.file | STRING "Qwen3.5-0.8B-GGUF/imatrix_unsloth.gguf"
+qwen35.attention.head_count | UINT32 8
+qwen35.attention.head_count_kv | UINT32 2
+qwen35.attention.key_length | UINT32 256
+qwen35.attention.layer_norm_rms_epsilon | FLOAT32 9.999999974752427e-07
+qwen35.attention.value_length | UINT32 256
+qwen35.block_count | UINT32 24
+qwen35.context_length | UINT32 262144
+qwen35.embedding_length | UINT32 1024
+qwen35.feed_forward_length | UINT32 3584
+qwen35.full_attention_interval | UINT32 4
+qwen35.rope.dimension_count | UINT32 64
+qwen35.rope.dimension_sections | ARRAY<INT32> len=4 [11, 11, 10, 0]
+qwen35.rope.freq_base | FLOAT32 10000000.0
+qwen35.ssm.conv_kernel | UINT32 4
+qwen35.ssm.group_count | UINT32 16
+qwen35.ssm.inner_size | UINT32 2048
+qwen35.ssm.state_size | UINT32 128
+qwen35.ssm.time_step_rank | UINT32 16
+tokenizer.chat_template | STRING "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is mapping %}\n                    {%- for args_name in tool_call.arguments %}\n                        {%- set args_value = tool_call.arguments[args_name] %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}"
+tokenizer.ggml.eos_token_id | UINT32 248046
+tokenizer.ggml.merges | ARRAY<STRING> len=247587
+tokenizer.ggml.model | STRING "gpt2"
+tokenizer.ggml.padding_token_id | UINT32 248055
+tokenizer.ggml.pre | STRING "qwen35"
+tokenizer.ggml.token_type | ARRAY<INT32> len=248320
+tokenizer.ggml.tokens | ARRAY<STRING> len=248320
+
+=== tensors ===
+output_norm.weight | F32 | 1024 | 10961920 | bytes=4096
+token_embd.weight | Q8_0 | 1024,248320 | 10966016 | bytes=270172160
+blk.0.attn_gate.weight | Q8_0 | 1024,2048 | 281138176 | bytes=2228224
+blk.0.attn_norm.weight | F32 | 1024 | 283366400 | bytes=4096
+blk.0.attn_qkv.weight | Q8_0 | 1024,6144 | 283370496 | bytes=6684672
+blk.0.ffn_down.weight | Q8_0 | 3584,1024 | 290055168 | bytes=3899392
+blk.0.ffn_gate.weight | Q8_0 | 1024,3584 | 293954560 | bytes=3899392
+blk.0.ffn_up.weight | Q8_0 | 1024,3584 | 297853952 | bytes=3899392
+blk.0.post_attention_norm.weight | F32 | 1024 | 301753344 | bytes=4096
+blk.0.ssm_a | F32 | 16 | 301757440 | bytes=64
+blk.0.ssm_alpha.weight | Q8_0 | 1024,16 | 301757504 | bytes=17408
+blk.0.ssm_beta.weight | Q8_0 | 1024,16 | 301774912 | bytes=17408
+blk.0.ssm_conv1d.weight | F32 | 4,6144 | 301792320 | bytes=98304
+blk.0.ssm_dt.bias | F32 | 16 | 301890624 | bytes=64
+blk.0.ssm_norm.weight | F32 | 128 | 301890688 | bytes=512
+blk.0.ssm_out.weight | Q8_0 | 2048,1024 | 301891200 | bytes=2228224
+blk.1.attn_gate.weight | Q8_0 | 1024,2048 | 304119424 | bytes=2228224
+blk.1.attn_norm.weight | F32 | 1024 | 306347648 | bytes=4096
+blk.1.attn_qkv.weight | Q8_0 | 1024,6144 | 306351744 | bytes=6684672
+blk.1.ffn_down.weight | Q8_0 | 3584,1024 | 313036416 | bytes=3899392
+blk.1.ffn_gate.weight | Q8_0 | 1024,3584 | 316935808 | bytes=3899392
+blk.1.ffn_up.weight | Q8_0 | 1024,3584 | 320835200 | bytes=3899392
+blk.1.post_attention_norm.weight | F32 | 1024 | 324734592 | bytes=4096
+blk.1.ssm_a | F32 | 16 | 324738688 | bytes=64
+blk.1.ssm_alpha.weight | Q8_0 | 1024,16 | 324738752 | bytes=17408
+blk.1.ssm_beta.weight | Q8_0 | 1024,16 | 324756160 | bytes=17408
+blk.1.ssm_conv1d.weight | F32 | 4,6144 | 324773568 | bytes=98304
+blk.1.ssm_dt.bias | F32 | 16 | 324871872 | bytes=64
+blk.1.ssm_norm.weight | F32 | 128 | 324871936 | bytes=512
+blk.1.ssm_out.weight | Q8_0 | 2048,1024 | 324872448 | bytes=2228224
+blk.2.attn_gate.weight | Q8_0 | 1024,2048 | 327100672 | bytes=2228224
+blk.2.attn_norm.weight | F32 | 1024 | 329328896 | bytes=4096
+blk.2.attn_qkv.weight | Q8_0 | 1024,6144 | 329332992 | bytes=6684672
+blk.2.ffn_down.weight | Q8_0 | 3584,1024 | 336017664 | bytes=3899392
+blk.2.ffn_gate.weight | Q8_0 | 1024,3584 | 339917056 | bytes=3899392
+blk.2.ffn_up.weight | Q8_0 | 1024,3584 | 343816448 | bytes=3899392
+blk.2.post_attention_norm.weight | F32 | 1024 | 347715840 | bytes=4096
+blk.2.ssm_a | F32 | 16 | 347719936 | bytes=64
+blk.2.ssm_alpha.weight | Q8_0 | 1024,16 | 347720000 | bytes=17408
+blk.2.ssm_beta.weight | Q8_0 | 1024,16 | 347737408 | bytes=17408
+blk.2.ssm_conv1d.weight | F32 | 4,6144 | 347754816 | bytes=98304
+blk.2.ssm_dt.bias | F32 | 16 | 347853120 | bytes=64
+blk.2.ssm_norm.weight | F32 | 128 | 347853184 | bytes=512
+blk.2.ssm_out.weight | Q8_0 | 2048,1024 | 347853696 | bytes=2228224
+blk.3.attn_k.weight | Q8_0 | 1024,512 | 350081920 | bytes=557056
+blk.3.attn_k_norm.weight | F32 | 256 | 350638976 | bytes=1024
+blk.3.attn_norm.weight | F32 | 1024 | 350640000 | bytes=4096
+blk.3.attn_output.weight | Q8_0 | 2048,1024 | 350644096 | bytes=2228224
+blk.3.attn_q.weight | Q8_0 | 1024,4096 | 352872320 | bytes=4456448
+blk.3.attn_q_norm.weight | F32 | 256 | 357328768 | bytes=1024
+blk.3.attn_v.weight | Q8_0 | 1024,512 | 357329792 | bytes=557056
+blk.3.ffn_down.weight | Q8_0 | 3584,1024 | 357886848 | bytes=3899392
+blk.3.ffn_gate.weight | Q8_0 | 1024,3584 | 361786240 | bytes=3899392
+blk.3.ffn_up.weight | Q8_0 | 1024,3584 | 365685632 | bytes=3899392
+blk.3.post_attention_norm.weight | F32 | 1024 | 369585024 | bytes=4096
+blk.4.attn_gate.weight | Q8_0 | 1024,2048 | 369589120 | bytes=2228224
+blk.4.attn_norm.weight | F32 | 1024 | 371817344 | bytes=4096
+blk.4.attn_qkv.weight | Q8_0 | 1024,6144 | 371821440 | bytes=6684672
+blk.4.ffn_down.weight | Q8_0 | 3584,1024 | 378506112 | bytes=3899392
+blk.4.ffn_gate.weight | Q8_0 | 1024,3584 | 382405504 | bytes=3899392
+blk.4.ffn_up.weight | Q8_0 | 1024,3584 | 386304896 | bytes=3899392
+blk.4.post_attention_norm.weight | F32 | 1024 | 390204288 | bytes=4096
+blk.4.ssm_a | F32 | 16 | 390208384 | bytes=64
+blk.4.ssm_alpha.weight | Q8_0 | 1024,16 | 390208448 | bytes=17408
+blk.4.ssm_beta.weight | Q8_0 | 1024,16 | 390225856 | bytes=17408
+blk.4.ssm_conv1d.weight | F32 | 4,6144 | 390243264 | bytes=98304
+blk.4.ssm_dt.bias | F32 | 16 | 390341568 | bytes=64
+blk.4.ssm_norm.weight | F32 | 128 | 390341632 | bytes=512
+blk.4.ssm_out.weight | Q8_0 | 2048,1024 | 390342144 | bytes=2228224
+blk.5.attn_gate.weight | Q8_0 | 1024,2048 | 392570368 | bytes=2228224
+blk.5.attn_norm.weight | F32 | 1024 | 394798592 | bytes=4096
+blk.5.attn_qkv.weight | Q8_0 | 1024,6144 | 394802688 | bytes=6684672
+blk.5.ffn_down.weight | Q8_0 | 3584,1024 | 401487360 | bytes=3899392
+blk.5.ffn_gate.weight | Q8_0 | 1024,3584 | 405386752 | bytes=3899392
+blk.5.ffn_up.weight | Q8_0 | 1024,3584 | 409286144 | bytes=3899392
+blk.5.post_attention_norm.weight | F32 | 1024 | 413185536 | bytes=4096
+blk.5.ssm_a | F32 | 16 | 413189632 | bytes=64
+blk.5.ssm_alpha.weight | Q8_0 | 1024,16 | 413189696 | bytes=17408
+blk.5.ssm_beta.weight | Q8_0 | 1024,16 | 413207104 | bytes=17408
+blk.5.ssm_conv1d.weight | F32 | 4,6144 | 413224512 | bytes=98304
+blk.5.ssm_dt.bias | F32 | 16 | 413322816 | bytes=64
+blk.5.ssm_norm.weight | F32 | 128 | 413322880 | bytes=512
+blk.5.ssm_out.weight | Q8_0 | 2048,1024 | 413323392 | bytes=2228224
+blk.6.attn_gate.weight | Q8_0 | 1024,2048 | 415551616 | bytes=2228224
+blk.6.attn_norm.weight | F32 | 1024 | 417779840 | bytes=4096
+blk.6.attn_qkv.weight | Q8_0 | 1024,6144 | 417783936 | bytes=6684672
+blk.6.ffn_down.weight | Q8_0 | 3584,1024 | 424468608 | bytes=3899392
+blk.6.ffn_gate.weight | Q8_0 | 1024,3584 | 428368000 | bytes=3899392
+blk.6.ffn_up.weight | Q8_0 | 1024,3584 | 432267392 | bytes=3899392
+blk.6.post_attention_norm.weight | F32 | 1024 | 436166784 | bytes=4096
+blk.6.ssm_a | F32 | 16 | 436170880 | bytes=64
+blk.6.ssm_alpha.weight | Q8_0 | 1024,16 | 436170944 | bytes=17408
+blk.6.ssm_beta.weight | Q8_0 | 1024,16 | 436188352 | bytes=17408
+blk.6.ssm_conv1d.weight | F32 | 4,6144 | 436205760 | bytes=98304
+blk.6.ssm_dt.bias | F32 | 16 | 436304064 | bytes=64
+blk.6.ssm_norm.weight | F32 | 128 | 436304128 | bytes=512
+blk.6.ssm_out.weight | Q8_0 | 2048,1024 | 436304640 | bytes=2228224
+blk.7.attn_k.weight | Q8_0 | 1024,512 | 438532864 | bytes=557056
+blk.7.attn_k_norm.weight | F32 | 256 | 439089920 | bytes=1024
+blk.7.attn_norm.weight | F32 | 1024 | 439090944 | bytes=4096
+blk.7.attn_output.weight | Q8_0 | 2048,1024 | 439095040 | bytes=2228224
+blk.7.attn_q.weight | Q8_0 | 1024,4096 | 441323264 | bytes=4456448
+blk.7.attn_q_norm.weight | F32 | 256 | 445779712 | bytes=1024
+blk.7.attn_v.weight | Q8_0 | 1024,512 | 445780736 | bytes=557056
+blk.7.ffn_down.weight | Q8_0 | 3584,1024 | 446337792 | bytes=3899392
+blk.7.ffn_gate.weight | Q8_0 | 1024,3584 | 450237184 | bytes=3899392
+blk.7.ffn_up.weight | Q8_0 | 1024,3584 | 454136576 | bytes=3899392
+blk.7.post_attention_norm.weight | F32 | 1024 | 458035968 | bytes=4096
+blk.8.attn_gate.weight | Q8_0 | 1024,2048 | 458040064 | bytes=2228224
+blk.8.attn_norm.weight | F32 | 1024 | 460268288 | bytes=4096
+blk.8.attn_qkv.weight | Q8_0 | 1024,6144 | 460272384 | bytes=6684672
+blk.8.ffn_down.weight | Q8_0 | 3584,1024 | 466957056 | bytes=3899392
+blk.8.ffn_gate.weight | Q8_0 | 1024,3584 | 470856448 | bytes=3899392
+blk.8.ffn_up.weight | Q8_0 | 1024,3584 | 474755840 | bytes=3899392
+blk.8.post_attention_norm.weight | F32 | 1024 | 478655232 | bytes=4096
+blk.8.ssm_a | F32 | 16 | 478659328 | bytes=64
+blk.8.ssm_alpha.weight | Q8_0 | 1024,16 | 478659392 | bytes=17408
+blk.8.ssm_beta.weight | Q8_0 | 1024,16 | 478676800 | bytes=17408
+blk.8.ssm_conv1d.weight | F32 | 4,6144 | 478694208 | bytes=98304
+blk.8.ssm_dt.bias | F32 | 16 | 478792512 | bytes=64
+blk.8.ssm_norm.weight | F32 | 128 | 478792576 | bytes=512
+blk.8.ssm_out.weight | Q8_0 | 2048,1024 | 478793088 | bytes=2228224
+blk.9.attn_gate.weight | Q8_0 | 1024,2048 | 481021312 | bytes=2228224
+blk.9.attn_norm.weight | F32 | 1024 | 483249536 | bytes=4096
+blk.9.attn_qkv.weight | Q8_0 | 1024,6144 | 483253632 | bytes=6684672
+blk.9.ffn_down.weight | Q8_0 | 3584,1024 | 489938304 | bytes=3899392
+blk.9.ffn_gate.weight | Q8_0 | 1024,3584 | 493837696 | bytes=3899392
+blk.9.ffn_up.weight | Q8_0 | 1024,3584 | 497737088 | bytes=3899392
+blk.9.post_attention_norm.weight | F32 | 1024 | 501636480 | bytes=4096
+blk.9.ssm_a | F32 | 16 | 501640576 | bytes=64
+blk.9.ssm_alpha.weight | Q8_0 | 1024,16 | 501640640 | bytes=17408
+blk.9.ssm_beta.weight | Q8_0 | 1024,16 | 501658048 | bytes=17408
+blk.9.ssm_conv1d.weight | F32 | 4,6144 | 501675456 | bytes=98304
+blk.9.ssm_dt.bias | F32 | 16 | 501773760 | bytes=64
+blk.9.ssm_norm.weight | F32 | 128 | 501773824 | bytes=512
+blk.9.ssm_out.weight | Q8_0 | 2048,1024 | 501774336 | bytes=2228224
+blk.10.attn_gate.weight | Q8_0 | 1024,2048 | 504002560 | bytes=2228224
+blk.10.attn_norm.weight | F32 | 1024 | 506230784 | bytes=4096
+blk.10.attn_qkv.weight | Q8_0 | 1024,6144 | 506234880 | bytes=6684672
+blk.10.ffn_down.weight | Q8_0 | 3584,1024 | 512919552 | bytes=3899392
+blk.10.ffn_gate.weight | Q8_0 | 1024,3584 | 516818944 | bytes=3899392
+blk.10.ffn_up.weight | Q8_0 | 1024,3584 | 520718336 | bytes=3899392
+blk.10.post_attention_norm.weight | F32 | 1024 | 524617728 | bytes=4096
+blk.10.ssm_a | F32 | 16 | 524621824 | bytes=64
+blk.10.ssm_alpha.weight | Q8_0 | 1024,16 | 524621888 | bytes=17408
+blk.10.ssm_beta.weight | Q8_0 | 1024,16 | 524639296 | bytes=17408
+blk.10.ssm_conv1d.weight | F32 | 4,6144 | 524656704 | bytes=98304
+blk.10.ssm_dt.bias | F32 | 16 | 524755008 | bytes=64
+blk.10.ssm_norm.weight | F32 | 128 | 524755072 | bytes=512
+blk.10.ssm_out.weight | Q8_0 | 2048,1024 | 524755584 | bytes=2228224
+blk.11.attn_k.weight | Q8_0 | 1024,512 | 526983808 | bytes=557056
+blk.11.attn_k_norm.weight | F32 | 256 | 527540864 | bytes=1024
+blk.11.attn_norm.weight | F32 | 1024 | 527541888 | bytes=4096
+blk.11.attn_output.weight | Q8_0 | 2048,1024 | 527545984 | bytes=2228224
+blk.11.attn_q.weight | Q8_0 | 1024,4096 | 529774208 | bytes=4456448
+blk.11.attn_q_norm.weight | F32 | 256 | 534230656 | bytes=1024
+blk.11.attn_v.weight | Q8_0 | 1024,512 | 534231680 | bytes=557056
+blk.11.ffn_down.weight | Q8_0 | 3584,1024 | 534788736 | bytes=3899392
+blk.11.ffn_gate.weight | Q8_0 | 1024,3584 | 538688128 | bytes=3899392
+blk.11.ffn_up.weight | Q8_0 | 1024,3584 | 542587520 | bytes=3899392
+blk.11.post_attention_norm.weight | F32 | 1024 | 546486912 | bytes=4096
+blk.12.attn_gate.weight | Q8_0 | 1024,2048 | 546491008 | bytes=2228224
+blk.12.attn_norm.weight | F32 | 1024 | 548719232 | bytes=4096
+blk.12.attn_qkv.weight | Q8_0 | 1024,6144 | 548723328 | bytes=6684672
+blk.12.ffn_down.weight | Q8_0 | 3584,1024 | 555408000 | bytes=3899392
+blk.12.ffn_gate.weight | Q8_0 | 1024,3584 | 559307392 | bytes=3899392
+blk.12.ffn_up.weight | Q8_0 | 1024,3584 | 563206784 | bytes=3899392
+blk.12.post_attention_norm.weight | F32 | 1024 | 567106176 | bytes=4096
+blk.12.ssm_a | F32 | 16 | 567110272 | bytes=64
+blk.12.ssm_alpha.weight | Q8_0 | 1024,16 | 567110336 | bytes=17408
+blk.12.ssm_beta.weight | Q8_0 | 1024,16 | 567127744 | bytes=17408
+blk.12.ssm_conv1d.weight | F32 | 4,6144 | 567145152 | bytes=98304
+blk.12.ssm_dt.bias | F32 | 16 | 567243456 | bytes=64
+blk.12.ssm_norm.weight | F32 | 128 | 567243520 | bytes=512
+blk.12.ssm_out.weight | Q8_0 | 2048,1024 | 567244032 | bytes=2228224
+blk.13.attn_gate.weight | Q8_0 | 1024,2048 | 569472256 | bytes=2228224
+blk.13.attn_norm.weight | F32 | 1024 | 571700480 | bytes=4096
+blk.13.attn_qkv.weight | Q8_0 | 1024,6144 | 571704576 | bytes=6684672
+blk.13.ffn_down.weight | Q8_0 | 3584,1024 | 578389248 | bytes=3899392
+blk.13.ffn_gate.weight | Q8_0 | 1024,3584 | 582288640 | bytes=3899392
+blk.13.ffn_up.weight | Q8_0 | 1024,3584 | 586188032 | bytes=3899392
+blk.13.post_attention_norm.weight | F32 | 1024 | 590087424 | bytes=4096
+blk.13.ssm_a | F32 | 16 | 590091520 | bytes=64
+blk.13.ssm_alpha.weight | Q8_0 | 1024,16 | 590091584 | bytes=17408
+blk.13.ssm_beta.weight | Q8_0 | 1024,16 | 590108992 | bytes=17408
+blk.13.ssm_conv1d.weight | F32 | 4,6144 | 590126400 | bytes=98304
+blk.13.ssm_dt.bias | F32 | 16 | 590224704 | bytes=64
+blk.13.ssm_norm.weight | F32 | 128 | 590224768 | bytes=512
+blk.13.ssm_out.weight | Q8_0 | 2048,1024 | 590225280 | bytes=2228224
+blk.14.attn_gate.weight | Q8_0 | 1024,2048 | 592453504 | bytes=2228224
+blk.14.attn_norm.weight | F32 | 1024 | 594681728 | bytes=4096
+blk.14.attn_qkv.weight | Q8_0 | 1024,6144 | 594685824 | bytes=6684672
+blk.14.ffn_down.weight | Q8_0 | 3584,1024 | 601370496 | bytes=3899392
+blk.14.ffn_gate.weight | Q8_0 | 1024,3584 | 605269888 | bytes=3899392
+blk.14.ffn_up.weight | Q8_0 | 1024,3584 | 609169280 | bytes=3899392
+blk.14.post_attention_norm.weight | F32 | 1024 | 613068672 | bytes=4096
+blk.14.ssm_a | F32 | 16 | 613072768 | bytes=64
+blk.14.ssm_alpha.weight | Q8_0 | 1024,16 | 613072832 | bytes=17408
+blk.14.ssm_beta.weight | Q8_0 | 1024,16 | 613090240 | bytes=17408
+blk.14.ssm_conv1d.weight | F32 | 4,6144 | 613107648 | bytes=98304
+blk.14.ssm_dt.bias | F32 | 16 | 613205952 | bytes=64
+blk.14.ssm_norm.weight | F32 | 128 | 613206016 | bytes=512
+blk.14.ssm_out.weight | Q8_0 | 2048,1024 | 613206528 | bytes=2228224
+blk.15.attn_k.weight | Q8_0 | 1024,512 | 615434752 | bytes=557056
+blk.15.attn_k_norm.weight | F32 | 256 | 615991808 | bytes=1024
+blk.15.attn_norm.weight | F32 | 1024 | 615992832 | bytes=4096
+blk.15.attn_output.weight | Q8_0 | 2048,1024 | 615996928 | bytes=2228224
+blk.15.attn_q.weight | Q8_0 | 1024,4096 | 618225152 | bytes=4456448
+blk.15.attn_q_norm.weight | F32 | 256 | 622681600 | bytes=1024
+blk.15.attn_v.weight | Q8_0 | 1024,512 | 622682624 | bytes=557056
+blk.15.ffn_down.weight | Q8_0 | 3584,1024 | 623239680 | bytes=3899392
+blk.15.ffn_gate.weight | Q8_0 | 1024,3584 | 627139072 | bytes=3899392
+blk.15.ffn_up.weight | Q8_0 | 1024,3584 | 631038464 | bytes=3899392
+blk.15.post_attention_norm.weight | F32 | 1024 | 634937856 | bytes=4096
+blk.16.attn_gate.weight | Q8_0 | 1024,2048 | 634941952 | bytes=2228224
+blk.16.attn_norm.weight | F32 | 1024 | 637170176 | bytes=4096
+blk.16.attn_qkv.weight | Q8_0 | 1024,6144 | 637174272 | bytes=6684672
+blk.16.ffn_down.weight | Q8_0 | 3584,1024 | 643858944 | bytes=3899392
+blk.16.ffn_gate.weight | Q8_0 | 1024,3584 | 647758336 | bytes=3899392
+blk.16.ffn_up.weight | Q8_0 | 1024,3584 | 651657728 | bytes=3899392
+blk.16.post_attention_norm.weight | F32 | 1024 | 655557120 | bytes=4096
+blk.16.ssm_a | F32 | 16 | 655561216 | bytes=64
+blk.16.ssm_alpha.weight | Q8_0 | 1024,16 | 655561280 | bytes=17408
+blk.16.ssm_beta.weight | Q8_0 | 1024,16 | 655578688 | bytes=17408
+blk.16.ssm_conv1d.weight | F32 | 4,6144 | 655596096 | bytes=98304
+blk.16.ssm_dt.bias | F32 | 16 | 655694400 | bytes=64
+blk.16.ssm_norm.weight | F32 | 128 | 655694464 | bytes=512
+blk.16.ssm_out.weight | Q8_0 | 2048,1024 | 655694976 | bytes=2228224
+blk.17.attn_gate.weight | Q8_0 | 1024,2048 | 657923200 | bytes=2228224
+blk.17.attn_norm.weight | F32 | 1024 | 660151424 | bytes=4096
+blk.17.attn_qkv.weight | Q8_0 | 1024,6144 | 660155520 | bytes=6684672
+blk.17.ffn_down.weight | Q8_0 | 3584,1024 | 666840192 | bytes=3899392
+blk.17.ffn_gate.weight | Q8_0 | 1024,3584 | 670739584 | bytes=3899392
+blk.17.ffn_up.weight | Q8_0 | 1024,3584 | 674638976 | bytes=3899392
+blk.17.post_attention_norm.weight | F32 | 1024 | 678538368 | bytes=4096
+blk.17.ssm_a | F32 | 16 | 678542464 | bytes=64
+blk.17.ssm_alpha.weight | Q8_0 | 1024,16 | 678542528 | bytes=17408
+blk.17.ssm_beta.weight | Q8_0 | 1024,16 | 678559936 | bytes=17408
+blk.17.ssm_conv1d.weight | F32 | 4,6144 | 678577344 | bytes=98304
+blk.17.ssm_dt.bias | F32 | 16 | 678675648 | bytes=64
+blk.17.ssm_norm.weight | F32 | 128 | 678675712 | bytes=512
+blk.17.ssm_out.weight | Q8_0 | 2048,1024 | 678676224 | bytes=2228224
+blk.18.attn_gate.weight | Q8_0 | 1024,2048 | 680904448 | bytes=2228224
+blk.18.attn_norm.weight | F32 | 1024 | 683132672 | bytes=4096
+blk.18.attn_qkv.weight | Q8_0 | 1024,6144 | 683136768 | bytes=6684672
+blk.18.ffn_down.weight | Q8_0 | 3584,1024 | 689821440 | bytes=3899392
+blk.18.ffn_gate.weight | Q8_0 | 1024,3584 | 693720832 | bytes=3899392
+blk.18.ffn_up.weight | Q8_0 | 1024,3584 | 697620224 | bytes=3899392
+blk.18.post_attention_norm.weight | F32 | 1024 | 701519616 | bytes=4096
+blk.18.ssm_a | F32 | 16 | 701523712 | bytes=64
+blk.18.ssm_alpha.weight | Q8_0 | 1024,16 | 701523776 | bytes=17408
+blk.18.ssm_beta.weight | Q8_0 | 1024,16 | 701541184 | bytes=17408
+blk.18.ssm_conv1d.weight | F32 | 4,6144 | 701558592 | bytes=98304
+blk.18.ssm_dt.bias | F32 | 16 | 701656896 | bytes=64
+blk.18.ssm_norm.weight | F32 | 128 | 701656960 | bytes=512
+blk.18.ssm_out.weight | Q8_0 | 2048,1024 | 701657472 | bytes=2228224
+blk.19.attn_k.weight | Q8_0 | 1024,512 | 703885696 | bytes=557056
+blk.19.attn_k_norm.weight | F32 | 256 | 704442752 | bytes=1024
+blk.19.attn_norm.weight | F32 | 1024 | 704443776 | bytes=4096
+blk.19.attn_output.weight | Q8_0 | 2048,1024 | 704447872 | bytes=2228224
+blk.19.attn_q.weight | Q8_0 | 1024,4096 | 706676096 | bytes=4456448
+blk.19.attn_q_norm.weight | F32 | 256 | 711132544 | bytes=1024
+blk.19.attn_v.weight | Q8_0 | 1024,512 | 711133568 | bytes=557056
+blk.19.ffn_down.weight | Q8_0 | 3584,1024 | 711690624 | bytes=3899392
+blk.19.ffn_gate.weight | Q8_0 | 1024,3584 | 715590016 | bytes=3899392
+blk.19.ffn_up.weight | Q8_0 | 1024,3584 | 719489408 | bytes=3899392
+blk.19.post_attention_norm.weight | F32 | 1024 | 723388800 | bytes=4096
+blk.20.attn_gate.weight | Q8_0 | 1024,2048 | 723392896 | bytes=2228224
+blk.20.attn_norm.weight | F32 | 1024 | 725621120 | bytes=4096
+blk.20.attn_qkv.weight | Q8_0 | 1024,6144 | 725625216 | bytes=6684672
+blk.20.ffn_down.weight | Q8_0 | 3584,1024 | 732309888 | bytes=3899392
+blk.20.ffn_gate.weight | Q8_0 | 1024,3584 | 736209280 | bytes=3899392
+blk.20.ffn_up.weight | Q8_0 | 1024,3584 | 740108672 | bytes=3899392
+blk.20.post_attention_norm.weight | F32 | 1024 | 744008064 | bytes=4096
+blk.20.ssm_a | F32 | 16 | 744012160 | bytes=64
+blk.20.ssm_alpha.weight | Q8_0 | 1024,16 | 744012224 | bytes=17408
+blk.20.ssm_beta.weight | Q8_0 | 1024,16 | 744029632 | bytes=17408
+blk.20.ssm_conv1d.weight | F32 | 4,6144 | 744047040 | bytes=98304
+blk.20.ssm_dt.bias | F32 | 16 | 744145344 | bytes=64
+blk.20.ssm_norm.weight | F32 | 128 | 744145408 | bytes=512
+blk.20.ssm_out.weight | Q8_0 | 2048,1024 | 744145920 | bytes=2228224
+blk.21.attn_gate.weight | Q8_0 | 1024,2048 | 746374144 | bytes=2228224
+blk.21.attn_norm.weight | F32 | 1024 | 748602368 | bytes=4096
+blk.21.attn_qkv.weight | Q8_0 | 1024,6144 | 748606464 | bytes=6684672
+blk.21.ffn_down.weight | Q8_0 | 3584,1024 | 755291136 | bytes=3899392
+blk.21.ffn_gate.weight | Q8_0 | 1024,3584 | 759190528 | bytes=3899392
+blk.21.ffn_up.weight | Q8_0 | 1024,3584 | 763089920 | bytes=3899392
+blk.21.post_attention_norm.weight | F32 | 1024 | 766989312 | bytes=4096
+blk.21.ssm_a | F32 | 16 | 766993408 | bytes=64
+blk.21.ssm_alpha.weight | Q8_0 | 1024,16 | 766993472 | bytes=17408
+blk.21.ssm_beta.weight | Q8_0 | 1024,16 | 767010880 | bytes=17408
+blk.21.ssm_conv1d.weight | F32 | 4,6144 | 767028288 | bytes=98304
+blk.21.ssm_dt.bias | F32 | 16 | 767126592 | bytes=64
+blk.21.ssm_norm.weight | F32 | 128 | 767126656 | bytes=512
+blk.21.ssm_out.weight | Q8_0 | 2048,1024 | 767127168 | bytes=2228224
+blk.22.attn_gate.weight | Q8_0 | 1024,2048 | 769355392 | bytes=2228224
+blk.22.attn_norm.weight | F32 | 1024 | 771583616 | bytes=4096
+blk.22.attn_qkv.weight | Q8_0 | 1024,6144 | 771587712 | bytes=6684672
+blk.22.ffn_down.weight | Q8_0 | 3584,1024 | 778272384 | bytes=3899392
+blk.22.ffn_gate.weight | Q8_0 | 1024,3584 | 782171776 | bytes=3899392
+blk.22.ffn_up.weight | Q8_0 | 1024,3584 | 786071168 | bytes=3899392
+blk.22.post_attention_norm.weight | F32 | 1024 | 789970560 | bytes=4096
+blk.22.ssm_a | F32 | 16 | 789974656 | bytes=64
+blk.22.ssm_alpha.weight | Q8_0 | 1024,16 | 789974720 | bytes=17408
+blk.22.ssm_beta.weight | Q8_0 | 1024,16 | 789992128 | bytes=17408
+blk.22.ssm_conv1d.weight | F32 | 4,6144 | 790009536 | bytes=98304
+blk.22.ssm_dt.bias | F32 | 16 | 790107840 | bytes=64
+blk.22.ssm_norm.weight | F32 | 128 | 790107904 | bytes=512
+blk.22.ssm_out.weight | Q8_0 | 2048,1024 | 790108416 | bytes=2228224
+blk.23.attn_k.weight | Q8_0 | 1024,512 | 792336640 | bytes=557056
+blk.23.attn_k_norm.weight | F32 | 256 | 792893696 | bytes=1024
+blk.23.attn_norm.weight | F32 | 1024 | 792894720 | bytes=4096
+blk.23.attn_output.weight | Q8_0 | 2048,1024 | 792898816 | bytes=2228224
+blk.23.attn_q.weight | Q8_0 | 1024,4096 | 795127040 | bytes=4456448
+blk.23.attn_q_norm.weight | F32 | 256 | 799583488 | bytes=1024
+blk.23.attn_v.weight | Q8_0 | 1024,512 | 799584512 | bytes=557056
+blk.23.ffn_down.weight | Q8_0 | 3584,1024 | 800141568 | bytes=3899392
+blk.23.ffn_gate.weight | Q8_0 | 1024,3584 | 804040960 | bytes=3899392
+blk.23.ffn_up.weight | Q8_0 | 1024,3584 | 807940352 | bytes=3899392
+blk.23.post_attention_norm.weight | F32 | 1024 | 811839744 | bytes=4096
+
+sum_aligned_bytes 800881920
+check data_offset+sum == file_size : OK

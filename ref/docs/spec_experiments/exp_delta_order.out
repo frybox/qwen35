@@ -1,0 +1,36 @@
+[transformers] `fused_recurrent_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+==============================================================================
+shapes: q,k (1, 6, 2, 8)  v (1, 6, 2, 8)  g (1, 6, 2)
+g range: [-0.3565, -0.0451]  -> exp(g) in (0,1): [0.7001, 0.9559]
+==============================================================================
+
+[1] hand-written orders, initial_state=None
+    max |o_pre_decay_read - o_post_decay_read| = 2.631876e-02
+    mean|...|                                 = 4.420472e-03
+    max |S_pre  - S_post|                     = 1.724991e-02
+    o_pre[0,0,:4]  = [0.121658, -0.115972, -0.088453, -0.085779]
+    o_post[0,0,:4] = [0.121658, -0.115972, -0.088453, -0.085779]
+    => the two orders are NOT equivalent (relative diff 3.739%)
+
+[2] hand-written orders, initial_state = randn*0.35
+    max |o_pre - o_post| = 7.612559e-02   (mean 2.107939e-02)
+    o_pre[0,0,:4]  = [0.183809, 0.054764, -0.49001, 0.641884]
+    o_post[0,0,:4] = [0.173606, 0.105578, -0.435371, 0.648344]
+
+[3] cross-check against the REAL torch_recurrent_gated_delta_rule (modeling_qwen3_5.py:438)
+    max |ref - pre_decay_read | = 0.000000e+00
+    max |ref - post_decay_read| = 1.789570e-02
+    max |ref_S - pre_S  |       = 0.000000e+00
+    max |ref_S - post_S |       = 4.273649e-02
+    ref[0,0,:4]      = [0.043187, -0.03804, -0.177292, 0.156293]
+    pre[0,0,:4]      = [0.043187, -0.03804, -0.177292, 0.156293]
+    post[0,0,:4]     = [0.042522, -0.034729, -0.173732, 0.156714]
+    ==> REFERENCE MATCHES: pre_decay_read (decay FIRST, then read kv_mem)
+
+[4] torch_chunk_gated_delta_rule (chunk_size=4) vs torch_recurrent: max|diff| = 2.980232e-08
+
+[5] output read with PRE-update vs POST-update state: max|diff| = 2.571420e-01
+    => output MUST use the state AFTER the current token's update.
+
+[6] sanity: forget exp (gamma = g) -> max|diff| = 3.061299e-01 ; flip sign (gamma=exp(+|g|)) -> 9.175115e-01

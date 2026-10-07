@@ -1,0 +1,485 @@
+file_size 2579944608
+version 3
+tensor_count 426
+metadata_kv_count 46
+alignment 32
+data_offset 10968224
+
+=== metadata ===
+general.architecture | STRING "qwen35"
+general.type | STRING "model"
+general.name | STRING "Qwen3.5-4B"
+general.basename | STRING "Qwen3.5-4B"
+general.quantized_by | STRING "Unsloth"
+general.size_label | STRING "4B"
+general.license | STRING "apache-2.0"
+general.license.link | STRING "https://huggingface.co/Qwen/Qwen3.5-4B/blob/main/LICENSE"
+general.repo_url | STRING "https://huggingface.co/unsloth"
+general.base_model.count | UINT32 1
+general.base_model.0.name | STRING "Qwen3.5 4B"
+general.base_model.0.organization | STRING "Qwen"
+general.base_model.0.repo_url | STRING "https://huggingface.co/Qwen/Qwen3.5-4B"
+general.tags | ARRAY<STRING> len=2 ["unsloth", "image-text-to-text"]
+qwen35.block_count | UINT32 32
+qwen35.context_length | UINT32 262144
+qwen35.embedding_length | UINT32 2560
+qwen35.feed_forward_length | UINT32 9216
+qwen35.attention.head_count | UINT32 16
+qwen35.attention.head_count_kv | UINT32 4
+qwen35.rope.dimension_sections | ARRAY<INT32> len=4 [11, 11, 10, 0]
+qwen35.rope.freq_base | FLOAT32 10000000.0
+qwen35.attention.layer_norm_rms_epsilon | FLOAT32 9.999999974752427e-07
+qwen35.attention.key_length | UINT32 256
+qwen35.attention.value_length | UINT32 256
+qwen35.ssm.conv_kernel | UINT32 4
+qwen35.ssm.state_size | UINT32 128
+qwen35.ssm.group_count | UINT32 16
+qwen35.ssm.time_step_rank | UINT32 32
+qwen35.ssm.inner_size | UINT32 4096
+qwen35.full_attention_interval | UINT32 4
+qwen35.rope.dimension_count | UINT32 64
+tokenizer.ggml.model | STRING "gpt2"
+tokenizer.ggml.pre | STRING "qwen35"
+tokenizer.ggml.tokens | ARRAY<STRING> len=248320
+tokenizer.ggml.token_type | ARRAY<INT32> len=248320
+tokenizer.ggml.merges | ARRAY<STRING> len=247587
+tokenizer.ggml.eos_token_id | UINT32 248046
+tokenizer.ggml.padding_token_id | UINT32 248055
+tokenizer.chat_template | STRING "{%- set image_count = namespace(value=0) %}\n{%- set video_count = namespace(value=0) %}\n{%- macro render_content(content, do_vision_count, is_system_content=false) %}\n    {%- if content is string %}\n        {{- content }}\n    {%- elif content is iterable and content is not mapping %}\n        {%- for item in content %}\n            {%- if 'image' in item or 'image_url' in item or item.type == 'image' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain images.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set image_count.value = image_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Picture ' ~ image_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|image_pad|><|vision_end|>' }}\n            {%- elif 'video' in item or item.type == 'video' %}\n                {%- if is_system_content %}\n                    {{- raise_exception('System message cannot contain videos.') }}\n                {%- endif %}\n                {%- if do_vision_count %}\n                    {%- set video_count.value = video_count.value + 1 %}\n                {%- endif %}\n                {%- if add_vision_id %}\n                    {{- 'Video ' ~ video_count.value ~ ': ' }}\n                {%- endif %}\n                {{- '<|vision_start|><|video_pad|><|vision_end|>' }}\n            {%- elif 'text' in item %}\n                {{- item.text }}\n            {%- else %}\n                {{- raise_exception('Unexpected item type in content.') }}\n            {%- endif %}\n        {%- endfor %}\n    {%- elif content is none or content is undefined %}\n        {{- '' }}\n    {%- else %}\n        {{- raise_exception('Unexpected content type.') }}\n    {%- endif %}\n{%- endmacro %}\n{%- if not messages %}\n    {{- raise_exception('No messages provided.') }}\n{%- endif %}\n{%- if tools and tools is iterable and tools is not mapping %}\n    {{- '<|im_start|>system\\n' }}\n    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n    {%- for tool in tools %}\n        {{- \"\\n\" }}\n        {{- tool | tojson }}\n    {%- endfor %}\n    {{- \"\\n</tools>\" }}\n    {{- '\\n\\nIf you choose to call a function ONLY reply in the following format with NO suffix:\\n\\n<tool_call>\\n<function=example_function_name>\\n<parameter=example_parameter_1>\\nvalue_1\\n</parameter>\\n<parameter=example_parameter_2>\\nThis is the value for the second parameter\\nthat can span\\nmultiple lines\\n</parameter>\\n</function>\\n</tool_call>\\n\\n<IMPORTANT>\\nReminder:\\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\\n- Required parameters MUST be specified\\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\\n</IMPORTANT>' }}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {%- if content %}\n            {{- '\\n\\n' + content }}\n        {%- endif %}\n    {%- endif %}\n    {{- '<|im_end|>\\n' }}\n{%- else %}\n    {%- if messages[0].role == 'system' %}\n        {%- set content = render_content(messages[0].content, false, true)|trim %}\n        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n    {%- endif %}\n{%- endif %}\n{%- set ns = namespace(multi_step_tool=true, last_query_index=messages|length - 1) %}\n{%- for message in messages[::-1] %}\n    {%- set index = (messages|length - 1) - loop.index0 %}\n    {%- if ns.multi_step_tool and message.role == \"user\" %}\n        {%- set content = render_content(message.content, false)|trim %}\n        {%- if not(content.startswith('<tool_response>') and content.endswith('</tool_response>')) %}\n            {%- set ns.multi_step_tool = false %}\n            {%- set ns.last_query_index = index %}\n        {%- endif %}\n    {%- endif %}\n{%- endfor %}\n{%- if ns.multi_step_tool %}\n    {{- raise_exception('No user query found in messages.') }}\n{%- endif %}\n{%- for message in messages %}\n    {%- set content = render_content(message.content, true)|trim %}\n    {%- if message.role == \"system\" %}\n        {%- if not loop.first %}\n            {{- raise_exception('System message must be at the beginning.') }}\n        {%- endif %}\n    {%- elif message.role == \"user\" %}\n        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>' + '\\n' }}\n    {%- elif message.role == \"assistant\" %}\n        {%- set reasoning_content = '' %}\n        {%- if message.reasoning_content is string %}\n            {%- set reasoning_content = message.reasoning_content %}\n        {%- else %}\n            {%- if '</think>' in content %}\n                {%- set reasoning_content = content.split('</think>')[0].rstrip('\\n').split('<think>')[-1].lstrip('\\n') %}\n                {%- set content = content.split('</think>')[-1].lstrip('\\n') %}\n            {%- endif %}\n        {%- endif %}\n        {%- set reasoning_content = reasoning_content|trim %}\n        {%- if loop.index0 > ns.last_query_index %}\n            {{- '<|im_start|>' + message.role + '\\n<think>\\n' + reasoning_content + '\\n</think>\\n\\n' + content }}\n        {%- else %}\n            {{- '<|im_start|>' + message.role + '\\n' + content }}\n        {%- endif %}\n        {%- if message.tool_calls and message.tool_calls is iterable and message.tool_calls is not mapping %}\n            {%- for tool_call in message.tool_calls %}\n                {%- if tool_call.function is defined %}\n                    {%- set tool_call = tool_call.function %}\n                {%- endif %}\n                {%- if loop.first %}\n                    {%- if content|trim %}\n                        {{- '\\n\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- else %}\n                        {{- '<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                    {%- endif %}\n                {%- else %}\n                    {{- '\\n<tool_call>\\n<function=' + tool_call.name + '>\\n' }}\n                {%- endif %}\n                {%- if tool_call.arguments is mapping %}\n                    {%- for args_name in tool_call.arguments %}\n                        {%- set args_value = tool_call.arguments[args_name] %}\n                        {{- '<parameter=' + args_name + '>\\n' }}\n                        {%- set args_value = args_value | tojson | safe if args_value is mapping or (args_value is sequence and args_value is not string) else args_value | string %}\n                        {{- args_value }}\n                        {{- '\\n</parameter>\\n' }}\n                    {%- endfor %}\n                {%- endif %}\n                {{- '</function>\\n</tool_call>' }}\n            {%- endfor %}\n        {%- endif %}\n        {{- '<|im_end|>\\n' }}\n    {%- elif message.role == \"tool\" %}\n        {%- if loop.previtem and loop.previtem.role != \"tool\" %}\n            {{- '<|im_start|>user' }}\n        {%- endif %}\n        {{- '\\n<tool_response>\\n' }}\n        {{- content }}\n        {{- '\\n</tool_response>' }}\n        {%- if not loop.last and loop.nextitem.role != \"tool\" %}\n            {{- '<|im_end|>\\n' }}\n        {%- elif loop.last %}\n            {{- '<|im_end|>\\n' }}\n        {%- endif %}\n    {%- else %}\n        {{- raise_exception('Unexpected message role.') }}\n    {%- endif %}\n{%- endfor %}\n{%- if add_generation_prompt %}\n    {{- '<|im_start|>assistant\\n' }}\n    {%- if enable_thinking is defined and enable_thinking is true %}\n        {{- '<think>\\n' }}\n    {%- else %}\n        {{- '<think>\\n\\n</think>\\n\\n' }}\n    {%- endif %}\n{%- endif %}"
+general.quantization_version | UINT32 2
+general.file_type | UINT32 25
+quantize.imatrix.file | STRING "Qwen3.5-4B-GGUF/imatrix_unsloth.gguf"
+quantize.imatrix.dataset | STRING "unsloth_calibration_Qwen3.5-4B.txt"
+quantize.imatrix.entries_count | UINT32 248
+quantize.imatrix.chunks_count | UINT32 80
+
+=== tensors ===
+output_norm.weight | F32 | 2560 | 10968224 | bytes=10240
+token_embd.weight | Q6_K | 2560,248320 | 10978464 | bytes=521472000
+blk.0.attn_gate.weight | IQ4_NL | 2560,4096 | 532450464 | bytes=5898240
+blk.0.attn_norm.weight | F32 | 2560 | 538348704 | bytes=10240
+blk.0.attn_qkv.weight | IQ4_NL | 2560,8192 | 538358944 | bytes=11796480
+blk.0.ffn_down.weight | IQ4_NL | 9216,2560 | 550155424 | bytes=13271040
+blk.0.ffn_gate.weight | IQ4_NL | 2560,9216 | 563426464 | bytes=13271040
+blk.0.ffn_up.weight | IQ4_NL | 2560,9216 | 576697504 | bytes=13271040
+blk.0.post_attention_norm.weight | F32 | 2560 | 589968544 | bytes=10240
+blk.0.ssm_a | F32 | 32 | 589978784 | bytes=128
+blk.0.ssm_alpha.weight | Q8_0 | 2560,32 | 589978912 | bytes=87040
+blk.0.ssm_beta.weight | Q8_0 | 2560,32 | 590065952 | bytes=87040
+blk.0.ssm_conv1d.weight | F32 | 4,8192 | 590152992 | bytes=131072
+blk.0.ssm_dt.bias | F32 | 32 | 590284064 | bytes=128
+blk.0.ssm_norm.weight | F32 | 128 | 590284192 | bytes=512
+blk.0.ssm_out.weight | Q5_K | 4096,2560 | 590284704 | bytes=7208960
+blk.1.attn_gate.weight | IQ4_NL | 2560,4096 | 597493664 | bytes=5898240
+blk.1.attn_norm.weight | F32 | 2560 | 603391904 | bytes=10240
+blk.1.attn_qkv.weight | IQ4_NL | 2560,8192 | 603402144 | bytes=11796480
+blk.1.ffn_down.weight | IQ4_NL | 9216,2560 | 615198624 | bytes=13271040
+blk.1.ffn_gate.weight | IQ4_NL | 2560,9216 | 628469664 | bytes=13271040
+blk.1.ffn_up.weight | IQ4_NL | 2560,9216 | 641740704 | bytes=13271040
+blk.1.post_attention_norm.weight | F32 | 2560 | 655011744 | bytes=10240
+blk.1.ssm_a | F32 | 32 | 655021984 | bytes=128
+blk.1.ssm_alpha.weight | Q8_0 | 2560,32 | 655022112 | bytes=87040
+blk.1.ssm_beta.weight | Q8_0 | 2560,32 | 655109152 | bytes=87040
+blk.1.ssm_conv1d.weight | F32 | 4,8192 | 655196192 | bytes=131072
+blk.1.ssm_dt.bias | F32 | 32 | 655327264 | bytes=128
+blk.1.ssm_norm.weight | F32 | 128 | 655327392 | bytes=512
+blk.1.ssm_out.weight | Q5_K | 4096,2560 | 655327904 | bytes=7208960
+blk.2.attn_gate.weight | IQ4_NL | 2560,4096 | 662536864 | bytes=5898240
+blk.2.attn_norm.weight | F32 | 2560 | 668435104 | bytes=10240
+blk.2.attn_qkv.weight | IQ4_NL | 2560,8192 | 668445344 | bytes=11796480
+blk.2.ffn_down.weight | IQ4_NL | 9216,2560 | 680241824 | bytes=13271040
+blk.2.ffn_gate.weight | IQ4_NL | 2560,9216 | 693512864 | bytes=13271040
+blk.2.ffn_up.weight | IQ4_NL | 2560,9216 | 706783904 | bytes=13271040
+blk.2.post_attention_norm.weight | F32 | 2560 | 720054944 | bytes=10240
+blk.2.ssm_a | F32 | 32 | 720065184 | bytes=128
+blk.2.ssm_alpha.weight | Q8_0 | 2560,32 | 720065312 | bytes=87040
+blk.2.ssm_beta.weight | Q8_0 | 2560,32 | 720152352 | bytes=87040
+blk.2.ssm_conv1d.weight | F32 | 4,8192 | 720239392 | bytes=131072
+blk.2.ssm_dt.bias | F32 | 32 | 720370464 | bytes=128
+blk.2.ssm_norm.weight | F32 | 128 | 720370592 | bytes=512
+blk.2.ssm_out.weight | Q5_K | 4096,2560 | 720371104 | bytes=7208960
+blk.3.attn_k.weight | IQ4_NL | 2560,1024 | 727580064 | bytes=1474560
+blk.3.attn_k_norm.weight | F32 | 256 | 729054624 | bytes=1024
+blk.3.attn_norm.weight | F32 | 2560 | 729055648 | bytes=10240
+blk.3.attn_output.weight | IQ4_NL | 4096,2560 | 729065888 | bytes=5898240
+blk.3.attn_q.weight | IQ4_NL | 2560,8192 | 734964128 | bytes=11796480
+blk.3.attn_q_norm.weight | F32 | 256 | 746760608 | bytes=1024
+blk.3.attn_v.weight | Q5_K | 2560,1024 | 746761632 | bytes=1802240
+blk.3.ffn_down.weight | IQ4_NL | 9216,2560 | 748563872 | bytes=13271040
+blk.3.ffn_gate.weight | IQ4_NL | 2560,9216 | 761834912 | bytes=13271040
+blk.3.ffn_up.weight | IQ4_NL | 2560,9216 | 775105952 | bytes=13271040
+blk.3.post_attention_norm.weight | F32 | 2560 | 788376992 | bytes=10240
+blk.4.attn_gate.weight | IQ4_NL | 2560,4096 | 788387232 | bytes=5898240
+blk.4.attn_norm.weight | F32 | 2560 | 794285472 | bytes=10240
+blk.4.attn_qkv.weight | IQ4_NL | 2560,8192 | 794295712 | bytes=11796480
+blk.4.ffn_down.weight | IQ4_NL | 9216,2560 | 806092192 | bytes=13271040
+blk.4.ffn_gate.weight | IQ4_NL | 2560,9216 | 819363232 | bytes=13271040
+blk.4.ffn_up.weight | IQ4_NL | 2560,9216 | 832634272 | bytes=13271040
+blk.4.post_attention_norm.weight | F32 | 2560 | 845905312 | bytes=10240
+blk.4.ssm_a | F32 | 32 | 845915552 | bytes=128
+blk.4.ssm_alpha.weight | Q8_0 | 2560,32 | 845915680 | bytes=87040
+blk.4.ssm_beta.weight | Q8_0 | 2560,32 | 846002720 | bytes=87040
+blk.4.ssm_conv1d.weight | F32 | 4,8192 | 846089760 | bytes=131072
+blk.4.ssm_dt.bias | F32 | 32 | 846220832 | bytes=128
+blk.4.ssm_norm.weight | F32 | 128 | 846220960 | bytes=512
+blk.4.ssm_out.weight | Q5_K | 4096,2560 | 846221472 | bytes=7208960
+blk.5.attn_gate.weight | IQ4_NL | 2560,4096 | 853430432 | bytes=5898240
+blk.5.attn_norm.weight | F32 | 2560 | 859328672 | bytes=10240
+blk.5.attn_qkv.weight | IQ4_NL | 2560,8192 | 859338912 | bytes=11796480
+blk.5.ffn_down.weight | IQ4_NL | 9216,2560 | 871135392 | bytes=13271040
+blk.5.ffn_gate.weight | IQ4_NL | 2560,9216 | 884406432 | bytes=13271040
+blk.5.ffn_up.weight | IQ4_NL | 2560,9216 | 897677472 | bytes=13271040
+blk.5.post_attention_norm.weight | F32 | 2560 | 910948512 | bytes=10240
+blk.5.ssm_a | F32 | 32 | 910958752 | bytes=128
+blk.5.ssm_alpha.weight | Q8_0 | 2560,32 | 910958880 | bytes=87040
+blk.5.ssm_beta.weight | Q8_0 | 2560,32 | 911045920 | bytes=87040
+blk.5.ssm_conv1d.weight | F32 | 4,8192 | 911132960 | bytes=131072
+blk.5.ssm_dt.bias | F32 | 32 | 911264032 | bytes=128
+blk.5.ssm_norm.weight | F32 | 128 | 911264160 | bytes=512
+blk.5.ssm_out.weight | Q5_K | 4096,2560 | 911264672 | bytes=7208960
+blk.6.attn_gate.weight | IQ4_NL | 2560,4096 | 918473632 | bytes=5898240
+blk.6.attn_norm.weight | F32 | 2560 | 924371872 | bytes=10240
+blk.6.attn_qkv.weight | IQ4_NL | 2560,8192 | 924382112 | bytes=11796480
+blk.6.ffn_down.weight | IQ4_NL | 9216,2560 | 936178592 | bytes=13271040
+blk.6.ffn_gate.weight | IQ4_NL | 2560,9216 | 949449632 | bytes=13271040
+blk.6.ffn_up.weight | IQ4_NL | 2560,9216 | 962720672 | bytes=13271040
+blk.6.post_attention_norm.weight | F32 | 2560 | 975991712 | bytes=10240
+blk.6.ssm_a | F32 | 32 | 976001952 | bytes=128
+blk.6.ssm_alpha.weight | Q8_0 | 2560,32 | 976002080 | bytes=87040
+blk.6.ssm_beta.weight | Q8_0 | 2560,32 | 976089120 | bytes=87040
+blk.6.ssm_conv1d.weight | F32 | 4,8192 | 976176160 | bytes=131072
+blk.6.ssm_dt.bias | F32 | 32 | 976307232 | bytes=128
+blk.6.ssm_norm.weight | F32 | 128 | 976307360 | bytes=512
+blk.6.ssm_out.weight | Q5_K | 4096,2560 | 976307872 | bytes=7208960
+blk.7.attn_k.weight | IQ4_NL | 2560,1024 | 983516832 | bytes=1474560
+blk.7.attn_k_norm.weight | F32 | 256 | 984991392 | bytes=1024
+blk.7.attn_norm.weight | F32 | 2560 | 984992416 | bytes=10240
+blk.7.attn_output.weight | IQ4_NL | 4096,2560 | 985002656 | bytes=5898240
+blk.7.attn_q.weight | IQ4_NL | 2560,8192 | 990900896 | bytes=11796480
+blk.7.attn_q_norm.weight | F32 | 256 | 1002697376 | bytes=1024
+blk.7.attn_v.weight | Q5_K | 2560,1024 | 1002698400 | bytes=1802240
+blk.7.ffn_down.weight | IQ4_NL | 9216,2560 | 1004500640 | bytes=13271040
+blk.7.ffn_gate.weight | IQ4_NL | 2560,9216 | 1017771680 | bytes=13271040
+blk.7.ffn_up.weight | IQ4_NL | 2560,9216 | 1031042720 | bytes=13271040
+blk.7.post_attention_norm.weight | F32 | 2560 | 1044313760 | bytes=10240
+blk.8.attn_gate.weight | IQ4_NL | 2560,4096 | 1044324000 | bytes=5898240
+blk.8.attn_norm.weight | F32 | 2560 | 1050222240 | bytes=10240
+blk.8.attn_qkv.weight | IQ4_NL | 2560,8192 | 1050232480 | bytes=11796480
+blk.8.ffn_down.weight | IQ4_NL | 9216,2560 | 1062028960 | bytes=13271040
+blk.8.ffn_gate.weight | IQ4_NL | 2560,9216 | 1075300000 | bytes=13271040
+blk.8.ffn_up.weight | IQ4_NL | 2560,9216 | 1088571040 | bytes=13271040
+blk.8.post_attention_norm.weight | F32 | 2560 | 1101842080 | bytes=10240
+blk.8.ssm_a | F32 | 32 | 1101852320 | bytes=128
+blk.8.ssm_alpha.weight | Q8_0 | 2560,32 | 1101852448 | bytes=87040
+blk.8.ssm_beta.weight | Q8_0 | 2560,32 | 1101939488 | bytes=87040
+blk.8.ssm_conv1d.weight | F32 | 4,8192 | 1102026528 | bytes=131072
+blk.8.ssm_dt.bias | F32 | 32 | 1102157600 | bytes=128
+blk.8.ssm_norm.weight | F32 | 128 | 1102157728 | bytes=512
+blk.8.ssm_out.weight | Q5_K | 4096,2560 | 1102158240 | bytes=7208960
+blk.9.attn_gate.weight | IQ4_NL | 2560,4096 | 1109367200 | bytes=5898240
+blk.9.attn_norm.weight | F32 | 2560 | 1115265440 | bytes=10240
+blk.9.attn_qkv.weight | IQ4_NL | 2560,8192 | 1115275680 | bytes=11796480
+blk.9.ffn_down.weight | IQ4_NL | 9216,2560 | 1127072160 | bytes=13271040
+blk.9.ffn_gate.weight | IQ4_NL | 2560,9216 | 1140343200 | bytes=13271040
+blk.9.ffn_up.weight | IQ4_NL | 2560,9216 | 1153614240 | bytes=13271040
+blk.9.post_attention_norm.weight | F32 | 2560 | 1166885280 | bytes=10240
+blk.9.ssm_a | F32 | 32 | 1166895520 | bytes=128
+blk.9.ssm_alpha.weight | Q8_0 | 2560,32 | 1166895648 | bytes=87040
+blk.9.ssm_beta.weight | Q8_0 | 2560,32 | 1166982688 | bytes=87040
+blk.9.ssm_conv1d.weight | F32 | 4,8192 | 1167069728 | bytes=131072
+blk.9.ssm_dt.bias | F32 | 32 | 1167200800 | bytes=128
+blk.9.ssm_norm.weight | F32 | 128 | 1167200928 | bytes=512
+blk.9.ssm_out.weight | Q5_K | 4096,2560 | 1167201440 | bytes=7208960
+blk.10.attn_gate.weight | IQ4_NL | 2560,4096 | 1174410400 | bytes=5898240
+blk.10.attn_norm.weight | F32 | 2560 | 1180308640 | bytes=10240
+blk.10.attn_qkv.weight | IQ4_NL | 2560,8192 | 1180318880 | bytes=11796480
+blk.10.ffn_down.weight | IQ4_NL | 9216,2560 | 1192115360 | bytes=13271040
+blk.10.ffn_gate.weight | IQ4_NL | 2560,9216 | 1205386400 | bytes=13271040
+blk.10.ffn_up.weight | IQ4_NL | 2560,9216 | 1218657440 | bytes=13271040
+blk.10.post_attention_norm.weight | F32 | 2560 | 1231928480 | bytes=10240
+blk.10.ssm_a | F32 | 32 | 1231938720 | bytes=128
+blk.10.ssm_alpha.weight | Q8_0 | 2560,32 | 1231938848 | bytes=87040
+blk.10.ssm_beta.weight | Q8_0 | 2560,32 | 1232025888 | bytes=87040
+blk.10.ssm_conv1d.weight | F32 | 4,8192 | 1232112928 | bytes=131072
+blk.10.ssm_dt.bias | F32 | 32 | 1232244000 | bytes=128
+blk.10.ssm_norm.weight | F32 | 128 | 1232244128 | bytes=512
+blk.10.ssm_out.weight | Q5_K | 4096,2560 | 1232244640 | bytes=7208960
+blk.11.attn_k.weight | IQ4_NL | 2560,1024 | 1239453600 | bytes=1474560
+blk.11.attn_k_norm.weight | F32 | 256 | 1240928160 | bytes=1024
+blk.11.attn_norm.weight | F32 | 2560 | 1240929184 | bytes=10240
+blk.11.attn_output.weight | IQ4_NL | 4096,2560 | 1240939424 | bytes=5898240
+blk.11.attn_q.weight | IQ4_NL | 2560,8192 | 1246837664 | bytes=11796480
+blk.11.attn_q_norm.weight | F32 | 256 | 1258634144 | bytes=1024
+blk.11.attn_v.weight | Q5_K | 2560,1024 | 1258635168 | bytes=1802240
+blk.11.ffn_down.weight | IQ4_NL | 9216,2560 | 1260437408 | bytes=13271040
+blk.11.ffn_gate.weight | IQ4_NL | 2560,9216 | 1273708448 | bytes=13271040
+blk.11.ffn_up.weight | IQ4_NL | 2560,9216 | 1286979488 | bytes=13271040
+blk.11.post_attention_norm.weight | F32 | 2560 | 1300250528 | bytes=10240
+blk.12.attn_gate.weight | IQ4_NL | 2560,4096 | 1300260768 | bytes=5898240
+blk.12.attn_norm.weight | F32 | 2560 | 1306159008 | bytes=10240
+blk.12.attn_qkv.weight | IQ4_NL | 2560,8192 | 1306169248 | bytes=11796480
+blk.12.ffn_down.weight | IQ4_NL | 9216,2560 | 1317965728 | bytes=13271040
+blk.12.ffn_gate.weight | IQ4_NL | 2560,9216 | 1331236768 | bytes=13271040
+blk.12.ffn_up.weight | IQ4_NL | 2560,9216 | 1344507808 | bytes=13271040
+blk.12.post_attention_norm.weight | F32 | 2560 | 1357778848 | bytes=10240
+blk.12.ssm_a | F32 | 32 | 1357789088 | bytes=128
+blk.12.ssm_alpha.weight | Q8_0 | 2560,32 | 1357789216 | bytes=87040
+blk.12.ssm_beta.weight | Q8_0 | 2560,32 | 1357876256 | bytes=87040
+blk.12.ssm_conv1d.weight | F32 | 4,8192 | 1357963296 | bytes=131072
+blk.12.ssm_dt.bias | F32 | 32 | 1358094368 | bytes=128
+blk.12.ssm_norm.weight | F32 | 128 | 1358094496 | bytes=512
+blk.12.ssm_out.weight | Q5_K | 4096,2560 | 1358095008 | bytes=7208960
+blk.13.attn_gate.weight | IQ4_NL | 2560,4096 | 1365303968 | bytes=5898240
+blk.13.attn_norm.weight | F32 | 2560 | 1371202208 | bytes=10240
+blk.13.attn_qkv.weight | IQ4_NL | 2560,8192 | 1371212448 | bytes=11796480
+blk.13.ffn_down.weight | IQ4_NL | 9216,2560 | 1383008928 | bytes=13271040
+blk.13.ffn_gate.weight | IQ4_NL | 2560,9216 | 1396279968 | bytes=13271040
+blk.13.ffn_up.weight | IQ4_NL | 2560,9216 | 1409551008 | bytes=13271040
+blk.13.post_attention_norm.weight | F32 | 2560 | 1422822048 | bytes=10240
+blk.13.ssm_a | F32 | 32 | 1422832288 | bytes=128
+blk.13.ssm_alpha.weight | Q8_0 | 2560,32 | 1422832416 | bytes=87040
+blk.13.ssm_beta.weight | Q8_0 | 2560,32 | 1422919456 | bytes=87040
+blk.13.ssm_conv1d.weight | F32 | 4,8192 | 1423006496 | bytes=131072
+blk.13.ssm_dt.bias | F32 | 32 | 1423137568 | bytes=128
+blk.13.ssm_norm.weight | F32 | 128 | 1423137696 | bytes=512
+blk.13.ssm_out.weight | Q5_K | 4096,2560 | 1423138208 | bytes=7208960
+blk.14.attn_gate.weight | IQ4_NL | 2560,4096 | 1430347168 | bytes=5898240
+blk.14.attn_norm.weight | F32 | 2560 | 1436245408 | bytes=10240
+blk.14.attn_qkv.weight | IQ4_NL | 2560,8192 | 1436255648 | bytes=11796480
+blk.14.ffn_down.weight | IQ4_NL | 9216,2560 | 1448052128 | bytes=13271040
+blk.14.ffn_gate.weight | IQ4_NL | 2560,9216 | 1461323168 | bytes=13271040
+blk.14.ffn_up.weight | IQ4_NL | 2560,9216 | 1474594208 | bytes=13271040
+blk.14.post_attention_norm.weight | F32 | 2560 | 1487865248 | bytes=10240
+blk.14.ssm_a | F32 | 32 | 1487875488 | bytes=128
+blk.14.ssm_alpha.weight | Q8_0 | 2560,32 | 1487875616 | bytes=87040
+blk.14.ssm_beta.weight | Q8_0 | 2560,32 | 1487962656 | bytes=87040
+blk.14.ssm_conv1d.weight | F32 | 4,8192 | 1488049696 | bytes=131072
+blk.14.ssm_dt.bias | F32 | 32 | 1488180768 | bytes=128
+blk.14.ssm_norm.weight | F32 | 128 | 1488180896 | bytes=512
+blk.14.ssm_out.weight | Q5_K | 4096,2560 | 1488181408 | bytes=7208960
+blk.15.attn_k.weight | IQ4_NL | 2560,1024 | 1495390368 | bytes=1474560
+blk.15.attn_k_norm.weight | F32 | 256 | 1496864928 | bytes=1024
+blk.15.attn_norm.weight | F32 | 2560 | 1496865952 | bytes=10240
+blk.15.attn_output.weight | IQ4_NL | 4096,2560 | 1496876192 | bytes=5898240
+blk.15.attn_q.weight | IQ4_NL | 2560,8192 | 1502774432 | bytes=11796480
+blk.15.attn_q_norm.weight | F32 | 256 | 1514570912 | bytes=1024
+blk.15.attn_v.weight | Q5_K | 2560,1024 | 1514571936 | bytes=1802240
+blk.15.ffn_down.weight | IQ4_NL | 9216,2560 | 1516374176 | bytes=13271040
+blk.15.ffn_gate.weight | IQ4_NL | 2560,9216 | 1529645216 | bytes=13271040
+blk.15.ffn_up.weight | IQ4_NL | 2560,9216 | 1542916256 | bytes=13271040
+blk.15.post_attention_norm.weight | F32 | 2560 | 1556187296 | bytes=10240
+blk.16.attn_gate.weight | IQ4_NL | 2560,4096 | 1556197536 | bytes=5898240
+blk.16.attn_norm.weight | F32 | 2560 | 1562095776 | bytes=10240
+blk.16.attn_qkv.weight | IQ4_NL | 2560,8192 | 1562106016 | bytes=11796480
+blk.16.ffn_down.weight | IQ4_NL | 9216,2560 | 1573902496 | bytes=13271040
+blk.16.ffn_gate.weight | IQ4_NL | 2560,9216 | 1587173536 | bytes=13271040
+blk.16.ffn_up.weight | IQ4_NL | 2560,9216 | 1600444576 | bytes=13271040
+blk.16.post_attention_norm.weight | F32 | 2560 | 1613715616 | bytes=10240
+blk.16.ssm_a | F32 | 32 | 1613725856 | bytes=128
+blk.16.ssm_alpha.weight | Q8_0 | 2560,32 | 1613725984 | bytes=87040
+blk.16.ssm_beta.weight | Q8_0 | 2560,32 | 1613813024 | bytes=87040
+blk.16.ssm_conv1d.weight | F32 | 4,8192 | 1613900064 | bytes=131072
+blk.16.ssm_dt.bias | F32 | 32 | 1614031136 | bytes=128
+blk.16.ssm_norm.weight | F32 | 128 | 1614031264 | bytes=512
+blk.16.ssm_out.weight | Q5_K | 4096,2560 | 1614031776 | bytes=7208960
+blk.17.attn_gate.weight | IQ4_NL | 2560,4096 | 1621240736 | bytes=5898240
+blk.17.attn_norm.weight | F32 | 2560 | 1627138976 | bytes=10240
+blk.17.attn_qkv.weight | IQ4_NL | 2560,8192 | 1627149216 | bytes=11796480
+blk.17.ffn_down.weight | IQ4_NL | 9216,2560 | 1638945696 | bytes=13271040
+blk.17.ffn_gate.weight | IQ4_NL | 2560,9216 | 1652216736 | bytes=13271040
+blk.17.ffn_up.weight | IQ4_NL | 2560,9216 | 1665487776 | bytes=13271040
+blk.17.post_attention_norm.weight | F32 | 2560 | 1678758816 | bytes=10240
+blk.17.ssm_a | F32 | 32 | 1678769056 | bytes=128
+blk.17.ssm_alpha.weight | Q8_0 | 2560,32 | 1678769184 | bytes=87040
+blk.17.ssm_beta.weight | Q8_0 | 2560,32 | 1678856224 | bytes=87040
+blk.17.ssm_conv1d.weight | F32 | 4,8192 | 1678943264 | bytes=131072
+blk.17.ssm_dt.bias | F32 | 32 | 1679074336 | bytes=128
+blk.17.ssm_norm.weight | F32 | 128 | 1679074464 | bytes=512
+blk.17.ssm_out.weight | Q5_K | 4096,2560 | 1679074976 | bytes=7208960
+blk.18.attn_gate.weight | IQ4_NL | 2560,4096 | 1686283936 | bytes=5898240
+blk.18.attn_norm.weight | F32 | 2560 | 1692182176 | bytes=10240
+blk.18.attn_qkv.weight | IQ4_NL | 2560,8192 | 1692192416 | bytes=11796480
+blk.18.ffn_down.weight | IQ4_NL | 9216,2560 | 1703988896 | bytes=13271040
+blk.18.ffn_gate.weight | IQ4_NL | 2560,9216 | 1717259936 | bytes=13271040
+blk.18.ffn_up.weight | IQ4_NL | 2560,9216 | 1730530976 | bytes=13271040
+blk.18.post_attention_norm.weight | F32 | 2560 | 1743802016 | bytes=10240
+blk.18.ssm_a | F32 | 32 | 1743812256 | bytes=128
+blk.18.ssm_alpha.weight | Q8_0 | 2560,32 | 1743812384 | bytes=87040
+blk.18.ssm_beta.weight | Q8_0 | 2560,32 | 1743899424 | bytes=87040
+blk.18.ssm_conv1d.weight | F32 | 4,8192 | 1743986464 | bytes=131072
+blk.18.ssm_dt.bias | F32 | 32 | 1744117536 | bytes=128
+blk.18.ssm_norm.weight | F32 | 128 | 1744117664 | bytes=512
+blk.18.ssm_out.weight | Q5_K | 4096,2560 | 1744118176 | bytes=7208960
+blk.19.attn_k.weight | IQ4_NL | 2560,1024 | 1751327136 | bytes=1474560
+blk.19.attn_k_norm.weight | F32 | 256 | 1752801696 | bytes=1024
+blk.19.attn_norm.weight | F32 | 2560 | 1752802720 | bytes=10240
+blk.19.attn_output.weight | IQ4_NL | 4096,2560 | 1752812960 | bytes=5898240
+blk.19.attn_q.weight | IQ4_NL | 2560,8192 | 1758711200 | bytes=11796480
+blk.19.attn_q_norm.weight | F32 | 256 | 1770507680 | bytes=1024
+blk.19.attn_v.weight | Q5_K | 2560,1024 | 1770508704 | bytes=1802240
+blk.19.ffn_down.weight | IQ4_NL | 9216,2560 | 1772310944 | bytes=13271040
+blk.19.ffn_gate.weight | IQ4_NL | 2560,9216 | 1785581984 | bytes=13271040
+blk.19.ffn_up.weight | IQ4_NL | 2560,9216 | 1798853024 | bytes=13271040
+blk.19.post_attention_norm.weight | F32 | 2560 | 1812124064 | bytes=10240
+blk.20.attn_gate.weight | IQ4_NL | 2560,4096 | 1812134304 | bytes=5898240
+blk.20.attn_norm.weight | F32 | 2560 | 1818032544 | bytes=10240
+blk.20.attn_qkv.weight | IQ4_NL | 2560,8192 | 1818042784 | bytes=11796480
+blk.20.ffn_down.weight | IQ4_NL | 9216,2560 | 1829839264 | bytes=13271040
+blk.20.ffn_gate.weight | IQ4_NL | 2560,9216 | 1843110304 | bytes=13271040
+blk.20.ffn_up.weight | IQ4_NL | 2560,9216 | 1856381344 | bytes=13271040
+blk.20.post_attention_norm.weight | F32 | 2560 | 1869652384 | bytes=10240
+blk.20.ssm_a | F32 | 32 | 1869662624 | bytes=128
+blk.20.ssm_alpha.weight | Q8_0 | 2560,32 | 1869662752 | bytes=87040
+blk.20.ssm_beta.weight | Q8_0 | 2560,32 | 1869749792 | bytes=87040
+blk.20.ssm_conv1d.weight | F32 | 4,8192 | 1869836832 | bytes=131072
+blk.20.ssm_dt.bias | F32 | 32 | 1869967904 | bytes=128
+blk.20.ssm_norm.weight | F32 | 128 | 1869968032 | bytes=512
+blk.20.ssm_out.weight | Q5_K | 4096,2560 | 1869968544 | bytes=7208960
+blk.21.attn_gate.weight | IQ4_NL | 2560,4096 | 1877177504 | bytes=5898240
+blk.21.attn_norm.weight | F32 | 2560 | 1883075744 | bytes=10240
+blk.21.attn_qkv.weight | IQ4_NL | 2560,8192 | 1883085984 | bytes=11796480
+blk.21.ffn_down.weight | IQ4_NL | 9216,2560 | 1894882464 | bytes=13271040
+blk.21.ffn_gate.weight | IQ4_NL | 2560,9216 | 1908153504 | bytes=13271040
+blk.21.ffn_up.weight | IQ4_NL | 2560,9216 | 1921424544 | bytes=13271040
+blk.21.post_attention_norm.weight | F32 | 2560 | 1934695584 | bytes=10240
+blk.21.ssm_a | F32 | 32 | 1934705824 | bytes=128
+blk.21.ssm_alpha.weight | Q8_0 | 2560,32 | 1934705952 | bytes=87040
+blk.21.ssm_beta.weight | Q8_0 | 2560,32 | 1934792992 | bytes=87040
+blk.21.ssm_conv1d.weight | F32 | 4,8192 | 1934880032 | bytes=131072
+blk.21.ssm_dt.bias | F32 | 32 | 1935011104 | bytes=128
+blk.21.ssm_norm.weight | F32 | 128 | 1935011232 | bytes=512
+blk.21.ssm_out.weight | Q5_K | 4096,2560 | 1935011744 | bytes=7208960
+blk.22.attn_gate.weight | IQ4_NL | 2560,4096 | 1942220704 | bytes=5898240
+blk.22.attn_norm.weight | F32 | 2560 | 1948118944 | bytes=10240
+blk.22.attn_qkv.weight | IQ4_NL | 2560,8192 | 1948129184 | bytes=11796480
+blk.22.ffn_down.weight | IQ4_NL | 9216,2560 | 1959925664 | bytes=13271040
+blk.22.ffn_gate.weight | IQ4_NL | 2560,9216 | 1973196704 | bytes=13271040
+blk.22.ffn_up.weight | IQ4_NL | 2560,9216 | 1986467744 | bytes=13271040
+blk.22.post_attention_norm.weight | F32 | 2560 | 1999738784 | bytes=10240
+blk.22.ssm_a | F32 | 32 | 1999749024 | bytes=128
+blk.22.ssm_alpha.weight | Q8_0 | 2560,32 | 1999749152 | bytes=87040
+blk.22.ssm_beta.weight | Q8_0 | 2560,32 | 1999836192 | bytes=87040
+blk.22.ssm_conv1d.weight | F32 | 4,8192 | 1999923232 | bytes=131072
+blk.22.ssm_dt.bias | F32 | 32 | 2000054304 | bytes=128
+blk.22.ssm_norm.weight | F32 | 128 | 2000054432 | bytes=512
+blk.22.ssm_out.weight | Q5_K | 4096,2560 | 2000054944 | bytes=7208960
+blk.23.attn_k.weight | IQ4_NL | 2560,1024 | 2007263904 | bytes=1474560
+blk.23.attn_k_norm.weight | F32 | 256 | 2008738464 | bytes=1024
+blk.23.attn_norm.weight | F32 | 2560 | 2008739488 | bytes=10240
+blk.23.attn_output.weight | IQ4_NL | 4096,2560 | 2008749728 | bytes=5898240
+blk.23.attn_q.weight | IQ4_NL | 2560,8192 | 2014647968 | bytes=11796480
+blk.23.attn_q_norm.weight | F32 | 256 | 2026444448 | bytes=1024
+blk.23.attn_v.weight | Q5_K | 2560,1024 | 2026445472 | bytes=1802240
+blk.23.ffn_down.weight | IQ4_NL | 9216,2560 | 2028247712 | bytes=13271040
+blk.23.ffn_gate.weight | IQ4_NL | 2560,9216 | 2041518752 | bytes=13271040
+blk.23.ffn_up.weight | IQ4_NL | 2560,9216 | 2054789792 | bytes=13271040
+blk.23.post_attention_norm.weight | F32 | 2560 | 2068060832 | bytes=10240
+blk.24.attn_gate.weight | IQ4_NL | 2560,4096 | 2068071072 | bytes=5898240
+blk.24.attn_norm.weight | F32 | 2560 | 2073969312 | bytes=10240
+blk.24.attn_qkv.weight | IQ4_NL | 2560,8192 | 2073979552 | bytes=11796480
+blk.24.ffn_down.weight | IQ4_NL | 9216,2560 | 2085776032 | bytes=13271040
+blk.24.ffn_gate.weight | IQ4_NL | 2560,9216 | 2099047072 | bytes=13271040
+blk.24.ffn_up.weight | IQ4_NL | 2560,9216 | 2112318112 | bytes=13271040
+blk.24.post_attention_norm.weight | F32 | 2560 | 2125589152 | bytes=10240
+blk.24.ssm_a | F32 | 32 | 2125599392 | bytes=128
+blk.24.ssm_alpha.weight | Q8_0 | 2560,32 | 2125599520 | bytes=87040
+blk.24.ssm_beta.weight | Q8_0 | 2560,32 | 2125686560 | bytes=87040
+blk.24.ssm_conv1d.weight | F32 | 4,8192 | 2125773600 | bytes=131072
+blk.24.ssm_dt.bias | F32 | 32 | 2125904672 | bytes=128
+blk.24.ssm_norm.weight | F32 | 128 | 2125904800 | bytes=512
+blk.24.ssm_out.weight | Q5_K | 4096,2560 | 2125905312 | bytes=7208960
+blk.25.attn_gate.weight | IQ4_NL | 2560,4096 | 2133114272 | bytes=5898240
+blk.25.attn_norm.weight | F32 | 2560 | 2139012512 | bytes=10240
+blk.25.attn_qkv.weight | IQ4_NL | 2560,8192 | 2139022752 | bytes=11796480
+blk.25.ffn_down.weight | IQ4_NL | 9216,2560 | 2150819232 | bytes=13271040
+blk.25.ffn_gate.weight | IQ4_NL | 2560,9216 | 2164090272 | bytes=13271040
+blk.25.ffn_up.weight | IQ4_NL | 2560,9216 | 2177361312 | bytes=13271040
+blk.25.post_attention_norm.weight | F32 | 2560 | 2190632352 | bytes=10240
+blk.25.ssm_a | F32 | 32 | 2190642592 | bytes=128
+blk.25.ssm_alpha.weight | Q8_0 | 2560,32 | 2190642720 | bytes=87040
+blk.25.ssm_beta.weight | Q8_0 | 2560,32 | 2190729760 | bytes=87040
+blk.25.ssm_conv1d.weight | F32 | 4,8192 | 2190816800 | bytes=131072
+blk.25.ssm_dt.bias | F32 | 32 | 2190947872 | bytes=128
+blk.25.ssm_norm.weight | F32 | 128 | 2190948000 | bytes=512
+blk.25.ssm_out.weight | Q5_K | 4096,2560 | 2190948512 | bytes=7208960
+blk.26.attn_gate.weight | IQ4_NL | 2560,4096 | 2198157472 | bytes=5898240
+blk.26.attn_norm.weight | F32 | 2560 | 2204055712 | bytes=10240
+blk.26.attn_qkv.weight | IQ4_NL | 2560,8192 | 2204065952 | bytes=11796480
+blk.26.ffn_down.weight | IQ4_NL | 9216,2560 | 2215862432 | bytes=13271040
+blk.26.ffn_gate.weight | IQ4_NL | 2560,9216 | 2229133472 | bytes=13271040
+blk.26.ffn_up.weight | IQ4_NL | 2560,9216 | 2242404512 | bytes=13271040
+blk.26.post_attention_norm.weight | F32 | 2560 | 2255675552 | bytes=10240
+blk.26.ssm_a | F32 | 32 | 2255685792 | bytes=128
+blk.26.ssm_alpha.weight | Q8_0 | 2560,32 | 2255685920 | bytes=87040
+blk.26.ssm_beta.weight | Q8_0 | 2560,32 | 2255772960 | bytes=87040
+blk.26.ssm_conv1d.weight | F32 | 4,8192 | 2255860000 | bytes=131072
+blk.26.ssm_dt.bias | F32 | 32 | 2255991072 | bytes=128
+blk.26.ssm_norm.weight | F32 | 128 | 2255991200 | bytes=512
+blk.26.ssm_out.weight | Q5_K | 4096,2560 | 2255991712 | bytes=7208960
+blk.27.attn_k.weight | IQ4_NL | 2560,1024 | 2263200672 | bytes=1474560
+blk.27.attn_k_norm.weight | F32 | 256 | 2264675232 | bytes=1024
+blk.27.attn_norm.weight | F32 | 2560 | 2264676256 | bytes=10240
+blk.27.attn_output.weight | IQ4_NL | 4096,2560 | 2264686496 | bytes=5898240
+blk.27.attn_q.weight | IQ4_NL | 2560,8192 | 2270584736 | bytes=11796480
+blk.27.attn_q_norm.weight | F32 | 256 | 2282381216 | bytes=1024
+blk.27.attn_v.weight | Q5_K | 2560,1024 | 2282382240 | bytes=1802240
+blk.27.ffn_down.weight | IQ4_NL | 9216,2560 | 2284184480 | bytes=13271040
+blk.27.ffn_gate.weight | IQ4_NL | 2560,9216 | 2297455520 | bytes=13271040
+blk.27.ffn_up.weight | IQ4_NL | 2560,9216 | 2310726560 | bytes=13271040
+blk.27.post_attention_norm.weight | F32 | 2560 | 2323997600 | bytes=10240
+blk.28.attn_gate.weight | IQ4_NL | 2560,4096 | 2324007840 | bytes=5898240
+blk.28.attn_norm.weight | F32 | 2560 | 2329906080 | bytes=10240
+blk.28.attn_qkv.weight | IQ4_NL | 2560,8192 | 2329916320 | bytes=11796480
+blk.28.ffn_down.weight | IQ4_NL | 9216,2560 | 2341712800 | bytes=13271040
+blk.28.ffn_gate.weight | IQ4_NL | 2560,9216 | 2354983840 | bytes=13271040
+blk.28.ffn_up.weight | IQ4_NL | 2560,9216 | 2368254880 | bytes=13271040
+blk.28.post_attention_norm.weight | F32 | 2560 | 2381525920 | bytes=10240
+blk.28.ssm_a | F32 | 32 | 2381536160 | bytes=128
+blk.28.ssm_alpha.weight | Q8_0 | 2560,32 | 2381536288 | bytes=87040
+blk.28.ssm_beta.weight | Q8_0 | 2560,32 | 2381623328 | bytes=87040
+blk.28.ssm_conv1d.weight | F32 | 4,8192 | 2381710368 | bytes=131072
+blk.28.ssm_dt.bias | F32 | 32 | 2381841440 | bytes=128
+blk.28.ssm_norm.weight | F32 | 128 | 2381841568 | bytes=512
+blk.28.ssm_out.weight | Q5_K | 4096,2560 | 2381842080 | bytes=7208960
+blk.29.attn_gate.weight | IQ4_NL | 2560,4096 | 2389051040 | bytes=5898240
+blk.29.attn_norm.weight | F32 | 2560 | 2394949280 | bytes=10240
+blk.29.attn_qkv.weight | IQ4_NL | 2560,8192 | 2394959520 | bytes=11796480
+blk.29.ffn_down.weight | IQ4_NL | 9216,2560 | 2406756000 | bytes=13271040
+blk.29.ffn_gate.weight | IQ4_NL | 2560,9216 | 2420027040 | bytes=13271040
+blk.29.ffn_up.weight | IQ4_NL | 2560,9216 | 2433298080 | bytes=13271040
+blk.29.post_attention_norm.weight | F32 | 2560 | 2446569120 | bytes=10240
+blk.29.ssm_a | F32 | 32 | 2446579360 | bytes=128
+blk.29.ssm_alpha.weight | Q8_0 | 2560,32 | 2446579488 | bytes=87040
+blk.29.ssm_beta.weight | Q8_0 | 2560,32 | 2446666528 | bytes=87040
+blk.29.ssm_conv1d.weight | F32 | 4,8192 | 2446753568 | bytes=131072
+blk.29.ssm_dt.bias | F32 | 32 | 2446884640 | bytes=128
+blk.29.ssm_norm.weight | F32 | 128 | 2446884768 | bytes=512
+blk.29.ssm_out.weight | Q5_K | 4096,2560 | 2446885280 | bytes=7208960
+blk.30.attn_gate.weight | IQ4_NL | 2560,4096 | 2454094240 | bytes=5898240
+blk.30.attn_norm.weight | F32 | 2560 | 2459992480 | bytes=10240
+blk.30.attn_qkv.weight | IQ4_NL | 2560,8192 | 2460002720 | bytes=11796480
+blk.30.ffn_down.weight | IQ4_NL | 9216,2560 | 2471799200 | bytes=13271040
+blk.30.ffn_gate.weight | IQ4_NL | 2560,9216 | 2485070240 | bytes=13271040
+blk.30.ffn_up.weight | IQ4_NL | 2560,9216 | 2498341280 | bytes=13271040
+blk.30.post_attention_norm.weight | F32 | 2560 | 2511612320 | bytes=10240
+blk.30.ssm_a | F32 | 32 | 2511622560 | bytes=128
+blk.30.ssm_alpha.weight | Q8_0 | 2560,32 | 2511622688 | bytes=87040
+blk.30.ssm_beta.weight | Q8_0 | 2560,32 | 2511709728 | bytes=87040
+blk.30.ssm_conv1d.weight | F32 | 4,8192 | 2511796768 | bytes=131072
+blk.30.ssm_dt.bias | F32 | 32 | 2511927840 | bytes=128
+blk.30.ssm_norm.weight | F32 | 128 | 2511927968 | bytes=512
+blk.30.ssm_out.weight | Q5_K | 4096,2560 | 2511928480 | bytes=7208960
+blk.31.attn_k.weight | IQ4_NL | 2560,1024 | 2519137440 | bytes=1474560
+blk.31.attn_k_norm.weight | F32 | 256 | 2520612000 | bytes=1024
+blk.31.attn_norm.weight | F32 | 2560 | 2520613024 | bytes=10240
+blk.31.attn_output.weight | IQ4_NL | 4096,2560 | 2520623264 | bytes=5898240
+blk.31.attn_q.weight | IQ4_NL | 2560,8192 | 2526521504 | bytes=11796480
+blk.31.attn_q_norm.weight | F32 | 256 | 2538317984 | bytes=1024
+blk.31.attn_v.weight | Q5_K | 2560,1024 | 2538319008 | bytes=1802240
+blk.31.ffn_down.weight | IQ4_NL | 9216,2560 | 2540121248 | bytes=13271040
+blk.31.ffn_gate.weight | IQ4_NL | 2560,9216 | 2553392288 | bytes=13271040
+blk.31.ffn_up.weight | IQ4_NL | 2560,9216 | 2566663328 | bytes=13271040
+blk.31.post_attention_norm.weight | F32 | 2560 | 2579934368 | bytes=10240
+
+sum_aligned_bytes 2568976384
+check data_offset+sum == file_size : OK

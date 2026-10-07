@@ -1,0 +1,42 @@
+[transformers] You tried to access the `AttentionInterface` with a `config._attn_implementation` set to `None`. This is expected if you use an Attention Module as a standalone Module. If this is not the case, something went wrong with the dispatch of `config._attn_implementation`
+==============================================================================
+[Q16] checkpoint keys: lm_head present? False
+      embed_tokens: (248320, 1024)
+      -> no lm_head tensor; _tied_weights_keys = {'lm_head.weight': 'model.embed_tokens.weight'}
+         (modeling_qwen3_5.py:1665) and config tie_word_embeddings = True
+      model.language_model.norm.weight: (1024,)
+      lm_head = nn.Linear(hidden, vocab, bias=False) (line 1676); logits = x @ W^T
+      (nn.Linear stores weight as [out_features, in_features] = [248320, 1024])
+
+[MLP] layer0 tensors: [('gate_proj.weight', (3584, 1024)), ('up_proj.weight', (3584, 1024)), ('down_proj.weight', (1024, 3584))]
+      SwiGLU: down_proj( silu(gate_proj(x)) * up_proj(x) )   (Qwen3_5MLP, see modeling file)
+      ACT2FN[config.hidden_act] with hidden_act = silu
+
+[Q9/Q10] rotary_dim (2*len(inv_freq)) = 64  cos.shape = (1, 5, 64)  (last dim = 2*rotary_dim)
+      cos[0,1,:6] = [0.54030234, 0.82290208, 0.93406159, 0.97575027, 0.99112177, 0.99675483]
+      sin[0,1,:6] = [0.84147096, 0.56818324, 0.35711196, 0.21888675, 0.13295726, 0.08049703]
+
+[Q12] q_norm.weight shape (256,)  mean=0.42688 min=-0.21094 max=1.22656
+      kn_w stats mean=0.41667 min=-0.89844 max=1.63281
+      NOTE Qwen3_5RMSNorm init is torch.zeros + forward multiplies by (1.0 + weight)
+           (lines 845 & 854). These are real trained values != 0, but the +1 convention
+           is what matters: effective scale = 1 + w.  (Same for input/post_attention layernorm.)
+
+[Q12/Q13/Q14] hand-written full attention vs real Qwen3_5Attention:
+   max|correct - real|                     = 0.000e+00
+   max|rope-before-norm (WRONG) - real|    = 2.694e-02
+   max|gate-block split (WRONG) - real|    = 6.330e-01
+   max|h%nkv mapping (WRONG) - real|        = 8.561e-01
+   max|no causal mask (WRONG) - real|      = 5.286e-01
+   max|scale=1.0 (WRONG) - real|           = 2.907e-01
+
+[Q16] end-to-end: real model forward, last-token logits argmax
+Loading weights:   0%|          | 0/320 [00:00<?, ?it/s]Loading weights:  79%|███████▉  | 253/320 [00:00<00:00, 2516.37it/s]Loading weights: 100%|██████████| 320/320 [00:00<00:00, 2553.87it/s]
+[transformers] `causal_conv1d_fn` is falling back to its reference PyTorch implementation because `causal_conv1d` is not installed. This is correct but much slower; install `causal_conv1d` for the optimized kernel.
+[transformers] `chunk_gated_delta_rule` is falling back to its reference PyTorch implementation because `flash-linear-attention` is not installed. This is correct but much slower; install `flash-linear-attention` for the optimized kernel.
+   logits shape (1, 5, 248320)  argmax = 11751 -> ' Paris'
+   lm_head weight tied to embed_tokens? True
+   tie check (allclose): True
+   (manual) final_norm(x) @ W^T argmax = 11751 == model argmax: True
+   W is [vocab, hidden] = (248320, 1024) so logits = x @ W.T  (NOT W @ x, which would need W as [hidden, vocab])
+==============================================================================
