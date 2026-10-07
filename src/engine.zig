@@ -1,5 +1,9 @@
 //! Qwen3.5-0.8B CPU scalar inference engine (Q8_0 GGUF only).
 //!
+//! Linear weights stay in their native Q8_0 blocks (zero-copy views into the
+//! mmapped GGUF); matvecs quantize the activation on the fly and accumulate
+//! per-block dot products in i32. Norms and elementwise ops stay f32.
+//!
 //! Numerics follow ref/docs/SPEC.md (authoritative) and ref/docs/GDN_IMPL.md;
 //! control flow mirrors ref/c/qwen35_engine.c. GGUF-specific notes:
 //!   - GGUF tensor layout differs from the C ref's safetensors (see briefing):
@@ -103,13 +107,24 @@ pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: u
     }
 }
 
+/// Linear layer with Q8_0-native weights: dispatch to the integer dot-product
+/// path when the weight is kept quantized, plain f32 otherwise. `q8` is the
+/// engine's quantization scratch (must fit ceil(cols/32) blocks).
+fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8) void {
+    switch (w) {
+        .q8 => |row| matvecQ8_0(out, row, x, q8),
+        .f32 => |m| matvec(out, m, x, out.len, x.len),
+    }
+}
+
 // ---------------------------------------------------------------------------
-// Q8_0 dequantization (ggml format: 34 bytes per 32 elements)
+// Q8_0 block format (ggml: 34 bytes per 32 elements: f16 scale + 32 x i8)
 // ---------------------------------------------------------------------------
 
 pub const q8_0_block_elems = 32;
 pub const q8_0_block_bytes = 34;
 
+/// Dequantize Q8_0 into f32 (used for small tensors / tests).
 pub fn dequantizeQ8_0(data: []const u8, out: []f32) !void {
     if (out.len % q8_0_block_elems != 0) return error.NotMultipleOfBlock;
     if (data.len != out.len / q8_0_block_elems * q8_0_block_bytes) return error.SizeMismatch;
@@ -141,9 +156,92 @@ pub fn quantizeQ8_0(data: []const f32, out: []u8) !void {
         const scale32: f32 = max / 127.0;
         const scale: f16 = @floatCast(scale32);
         std.mem.writeInt(u16, out[iout..][0..2], @bitCast(scale), .little);
-        for (0..16) |i| {
+        for (0..q8_0_block_elems) |i| {
             out[iout+2+i] = @bitCast(@as(i8, @intFromFloat(@round(data[idata+i]/scale32))));
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Q8_0-native matvec: weights stay in quantized blocks (zero-copy mmap
+// view), dot products accumulate in i32 per block and rescale by the f16
+// block scale. x is f32, quantized on the fly into a scratch buffer.
+// ---------------------------------------------------------------------------
+
+/// Per-row Q8_0 weight view into the mmapped GGUF data section.
+pub const Q8Row = struct {
+    /// raw block bytes, `rows * row_blocks * q8_0_block_bytes`
+    data: []const u8,
+    /// quantized blocks per row (cols / 32)
+    row_blocks: usize,
+
+    pub fn rowBytes(self: Q8Row) usize {
+        return self.row_blocks * q8_0_block_bytes;
+    }
+
+    pub fn rows(self: Q8Row) usize {
+        return self.data.len / self.rowBytes();
+    }
+
+    pub fn row(self: Q8Row, r: usize) []const u8 {
+        return self.data[r * self.rowBytes() ..][0..self.rowBytes()];
+    }
+};
+
+/// out[r] = sum_c W[r,c] * x[c], W row-major Q8_0 blocks. Scratch q8 must
+/// hold ceil(cols / 32) blocks (x quantized per block with round-to-nearest,
+/// matching quantizeQ8_0 semantics).
+pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8) void {
+    std.debug.assert(w.rows() == out.len);
+    const cols = w.row_blocks * q8_0_block_elems;
+    std.debug.assert(x.len == cols);
+    std.debug.assert(q8.len >= w.row_blocks * q8_0_block_bytes);
+
+    // quantize x into scratch (same scale rule as quantizeQ8_0)
+    var qblocks: usize = 0;
+    var qi: usize = 0;
+    while (qi < x.len) : ({
+        qi += q8_0_block_elems;
+        qblocks += 1;
+    }) {
+        const xblk = x[qi..][0..q8_0_block_elems];
+        const qbase = q8[qblocks * q8_0_block_bytes ..][0..q8_0_block_bytes];
+        var max: f32 = 0;
+        for (xblk) |v| {
+            const a = @abs(v);
+            if (a > max) max = a;
+        }
+        const scale32: f32 = if (max > 0) max / 127.0 else 1.0;
+        const scale: f16 = @floatCast(scale32);
+        std.mem.writeInt(u16, qbase[0..2], @bitCast(scale), .little);
+        for (0..q8_0_block_elems) |j| {
+            const q: i32 = if (max > 0) @intFromFloat(@round(xblk[j] / scale32)) else 0;
+            qbase[2 + j] = @bitCast(@as(i8, @intCast(std.math.clamp(q, -128, 127))));
+        }
+    }
+
+    // dot products: per-block i32 accumulation, rescale, sum in f32
+    for (out, 0..) |*o, r| {
+        const wrow = w.row(r);
+        var acc: f32 = 0;
+        var wb: usize = 0;
+        var xb: usize = 0;
+        while (wb < w.row_blocks) : ({
+            wb += 1;
+            xb += 1;
+        }) {
+            const wb_slice = wrow[wb * q8_0_block_bytes ..][0..q8_0_block_bytes];
+            const wscale: f16 = @bitCast(std.mem.readInt(u16, wb_slice[0..2], .little));
+            const xscale: f16 = @bitCast(std.mem.readInt(u16, q8[xb * q8_0_block_bytes ..][0..2], .little));
+            var dot: i32 = 0;
+            inline for (0..q8_0_block_elems) |j| {
+                const wq: i8 = @bitCast(wb_slice[2 + j]);
+                const xq: i8 = @bitCast(q8[xb * q8_0_block_bytes + 2 + j]);
+                dot += @as(i32, wq) * @as(i32, xq);
+            }
+            acc += @as(f32, @floatCast(wscale)) * @as(f32, @floatFromInt(dot)) * @as(f32, @floatCast(xscale));
+        }
+        o.* = acc;
     }
 }
 
@@ -163,6 +261,14 @@ fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8
         else => return error.UnsupportedTensorType,
     }
     return out;
+}
+
+/// Load a 2D linear weight: Q8_0 tensors stay quantized (zero-copy view
+/// into the mmap), anything else is dequantized to f32.
+fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine.LinearW {
+    const t = g.findTensor(name) orelse return error.MissingTensor;
+    if (t.ttype == .q8_0) return .{ .q8 = try Engine.q8RowOf(g, t) };
+    return .{ .f32 = try loadTensorF32(alloc, g, name) };
 }
 
 // ---------------------------------------------------------------------------
@@ -204,8 +310,10 @@ pub const Engine = struct {
     /// set by `load` when it created the Threaded instance; freed in deinit
     owns_io: ?*std.Io.Threaded = null,
 
-    token_embd: []f32, // [vocab, hidden] row-major (tied output)
+    token_embd: LinearW, // [vocab, hidden] row-major (tied output)
     output_norm: []f32, // [hidden]
+    /// Q8 scratch for quantizing activations, sized for the largest row (6144)
+    q8_scratch: []u8,
     layers: []LayerWeights,
     kv: []KvCache,
     gdn: []GdnState,
@@ -229,30 +337,51 @@ pub const Engine = struct {
     kv_mem: []f32, // 128
     prefill_ms: f64 = 0,
 
+    /// A linear layer weight: either kept in its native Q8_0 blocks
+    /// (zero-copy view into the mmapped file) or dequantized to f32
+    /// (small tensors already stored as F32 in the GGUF).
+    pub const LinearW = union(enum) {
+        q8: Q8Row,
+        f32: []f32,
+    };
+
+    fn q8RowOf(g: *gguf.File, t: *const gguf.Tensor) !Q8Row {
+        // GGUF dims are innermost-first: dims[0] = contiguous cols, dims[1] = rows
+        std.debug.assert(t.dims.len == 2);
+        std.debug.assert(t.dims[0] % q8_0_block_elems == 0);
+        const row_blocks: usize = @intCast(t.dims[0] / q8_0_block_elems);
+        std.debug.assert(t.nElems() / t.dims[0] * row_blocks * q8_0_block_bytes ==
+            (try g.tensorData(t)).len);
+        return .{
+            .data = try g.tensorData(t),
+            .row_blocks = row_blocks,
+        };
+    }
+
     const LayerWeights = struct {
         attn_norm: []f32,
         post_attention_norm: []f32,
         // GDN-only
-        attn_qkv: ?[]f32 = null,
-        attn_gate: ?[]f32 = null,
-        ssm_alpha: ?[]f32 = null, // a (decay input)
-        ssm_beta: ?[]f32 = null, // b (beta input)
+        attn_qkv: ?LinearW = null,
+        attn_gate: ?LinearW = null,
+        ssm_alpha: ?LinearW = null, // a (decay input)
+        ssm_beta: ?LinearW = null, // b (beta input)
         ssm_conv1d: ?[]f32 = null, // F32 [4,6144]: w[ch*k + t]
         ssm_dt_bias: ?[]f32 = null, // [16]
         ssm_a: ?[]f32 = null, // [16], already -exp(A_log)
         ssm_norm: ?[]f32 = null, // [128]
-        ssm_out: ?[]f32 = null,
+        ssm_out: ?LinearW = null,
         // full-attention-only
-        attn_q: ?[]f32 = null, // [1024, 4096] = per-head [q|gate] interleaved
-        attn_k: ?[]f32 = null,
-        attn_v: ?[]f32 = null,
+        attn_q: ?LinearW = null, // [1024, 4096] = per-head [q|gate] interleaved
+        attn_k: ?LinearW = null,
+        attn_v: ?LinearW = null,
         attn_q_norm: ?[]f32 = null, // [256]
         attn_k_norm: ?[]f32 = null, // [256]
-        attn_output: ?[]f32 = null,
+        attn_output: ?LinearW = null,
         // shared
-        ffn_gate: []f32,
-        ffn_up: []f32,
-        ffn_down: []f32,
+        ffn_gate: LinearW,
+        ffn_up: LinearW,
+        ffn_down: LinearW,
     };
 
     const KvCache = struct {
@@ -333,8 +462,9 @@ pub const Engine = struct {
             .file = file,
             .io = io,
             .owns_io = null,
-            .token_embd = &.{},
+            .token_embd = .{ .f32 = &.{} },
             .output_norm = &.{},
+            .q8_scratch = &.{},
             .layers = &.{},
             .kv = &.{},
             .gdn = &.{},
@@ -357,7 +487,7 @@ pub const Engine = struct {
         };
         errdefer e.freeAll();
 
-        e.token_embd = try loadTensorF32(alloc, &g, "token_embd.weight");
+        e.token_embd = try loadLinear(alloc, &g, "token_embd.weight");
         e.output_norm = try loadTensorF32(alloc, &g, "output_norm.weight");
 
         const n_layers = cfg.n_layers;
@@ -371,9 +501,9 @@ pub const Engine = struct {
             const lw = LayerWeights{
                 .attn_norm = try loadTensorF32(alloc, &g, std.fmt.bufPrint(&b1, "blk.{d}.attn_norm.weight", .{idx}) catch unreachable),
                 .post_attention_norm = try loadTensorF32(alloc, &g, std.fmt.bufPrint(&b2, "blk.{d}.post_attention_norm.weight", .{idx}) catch unreachable),
-                .ffn_gate = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ffn_gate.weight", idx)),
-                .ffn_up = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ffn_up.weight", idx)),
-                .ffn_down = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ffn_down.weight", idx)),
+                .ffn_gate = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.ffn_gate.weight", idx)),
+                .ffn_up = try loadLinear(alloc, &g, tname(&b2, "blk.{d}.ffn_up.weight", idx)),
+                .ffn_down = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.ffn_down.weight", idx)),
             };
             e.layers[li] = lw;
             loaded += 1;
@@ -414,22 +544,22 @@ pub const Engine = struct {
             var b1: [64]u8 = undefined;
             var b2: [64]u8 = undefined;
             if (cfg.isFullAttention(@intCast(li))) {
-                e.layers[li].attn_q = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_q.weight", idx));
-                e.layers[li].attn_k = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_k.weight", idx));
-                e.layers[li].attn_v = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_v.weight", idx));
+                e.layers[li].attn_q = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.attn_q.weight", idx));
+                e.layers[li].attn_k = try loadLinear(alloc, &g, tname(&b2, "blk.{d}.attn_k.weight", idx));
+                e.layers[li].attn_v = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.attn_v.weight", idx));
                 e.layers[li].attn_q_norm = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_q_norm.weight", idx));
                 e.layers[li].attn_k_norm = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_k_norm.weight", idx));
-                e.layers[li].attn_output = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_output.weight", idx));
+                e.layers[li].attn_output = try loadLinear(alloc, &g, tname(&b2, "blk.{d}.attn_output.weight", idx));
             } else {
-                e.layers[li].attn_qkv = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_qkv.weight", idx));
-                e.layers[li].attn_gate = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_gate.weight", idx));
-                e.layers[li].ssm_alpha = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_alpha.weight", idx));
-                e.layers[li].ssm_beta = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_beta.weight", idx));
+                e.layers[li].attn_qkv = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.attn_qkv.weight", idx));
+                e.layers[li].attn_gate = try loadLinear(alloc, &g, tname(&b2, "blk.{d}.attn_gate.weight", idx));
+                e.layers[li].ssm_alpha = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.ssm_alpha.weight", idx));
+                e.layers[li].ssm_beta = try loadLinear(alloc, &g, tname(&b2, "blk.{d}.ssm_beta.weight", idx));
                 e.layers[li].ssm_conv1d = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_conv1d.weight", idx));
                 e.layers[li].ssm_dt_bias = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_dt.bias", idx));
                 e.layers[li].ssm_a = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_a", idx));
                 e.layers[li].ssm_norm = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_norm.weight", idx));
-                e.layers[li].ssm_out = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_out.weight", idx));
+                e.layers[li].ssm_out = try loadLinear(alloc, &g, tname(&b1, "blk.{d}.ssm_out.weight", idx));
             }
             loaded2 += 1;
         }
@@ -439,6 +569,9 @@ pub const Engine = struct {
         e.x1 = try alloc.alloc(f32, cfg.hidden);
         e.x2 = try alloc.alloc(f32, cfg.hidden);
         e.qkv = try alloc.alloc(f32, 6144);
+        // Q8 quantization scratch for activations; largest matvec row is
+        // attn_qkv's 6144 cols = 192 blocks
+        e.q8_scratch = try alloc.alloc(u8, 192 * q8_0_block_bytes);
         e.z = try alloc.alloc(f32, 2048);
         e.ab = try alloc.alloc(f32, 32);
         e.gdn_out = try alloc.alloc(f32, 2048);
@@ -458,30 +591,34 @@ pub const Engine = struct {
         return std.fmt.bufPrint(buf, fmt, .{idx}) catch unreachable;
     }
 
+    fn freeLinear(alloc: std.mem.Allocator, w: LinearW) void {
+        // q8 views point into the mmap; only f32 copies are allocated
+        if (w == .f32) alloc.free(w.f32);
+    }
+
     fn freeLayerWeights(alloc: std.mem.Allocator, lw: LayerWeights) void {
         alloc.free(lw.attn_norm);
         alloc.free(lw.post_attention_norm);
-        alloc.free(lw.ffn_gate);
-        alloc.free(lw.ffn_up);
-        alloc.free(lw.ffn_down);
+        freeLinear(alloc, lw.ffn_gate);
+        freeLinear(alloc, lw.ffn_up);
+        freeLinear(alloc, lw.ffn_down);
     }
 
     fn freeLayerTyped(alloc: std.mem.Allocator, lw: *LayerWeights) void {
-        if (lw.attn_qkv) |p| alloc.free(p);
-        if (lw.attn_gate) |p| alloc.free(p);
-        if (lw.ssm_alpha) |p| alloc.free(p);
-        if (lw.ssm_beta) |p| alloc.free(p);
-        if (lw.ssm_conv1d) |p| alloc.free(p);
-        if (lw.ssm_dt_bias) |p| alloc.free(p);
-        if (lw.ssm_a) |p| alloc.free(p);
-        if (lw.ssm_norm) |p| alloc.free(p);
-        if (lw.ssm_out) |p| alloc.free(p);
-        if (lw.attn_q) |p| alloc.free(p);
-        if (lw.attn_k) |p| alloc.free(p);
-        if (lw.attn_v) |p| alloc.free(p);
-        if (lw.attn_q_norm) |p| alloc.free(p);
-        if (lw.attn_k_norm) |p| alloc.free(p);
-        if (lw.attn_output) |p| alloc.free(p);
+        // linear weights (q8 views point into the mmap, f32 copies are ours)
+        inline for (.{
+            &lw.attn_qkv, &lw.attn_gate, &lw.ssm_alpha, &lw.ssm_beta, &lw.ssm_out,
+            &lw.attn_q,   &lw.attn_k,    &lw.attn_v,    &lw.attn_output,
+        }) |p| {
+            if (p.*) |w| freeLinear(alloc, w);
+        }
+        // plain f32 scratch tensors
+        inline for (.{
+            &lw.ssm_conv1d, &lw.ssm_dt_bias, &lw.ssm_a, &lw.ssm_norm,
+            &lw.attn_q_norm, &lw.attn_k_norm,
+        }) |p| {
+            if (p.*) |w| alloc.free(w);
+        }
     }
 
     fn freeCachesUpTo(self: *Engine, n: usize) void {
@@ -497,8 +634,9 @@ pub const Engine = struct {
 
     fn freeAll(self: *Engine) void {
         const a = self.alloc;
-        if (self.token_embd.len > 0) a.free(self.token_embd);
+        freeLinear(a, self.token_embd);
         if (self.output_norm.len > 0) a.free(self.output_norm);
+        if (self.q8_scratch.len > 0) a.free(self.q8_scratch);
         if (self.layers.len > 0) {
             for (self.layers) |lw| freeLayerWeights(a, lw);
             for (self.layers) |*lw| freeLayerTyped(a, lw);
@@ -531,7 +669,11 @@ pub const Engine = struct {
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        @memcpy(self.x, self.token_embd[@as(usize, token) * hidden ..][0..hidden]);
+        // embedding lookup: dequantize the token row straight into x
+        switch (self.token_embd) {
+            .q8 => |row| dequantizeQ8_0(row.row(token), self.x[0..hidden]) catch unreachable,
+            .f32 => |m| @memcpy(self.x[0..hidden], m[token * hidden ..][0..hidden]),
+        }
 
         for (self.layers, 0..) |*lw, li| {
             if (c.isFullAttention(@intCast(li))) {
@@ -544,12 +686,17 @@ pub const Engine = struct {
 
         rmsNorm(self.x1, self.x, self.output_norm, c.rms_eps);
         // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
-        const vocab: usize = c.vocab;
-        for (0..vocab) |vi| {
-            const row = self.token_embd[vi * hidden ..][0..hidden];
-            var acc: f32 = 0;
-            for (row, self.x1) |m, vv| acc += m * vv;
-            self.logits[vi] = acc;
+        switch (self.token_embd) {
+            .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
+            .f32 => |m| {
+                const vocab: usize = c.vocab;
+                for (0..vocab) |vi| {
+                    const rowv = m[vi * hidden ..][0..hidden];
+                    var acc: f32 = 0;
+                    for (rowv, self.x1) |mv, vv| acc += mv * vv;
+                    self.logits[vi] = acc;
+                }
+            },
         }
         return self.argmax();
     }
@@ -581,16 +728,16 @@ pub const Engine = struct {
 
         // in_proj_qkv [1024, 6144] = [Q|K|V] contiguous (SPEC A1)
         const qkv = self.qkv[0..conv_dim];
-        matvec(qkv, lw.attn_qkv.?, self.x1, conv_dim, hidden);
+        linMatvec(qkv, lw.attn_qkv.?, self.x1, self.q8_scratch);
 
         // z projection (attn_gate [1024, 2048])
         const z = self.z[0..value_dim];
-        matvec(z, lw.attn_gate.?, self.x1, value_dim, hidden);
+        linMatvec(z, lw.attn_gate.?, self.x1, self.q8_scratch);
 
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input)
         const ab = self.ab[0 .. 2 * nv];
-        matvec(ab[0..nv], lw.ssm_alpha.?, self.x1, nv, hidden);
-        matvec(ab[nv..], lw.ssm_beta.?, self.x1, nv, hidden);
+        linMatvec(ab[0..nv], lw.ssm_alpha.?, self.x1, self.q8_scratch);
+        linMatvec(ab[nv..], lw.ssm_beta.?, self.x1, self.q8_scratch);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all 6144 channels; beta/gamma
@@ -659,7 +806,7 @@ pub const Engine = struct {
         }
 
         // out projection [2048 -> 1024]
-        matvec(self.x2[0..hidden], lw.ssm_out.?, gout, hidden, value_dim);
+        linMatvec(self.x2[0..hidden], lw.ssm_out.?, gout, self.q8_scratch);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -699,7 +846,7 @@ pub const Engine = struct {
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv[0 .. 2 * q_dim];
-        matvec(qg, lw.attn_q.?, self.x1, 2 * q_dim, hidden);
+        linMatvec(qg, lw.attn_q.?, self.x1, self.q8_scratch);
         const q = self.q[0..q_dim];
         const gate = self.z[0..q_dim];
         for (0..heads) |h| {
@@ -707,8 +854,8 @@ pub const Engine = struct {
             @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
             @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
         }
-        matvec(self.k[0..kv_dim], lw.attn_k.?, self.x1, kv_dim, hidden);
-        matvec(self.v[0..kv_dim], lw.attn_v.?, self.x1, kv_dim, hidden);
+        linMatvec(self.k[0..kv_dim], lw.attn_k.?, self.x1, self.q8_scratch);
+        linMatvec(self.v[0..kv_dim], lw.attn_v.?, self.x1, self.q8_scratch);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
@@ -760,7 +907,7 @@ pub const Engine = struct {
 
         // sigmoid gate (B14), then o_proj [2048 -> 1024]
         for (0..q_dim) |i| gout[i] *= sigmoid(gate[i]);
-        matvec(self.x2[0..hidden], lw.attn_output.?, gout, hidden, q_dim);
+        linMatvec(self.x2[0..hidden], lw.attn_output.?, gout, self.q8_scratch);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -770,10 +917,10 @@ pub const Engine = struct {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         rmsNorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
-        matvec(self.mlp_h, lw.ffn_gate, self.x1, c.n_ff, hidden);
-        matvec(self.mlp_h1, lw.ffn_up, self.x1, c.n_ff, hidden);
+        linMatvec(self.mlp_h, lw.ffn_gate, self.x1, self.q8_scratch);
+        linMatvec(self.mlp_h1, lw.ffn_up, self.x1, self.q8_scratch);
         for (0..c.n_ff) |i| self.mlp_h[i] = silu(self.mlp_h[i]) * self.mlp_h1[i];
-        matvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h, hidden, c.n_ff);
+        linMatvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h, self.q8_scratch);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -975,6 +1122,59 @@ test "matvec 2x3 hand computed" {
     try std.testing.expectEqual(@as(f32, 122), out[1]);
 }
 
+test "matvecQ8_0 matches f32 matvec on dequantized weights" {
+    var prng = std.Random.DefaultPrng.init(42);
+    const rand = prng.random();
+
+    const rows = 5;
+    const cols = 96; // 3 blocks
+    var wq: [rows * cols / q8_0_block_elems * q8_0_block_bytes]u8 = undefined;
+    var wf: [rows * cols]f32 = undefined;
+    var x: [cols]f32 = undefined;
+
+    // random f32 weights, quantize to Q8_0 blocks, keep f32 dequant copy
+    for (0..rows * cols / q8_0_block_elems) |blk| {
+        var f32blk: [q8_0_block_elems]f32 = undefined;
+        for (&f32blk) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
+        try quantizeQ8_0(&f32blk, wq[blk * q8_0_block_bytes ..][0..q8_0_block_bytes]);
+        try dequantizeQ8_0(wq[blk * q8_0_block_bytes ..][0..q8_0_block_bytes], wf[blk * q8_0_block_elems ..][0..q8_0_block_elems]);
+    }
+    for (&x) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
+
+    const w: Q8Row = .{ .data = &wq, .row_blocks = cols / q8_0_block_elems };
+    var out_q8: [rows]f32 = undefined;
+    var q8scratch: [cols / q8_0_block_elems * q8_0_block_bytes]u8 = undefined;
+    matvecQ8_0(&out_q8, w, &x, &q8scratch);
+
+    // reference: f32 matvec over dequantized weights AND dequantized x
+    // (the q8 path necessarily quantizes x, so feed the same values in)
+    var xq: [cols]f32 = undefined;
+    for (0..cols / q8_0_block_elems) |blk| {
+        try dequantizeQ8_0(q8scratch[blk * q8_0_block_bytes ..][0..q8_0_block_bytes], xq[blk * q8_0_block_elems ..][0..q8_0_block_elems]);
+    }
+    var out_f32: [rows]f32 = undefined;
+    matvec(&out_f32, &wf, &xq, rows, cols);
+
+    for (out_q8, out_f32) |a, b| {
+        // same math (i32 exact per block vs f32 accumulate): tiny rounding only
+        try std.testing.expectApproxEqAbs(b, a, @abs(b) * 1e-5 + 1e-4);
+    }
+}
+
+test "matvecQ8_0 zero x gives zero out" {
+    const cols = 32;
+    var wq: [2 * q8_0_block_bytes]u8 = undefined;
+    const wvals = [3]f32{ 1, 2, 3 } ++ @as([29]f32, @splat(0));
+    try quantizeQ8_0(&wvals, wq[0..q8_0_block_bytes]);
+    try quantizeQ8_0(&wvals, wq[q8_0_block_bytes..]);
+    var x: [cols]f32 = @splat(0);
+    var out: [2]f32 = undefined;
+    var scratch: [q8_0_block_bytes]u8 = undefined;
+    matvecQ8_0(&out, .{ .data = &wq, .row_blocks = 1 }, &x, &scratch);
+    try std.testing.expectEqual(@as(f32, 0), out[0]);
+    try std.testing.expectEqual(@as(f32, 0), out[1]);
+}
+
 test "convStep: causal left-pad semantics" {
     // single channel with taps [a0,a1,a2,a3]; feed three tokens manually
     const alloc = std.testing.allocator;
@@ -989,8 +1189,9 @@ test "convStep: causal left-pad semantics" {
         .mm = undefined,
         .file = undefined,
         .io = undefined,
-        .token_embd = &.{},
+        .token_embd = .{ .f32 = &.{} },
         .output_norm = &.{},
+        .q8_scratch = &.{},
         .layers = &.{},
         .kv = &.{},
         .gdn = &.{},
