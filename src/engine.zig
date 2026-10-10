@@ -7,11 +7,13 @@
 //! Numerics follow ref/docs/SPEC.md (authoritative) and ref/docs/GDN_IMPL.md;
 //! control flow mirrors ref/c/qwen35_engine.c. GGUF-specific notes:
 //!   - GGUF tensor layout differs from the C ref's safetensors (see briefing):
-//!     linear layers have attn_qkv [1024,6144] = [Q|K|V] contiguous thirds,
-//!     attn_gate [1024,2048] (= z), ssm_alpha/ssm_beta [1024,16] (= a/b),
-//!     ssm_a [16] is already -exp(A_log) (negative values, verified numerically
-//!     against SPEC A7's A_log.exp() list), ssm_conv1d is F32 [4,6144]
-//!     channel-major taps (identical to C ref's [6144][4] rows).
+//!     linear layers have attn_qkv [hidden, nk*kd|nk*kd|nv*kd] = [Q|K|V],
+//!     attn_gate [hidden, nv*kd] (= z), ssm_alpha [hidden, nv], ssm_beta
+//!     [hidden, nk], ssm_a [nv] is already -exp(A_log) (negative values,
+//!     verified numerically against SPEC A7's A_log.exp() list), ssm_conv1d
+//!     is F32 [4, conv_dim] channel-major taps.
+//!     0.8B: hidden=1024, nv=nk=16, kd=128 (conv_dim 6144); 4B: hidden=2560,
+//!     nv=32, nk=16, kd=128 (conv_dim 8192).
 //!   - GGUF Qwen3_5RMSNorm weights are already (1+w) folded at conversion time
 //!     (verified: blk.0.attn_norm[0] == 2.0, q_norm mean ~ 1.4), so they are
 //!     applied directly; the gated ssm_norm (Qwen3_5RMSNormGated) is also
@@ -40,7 +42,10 @@ pub const Config = struct {
     /// rotary_dim = head_dim * 0.25 = 64 (un-rotated tail = 192).
     rotary_dim: u32 = 64,
     // GDN
-    gdn_n_heads: u32 = 16, // linear_num_value_heads == num_key_heads
+    gdn_n_heads: u32 = 16, // linear_num_value_heads (0.8B: 16, 4B: 32)
+    /// k/q head count (ssm.group_count); v-head h uses k-head h / (nv/nk).
+    /// 0.8B: 16 (nv == nk), 4B: 16 (nv/nk = 2).
+    gdn_num_k_heads: u32 = 16,
     gdn_head_dim: u32 = 128,
     conv_kernel: u32 = 4,
     eos_token_id: u32 = 248046,
@@ -312,7 +317,8 @@ pub const Engine = struct {
 
     token_embd: LinearW, // [vocab, hidden] row-major (tied output)
     output_norm: []f32, // [hidden]
-    /// Q8 scratch for quantizing activations, sized for the largest row (6144)
+    /// Q8 scratch for quantizing activations; sized for the widest matvec
+    /// (GDN attn_qkv cols)
     q8_scratch: []u8,
     layers: []LayerWeights,
     kv: []KvCache,
@@ -322,16 +328,16 @@ pub const Engine = struct {
     x: []f32, // hidden residual stream
     x1: []f32, // hidden normed input
     x2: []f32, // hidden output projection target
-    qkv: []f32, // 6144 (GDN) / reused for q,k,v of full layers
-    z: []f32, // 2048 gate
-    ab: []f32, // 32 (a|b)
-    gdn_out: []f32, // 2048
-    q: []f32, // 2048 full-attn q
-    k: []f32, // 512
-    v: []f32, // 512
-    attn: []f32, // 4096 scores
-    mlp_h: []f32, // 3584
-    mlp_h1: []f32, // 3584
+    qkv: []f32, // GDN conv_dim / reused for q,k,v of full layers
+    z: []f32, // gate (GDN value_dim / full-attn q_dim)
+    ab: []f32, // a|b (2*nv scalars)
+    gdn_out: []f32, // GDN output / full-attn attention out
+    q: []f32, // full-attn q
+    k: []f32, // full-attn k
+    v: []f32, // full-attn v
+    attn: []f32, // full-attn scores [max_seq]
+    mlp_h: []f32, // n_ff
+    mlp_h1: []f32, // n_ff
     logits: []f32,
     delta: []f32, // 128 per-head scratch
     kv_mem: []f32, // 128
@@ -366,9 +372,9 @@ pub const Engine = struct {
         attn_gate: ?LinearW = null,
         ssm_alpha: ?LinearW = null, // a (decay input)
         ssm_beta: ?LinearW = null, // b (beta input)
-        ssm_conv1d: ?[]f32 = null, // F32 [4,6144]: w[ch*k + t]
-        ssm_dt_bias: ?[]f32 = null, // [16]
-        ssm_a: ?[]f32 = null, // [16], already -exp(A_log)
+        ssm_conv1d: ?[]f32 = null, // F32 [4, conv_dim]: w[ch*k + t]
+        ssm_dt_bias: ?[]f32 = null, // [nv], already softplus-anchored
+        ssm_a: ?[]f32 = null, // [nv], already -exp(A_log)
         ssm_norm: ?[]f32 = null, // [128]
         ssm_out: ?LinearW = null,
         // full-attention-only
@@ -390,9 +396,9 @@ pub const Engine = struct {
         len: u32,
     };
 
-    /// Causal conv state: [6144] history of the last K-1=3 raw samples
+    /// Causal conv state: [conv_dim] history of the last K-1=3 raw samples
     /// (channel-major, same order as the C ref's per-channel rows).
-    /// delta-rule state: [n_heads, 128, 128] row-major S[k][v].
+    /// delta-rule state: [nv, kd, kd] row-major S[k][v].
     const GdnState = struct {
         conv: []f32,
         conv_len: u32,
@@ -437,8 +443,16 @@ pub const Engine = struct {
         if (g.getUint("qwen35.attention.key_length")) |v| cfg.head_dim = @intCast(v);
         if (g.getFloat("qwen35.attention.layer_norm_rms_epsilon")) |v| cfg.rms_eps = @floatCast(v);
         if (g.getUint("qwen35.ssm.state_size")) |v| cfg.gdn_head_dim = @intCast(v);
-        if (g.getUint("qwen35.ssm.time_step_rank")) |_| {} // 16, informational
+        if (g.getUint("qwen35.ssm.time_step_rank")) |_| {} // informational
         if (g.getUint("qwen35.ssm.conv_kernel")) |v| cfg.conv_kernel = @intCast(v);
+        // qwen35.ssm.inner_size = value_dim = num_v_heads * head_dim
+        if (g.getUint("qwen35.ssm.inner_size")) |v| {
+            cfg.gdn_n_heads = @intCast(v / cfg.gdn_head_dim);
+        }
+        // qwen35.ssm.group_count = k/q head count (== v heads on 0.8B, half on 4B)
+        if (g.getUint("qwen35.ssm.group_count")) |v| {
+            cfg.gdn_num_k_heads = @intCast(v);
+        }
         if (g.getFloat("qwen35.rope.freq_base")) |v| cfg.rope_freq_base = @floatCast(v);
         if (g.getUint("qwen35.rope.dimension_count")) |v| {
             cfg.rotary_dim = @intCast(v);
@@ -516,6 +530,9 @@ pub const Engine = struct {
         errdefer e.freeCachesUpTo(inited);
         const kv_dim: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
         const gdn_kv: usize = @as(usize, cfg.gdn_n_heads) * cfg.gdn_head_dim * cfg.gdn_head_dim;
+        const gdn_conv_dim: usize =
+            2 * @as(usize, cfg.gdn_num_k_heads) * cfg.gdn_head_dim +
+            @as(usize, cfg.gdn_n_heads) * cfg.gdn_head_dim;
         for (0..n_layers) |li| {
             if (cfg.isFullAttention(@intCast(li))) {
                 e.kv[li] = .{
@@ -527,7 +544,7 @@ pub const Engine = struct {
             } else {
                 e.kv[li] = .{ .k = &.{}, .v = &.{}, .len = 0 };
                 e.gdn[li] = .{
-                    .conv = try alloc.alloc(f32, 6144 * (@as(usize, cfg.conv_kernel) - 1)),
+                    .conv = try alloc.alloc(f32, gdn_conv_dim * (@as(usize, cfg.conv_kernel) - 1)),
                     .conv_len = 0,
                     .state = try alloc.alloc(f32, gdn_kv),
                 };
@@ -568,22 +585,29 @@ pub const Engine = struct {
         e.x = try alloc.alloc(f32, cfg.hidden);
         e.x1 = try alloc.alloc(f32, cfg.hidden);
         e.x2 = try alloc.alloc(f32, cfg.hidden);
-        e.qkv = try alloc.alloc(f32, 6144);
-        // Q8 quantization scratch for activations; largest matvec row is
-        // attn_qkv's 6144 cols = 192 blocks
-        e.q8_scratch = try alloc.alloc(u8, 192 * q8_0_block_bytes);
-        e.z = try alloc.alloc(f32, 2048);
-        e.ab = try alloc.alloc(f32, 32);
-        e.gdn_out = try alloc.alloc(f32, 2048);
-        e.q = try alloc.alloc(f32, 2048);
-        e.k = try alloc.alloc(f32, 512);
-        e.v = try alloc.alloc(f32, 512);
-        e.attn = try alloc.alloc(f32, 4096);
+        const gdn_nv: usize = @as(usize, cfg.gdn_n_heads);
+        const gdn_kd: usize = @as(usize, cfg.gdn_head_dim);
+        const gdn_value_dim: usize = gdn_nv * gdn_kd;
+        // Largest Q8_0 activation row: attn_qkv cols on a GDN layer; on full
+        // attention layers attn_q (2*q_dim) is smaller for every known config.
+        const max_q8_row_bytes = @max(
+            gdn_conv_dim,
+            2 * @as(usize, cfg.n_heads) * @as(usize, cfg.head_dim),
+        ) / q8_0_block_elems * q8_0_block_bytes;
+        e.qkv = try alloc.alloc(f32, @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * cfg.head_dim));
+        e.q8_scratch = try alloc.alloc(u8, max_q8_row_bytes);
+        e.z = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
+        e.ab = try alloc.alloc(f32, 2 * gdn_nv);
+        e.gdn_out = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
+        e.q = try alloc.alloc(f32, @as(usize, cfg.n_heads) * cfg.head_dim);
+        e.k = try alloc.alloc(f32, @as(usize, cfg.n_kv_heads) * cfg.head_dim);
+        e.v = try alloc.alloc(f32, @as(usize, cfg.n_kv_heads) * cfg.head_dim);
+        e.attn = try alloc.alloc(f32, max_seq);
         e.mlp_h = try alloc.alloc(f32, cfg.n_ff);
         e.mlp_h1 = try alloc.alloc(f32, cfg.n_ff);
         e.logits = try alloc.alloc(f32, cfg.vocab);
-        e.delta = try alloc.alloc(f32, 128);
-        e.kv_mem = try alloc.alloc(f32, 128);
+        e.delta = try alloc.alloc(f32, gdn_kd);
+        e.kv_mem = try alloc.alloc(f32, gdn_kd);
         return e;
     }
 
@@ -718,29 +742,34 @@ pub const Engine = struct {
     fn forwardGdn(self: *Engine, lw: *LayerWeights, li: usize) void {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        const nv: usize = c.gdn_n_heads; // 16
+        const nv: usize = c.gdn_n_heads; // value heads (0.8B: 16, 4B: 32)
+        const nk: usize = c.gdn_num_k_heads; // k/q heads (0.8B: 16, 4B: 16)
         const kd: usize = c.gdn_head_dim; // 128
         const vd: usize = c.gdn_head_dim; // 128
-        const conv_dim: usize = nv * kd * 3; // 6144
-        const value_dim: usize = nv * vd; // 2048
+        const conv_dim: usize = 2 * nk * kd + nv * kd; // [Q|K|V] = nk*kd + nk*kd + nv*kd
+        const kq_dim: usize = nk * kd; // Q and K sections are nk*kd wide each
+        const value_dim: usize = nv * vd; // 2048 (0.8B) / 4096 (4B)
 
         rmsNorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
 
-        // in_proj_qkv [1024, 6144] = [Q|K|V] contiguous (SPEC A1)
+        // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
+        // Q,K are nk*kd wide, V is nv*kd wide
         const qkv = self.qkv[0..conv_dim];
         linMatvec(qkv, lw.attn_qkv.?, self.x1, self.q8_scratch);
 
-        // z projection (attn_gate [1024, 2048])
+        // z projection (attn_gate [hidden, value_dim])
         const z = self.z[0..value_dim];
         linMatvec(z, lw.attn_gate.?, self.x1, self.q8_scratch);
 
-        // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input)
+        // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
+        // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
+        // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
         const ab = self.ab[0 .. 2 * nv];
         linMatvec(ab[0..nv], lw.ssm_alpha.?, self.x1, self.q8_scratch);
         linMatvec(ab[nv..], lw.ssm_beta.?, self.x1, self.q8_scratch);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
-        // convStep handles history + silu for all 6144 channels; beta/gamma
+        // convStep handles history + silu for all channels; beta/gamma
         // are computed after, on the RAW a/b projections (not conv'd).
         const st = &self.gdn[li];
         self.convStep(st, qkv, lw.ssm_conv1d.?, c.conv_kernel);
@@ -748,7 +777,7 @@ pub const Engine = struct {
         // beta = sigmoid(b); g = A * softplus(a + dt_bias) with A = ssm_a
         // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
         const beta = self.ab[0..nv]; // reuse: store beta in first half
-        var gamma: [16]f32 = undefined;
+        var gamma: [64]f32 = undefined;
         for (0..nv) |h| {
             const a_raw = ab[h];
             const b_raw = ab[nv + h];
@@ -757,12 +786,15 @@ pub const Engine = struct {
             gamma[h] = @exp(g); // g <= 0 -> gamma in (0,1]
         }
 
-        const state = st.state; // [16, 128, 128]
+        const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out[0..value_dim];
         for (0..nv) |h| {
-            const q_h = qkv[h * kd ..][0..kd];
-            const k_h = qkv[nv * kd + h * kd ..][0..kd];
-            const v_h = qkv[2 * nv * kd + h * kd ..][0..kd];
+            // GGUF v slots are in "tiled" order (converter _reorder_v_heads):
+            // slot h <-> HF v head (h%nk)*nvp + h/nk, whose k head is h%nk.
+            const kh = h % nk;
+            const q_h = qkv[kh * kd ..][0..kd];
+            const k_h = qkv[kq_dim + kh * kd ..][0..kd];
+            const v_h = qkv[2 * kq_dim + h * kd ..][0..kd];
             const sh = state[h * kd * vd ..][0 .. kd * vd];
 
             // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128)
