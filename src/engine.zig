@@ -407,17 +407,7 @@ pub const Engine = struct {
 
     pub const max_seq: u32 = 4096;
 
-    pub fn load(alloc: std.mem.Allocator, path: []const u8) !Engine {
-        const threaded = try alloc.create(std.Io.Threaded);
-        errdefer alloc.destroy(threaded);
-        threaded.* = std.Io.Threaded.init(alloc, .{});
-        errdefer threaded.deinit();
-        var e = try loadWithIo(alloc, path, threaded.io());
-        e.owns_io = threaded;
-        return e;
-    }
-
-    pub fn loadWithIo(alloc: std.mem.Allocator, path: []const u8, io: std.Io) !Engine {
+    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io) !Engine {
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.OpenFailed;
         errdefer file.close(io);
         const stat = file.stat(io) catch return error.OpenFailed;
@@ -986,7 +976,7 @@ pub const Engine = struct {
         self: *Engine,
         alloc: std.mem.Allocator,
         prompt: []const u32,
-        max_new_tokens: usize,
+        max_tokens: usize,
         greedy: bool,
         progress: ?*const fn (ctx: ?*anyopaque, tok: u32) void,
         progress_ctx: ?*anyopaque,
@@ -1004,10 +994,9 @@ pub const Engine = struct {
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(alloc);
         var pos: u32 = @intCast(prompt.len);
-        var n: usize = 0;
         var gen_ns: i96 = 0;
         var hit_eos = false;
-        while (n < max_new_tokens) : (n += 1) {
+        while (pos < max_tokens) : (pos += 1) {
             if (next == self.cfg.eos_token_id) {
                 hit_eos = true;
                 break;
@@ -1017,7 +1006,6 @@ pub const Engine = struct {
             const t0 = Io.Clock.Timestamp.now(io, .awake);
             next = self.step(next, pos);
             gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
-            pos += 1;
         }
         const per: f64 = if (out.items.len > 0)
             @as(f64, @floatFromInt(gen_ns)) / 1e6 / @as(f64, @floatFromInt(out.items.len))

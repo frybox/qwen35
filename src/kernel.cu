@@ -652,10 +652,3 @@ extern "C" void q35_argmax(const float *x, int *outidx, int n) {
     k_argmax<<<1, Q35_BLK>>>(x, outidx, n);
 }
 
-// ---------------------------------------------------------------------------
-// (7) C entry point -> Zig host
-// ---------------------------------------------------------------------------
-
-extern "C" int q35_main(int argc, char **argv);
-
-int main(int argc, char **argv) { return q35_main(argc, argv); }

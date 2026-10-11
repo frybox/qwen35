@@ -28,12 +28,12 @@ cpufast:
 
 cuda: $(CUDA_EXE)
 
-$(CUDA_EXE): $(HOST_OBJ) src/engine_cuda.cu
-	$(NVCC) -O3 -arch=native -o=$@ $(HOST_OBJ) src/engine_cuda.cu -lcudart -lm
+$(CUDA_EXE): $(HOST_OBJ) src/kernel.cu
+	$(NVCC) -O3 -arch=native -o=$@ $(HOST_OBJ) src/kernel.cu -lcudart -lm
 
 $(HOST_OBJ): src/main_cuda.zig src/engine.zig src/tokenizer.zig
 	mkdir -p $(dir $@)
-	$(ZIG) cc -c src/main_cuda.zig -o $@
+	$(ZIG) cc -c $< -o $@
 
 test:
 	$(ZIG) build test

@@ -60,12 +60,6 @@ fn hsrcC(p: [*]const u8) ?*anyopaque {
 fn hsrcC32(p: [*]const f32) ?*anyopaque {
     return @ptrCast(@constCast(p));
 }
-/// NUL-terminated C string -> slice (for argv / -n parsing).
-fn cstr(s: [*]u8) []const u8 {
-    var i: usize = 0;
-    while (s[i] != 0) : (i += 1) {}
-    return @constCast(s)[0..i];
-}
 fn u8p(p: ?*anyopaque) *u8 {
     return @ptrCast(p.?);
 }
@@ -666,7 +660,7 @@ fn generate(
     g: *Gpu,
     io: Io,
     prompt: []const u32,
-    max_new: usize,
+    max_seq: usize,
     stream: *StreamCtx,
 ) !GenRes {
     var ctx = makeCtx(g);
@@ -682,11 +676,10 @@ fn generate(
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(arena);
     var pos: u32 = @intCast(prompt.len);
-    var n: usize = 0;
     var gen_ns: i96 = 0;
     var hit_eos = false;
     const eos: u32 = ctx.cfg.eos_token_id;
-    while (n < max_new) : (n += 1) {
+    while (pos < max_seq) : (pos += 1) {
         if (next == eos) {
             hit_eos = true;
             break;
@@ -696,7 +689,6 @@ fn generate(
         const t0 = Io.Clock.Timestamp.now(io, .awake);
         next = step(&ctx, next, pos);
         gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
-        pos += 1;
     }
     return .{
         .tokens = try out.toOwnedSlice(arena),
@@ -710,93 +702,72 @@ fn generate(
 // C entry point (called by engine_cuda.cu's main)
 // ---------------------------------------------------------------------------
 
-pub export fn q35_main(argc: c_int, argv: [*][*]u8) c_int {
-    const arena: std.mem.Allocator = std.heap.page_allocator;
+pub fn main(init: std.process.Init) !void {
+    const arena: std.mem.Allocator = init.arena.allocator();
+    const io = init.io;
+    var stdout_buffer: [32768]u8 = undefined;
+    var stdout_file_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
+    const out = &stdout_file_writer.interface;
 
-    if (argc < 2) {
-        std.debug.print("usage: {s} <file.gguf> [--full]\n      {s} run <file.gguf> <prompt> [-n N]\n\n", .{ cstr(argv[0]), cstr(argv[0]) });
-        return 1;
-    }
-    if (!std.mem.eql(u8, cstr(argv[1]), "run")) {
-        std.debug.print("error: unknown command '{s}'\n", .{cstr(argv[1])});
-        return 1;
-    }
-    if (argc < 4) {
-        std.debug.print("usage: {s} run <file.gguf> <prompt> [-n N]\n", .{cstr(argv[0])});
-        return 1;
-    }
-    const path = cstr(argv[2]);
-    const prompt_text = cstr(argv[3]);
-    var max_new: usize = 48;
-    const argc_u: usize = @intCast(argc);
-    var i: usize = 4;
-    while (i < argc_u) : (i += 1) {
-        if (std.mem.eql(u8, cstr(argv[i]), "-n")) {
-            if (i + 1 >= argc_u) {
-                std.debug.print("error: -n expects a number\n", .{});
-                return 1;
-            }
-            max_new = std.fmt.parseInt(usize, cstr(argv[i + 1]), 10) catch {
-                std.debug.print("error: -n expects a number, got '{s}'\n", .{cstr(argv[i + 1])});
-                return 1;
-            };
-            i += 1;
-        } else {
-            std.debug.print("error: unknown argument '{s}'\n", .{cstr(argv[i])});
-            return 1;
-        }
-    }
+    var stderr_buffer: [4096]u8 = undefined;
+    var stderr_file_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
+    const err_out = &stderr_file_writer.interface;
 
-    // Use a single-threaded Io and `loadWithIo` (mirrors src/main.zig): the
-    // engine then has owns_io == null, so e.deinit() does NOT join/destroy a
-    // Threaded io instance (that join path was the source of the exit crash).
-    // The CUDA host does all its file IO synchronously on this thread anyway.
-    const io = Io.Threaded.global_single_threaded.io();
-    var e = engine.Engine.loadWithIo(arena, path, io) catch |err| {
-        std.debug.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(err) });
-        return 1;
+    const args = try init.minimal.args.toSlice(arena);
+    if (args.len < 2) {
+        try err_out.print("usage: {s} <file.gguf> [--full]\n      {s} run <file.gguf> <prompt> [-n N]\n\n", .{ args[0], args[0] });
+        try err_out.flush();
+        return error.MissingArgument;
+    }
+    if (!std.mem.eql(u8, args[1], "run")) {
+        try err_out.print("error: unknown command '{s}'\n", .{args[1]});
+        return error.UnknownCommand;
+    }
+    if (args.len < 4) {
+        try err_out.print("usage: {s} run <file.gguf> <prompt>\n", .{args[0]});
+        return error.MissingArgument;
+    }
+    const path = args[2];
+    const prompt_text = args[3];
+    const max_seq: usize = engine.Engine.max_seq;
+    var e = engine.Engine.load(arena, path, io) catch |err| {
+        err_out.print("error: failed to load '{s}': {s}\n", .{path, @errorName(err)}) catch {};
+        return error.LoadFailed;
     };
     defer e.deinit();
 
-    var stdout_buffer: [1 << 16]u8 = undefined;
-    var stdout_writer: Io.File.Writer = .init(.stdout(), io, &stdout_buffer);
-    const out = &stdout_writer.interface;
-    var stderr_buffer: [4096]u8 = undefined;
-    var stderr_writer: Io.File.Writer = .init(.stderr(), io, &stderr_buffer);
-    const err_out = &stderr_writer.interface;
-
     if (q35_cuda_init() != 0) {
-        std.debug.print("error: CUDA init failed\n", .{});
-        return 1;
+        err_out.print("error: CUDA init failed\n", .{}) catch {};
+        return error.CudaInitFailed;
     }
     var g = gpuInit(arena, &e) catch |err| {
-        std.debug.print("error: GPU init failed: {s}\n", .{@errorName(err)});
+        err_out.print("error: GPU init failed: {s}\n", .{@errorName(err)}) catch {};
         err_out.flush() catch {};
-        return 1;
+        return error.CudaInitFailed;
     };
     defer g.deinit(arena);
 
     var tok = tokenizer.Tokenizer.initFromGguf(arena, &e.g) catch {
-        std.debug.print("error: tokenizer init failed\n", .{});
-        return 1;
+        err_out.print("error: tokenizer init failed\n", .{}) catch {};
+        return error.TokenizerInitFailed;
     };
     const rendered = tokenizer.Tokenizer.renderChatTurn(arena, prompt_text, false) catch {
-        std.debug.print("error: prompt render failed\n", .{});
-        return 1;
+        err_out.print("error: prompt render failed\n", .{}) catch {};
+        return error.PromptRenderFailed;
     };
     const ptok = tok.encode(arena, rendered) catch {
-        std.debug.print("error: prompt encode failed\n", .{});
-        return 1;
+        err_out.print("error: prompt encode failed\n", .{}) catch {};
+        return error.PromptEncodeFailed;
     };
     out.print("[prompt: {d} tokens]\n", .{ptok.len}) catch {};
     out.print("Output: ", .{}) catch {};
     out.flush() catch {};
 
     var stream = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
-    const res = generate(arena, g, io, ptok, max_new, &stream) catch |err| {
-        std.debug.print("error: generation failed: {s}\n", .{@errorName(err)});
+    const res = generate(arena, g, io, ptok, max_seq, &stream) catch |err| {
+        err_out.print("error: generation failed: {s}\n", .{@errorName(err)}) catch {};
         err_out.flush() catch {};
-        return 1;
+        return error.GenerationFailed;
     };
 
     out.print("\n\n-------------------\n", .{}) catch {};
@@ -812,5 +783,4 @@ pub export fn q35_main(argc: c_int, argv: [*][*]u8) c_int {
     }) catch {};
     out.print("{s}\n", .{if (res.hit_eos) "Stop reason: EOS" else "Stop reason: max tokens reached"}) catch {};
     out.flush() catch {};
-    return 0;
 }

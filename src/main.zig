@@ -94,11 +94,12 @@ fn runInference(
     }
     const path = args[2];
     const prompt_text = args[3];
-    var max_new: usize = 48;
+    const engine = qwen35.engine;
+    var max_seq: usize = engine.Engine.max_seq;
     var i: usize = 4;
     while (i + 1 < args.len + 1 and i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
-            max_new = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+            max_seq = std.fmt.parseInt(usize, args[i + 1], 10) catch {
                 try err_out.print("error: -n expects a number, got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
                 return error.InvalidArgument;
@@ -111,8 +112,7 @@ fn runInference(
         }
     }
 
-    const engine = qwen35.engine;
-    var e = engine.Engine.loadWithIo(arena, path, io) catch |e2| {
+    var e = engine.Engine.load(arena, path, io) catch |e2| {
         try err_out.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(e2) });
         try err_out.flush();
         return e2;
@@ -128,7 +128,7 @@ fn runInference(
     var stream_ctx = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
     try out.print("Output: ", .{});
     try out.flush();
-    const res = try e.generate(arena, prompt, max_new, true, StreamCtx.onToken, &stream_ctx);
+    const res = try e.generate(arena, prompt, max_seq, true, StreamCtx.onToken, &stream_ctx);
 
     try out.print("\n\n-------------------\n", .{});
     try out.print("Prefill: {d} tokens in {d:.3} s  ({d:.2} tok/s)\n", .{
