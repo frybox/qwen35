@@ -31,20 +31,30 @@ extern "C" fn q35_zero(d: ?*anyopaque, n: usize) c_int;
 extern "C" fn q35_quantize_q8(x: ?*anyopaque, out: ?*anyopaque, nblocks: c_int) void;
 extern "C" fn q35_matvec_q8(w: ?*anyopaque, xq: ?*anyopaque, out: ?*anyopaque, rows: c_int, row_blocks: c_int) void;
 extern "C" fn q35_matvec_f32(w: ?*anyopaque, x: ?*anyopaque, out: ?*anyopaque, rows: c_int, cols: c_int) void;
-extern "C" fn q35_embed_row(w: ?*anyopaque, x: ?*anyopaque, row: c_int, n: c_int) void;
+extern "C" fn q35_embed_row(w: ?*anyopaque, x: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_rmsnorm_rows(x: ?*anyopaque, w: ?*anyopaque, out: ?*anyopaque, rows: c_int, n: c_int, eps: f32) void;
 extern "C" fn q35_rmsnorm_strided(x: ?*anyopaque, w: ?*anyopaque, out: ?*anyopaque, rows: c_int, n: c_int, stride: c_int, eps: f32) void;
 extern "C" fn q35_l2norm(x: ?*anyopaque, rows: c_int, n: c_int, eps: f32, scale: f32) void;
-extern "C" fn q35_rope(x: ?*anyopaque, rows: c_int, hd: c_int, rope_dim: c_int, stride: c_int, pos: c_int, base: f32) void;
+extern "C" fn q35_rope(x: ?*anyopaque, rows: c_int, hd: c_int, rope_dim: c_int, stride: c_int, base: f32) void;
 extern "C" fn q35_conv1d(wconv: ?*anyopaque, x: ?*anyopaque, hist: ?*anyopaque, conv_dim: c_int, k: c_int) void;
 extern "C" fn q35_beta_gamma(a: ?*anyopaque, b: ?*anyopaque, abar: ?*anyopaque, dtb: ?*anyopaque, beta: ?*anyopaque, gamma: ?*anyopaque, nv: c_int) void;
 extern "C" fn q35_gdn_state(qkv: ?*anyopaque, state: ?*anyopaque, beta: ?*anyopaque, gamma: ?*anyopaque, out: ?*anyopaque, nv: c_int, nk: c_int, kd: c_int, vd: c_int) void;
 extern "C" fn q35_gated_rmsnorm(out: ?*anyopaque, w: ?*anyopaque, z: ?*anyopaque, rows: c_int, n: c_int, eps: f32) void;
-extern "C" fn q35_attn(q: ?*anyopaque, kc: ?*anyopaque, vc: ?*anyopaque, gate: ?*anyopaque, out: ?*anyopaque, heads: c_int, kv_heads: c_int, hd: c_int, n_t: c_int, kv_dim: c_int, q_stride: c_int, scale: f32) void;
+extern "C" fn q35_attn(q: ?*anyopaque, kc: ?*anyopaque, vc: ?*anyopaque, gate: ?*anyopaque, out: ?*anyopaque, heads: c_int, kv_heads: c_int, hd: c_int, kv_dim: c_int, q_stride: c_int, scale: f32) void;
 extern "C" fn q35_silu_mul(h: ?*anyopaque, h1: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_sigmoid_mul(o: ?*anyopaque, g: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_add(a: ?*anyopaque, b: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_argmax(x: ?*anyopaque, outidx: ?*anyopaque, n: c_int) void;
+extern "C" fn q35_kvstore(kvcache: ?*anyopaque, src: ?*anyopaque, kv_dim: c_int) void;
+
+// CUDA Graph API (kernel.cu).  token/pos are uploaded to a device param block;
+// the whole-forward graph is captured once (Zig drives the forward under
+// capture_begin/end) and replayed each step via q35_graph_launch.
+extern "C" fn q35_graph_set_params(token: c_int, pos: c_int) c_int;
+extern "C" fn q35_capture_begin() c_int;
+extern "C" fn q35_capture_end() c_int;
+extern "C" fn q35_graph_launch() c_int;
+extern "C" fn q35_graph_destroy() c_int;
 
 // ---------------------------------------------------------------------------
 // pointer helpers
@@ -182,6 +192,8 @@ const Gpu = struct {
         return p;
     }
     fn deinit(self: *Gpu, arena: std.mem.Allocator) void {
+        // Drop the CUDA Graph first (it references the device pointers below).
+        _ = q35_graph_destroy();
         for (self.gpu_ptrs.items) |p| {
             _ = q35_free(p);
         }
@@ -257,6 +269,17 @@ const Ctx = struct {
     K: usize,
 };
 
+// Build the CUDA Graph for one whole forward.  Runs runForward under stream
+// capture so every kernel launch (all on the graph stream) is recorded as a
+// graph node.  token/pos are irrelevant here (recorded as pointers/dims, not
+// values); the param block is reset to (0,0) by q35_capture_end, and each real
+// step calls q35_graph_set_params before q35_graph_launch.
+fn captureGraph(ctx: *Ctx) void {
+    _ = q35_capture_begin();
+    runForward(ctx);
+    _ = q35_capture_end();
+}
+
 fn makeCtx(g: *Gpu) Ctx {
     return .{
         .gpu = g,
@@ -326,13 +349,12 @@ fn forwardGdn(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     q35_add(g.x, g.x2, toC(hidden));
 }
 
-fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize, pos: u32) void {
+fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     const c = ctx.cfg;
     const hidden = ctx.hidden;
     const heads = ctx.heads;
     const kv_heads = ctx.kv_heads;
     const hd = ctx.hd;
-    const q_dim = heads * hd;
     const kv_dim = kv_heads * hd;
 
     const g = ctx.gpu;
@@ -353,28 +375,26 @@ fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize, pos: u32) void {
     q35_rmsnorm_strided(g.qkv, cf32(lw.attn_q_norm), g.qkv, toC(heads), toC(hd), toC(2 * hd), c.rms_eps);
     q35_rmsnorm_strided(g.k, cf32(lw.attn_k_norm), g.k, toC(kv_heads), toC(hd), toC(hd), c.rms_eps);
 
-    // RoPE on first rotary_dim dims of each q/k head
+    // RoPE on first rotary_dim dims of each q/k head (pos from device params)
     const rope_dim: usize = @intCast(c.rotary_dim);
     const base: f32 = c.rope_freq_base;
-    q35_rope(g.qkv, toC(heads), toC(hd), toC(rope_dim), toC(2 * hd), toC(pos), base);
-    q35_rope(g.k, toC(kv_heads), toC(hd), toC(rope_dim), toC(hd), toC(pos), base);
+    q35_rope(g.qkv, toC(heads), toC(hd), toC(rope_dim), toC(2 * hd), base);
+    q35_rope(g.k, toC(kv_heads), toC(hd), toC(rope_dim), toC(hd), base);
 
-    // KV cache write (device-to-device), slot = current len
-    const slot: usize = g.kv_len[li];
-    _ = q35_d2d(offBytes(g.kv_k[li], slot * kv_dim * 4), g.k, kv_dim * 4);
-    _ = q35_d2d(offBytes(g.kv_v[li], slot * kv_dim * 4), g.v, kv_dim * 4);
-    g.kv_len[li] = @intCast(slot + 1);
-    const n_t: usize = slot + 1;
+    // KV cache write.  The destination slot is `pos`, read by the kernel from
+    // the device param block (a cudaMemcpy node can't express a pos-dependent
+    // offset), so no host bookkeeping is needed here.
+    q35_kvstore(g.kv_k[li], g.k, toC(kv_dim));
+    q35_kvstore(g.kv_v[li], g.v, toC(kv_dim));
 
     // GQA attention (sigmoid gate applied in-kernel)
     const scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(hd)));
-    q35_attn(g.qkv, g.kv_k[li], g.kv_v[li], gate, g.gdn_out, toC(heads), toC(kv_heads), toC(hd), toC(n_t), toC(kv_dim), toC(2 * hd), scale);
+    q35_attn(g.qkv, g.kv_k[li], g.kv_v[li], gate, g.gdn_out, toC(heads), toC(kv_heads), toC(hd), toC(kv_dim), toC(2 * hd), scale);
 
     // x += attn_output @ gdn_out
     linMatvec(g, &lw.attn_output, g.gdn_out, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
-    _ = q_dim;
 }
 
 fn forwardMlp(ctx: *Ctx, lw: *GpuLayer) void {
@@ -397,26 +417,29 @@ fn forwardMlp(ctx: *Ctx, lw: *GpuLayer) void {
     q35_add(g.x, g.x2, toC(hidden));
 }
 
-fn step(ctx: *Ctx, token: u32, pos: u32) u32 {
+// The whole forward as a sequence of kernel launches (no host sync, no d2h/d2d
+// — every q35_* below goes to the graph stream).  Run under stream capture to
+// build the graph; conceptually "what the graph replays".  token/pos are NOT
+// arguments: embed/rope/attn/kvstore read them from the device param block.
+fn runForward(ctx: *Ctx) void {
     const c = ctx.cfg;
     const hidden = ctx.hidden;
     const g = ctx.gpu;
 
-    // embedding lookup
+    // embedding lookup (row = token, read from device params)
     if (g.emb_is_q8) {
-        q35_embed_row(cu8(g.token_embd), g.x, toC(token), toC(hidden));
+        q35_embed_row(cu8(g.token_embd), g.x, toC(hidden));
     } else {
-        // f32 embedding (dequantized path): bounce one row through the host.
-        const off_bytes: usize = token * hidden * @sizeOf(f32);
-        const row_u8: *u8 = @ptrFromInt(@intFromPtr(u8p(g.token_embd)) + off_bytes);
-        const emb_buf: ?*anyopaque = @ptrCast(g.emb_row.ptr);
-        _ = q35_d2h(emb_buf, @ptrCast(row_u8), hidden * @sizeOf(f32));
-        _ = q35_h2d(g.x, emb_buf, hidden * @sizeOf(f32));
+        // f32 token_embd would need a host-bounce (not capturable).  Q8_0
+        // models (the ones we ship) use the q8 path above; assert the f32
+        // path is never taken while building a graph.
+        std.debug.assert(false);
+        q35_embed_row(cu8(g.token_embd), g.x, toC(hidden));
     }
 
     for (g.layers, 0..) |*lw, li| {
         if (c.isFullAttention(@intCast(li))) {
-            forwardFull(ctx, lw, li, pos);
+            forwardFull(ctx, lw, li);
         } else {
             forwardGdn(ctx, lw, li);
         }
@@ -436,6 +459,18 @@ fn step(ctx: *Ctx, token: u32, pos: u32) u32 {
 
     // argmax (strict >, first max)
     q35_argmax(g.logits, g.argmax_buf, toC(vocab));
+}
+
+// One decode step via the CUDA Graph: upload (token,pos) to the device param
+// block, launch the whole-forward graph (one launch replaces ~900 host
+// launches), sync, and read back the argmax token.
+fn step(ctx: *Ctx, token: u32, pos: u32) u32 {
+    const g = ctx.gpu;
+    _ = q35_graph_set_params(@as(c_int, @intCast(token)), @as(c_int, @intCast(pos)));
+    _ = q35_graph_launch();
+    // Read back the argmax token.  The blocking D2H (cudaMemcpy) implicitly
+    // waits for the stream (and hence the whole graph) to finish, so no
+    // separate device sync is needed.
     var idx: i32 = 0;
     _ = q35_d2h(@ptrCast(&idx), g.argmax_buf, 4);
     return @intCast(idx);
@@ -666,6 +701,9 @@ fn generate(
     var ctx = makeCtx(g);
 
     resetGdn(g);
+
+    // Build the whole-forward CUDA Graph once (stream-capture runForward).
+    captureGraph(&ctx);
 
     const t_start = Io.Clock.Timestamp.now(io, .awake);
     var next: u32 = 0;

@@ -36,6 +36,13 @@
 // (1) device mgmt + memory
 // ---------------------------------------------------------------------------
 
+// CUDA Graph state (device param block + one stream + the instantiated graph).
+static cudaStream_t g_stream = nullptr;
+static cudaGraph_t g_graph = nullptr;
+static cudaGraphExec_t g_exec = nullptr;
+static int *g_params_dev = nullptr; // device: [0]=token, [1]=pos
+static int g_params_host[2];
+
 extern "C" int q35_cuda_init(void) {
     int dev = 0;
     Q35_CHECK(cudaGetDevice(&dev));
@@ -44,6 +51,12 @@ extern "C" int q35_cuda_init(void) {
     fprintf(stderr, "[cuda] device %d: %s (sm_%d%d, %.1f GiB, %d SMs)\n", dev,
             p.name, p.major, p.minor, (double)p.totalGlobalMem / 1073741824.0,
             p.multiProcessorCount);
+    Q35_CHECK(cudaStreamCreate(&g_stream));
+    Q35_CHECK(cudaMalloc((void **)&g_params_dev, sizeof(int) * 2));
+    g_params_host[0] = 0;
+    g_params_host[1] = 0;
+    Q35_CHECK(cudaMemcpy(g_params_dev, g_params_host, sizeof(int) * 2,
+                        cudaMemcpyHostToDevice));
     return 0;
 }
 
@@ -200,9 +213,10 @@ __global__ void k_matvec_f32(const float *__restrict__ w,
 
 // Dequantize one Q8_0 row of `w` (n elements) into x.
 __global__ void k_embed_row(const unsigned char *__restrict__ w,
-                            float *__restrict__ x, int row, int n) {
+                            float *__restrict__ x, const int *params, int n) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= n) return;
+    int row = params[0];
     int blk = i >> 5;
     int j = i & 31;
     const unsigned char *p = w + ((size_t)row * (size_t)(n >> 5) + blk) * 34;
@@ -290,12 +304,13 @@ __global__ void k_l2norm_rows(float *__restrict__ x, int rows, int n, float eps,
 
 // NeoX half-rotation on the first rope_dim dims of every head.
 __global__ void k_rope(float *__restrict__ x, int rows, int hd, int rope_dim,
-                       int stride, int pos, float base) {
+                       int stride, const int *params, float base) {
     int h = blockIdx.x;
     if (h >= rows) return;
     int half = rope_dim / 2;
     int j = threadIdx.x;
     if (j >= half) return;
+    int pos = params[1];
     float *head = x + (size_t)h * stride;
     float inv = powf(base, -2.0f * (float)j / (float)rope_dim);
     float theta = (float)pos * inv;
@@ -478,10 +493,11 @@ __global__ void k_gated_rmsnorm(float *__restrict__ out,
 __global__ void k_attn(const float *__restrict__ q, const float *__restrict__ kc,
                        const float *__restrict__ vc, const float *__restrict__ gate,
                        float *__restrict__ out, int heads, int kv_heads, int hd,
-                       int n_t, int kv_dim, int q_stride, float scale) {
+                       const int *params, int kv_dim, int q_stride, float scale) {
     int h = blockIdx.x;
     if (h >= heads) return;
     int tid = threadIdx.x;
+    int n_t = params[1] + 1; // slot=pos, so n_t = pos+1
     extern __shared__ float shsc[]; // n_t scores
     __shared__ float red[Q35_BLK];
     int gqa = heads / kv_heads;
@@ -532,72 +548,72 @@ static inline int q35_grid(int n, int block) { return (n + block - 1) / block; }
 
 extern "C" void q35_quantize_q8(const float *x, unsigned char *out, int nblocks) {
     if (nblocks <= 0) return;
-    k_quantize_q8<<<q35_grid(nblocks, Q35_BLK), Q35_BLK>>>(x, out, nblocks);
+    k_quantize_q8<<<q35_grid(nblocks, Q35_BLK), Q35_BLK, 0, g_stream>>>(x, out, nblocks);
 }
 
 extern "C" void q35_matvec_q8(const unsigned char *w, const unsigned char *xq,
                               float *out, int rows, int row_blocks) {
     if (rows <= 0 || row_blocks <= 0) return;
     int warps = 8;
-    k_matvec_q8<<<q35_grid(rows, warps), warps * 32>>>(w, xq, out, rows, row_blocks);
+    k_matvec_q8<<<q35_grid(rows, warps), warps * 32, 0, g_stream>>>(w, xq, out, rows, row_blocks);
 }
 
 extern "C" void q35_matvec_f32(const float *w, const float *x, float *out,
                                int rows, int cols) {
     if (rows <= 0 || cols <= 0) return;
     int warps = 8;
-    k_matvec_f32<<<q35_grid(rows, warps), warps * 32>>>(w, x, out, rows, cols);
+    k_matvec_f32<<<q35_grid(rows, warps), warps * 32, 0, g_stream>>>(w, x, out, rows, cols);
 }
 
-extern "C" void q35_embed_row(const unsigned char *w, float *x, int row, int n) {
+extern "C" void q35_embed_row(const unsigned char *w, float *x, int n) {
     if (n <= 0) return;
-    k_embed_row<<<q35_grid(n, Q35_BLK), Q35_BLK>>>(w, x, row, n);
+    k_embed_row<<<q35_grid(n, Q35_BLK), Q35_BLK, 0, g_stream>>>(w, x, g_params_dev, n);
 }
 
 extern "C" void q35_rmsnorm_rows(const float *x, const float *w, float *out,
                                  int rows, int n, float eps) {
     if (rows <= 0 || n <= 0) return;
     if (n <= 128)
-        k_rmsnorm_rows<128><<<rows, 128>>>(x, w, out, rows, n, eps);
+        k_rmsnorm_rows<128><<<rows, 128, 0, g_stream>>>(x, w, out, rows, n, eps);
     else
-        k_rmsnorm_rows<256><<<rows, 256>>>(x, w, out, rows, n, eps);
+        k_rmsnorm_rows<256><<<rows, 256, 0, g_stream>>>(x, w, out, rows, n, eps);
 }
 
 extern "C" void q35_rmsnorm_strided(const float *x, const float *w, float *out,
                                     int rows, int n, int stride, float eps) {
     if (rows <= 0 || n <= 0) return;
     if (n <= 128)
-        k_rmsnorm_strided<128><<<rows, 128>>>(x, w, out, rows, n, stride, eps);
+        k_rmsnorm_strided<128><<<rows, 128, 0, g_stream>>>(x, w, out, rows, n, stride, eps);
     else
-        k_rmsnorm_strided<256><<<rows, 256>>>(x, w, out, rows, n, stride, eps);
+        k_rmsnorm_strided<256><<<rows, 256, 0, g_stream>>>(x, w, out, rows, n, stride, eps);
 }
 
 extern "C" void q35_l2norm(float *x, int rows, int n, float eps, float scale) {
     if (rows <= 0 || n <= 0) return;
     if (n <= 128)
-        k_l2norm_rows<128><<<rows, 128>>>(x, rows, n, eps, scale);
+        k_l2norm_rows<128><<<rows, 128, 0, g_stream>>>(x, rows, n, eps, scale);
     else
-        k_l2norm_rows<256><<<rows, 256>>>(x, rows, n, eps, scale);
+        k_l2norm_rows<256><<<rows, 256, 0, g_stream>>>(x, rows, n, eps, scale);
 }
 
 extern "C" void q35_rope(float *x, int rows, int hd, int rope_dim, int stride,
-                         int pos, float base) {
+                         float base) {
     if (rows <= 0 || rope_dim <= 0) return;
     int half = rope_dim / 2;
-    k_rope<<<rows, half>>>(x, rows, hd, rope_dim, stride, pos, base);
+    k_rope<<<rows, half, 0, g_stream>>>(x, rows, hd, rope_dim, stride, g_params_dev, base);
 }
 
 extern "C" void q35_conv1d(const float *wconv, float *x, float *hist,
                            int conv_dim, int k) {
     if (conv_dim <= 0 || k < 2) return;
-    k_conv1d<<<q35_grid(conv_dim, Q35_BLK), Q35_BLK>>>(wconv, x, hist, conv_dim, k);
+    k_conv1d<<<q35_grid(conv_dim, Q35_BLK), Q35_BLK, 0, g_stream>>>(wconv, x, hist, conv_dim, k);
 }
 
 extern "C" void q35_beta_gamma(const float *a, const float *b, const float *abar,
                                const float *dtb, float *beta, float *gamma,
                                int nv) {
     if (nv <= 0) return;
-    k_beta_gamma<<<q35_grid(nv, 128), 128>>>(a, b, abar, dtb, beta, gamma, nv);
+    k_beta_gamma<<<q35_grid(nv, 128), 128, 0, g_stream>>>(a, b, abar, dtb, beta, gamma, nv);
 }
 
 extern "C" void q35_gdn_state(float *qkv, float *state, const float *beta,
@@ -608,40 +624,60 @@ extern "C" void q35_gdn_state(float *qkv, float *state, const float *beta,
         fprintf(stderr, "[cuda] gdn_state: kd=%d vd=%d out of range\n", kd, vd);
         exit(1);
     }
-    k_gdn_state<<<nv, vd>>>(qkv, state, beta, gamma, out, nv, nk, kd, vd);
+    k_gdn_state<<<nv, vd, 0, g_stream>>>(qkv, state, beta, gamma, out, nv, nk, kd, vd);
 }
 
 extern "C" void q35_gated_rmsnorm(float *out, const float *w, const float *z,
                                   int rows, int n, float eps) {
     if (rows <= 0 || n <= 0) return;
     if (n <= 128)
-        k_gated_rmsnorm<128><<<rows, 128>>>(out, w, z, rows, n, eps);
+        k_gated_rmsnorm<128><<<rows, 128, 0, g_stream>>>(out, w, z, rows, n, eps);
     else
-        k_gated_rmsnorm<256><<<rows, 256>>>(out, w, z, rows, n, eps);
+        k_gated_rmsnorm<256><<<rows, 256, 0, g_stream>>>(out, w, z, rows, n, eps);
 }
 
 extern "C" void q35_attn(const float *q, const float *kc, const float *vc,
                          const float *gate, float *out, int heads, int kv_heads,
-                         int hd, int n_t, int kv_dim, int q_stride, float scale) {
-    if (heads <= 0 || n_t <= 0) return;
-    size_t shmem = (size_t)n_t * sizeof(float);
-    k_attn<<<heads, 256, shmem>>>(q, kc, vc, gate, out, heads, kv_heads, hd, n_t,
-                                 kv_dim, q_stride, scale);
+                         int hd, int kv_dim, int q_stride, float scale) {
+    if (heads <= 0) return;
+    // n_t is read at runtime from the device param block (pos+1); the shared
+    // scratch must cover the max possible n_t (max_seq) since the graph is
+    // static.  max_seq floats is well within the 4096-block dynamic limit.
+    const size_t max_nt = 4096;
+    size_t shmem = max_nt * sizeof(float);
+    k_attn<<<heads, 256, shmem, g_stream>>>(q, kc, vc, gate, out, heads, kv_heads,
+                                           hd, g_params_dev, kv_dim, q_stride, scale);
 }
 
 extern "C" void q35_silu_mul(float *h, const float *h1, int n) {
     if (n <= 0) return;
-    k_silu_mul<<<q35_grid(n, Q35_BLK), Q35_BLK>>>(h, h1, n);
+    k_silu_mul<<<q35_grid(n, Q35_BLK), Q35_BLK, 0, g_stream>>>(h, h1, n);
 }
 
 extern "C" void q35_sigmoid_mul(float *o, const float *g, int n) {
     if (n <= 0) return;
-    k_sigmoid_mul<<<q35_grid(n, Q35_BLK), Q35_BLK>>>(o, g, n);
+    k_sigmoid_mul<<<q35_grid(n, Q35_BLK), Q35_BLK, 0, g_stream>>>(o, g, n);
 }
 
 extern "C" void q35_add(float *a, const float *b, int n) {
     if (n <= 0) return;
-    k_add<<<q35_grid(n, Q35_BLK), Q35_BLK>>>(a, b, n);
+    k_add<<<q35_grid(n, Q35_BLK), Q35_BLK, 0, g_stream>>>(a, b, n);
+}
+
+// KV-cache slot store.  The destination is `kvcache + slot*kv_dim` f32s where
+// slot = pos (device param), which a cudaMemcpy node cannot express, so this is
+// a kernel.  One thread per element (kv_dim <= 1024 = block limit).
+__global__ void k_kvstore(float *kvcache, const float *__restrict__ src,
+                          const int *params, int kv_dim) {
+    int i = threadIdx.x;
+    if (i >= kv_dim) return;
+    float *dst = kvcache + (size_t)params[1] * kv_dim;
+    dst[i] = src[i];
+}
+
+extern "C" void q35_kvstore(float *kvcache, const float *src, int kv_dim) {
+    if (kv_dim <= 0) return;
+    k_kvstore<<<1, kv_dim, 0, g_stream>>>(kvcache, src, g_params_dev, kv_dim);
 }
 
 extern "C" void q35_argmax(const float *x, int *outidx, int n) {
@@ -649,6 +685,83 @@ extern "C" void q35_argmax(const float *x, int *outidx, int n) {
     // Single block: one global reduction over the whole vocab.  (A multi-block
     // launch would race on outidx[0] — see k_argmax.)  argmax is once/token and
     // not on the decode bottleneck path.
-    k_argmax<<<1, Q35_BLK>>>(x, outidx, n);
+    k_argmax<<<1, Q35_BLK, 0, g_stream>>>(x, outidx, n);
+}
+
+// ---------------------------------------------------------------------------
+// CUDA Graph: host uploads the per-step (token,pos), host runs the whole
+// forward under stream capture once (Zig drives it), then replays the graph
+// each step.  The graph is fully static: all pointers/dims are fixed at capture
+// time; only token/pos change per step, and those are read by the kernels from
+// the device param block (so no per-step node param update is needed).
+// ---------------------------------------------------------------------------
+
+extern "C" int q35_graph_set_params(int token, int pos) {
+    g_params_host[0] = token;
+    g_params_host[1] = pos;
+    cudaError_t e =
+        cudaMemcpyAsync(g_params_dev, g_params_host, sizeof(int) * 2,
+                        cudaMemcpyHostToDevice, g_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[cuda] graph set_params: %s\n", cudaGetErrorString(e));
+        return (int)e;
+    }
+    return 0;
+}
+
+// Begin capturing on g_stream.  The host must then issue the whole forward
+// (embedding + per-layer kernels + final logits) on g_stream; all kernel
+// launches below go to g_stream, so they are captured as graph nodes.
+extern "C" int q35_capture_begin(void) {
+    cudaError_t e =
+        cudaStreamBeginCapture(g_stream, cudaStreamCaptureModeGlobal);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[cuda] capture_begin: %s\n", cudaGetErrorString(e));
+        return (int)e;
+    }
+    return 0;
+}
+
+// End capture, instantiate the graph, and (crucially) RESET the device param
+// block to (0,0) so the replayed graph's first step (or any step the host
+// forgot to set) reads token=0,pos=0 deterministically.  The host will call
+// q35_graph_set_params again on g_stream right before each launch.
+extern "C" int q35_capture_end(void) {
+    cudaError_t e = cudaStreamEndCapture(g_stream, &g_graph);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[cuda] capture_end: %s\n", cudaGetErrorString(e));
+        return (int)e;
+    }
+    e = cudaGraphInstantiate(&g_exec, g_graph, nullptr, nullptr, 0);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[cuda] graph instantiate: %s\n", cudaGetErrorString(e));
+        return (int)e;
+    }
+    cudaGraphDestroy(g_graph);
+    g_graph = nullptr;
+    // Reset the param block to a known state; the first real step will set it.
+    g_params_host[0] = 0;
+    g_params_host[1] = 0;
+    cudaMemcpy(g_params_dev, g_params_host, sizeof(int) * 2,
+               cudaMemcpyHostToDevice);
+    return 0;
+}
+
+// Launch the whole-forward graph on g_stream (replaces ~900 host launches).
+extern "C" int q35_graph_launch(void) {
+    cudaError_t e = cudaGraphLaunch(g_exec, g_stream);
+    if (e != cudaSuccess) {
+        fprintf(stderr, "[cuda] graph_launch: %s\n", cudaGetErrorString(e));
+        return (int)e;
+    }
+    return 0;
+}
+
+extern "C" int q35_graph_destroy(void) {
+    if (g_exec) {
+        cudaGraphExecDestroy(g_exec);
+        g_exec = nullptr;
+    }
+    return 0;
 }
 
