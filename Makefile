@@ -39,19 +39,19 @@ test:
 	$(ZIG) build test
 
 run0.8b:
-	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 中国首都在哪里？
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？
 
 run2b:
-	zig-out/bin/qwen35 run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 中国首都在哪里？
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 天空为什么是蓝色的？
 
 run4b:
-	zig-out/bin/qwen35 run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 中国首都在哪里？
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 天空为什么是蓝色的？
 
 run0.8b-cuda:
-	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 中国首都在哪里？
+	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？
 
 run2b-cuda:
-	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 中国首都在哪里？
+	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 天空为什么是蓝色的？
 
 run4b-cuda:
-	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 中国首都在哪里？
+	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 天空为什么是蓝色的？

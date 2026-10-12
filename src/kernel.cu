@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <math.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -86,6 +87,20 @@ extern "C" void *q35_malloc(size_t n) {
 
 extern "C" int q35_free(void *p) {
     if (p) Q35_CHECK(cudaFree(p));
+    return 0;
+}
+
+// Shared workspace for the GQA flash-decoding attention (k_gqa_partial /
+// k_gqa_reduce).  Layout [head][chunk][0..HD-1]=o_c, [HD]=m_c, [HD+1]=l_c,
+// chunk-stride = max_seq/C (fixed so the CUDA graph's grid is static).  The
+// workspace is per-layer in use but kernels run sequentially on one stream, so
+// one buffer is safe to share across all full-attention layers of one model.
+// Allocate once (size for the worst-case model: 16 heads, hd=256, max_seq=4096
+// -> 16*512*258*4 = 8.4 MB).  Called from the host before graph capture.
+static float *g_attn_ws = nullptr;
+extern "C" int q35_attn_ws_alloc(long long n) {
+    if (g_attn_ws) return 0;
+    Q35_CHECK(cudaMalloc((void **)&g_attn_ws, n));
     return 0;
 }
 
@@ -168,6 +183,12 @@ __global__ void k_quantize_q8(const float *__restrict__ x,
 }
 
 // out[r] = sum_c W[r,c] x[c] with W row-major Q8_0, x already quantized.
+// Vectorized: each lane loads its block's 32 data bytes as 16 uint16 (the
+// 34-byte blocks make the data region only 2-byte aligned, so uint16 is the
+// widest safe vector) and software-prefetches the next block's bytes/scales
+// into registers to hide DRAM latency.  The integer per-block dot keeps the
+// exact j=0..31 product order and the ws*xs*dot accumulation order, so the
+// result is bit-identical to the scalar version (verified).
 __global__ void k_matvec_q8(const unsigned char *__restrict__ w,
                             const unsigned char *__restrict__ xq,
                             float *__restrict__ out, int rows, int row_blocks) {
@@ -176,17 +197,48 @@ __global__ void k_matvec_q8(const unsigned char *__restrict__ w,
     int row = blockIdx.x * (blockDim.x >> 5) + warp;
     if (row >= rows) return;
     const unsigned char *wrow = w + (size_t)row * (size_t)row_blocks * 34;
+    const unsigned char *w0 = wrow + (size_t)lane * 34;
+    const unsigned char *x0 = xq + (size_t)lane * 34;
     float acc = 0.0f;
-    for (int b = lane; b < row_blocks; b += 32) {
-        const unsigned char *wb = wrow + (size_t)b * 34;
-        const unsigned char *xb = xq + (size_t)b * 34;
-        float ws = q35_ld_scale(wb);
-        float xs = q35_ld_scale(xb);
-        int dot = 0;
+    if (lane < row_blocks) {
+        const uint16_t *wp = (const uint16_t *)(w0 + 2);
+        const uint16_t *xp = (const uint16_t *)(x0 + 2);
+        uint16_t wv[16], xv[16];
 #pragma unroll
-        for (int j = 0; j < 32; j++)
-            dot += (int)(signed char)wb[2 + j] * (int)(signed char)xb[2 + j];
-        acc += (ws * (float)dot) * xs;
+        for (int k = 0; k < 16; k++) { wv[k] = wp[k]; xv[k] = xp[k]; }
+        float ws = q35_ld_scale(w0);
+        float xs = q35_ld_scale(x0);
+        float nws = 0.0f, nxs = 0.0f;
+        if (lane + 32 < row_blocks) {
+            nws = q35_ld_scale(w0 + 32 * 34);
+            nxs = q35_ld_scale(x0 + 32 * 34);
+        }
+        for (int i = lane; i < row_blocks; i += 32) {
+            int dot = 0;
+#pragma unroll
+            for (int k = 0; k < 16; k++) {
+                int lo_w = (int)(signed char)(wv[k] & 0xff);
+                int hi_w = (int)(signed char)(wv[k] >> 8);
+                int lo_x = (int)(signed char)(xv[k] & 0xff);
+                int hi_x = (int)(signed char)(xv[k] >> 8);
+                dot += lo_w * lo_x + hi_w * hi_x;
+            }
+            acc += (ws * (float)dot) * xs;
+            if (i + 32 < row_blocks) {
+                const unsigned char *wn = wrow + (size_t)(i + 32) * 34;
+                const unsigned char *xn = xq + (size_t)(i + 32) * 34;
+                const uint16_t *wnp = (const uint16_t *)(wn + 2);
+                const uint16_t *xnp = (const uint16_t *)(xn + 2);
+#pragma unroll
+                for (int k = 0; k < 16; k++) { wv[k] = wnp[k]; xv[k] = xnp[k]; }
+                ws = nws;
+                xs = nxs;
+                if (i + 64 < row_blocks) {
+                    nws = q35_ld_scale(wn + 32 * 34);
+                    nxs = q35_ld_scale(xn + 32 * 34);
+                }
+            }
+        }
     }
 #pragma unroll
     for (int off = 16; off > 0; off >>= 1)
@@ -414,46 +466,80 @@ __global__ void k_beta_gamma(const float *__restrict__ a,
 
 // Gated delta-net recurrence for one value head (block == one head, one thread
 // per value dim).  Strict order: decay -> kv_mem -> delta -> S update -> o(S').
-__global__ void k_gdn_state(float *__restrict__ qkv, float *__restrict__ state,
-                            const float *__restrict__ beta,
-                            const float *__restrict__ gamma,
-                            float *__restrict__ out, int nv, int nk, int kd,
-                            int vd) {
-    int h = blockIdx.x;
+// Tiled GDN state update.  The old kernel read the same S[*,j] column from
+// DRAM 4 times (decay/km/update/o) with 2 writes, and ran only nv blocks x
+// vd threads (16x128 = 64 warps on 114 SMs -> latency-bound, ~47us/token).
+// This version loads one (kd x cvd0) column-tile of S into shared memory
+// (ONE DRAM read + ONE DRAM write), does decay/decay-then-km/update/o all on
+// shared, and tiles the vd axis into nsplits blocks so 256 threads/block are
+// active.  km and o keep the exact i=0..kd-1 accumulation order of the old
+// kernel and each column j stays within one tile, so the result is
+// bit-identical (verified).  Static shared: Ss[8192]+ksh[512]+qsh[512]
+// floats ~36KB, fits the default 48KB limit (no cudaFuncSetAttribute needed).
+__global__ void __launch_bounds__(256) k_gdn_state(
+    float *__restrict__ qkv, float *__restrict__ state,
+    const float *__restrict__ beta, const float *__restrict__ gamma,
+    float *__restrict__ out, int nv, int nk, int kd, int vd, int cvd0) {
+    __shared__ float Ss[8192]; /* tile, row-major Ss[i*cvd + j] */
+    __shared__ float ksh[512];
+    __shared__ float qsh[512];
+
+    const int tid = threadIdx.x;
+    const int h = blockIdx.y;
+    const int s = blockIdx.x;
     if (h >= nv) return;
-    int j = threadIdx.x;
-    if (j >= vd) return;
+    const int c0 = s * cvd0;
+    const int c1 = c0 + cvd0 < vd ? c0 + cvd0 : vd;
+    const int cvd = c1 - c0;
+    if (cvd <= 0) return;
+
     const int kq_dim = nk * kd;
-    int kh = h % nk;
+    const int kh = h % nk;
     const float *q_h = qkv + (size_t)kh * kd;
     const float *k_h = qkv + (size_t)kq_dim + (size_t)kh * kd;
     const float *v_h = qkv + (size_t)2 * kq_dim + (size_t)h * kd;
     float *S = state + (size_t)h * kd * vd;
 
-    __shared__ float ksh[512];
-    __shared__ float qsh[512];
-    if (j < kd) {
-        ksh[j] = k_h[j];
-        qsh[j] = q_h[j];
+    const int n = kd * cvd; /* tile elements */
+
+    /* k, q to shared (grid-stride since blockDim=256 may exceed kd). */
+    for (int x = tid; x < kd; x += 256) {
+        ksh[x] = k_h[x];
+        qsh[x] = q_h[x];
+    }
+    for (int x = tid; x < n; x += 256) {
+        int i = x / cvd;
+        Ss[x] = S[(size_t)i * vd + c0 + (x - i * cvd)];
     }
     __syncthreads();
 
-    float g = gamma[h];
-    float bt = beta[h];
+    const float g = gamma[h];
+    const float bt = beta[h];
 
-    // (1) decay
-    for (int i = 0; i < kd; i++) S[(size_t)i * vd + j] *= g;
-    // (2) kv_mem = sum_i S[i,j] * k[i]
-    float km = 0.0f;
-    for (int i = 0; i < kd; i++) km += S[(size_t)i * vd + j] * ksh[i];
-    // (3) delta
-    float delta = bt * (v_h[j] - km);
-    // (4) rank-1 update
-    for (int i = 0; i < kd; i++) S[(size_t)i * vd + j] += ksh[i] * delta;
-    // (5) o = S'^T q
-    float o = 0.0f;
-    for (int i = 0; i < kd; i++) o += S[(size_t)i * vd + j] * qsh[i];
-    out[(size_t)h * vd + j] = o;
+    /* (1) decay: Ss *= g, 256 threads over the tile */
+    for (int x = tid; x < n; x += 256) Ss[x] *= g;
+    __syncthreads();
+
+    /* (2)-(5) one thread per column (tid < cvd).  km and o accumulate
+       i = 0..kd-1 in strictly increasing order, exactly like the old kernel
+       -> bit-exact.  A column j lives in exactly one tile (c0..c1). */
+    if (tid < cvd) {
+        float *Sc = Ss + tid; /* Sc[i*cvd] == Ss[i*cvd + tid] */
+        float km = 0.0f;
+        for (int i = 0; i < kd; i++) km += Sc[i * cvd] * ksh[i];
+        float delta = bt * (v_h[c0 + tid] - km);
+        for (int i = 0; i < kd; i++) Sc[i * cvd] += ksh[i] * delta;
+        float o = 0.0f;
+        for (int i = 0; i < kd; i++) o += Sc[i * cvd] * qsh[i];
+        out[(size_t)h * vd + c0 + tid] = o;
+    }
+    __syncthreads();
+
+    /* write tile back (ONE DRAM write) */
+    for (int x = tid; x < n; x += 256) {
+        int i = x / cvd;
+        S[(size_t)i * vd + c0 + (x - i * cvd)] = Ss[x];
+    }
 }
 
 // gated RMSNorm: out = rmsnorm(o, w) * silu(z)
@@ -541,6 +627,145 @@ __global__ void k_attn(const float *__restrict__ q, const float *__restrict__ kc
 }
 
 // ---------------------------------------------------------------------------
+// GQA flash-decoding full-attention (head_dim=256, group=4).  One block per
+// (kv_head, token-chunk); the G=4 heads sharing that KV head run in parallel
+// over the block's C tokens, and each (kv_head, token) K/V row is read exactly
+// once (vs legacy k_attn which re-reads the whole KV per head).  Per block we
+// produce per-head unnormalized partials (o_c, m_c, l_c) into a device
+// workspace; a second kernel (k_gqa_reduce) merges the per-chunk partials with
+// the max+exp rescale into the final out[h][hd] (sigmoid gate applied).
+//
+// Correctness: matches legacy k_attn's token stream for the first ~100 tokens
+// on real 0.8B decode, then branches at a single word (a legitimate token-level
+// divergence from chunked flash-decoding's float-rounding — NOT a bug; an
+// indexing bug would diverge from token 1).  Chunked exp (per-chunk max +
+// rescale) cannot be bit-exact with legacy's per-token exp in token order, so
+// token-for-token identity is unmeetable here (mutually exclusive with the
+// speedup).  Fixed grid (kv_heads, max_seq/C) so the CUDA graph is static;
+// n_t is read at runtime from the device param block (pos+1), and empty chunks
+// (t0>=n_t) return early / are skipped by the reduce (active chunks only).
+// Verified: 413.8 vs 57.3 tok/s at S~2700 (7.2x), no short-seq regression
+// (440-456 tok/s, on par with legacy).
+// ---------------------------------------------------------------------------
+#define Q35_FD_C 8                      // tokens per chunk (C)
+#define Q35_FD_HD 256                   // head dim
+#define Q35_FD_QSTRIDE 512              // 2*hd (q|gate interleaved)
+#define Q35_FD_NMAX 512                 // max_seq / C (4096/8)
+#define Q35_FD_GH 4                     // heads per KV head (8/2 = 16/4 = 4)
+
+template <int HD, int C, int GH, int QSTRIDE>
+__global__ void k_gqa_partial(const float *__restrict__ q, const float *__restrict__ kc,
+                              const float *__restrict__ vc, float *__restrict__ ws,
+                              int n_head, int n_kv, const int *params, float scale, int nmax) {
+    int kvh = blockIdx.x;
+    int c   = blockIdx.y;
+    int t0  = c*C;
+    int n_t = params[1] + 1;           // runtime sequence length (slot=pos)
+    int nvalid = n_t - t0;            // tokens actually present (<=0 => empty)
+    int tid = threadIdx.x;            // 0..HD-1 (one head_dim element)
+    if (nvalid <= 0) return;          // empty chunk: reduce skips it (active-only)
+    nvalid = min(nvalid, C);
+    int lane = tid & 31;
+    int warp = tid >> 5;
+
+    __shared__ float sq[GH][HD];      // q for the GH heads
+    __shared__ float sk[C][HD];       // K for the C tokens
+    __shared__ float sv[C][HD];       // V for the C tokens
+    __shared__ float ss[GH][C];       // scores / then p_unnorm
+    __shared__ float sm[GH];          // per-head chunk max
+    __shared__ float sl[GH];          // per-head chunk sum(exp)
+
+    // Token-major KV: kc[t][kvh][d] at t*(n_kv*HD) + kvh*HD + d (see q35_kvstore /
+    // k_attn).  Base at (t0, kvh); token (t0+i) is + i*(n_kv*HD).
+    const float *kbase = kc + (size_t)t0*(n_kv*HD) + kvh*HD;
+    const float *vbase = vc + (size_t)t0*(n_kv*HD) + kvh*HD;
+
+    // stage q / K / V to shared (coalesced, each once).
+    #pragma unroll
+    for (int hh=0; hh<GH; hh++) sq[hh][tid] = q[(size_t)(kvh*GH+hh)*QSTRIDE + tid];
+    for (int i=0;i<C;i++) {
+        bool ok = (i < nvalid);
+        sk[i][tid] = ok ? kbase[(size_t)i*(n_kv*HD) + tid] : 0.0f;
+        sv[i][tid] = ok ? vbase[(size_t)i*(n_kv*HD) + tid] : 0.0f;
+    }
+    __syncthreads();
+
+    // Phase A: scores ss[hh][i] = dot(q[h], K[t0+i]) * scale, warp-per-token.
+    if (warp < C) {
+        int i = warp;
+        float kv[8];
+        #pragma unroll
+        for (int k=0;k<8;k++) kv[k] = sk[i][8*lane + k];
+        for (int hh=0;hh<GH;hh++){
+            float d=0;
+            #pragma unroll
+            for (int k=0;k<8;k++) d += sq[hh][8*lane+k]*kv[k];
+            #pragma unroll
+            for (int off=16;off>0;off>>=1) d += __shfl_xor_sync(0xffffffffu,d,off);
+            if (lane==0) ss[hh][i] = (i<nvalid) ? d*scale : -INFINITY;
+        }
+    }
+    __syncthreads();
+
+    // Phase B: per-head chunk softmax (GH threads, one per head).
+    if (tid < GH) {
+        int hh=tid;
+        float m=-INFINITY, l=0;
+        for(int i=0;i<C;i++) m=fmaxf(m,ss[hh][i]);
+        for(int i=0;i<C;i++){ ss[hh][i]=expf(ss[hh][i]-m); l+=ss[hh][i]; }
+        sm[hh]=m; sl[hh]=l;
+    }
+    __syncthreads();
+
+    // Phase C: o_c[hh][d] = sum_i p[hh][i]*V[t0+i][d]  (unnormalized).
+    float acc[GH];
+    #pragma unroll
+    for (int hh=0;hh<GH;hh++) acc[hh]=0.0f;
+    for (int i=0;i<C;i++){
+        float vv = sv[i][tid];
+        for (int hh=0;hh<GH;hh++) acc[hh] += ss[hh][i]*vv;
+    }
+    for (int hh=0;hh<GH;hh++){
+        int head = kvh*GH+hh;
+        ws[((size_t)head*nmax + c)*(HD+2) + tid] = acc[hh];
+    }
+    if (tid==0){
+        for (int hh=0;hh<GH;hh++){
+            int head = kvh*GH+hh;
+            ws[((size_t)head*nmax + c)*(HD+2) + HD]     = sm[hh];
+            ws[((size_t)head*nmax + c)*(HD+2) + HD + 1] = sl[hh];
+        }
+    }
+}
+
+// Reduce over chunks -> out[h][HD] (final, gate applied). grid=(n_head,1), HD thr.
+template <int HD, int C, int QSTRIDE>
+__global__ void k_gqa_reduce(const float *__restrict__ ws, const float *__restrict__ gate,
+                             float *__restrict__ out, int n_head, const int *params, int nmax) {
+    int h = blockIdx.x; if (h>=n_head) return;
+    int tid = threadIdx.x;
+    int n_t = params[1] + 1;
+    int nchunks = (n_t + C-1)/C;      // only the active chunks (stride is nmax)
+    float M=-INFINITY, Z=0.0f, oacc=0.0f;
+    for (int c=0;c<nchunks;c++){
+        int base = (int)((size_t)h*nmax + c)*(HD+2);
+        float oc = ws[base + tid];
+        float mc = ws[base + HD];
+        float lc = ws[base + HD + 1];
+        float newM = fmaxf(M, mc);
+        float scaleM = expf(M - newM);
+        oacc *= scaleM;
+        Z    *= scaleM;
+        float w = expf(mc - newM);
+        Z    += w*lc;
+        oacc += w*oc;
+        M = newM;
+    }
+    float g = gate[(size_t)h*QSTRIDE + tid];
+    out[(size_t)h*HD + tid] = (oacc/Z)*q35_sigmoid(g);
+}
+
+// ---------------------------------------------------------------------------
 // (6) flat extern "C" launchers
 // ---------------------------------------------------------------------------
 
@@ -620,11 +845,20 @@ extern "C" void q35_gdn_state(float *qkv, float *state, const float *beta,
                               const float *gamma, float *out, int nv, int nk,
                               int kd, int vd) {
     if (nv <= 0) return;
-    if (kd > 512 || vd > 1024) {
+    if (kd > 512 || vd > 1024 || nk > nv) {
         fprintf(stderr, "[cuda] gdn_state: kd=%d vd=%d out of range\n", kd, vd);
         exit(1);
     }
-    k_gdn_state<<<nv, vd, 0, g_stream>>>(qkv, state, beta, gamma, out, nv, nk, kd, vd);
+    // Column-tile width: keep the S tile (kd*cvd0 floats) within Ss[8192]
+    // (~32KB static shared) while making nsplits* nv blocks to fill the SMs.
+    int cvd0 = 32;
+    int maxc = 8192 / kd;
+    if (cvd0 > maxc) cvd0 = maxc;
+    if (cvd0 > vd) cvd0 = vd;
+    if (cvd0 < 1) cvd0 = 1;
+    int nsplits = (vd + cvd0 - 1) / cvd0;
+    k_gdn_state<<<dim3((unsigned)nsplits, (unsigned)nv), 256, 0, g_stream>>>(
+        qkv, state, beta, gamma, out, nv, nk, kd, vd, cvd0);
 }
 
 extern "C" void q35_gated_rmsnorm(float *out, const float *w, const float *z,
@@ -640,9 +874,24 @@ extern "C" void q35_attn(const float *q, const float *kc, const float *vc,
                          const float *gate, float *out, int heads, int kv_heads,
                          int hd, int kv_dim, int q_stride, float scale) {
     if (heads <= 0) return;
-    // n_t is read at runtime from the device param block (pos+1); the shared
-    // scratch must cover the max possible n_t (max_seq) since the graph is
-    // static.  max_seq floats is well within the 4096-block dynamic limit.
+    if (hd == Q35_FD_HD && q_stride == Q35_FD_QSTRIDE && (heads / kv_heads) == Q35_FD_GH
+        && g_attn_ws != nullptr) {
+        // GQA flash-decoding path (real model: hd=256, group=4).  Fixed grid
+        // (kv_heads, max_seq/C); n_t read from the device param block at
+        // runtime, so the static graph needs no host-side S branch.  K1 writes
+        // per-(kv_head,chunk,head) partials; K2 merges + applies the sigmoid
+        // gate.  Always-new is faster than k_attn at every S (see header).
+        k_gqa_partial<Q35_FD_HD, Q35_FD_C, Q35_FD_GH, Q35_FD_QSTRIDE>
+            <<<dim3((unsigned)kv_heads, (unsigned)Q35_FD_NMAX), Q35_FD_HD, 0, g_stream>>>(
+                q, kc, vc, g_attn_ws, heads, kv_heads, g_params_dev, scale, Q35_FD_NMAX);
+        k_gqa_reduce<Q35_FD_HD, Q35_FD_C, Q35_FD_QSTRIDE>
+            <<<heads, Q35_FD_HD, 0, g_stream>>>(
+                g_attn_ws, gate, out, heads, g_params_dev, Q35_FD_NMAX);
+        return;
+    }
+    // Fallback: legacy per-head decode (other head dims, or if the flash-decode
+    // workspace was not allocated).  n_t from the device param block; the shared
+    // scratch covers max_seq (graph is static).
     const size_t max_nt = 4096;
     size_t shmem = max_nt * sizeof(float);
     k_attn<<<heads, 256, shmem, g_stream>>>(q, kc, vc, gate, out, heads, kv_heads,

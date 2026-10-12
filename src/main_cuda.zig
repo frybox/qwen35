@@ -41,6 +41,9 @@ extern "C" fn q35_beta_gamma(a: ?*anyopaque, b: ?*anyopaque, abar: ?*anyopaque, 
 extern "C" fn q35_gdn_state(qkv: ?*anyopaque, state: ?*anyopaque, beta: ?*anyopaque, gamma: ?*anyopaque, out: ?*anyopaque, nv: c_int, nk: c_int, kd: c_int, vd: c_int) void;
 extern "C" fn q35_gated_rmsnorm(out: ?*anyopaque, w: ?*anyopaque, z: ?*anyopaque, rows: c_int, n: c_int, eps: f32) void;
 extern "C" fn q35_attn(q: ?*anyopaque, kc: ?*anyopaque, vc: ?*anyopaque, gate: ?*anyopaque, out: ?*anyopaque, heads: c_int, kv_heads: c_int, hd: c_int, kv_dim: c_int, q_stride: c_int, scale: f32) void;
+// Allocate the shared GQA flash-decoding workspace (see kernel.cu).  Called once
+// before graph capture; q35_attn uses it when the model is hd=256/group=4.
+extern "C" fn q35_attn_ws_alloc(n: c_long) c_int;
 extern "C" fn q35_silu_mul(h: ?*anyopaque, h1: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_sigmoid_mul(o: ?*anyopaque, g: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_add(a: ?*anyopaque, b: ?*anyopaque, n: c_int) void;
@@ -656,6 +659,13 @@ fn gpuInit(arena: std.mem.Allocator, e: *engine.Engine) !*Gpu {
 
         g.layers[li] = gl;
     }
+
+    // GQA flash-decoding attention workspace: [heads][max_seq/8][hd+2] floats,
+    // shared by every full-attention layer (kernels run sequentially on one
+    // stream).  Sized for the real model (hd=256, group=4); q35_attn falls
+    // back to legacy k_attn if this is absent or the dims don't match.
+    const attn_ws_n: usize = heads * 512 * (hd + 2) * 4;
+    _ = q35_attn_ws_alloc(@intCast(attn_ws_n));
 
     return g;
 }
