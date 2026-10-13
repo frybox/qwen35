@@ -30,6 +30,17 @@ extern "C" fn q35_d2d(d: ?*anyopaque, s: ?*anyopaque, n: usize) c_int;
 extern "C" fn q35_zero(d: ?*anyopaque, n: usize) c_int;
 extern "C" fn q35_quantize_q8(x: ?*anyopaque, out: ?*anyopaque, nblocks: c_int) void;
 extern "C" fn q35_matvec_q8(w: ?*anyopaque, xq: ?*anyopaque, out: ?*anyopaque, rows: c_int, row_blocks: c_int) void;
+extern "C" fn q35_matmul_q8(w: ?*anyopaque, xf: ?*anyopaque, xq: ?*anyopaque, out: ?*anyopaque, b: c_int, rows: c_int, cols: c_int) void;
+extern "C" fn q35_gdn_state_batch(qkv: ?*anyopaque, state: ?*anyopaque, beta: ?*anyopaque, gamma: ?*anyopaque, out: ?*anyopaque, nv: c_int, nk: c_int, kd: c_int, vd: c_int, B: c_int) void;
+extern "C" fn q35_attn_batch(q: ?*anyopaque, kc: ?*anyopaque, vc: ?*anyopaque, out: ?*anyopaque, heads: c_int, kv_heads: c_int, hd: c_int, kv_dim: c_int, q_stride: c_int, B: c_int, pos0: c_int, scale: f32) void;
+extern "C" fn q35_rope_batch(x: ?*anyopaque, rows: c_int, hd: c_int, rope_dim: c_int, stride: c_int, base: f32, pos0: c_int) void;
+extern "C" fn q35_kvstore_batch(qkv: ?*anyopaque, kc: ?*anyopaque, vc: ?*anyopaque, kv_dim: c_int, B: c_int, pos0: c_int) void;
+extern "C" fn q35_rope2(x: ?*anyopaque, B: c_int, heads: c_int, rope_dim: c_int, stride: c_int, base: f32, pos0: c_int) void;
+extern "C" fn q35_kvstore2(src: ?*anyopaque, cache: ?*anyopaque, kv_dim: c_int, B: c_int, pos0: c_int) void;
+extern "C" fn q35_embed_rows(w: ?*anyopaque, tok: ?*anyopaque, x: ?*anyopaque, B: c_int, n: c_int) void;
+extern "C" fn q35_conv1d_batch(wconv: ?*anyopaque, x: ?*anyopaque, hist: ?*anyopaque, B: c_int, conv_dim: c_int, k: c_int) void;
+extern "C" fn q35_beta_gamma_batch(a: ?*anyopaque, b: ?*anyopaque, abar: ?*anyopaque, dtb: ?*anyopaque, beta: ?*anyopaque, gamma: ?*anyopaque, nv: c_int, B: c_int) void;
+extern "C" fn q35_l2norm_strided2d(x: ?*anyopaque, B: c_int, nheads: c_int, n: c_int, token_stride: c_int, eps: f32, scale: f32) void;
 extern "C" fn q35_matvec_f32(w: ?*anyopaque, x: ?*anyopaque, out: ?*anyopaque, rows: c_int, cols: c_int) void;
 extern "C" fn q35_embed_row(w: ?*anyopaque, x: ?*anyopaque, n: c_int) void;
 extern "C" fn q35_rmsnorm_rows(x: ?*anyopaque, w: ?*anyopaque, out: ?*anyopaque, rows: c_int, n: c_int, eps: f32) void;
@@ -182,6 +193,26 @@ const Gpu = struct {
     gamma_buf: ?*anyopaque = null,
     emb_row: []f32 = &.{},
 
+    // Batched-prefill working buffers (see prefillChunk / runForwardBatched).
+    pb_x1: ?*anyopaque = null, // residual stream [B][hidden] (ORIGINAL, accumulated)
+    pb_x1n: ?*anyopaque = null, // rmsnorm'd residual [B][hidden] (scratch)
+    pb_qkv: ?*anyopaque = null, // gdn qkv [B][conv_dim] / full-attn q|gate [B][q_dim]
+    pb_z: ?*anyopaque = null, // gdn attn_gate z [B][value_dim]
+    pb_ab: ?*anyopaque = null, // ssm_alpha a [B][nv]
+    pb_bb: ?*anyopaque = null, // ssm_beta b [B][nv]
+    pb_beta: ?*anyopaque = null, // [B][nv]
+    pb_gamma: ?*anyopaque = null, // [B][nv]
+    pb_gdn_out: ?*anyopaque = null, // [B][value_dim]
+    pb_k: ?*anyopaque = null, // full-attn k [B][kv_dim]
+    pb_v: ?*anyopaque = null, // full-attn v [B][kv_dim]
+    pb_attn_out: ?*anyopaque = null, // [B][q_dim]
+    pb_mlp_h: ?*anyopaque = null, // [B][n_ff]
+    pb_mlp_h1: ?*anyopaque = null, // [B][n_ff]
+    pb_x2: ?*anyopaque = null, // [B][hidden] temp (linear output before add)
+    pb_tok: ?*anyopaque = null, // [B] u32 token ids (device)
+    pb_q8: ?*anyopaque = null, // Q8_0 scratch [B][max_cols/32*34]
+    pb_logit_row: ?*anyopaque = null, // [hidden] f32 (last-token rmsnormed x)
+
     gpu_ptrs: std.ArrayList(*anyopaque) = .empty,
 
     fn allocF32(self: *Gpu, arena: std.mem.Allocator, n: usize) !?*anyopaque {
@@ -252,6 +283,22 @@ fn linMatvec(gpu: *Gpu, w: *const LinearGpu, x: ?*anyopaque, out: ?*anyopaque) v
     }
 }
 
+// Decode fast path: the linear layers of one layer share the SAME input row,
+// so quantize it once and let the matvecs below reuse g.q8_scratch read-only.
+// Bit-exact vs calling linMatvec per matvec: the Q8_0 quantizer is a
+// deterministic per-32-element function (same x => same q8_scratch) and
+// k_matvec_q8 only READS xq (writes `out`).
+fn quantInput(g: *Gpu, x: ?*anyopaque, cols: usize) void {
+    q35_quantize_q8(cf32(x), g.q8_scratch, toC(cols / 32));
+}
+
+// out[rows] = W @ (already-quantized g.q8_scratch); see quantInput.
+fn matvecQ(g: *Gpu, w: *const LinearGpu, out: ?*anyopaque) void {
+    const rows = w.rows;
+    const rb = w.cols / 32;
+    q35_matvec_q8(cu8(w.ptr), cu8(g.q8_scratch), out, toC(rows), toC(rb));
+}
+
 // ---------------------------------------------------------------------------
 // per-layer forward passes (mirror src/engine.zig exactly, bit-exact)
 // ---------------------------------------------------------------------------
@@ -311,20 +358,24 @@ fn forwardGdn(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     const conv_dim = ctx.conv_dim;
     const kq_dim = nk * kd;
     const K = ctx.K;
+    const value_dim = nv * vd; // ssm_out's input width (g.gdn_out)
 
     const g = ctx.gpu;
 
     // rmsNorm(x1, x, attn_norm, eps)
     q35_rmsnorm_rows(cf32(g.x), cf32(lw.attn_norm), g.x1, 1, toC(hidden), c.rms_eps);
 
+    // x1 is shared by all 4 Q8_0 projections below: quantize ONCE, then reuse
+    // g.q8_scratch (bit-exact vs re-quantizing per matvec, see quantInput).
+    quantInput(g, g.x1, hidden);
     // qkv = attn_qkv @ x1   (conv_dim)
-    linMatvec(g, &lw.attn_qkv, g.x1, g.qkv);
+    matvecQ(g, &lw.attn_qkv, g.qkv);
     // z = attn_gate @ x1     (value_dim)
-    linMatvec(g, &lw.attn_gate, g.x1, g.z);
+    matvecQ(g, &lw.attn_gate, g.z);
     // ab[0..nv] = ssm_alpha @ x1 ; ab[nv..] = ssm_beta @ x1
-    linMatvec(g, &lw.ssm_alpha, g.x1, g.ab);
+    matvecQ(g, &lw.ssm_alpha, g.ab);
     const ab_b = offBytes(g.ab, nv * @sizeOf(f32));
-    linMatvec(g, &lw.ssm_beta, g.x1, ab_b);
+    matvecQ(g, &lw.ssm_beta, ab_b);
 
     // causal conv1d (in place qkv, per-layer history; silu in-kernel)
     const conv_hist = g.gdn_conv[li];
@@ -347,7 +398,8 @@ fn forwardGdn(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     q35_gated_rmsnorm(g.gdn_out, cf32(lw.ssm_norm), cf32(g.z), toC(nv), toC(vd), c.rms_eps);
 
     // x += ssm_out @ gdn_out
-    linMatvec(g, &lw.ssm_out, g.gdn_out, g.x2);
+    quantInput(g, g.gdn_out, value_dim);
+    matvecQ(g, &lw.ssm_out, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
 }
@@ -359,17 +411,21 @@ fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     const kv_heads = ctx.kv_heads;
     const hd = ctx.hd;
     const kv_dim = kv_heads * hd;
+    const q_dim = heads * hd; // attn_output's input width (g.gdn_out)
 
     const g = ctx.gpu;
 
     // rmsNorm(x1, x, attn_norm, eps)
     q35_rmsnorm_rows(cf32(g.x), cf32(lw.attn_norm), g.x1, 1, toC(hidden), c.rms_eps);
 
+    // x1 is shared by all 3 Q8_0 projections below: quantize ONCE, then reuse
+    // g.q8_scratch (bit-exact vs re-quantizing per matvec, see quantInput).
+    quantInput(g, g.x1, hidden);
     // qg = attn_q @ x1  (per-head [q|gate] interleaved in qkv)
-    linMatvec(g, &lw.attn_q, g.x1, g.qkv);
+    matvecQ(g, &lw.attn_q, g.qkv);
     // k = attn_k @ x1 ; v = attn_v @ x1
-    linMatvec(g, &lw.attn_k, g.x1, g.k);
-    linMatvec(g, &lw.attn_v, g.x1, g.v);
+    matvecQ(g, &lw.attn_k, g.k);
+    matvecQ(g, &lw.attn_v, g.v);
 
     // gate section = qg + hd (in f32); rmsnorm_strided/attn take ?*anyopaque
     const gate = offBytes(g.qkv, hd * @sizeOf(f32));
@@ -395,7 +451,8 @@ fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     q35_attn(g.qkv, g.kv_k[li], g.kv_v[li], gate, g.gdn_out, toC(heads), toC(kv_heads), toC(hd), toC(kv_dim), toC(2 * hd), scale);
 
     // x += attn_output @ gdn_out
-    linMatvec(g, &lw.attn_output, g.gdn_out, g.x2);
+    quantInput(g, g.gdn_out, q_dim);
+    matvecQ(g, &lw.attn_output, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
 }
@@ -409,15 +466,164 @@ fn forwardMlp(ctx: *Ctx, lw: *GpuLayer) void {
 
     // rmsNorm(x1, x, post_attention_norm, eps)
     q35_rmsnorm_rows(cf32(g.x), cf32(lw.post_attention_norm), g.x1, 1, toC(hidden), c.rms_eps);
+    // x1 is shared by both Q8_0 projections below: quantize ONCE, then reuse
+    // g.q8_scratch (bit-exact vs re-quantizing per matvec, see quantInput).
+    quantInput(g, g.x1, hidden);
     // mlp_h = ffn_gate @ x1 ; mlp_h1 = ffn_up @ x1
-    linMatvec(g, &lw.ffn_gate, g.x1, g.mlp_h);
-    linMatvec(g, &lw.ffn_up, g.x1, g.mlp_h1);
+    matvecQ(g, &lw.ffn_gate, g.mlp_h);
+    matvecQ(g, &lw.ffn_up, g.mlp_h1);
     // mlp_h = silu(mlp_h) * mlp_h1
     q35_silu_mul(g.mlp_h, cf32(g.mlp_h1), toC(n_ff));
     // x += ffn_down @ mlp_h
-    linMatvec(g, &lw.ffn_down, g.mlp_h, g.x2);
+    quantInput(g, g.mlp_h, n_ff);
+    matvecQ(g, &lw.ffn_down, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
+}
+
+// ---------------------------------------------------------------------------
+// batched prefill (chunks of PREFILL_CHUNK tokens)
+// ---------------------------------------------------------------------------
+
+const PREFILL_CHUNK: usize = 128;
+
+/// Batched linear: out = w @ x over B token-rows.  x is [B][cols] f32
+/// token-major, out is [B][rows] f32 token-major.  Q8_0 weights use the
+/// batched GEMM; f32 weights fall back to per-token matvec (Q8_0 models —
+/// the ones we ship — never hit the fallback).
+fn linBatched(g: *Gpu, l: *const LinearGpu, x: ?*anyopaque, out: ?*anyopaque, B: usize, cols: usize) void {
+    const w = l.ptr orelse return;
+    if (l.is_q8) {
+        q35_matmul_q8(cu8(w), cf32(x), g.pb_q8, cf32(out), @intCast(B), @intCast(l.rows), @intCast(cols));
+    } else {
+        for (0..B) |b| {
+            q35_matvec_f32(cf32(w), offBytes(x, b * cols * 4), offBytes(out, b * l.rows * 4), @intCast(l.rows), @intCast(cols));
+        }
+    }
+}
+
+fn forwardGdnBatched(ctx: *Ctx, lw: *GpuLayer, li: usize, B: c_int, pos0: u32) void {
+    const c = ctx.cfg;
+    const g = ctx.gpu;
+    const hidden: c_int = @intCast(ctx.hidden);
+    const conv_dim: c_int = @intCast(ctx.conv_dim);
+    const nv: c_int = @intCast(ctx.nv);
+    const nk: c_int = @intCast(ctx.nk);
+    const kd: c_int = @intCast(ctx.kd);
+    const vd: c_int = @intCast(ctx.vd);
+    const K: c_int = @intCast(ctx.K);
+
+    _ = pos0; // conv history carries the chunk; no pos needed here
+    // x1n = rmsNorm(x1, attn_norm); x1 (original residual) preserved for the add
+    q35_rmsnorm_rows(g.pb_x1, cf32(lw.attn_norm), g.pb_x1n, B, hidden, c.rms_eps);
+    // qkv = attn_qkv @ x1n ; z = attn_gate @ x1n ; a/b = ssm_alpha/ssm_beta @ x1n
+    linBatched(g, &lw.attn_qkv, g.pb_x1n, g.pb_qkv, @intCast(B), ctx.hidden);
+    linBatched(g, &lw.attn_gate, g.pb_x1n, g.pb_z, @intCast(B), ctx.hidden);
+    linBatched(g, &lw.ssm_alpha, g.pb_x1n, g.pb_ab, @intCast(B), ctx.hidden);
+    linBatched(g, &lw.ssm_beta, g.pb_x1n, g.pb_bb, @intCast(B), ctx.hidden);
+    // causal conv1d in place (per-layer history carries the chunk)
+    q35_conv1d_batch(cf32(lw.ssm_conv1d), g.pb_qkv, g.gdn_conv[li], B, conv_dim, K);
+    // beta = sigmoid(b); gamma = exp(a_bar * softplus(a + dt_bias))
+    q35_beta_gamma_batch(g.pb_ab, g.pb_bb, cf32(lw.ssm_a), cf32(lw.ssm_dt_bias), g.pb_beta, g.pb_gamma, nv, B);
+    // l2norm + qscale on the Q section; l2norm on the K section
+    const qscale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(ctx.kd)));
+    q35_l2norm_strided2d(g.pb_qkv, B, nk, kd, conv_dim, 1e-6, qscale);
+    q35_l2norm_strided2d(offBytes(g.pb_qkv, @intCast(nk * kd * 4)), B, nk, kd, conv_dim, 1e-6, 1.0);
+    // GDN state update (in-place state, loops the chunk)
+    q35_gdn_state_batch(g.pb_qkv, g.gdn_state[li], g.pb_beta, g.pb_gamma, g.pb_gdn_out, nv, nk, kd, vd, B);
+    // gated rmsNorm: gdn_out = rmsnorm(gdn_out, ssm_norm) * silu(z)
+    q35_gated_rmsnorm(g.pb_gdn_out, cf32(lw.ssm_norm), g.pb_z, B * nv, vd, c.rms_eps);
+    // x += ssm_out @ gdn_out
+    linBatched(g, &lw.ssm_out, g.pb_gdn_out, g.pb_x2, @intCast(B), g.value_dim);
+    q35_add(g.pb_x1, g.pb_x2, B * hidden);
+}
+
+fn forwardFullBatched(ctx: *Ctx, lw: *GpuLayer, li: usize, B: c_int, pos0: u32) void {
+    const c = ctx.cfg;
+    const g = ctx.gpu;
+    const hidden: c_int = @intCast(ctx.hidden);
+    const heads: c_int = @intCast(ctx.heads);
+    const kv_heads: c_int = @intCast(ctx.kv_heads);
+    const hd: c_int = @intCast(ctx.hd);
+    const kv_dim: c_int = @intCast(g.kv_dim);
+    const q_stride: c_int = 2 * hd;
+    const rope_dim: c_int = @intCast(c.rotary_dim);
+    const base: f32 = c.rope_freq_base;
+    const scale = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(ctx.hd)));
+    const pos0i: c_int = @intCast(pos0);
+
+    q35_rmsnorm_rows(g.pb_x1, cf32(lw.attn_norm), g.pb_x1n, B, hidden, c.rms_eps);
+    // q|gate interleaved [B][heads][2*hd]; k / v [B][kv_dim]
+    linBatched(g, &lw.attn_q, g.pb_x1n, g.pb_qkv, @intCast(B), ctx.hidden);
+    linBatched(g, &lw.attn_k, g.pb_x1n, g.pb_k, @intCast(B), ctx.hidden);
+    linBatched(g, &lw.attn_v, g.pb_x1n, g.pb_v, @intCast(B), ctx.hidden);
+    // q/k rmsNorm (in place, strided over token-major rows)
+    q35_rmsnorm_strided(g.pb_qkv, cf32(lw.attn_q_norm), g.pb_qkv, B * heads, hd, q_stride, c.rms_eps);
+    q35_rmsnorm_strided(g.pb_k, cf32(lw.attn_k_norm), g.pb_k, B * kv_heads, hd, hd, c.rms_eps);
+    // RoPE per-token (token b at position pos0 + b)
+    q35_rope2(g.pb_qkv, B, heads, rope_dim, q_stride, base, pos0i);
+    q35_rope2(g.pb_k, B, kv_heads, rope_dim, hd, base, pos0i);
+    // KV cache: k -> kv_k[li], v -> kv_v[li], slot pos0 + b
+    q35_kvstore2(g.pb_k, g.kv_k[li], kv_dim, B, pos0i);
+    q35_kvstore2(g.pb_v, g.kv_v[li], kv_dim, B, pos0i);
+    // batched causal GQA attention (sigmoid gate applied in-kernel)
+    q35_attn_batch(g.pb_qkv, g.kv_k[li], g.kv_v[li], g.pb_attn_out, heads, kv_heads, hd, kv_dim, q_stride, B, pos0i, scale);
+    // x += attn_output @ attn_out
+    linBatched(g, &lw.attn_output, g.pb_attn_out, g.pb_x2, @intCast(B), g.q_dim);
+    q35_add(g.pb_x1, g.pb_x2, B * hidden);
+}
+
+fn forwardMlpBatched(ctx: *Ctx, lw: *GpuLayer, B: c_int) void {
+    const c = ctx.cfg;
+    const g = ctx.gpu;
+    const hidden: c_int = @intCast(ctx.hidden);
+    const n_ff: c_int = @intCast(ctx.n_ff);
+
+    q35_rmsnorm_rows(g.pb_x1, cf32(lw.post_attention_norm), g.pb_x1n, B, hidden, c.rms_eps);
+    linBatched(g, &lw.ffn_gate, g.pb_x1n, g.pb_mlp_h, @intCast(B), ctx.hidden);
+    linBatched(g, &lw.ffn_up, g.pb_x1n, g.pb_mlp_h1, @intCast(B), ctx.hidden);
+    q35_silu_mul(g.pb_mlp_h, cf32(g.pb_mlp_h1), B * n_ff);
+    linBatched(g, &lw.ffn_down, g.pb_mlp_h, g.pb_x2, @intCast(B), ctx.n_ff);
+    q35_add(g.pb_x1, g.pb_x2, B * hidden);
+}
+
+/// Batched forward over B prompt tokens starting at position pos0.  Fills the
+/// KV-cache slots pos0..pos0+B-1 and the GDN conv/state history in place,
+/// returns the argmax token of the LAST token (logits computed for that token
+/// only, B=1, reusing the single-token quantize+matvec+argmax path).
+fn forwardBatched(ctx: *Ctx, tokens: []const u32, pos0: u32) u32 {
+    const c = ctx.cfg;
+    const g = ctx.gpu;
+    const hidden = ctx.hidden;
+    const B = tokens.len;
+
+    _ = q35_h2d(g.pb_tok, hsrcC(@ptrCast(tokens.ptr)), B * 4);
+    q35_embed_rows(cu8(g.token_embd), cu8(g.pb_tok), g.pb_x1, @intCast(B), @intCast(hidden));
+
+    for (g.layers, 0..) |*lw, li| {
+        if (c.isFullAttention(@intCast(li))) {
+            forwardFullBatched(ctx, lw, li, @intCast(B), pos0);
+        } else {
+            forwardGdnBatched(ctx, lw, li, @intCast(B), pos0);
+        }
+        forwardMlpBatched(ctx, lw, @intCast(B));
+    }
+
+    // final rmsNorm + tied lm_head + argmax for the last token only
+    const last_row = offBytes(g.pb_x1, (B - 1) * hidden * 4);
+    q35_rmsnorm_rows(last_row, cf32(g.output_norm), g.pb_logit_row, 1, @intCast(hidden), c.rms_eps);
+    const vocab: usize = @intCast(c.vocab);
+    if (g.emb_is_q8) {
+        const row_blocks = hidden / 32;
+        q35_quantize_q8(g.pb_logit_row, g.q8_scratch, @intCast(row_blocks));
+        q35_matvec_q8(cu8(g.token_embd), cu8(g.q8_scratch), g.logits, @intCast(vocab), @intCast(row_blocks));
+    } else {
+        q35_matvec_f32(cf32(g.token_embd), g.pb_logit_row, g.logits, @intCast(vocab), @intCast(hidden));
+    }
+    q35_argmax(g.logits, g.argmax_buf, @intCast(vocab));
+    var idx: i32 = 0;
+    _ = q35_d2h(@ptrCast(&idx), g.argmax_buf, 4);
+    return @intCast(idx);
 }
 
 // The whole forward as a sequence of kernel launches (no host sync, no d2h/d2d
@@ -585,6 +791,30 @@ fn gpuInit(arena: std.mem.Allocator, e: *engine.Engine) !*Gpu {
     // host bounce buffer for the f32 (dequant) embedding path
     g.emb_row = try arena.alloc(f32, hidden);
 
+    // Batched-prefill working buffers.  Each prefill chunk is CHUNK tokens
+    // (see prefillChunk); every [B] tensor below is sized for B = CHUNK.
+    const CH: usize = 128;
+    g.pb_x1 = try g.allocF32(arena, CH * hidden);
+    g.pb_x1n = try g.allocF32(arena, CH * hidden);
+    // gdn qkv is [conv_dim]; full-attn q|gate is [heads*2*hd = 2*q_dim].
+    g.pb_qkv = try g.allocF32(arena, CH * mx(conv_dim, 2 * q_dim));
+    g.pb_z = try g.allocF32(arena, CH * value_dim); // gdn attn_gate z
+    g.pb_ab = try g.allocF32(arena, CH * nv);
+    g.pb_bb = try g.allocF32(arena, CH * nv);
+    g.pb_beta = try g.allocF32(arena, CH * nv);
+    g.pb_gamma = try g.allocF32(arena, CH * nv);
+    g.pb_gdn_out = try g.allocF32(arena, CH * value_dim);
+    g.pb_k = try g.allocF32(arena, CH * kv_dim);
+    g.pb_v = try g.allocF32(arena, CH * kv_dim);
+    g.pb_attn_out = try g.allocF32(arena, CH * q_dim);
+    g.pb_mlp_h = try g.allocF32(arena, CH * n_ff);
+    g.pb_mlp_h1 = try g.allocF32(arena, CH * n_ff);
+    g.pb_x2 = try g.allocF32(arena, CH * hidden);
+    g.pb_tok = try g.allocU8(arena, CH * 4); // u32 token ids
+    // Q8_0 scratch for batched GEMM: B * (max_cols/32) * 34 bytes.
+    g.pb_q8 = try g.allocU8(arena, CH * (max_cols / 32) * 34);
+    g.pb_logit_row = try g.allocF32(arena, hidden);
+
     // token embedding + output norm
     switch (e.token_embd) {
         .q8 => |row| {
@@ -717,7 +947,14 @@ fn generate(
 
     const t_start = Io.Clock.Timestamp.now(io, .awake);
     var next: u32 = 0;
-    for (prompt, 0..) |t, i| next = step(&ctx, t, @intCast(i));
+    // Batched prefill: process the prompt in chunks of PREFILL_CHUNK tokens so
+    // each weight is read once per chunk (B>1 GEMMs) instead of once per token.
+    var ppos: usize = 0;
+    while (ppos < prompt.len) {
+        const end = @min(ppos + PREFILL_CHUNK, prompt.len);
+        next = forwardBatched(&ctx, prompt[ppos..end], @intCast(ppos));
+        ppos = end;
+    }
     const t_after = Io.Clock.Timestamp.now(io, .awake);
     const prefill_ns: i96 = t_start.durationTo(t_after).raw.nanoseconds;
 

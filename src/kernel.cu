@@ -182,6 +182,40 @@ __global__ void k_quantize_q8(const float *__restrict__ x,
     }
 }
 
+// Batched quantizer: exactly the k_quantize_q8 body applied per row of a
+// [B][nblocks*32] f32 input, writing [B][nblocks][34] Q8_0 blocks.  Grid-stride
+// over the B*nblocks blocks; bit-identical to k_quantize_q8 per (row, block).
+__global__ void k_quantize_q8_batch(const float *__restrict__ x,
+                                    unsigned char *__restrict__ out,
+                                    int B, int nblocks) {
+    const int total = B * nblocks;
+    for (int b = blockIdx.x * blockDim.x + threadIdx.x; b < total; b += gridDim.x * blockDim.x) {
+        const int bi = b / nblocks;
+        const float *xb = x + (size_t)bi * (size_t)nblocks * 32 + (size_t)(b - bi * nblocks) * 32;
+        unsigned char *ob = out + (size_t)bi * (size_t)nblocks * 34 + (size_t)(b - bi * nblocks) * 34;
+        float mx = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 32; j++) {
+            float a = fabsf(xb[j]);
+            if (a > mx) mx = a;
+        }
+        float scale = mx > 0.0f ? mx / 127.0f : 1.0f;
+        q35_st_scale(ob, scale);
+        if (mx > 0.0f) {
+#pragma unroll
+            for (int j = 0; j < 32; j++) {
+                int v = (int)roundf(xb[j] / scale);
+                if (v > 127) v = 127;
+                if (v < -128) v = -128;
+                ob[2 + j] = (unsigned char)(signed char)v;
+            }
+        } else {
+#pragma unroll
+            for (int j = 0; j < 32; j++) ob[2 + j] = 0;
+        }
+    }
+}
+
 // out[r] = sum_c W[r,c] x[c] with W row-major Q8_0, x already quantized.
 // Vectorized: each lane loads its block's 32 data bytes as 16 uint16 (the
 // 34-byte blocks make the data region only 2-byte aligned, so uint16 is the
@@ -766,6 +800,229 @@ __global__ void k_gqa_reduce(const float *__restrict__ ws, const float *__restri
 }
 
 // ---------------------------------------------------------------------------
+// Q8_0 batched GEMM (batched quantizer above + this kernel + q35_matmul_q8)
+// ---------------------------------------------------------------------------
+
+__global__ void k_gemm_q8(const unsigned char *__restrict__ W,
+                          const unsigned char *__restrict__ Xq,
+                          float *__restrict__ out, int B, int rows, int cols) {
+    const int row_blocks = cols >> 5;
+
+    // ---------------- B == 1 : bit-exact matvec (== k_matvec_q8) ----------------
+    if (B == 1) {
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int row = blockIdx.x * (blockDim.x >> 5) + warp;
+        if (row >= rows) return;
+        const unsigned char *wrow = W + (size_t)row * (size_t)row_blocks * 34;
+        const unsigned char *w0 = wrow + (size_t)lane * 34;
+        const unsigned char *x0 = Xq + (size_t)lane * 34;
+        float acc = 0.0f;
+        if (lane < row_blocks) {
+            const uint16_t *wp = (const uint16_t *)(w0 + 2);
+            const uint16_t *xp = (const uint16_t *)(x0 + 2);
+            uint16_t wv[16], xv[16];
+#pragma unroll
+            for (int k = 0; k < 16; k++) { wv[k] = wp[k]; xv[k] = xp[k]; }
+            float ws = q35_ld_scale(w0);
+            float xs = q35_ld_scale(x0);
+            float nws = 0.0f, nxs = 0.0f;
+            if (lane + 32 < row_blocks) {
+                nws = q35_ld_scale(w0 + 32 * 34);
+                nxs = q35_ld_scale(x0 + 32 * 34);
+            }
+            for (int i = lane; i < row_blocks; i += 32) {
+                int dot = 0;
+#pragma unroll
+                for (int k = 0; k < 16; k++) {
+                    int lo_w = (int)(signed char)(wv[k] & 0xff);
+                    int hi_w = (int)(signed char)(wv[k] >> 8);
+                    int lo_x = (int)(signed char)(xv[k] & 0xff);
+                    int hi_x = (int)(signed char)(xv[k] >> 8);
+                    dot += lo_w * lo_x + hi_w * hi_x;
+                }
+                acc += (ws * (float)dot) * xs;
+                if (i + 32 < row_blocks) {
+                    const unsigned char *wn = wrow + (size_t)(i + 32) * 34;
+                    const unsigned char *xn = Xq + (size_t)(i + 32) * 34;
+                    const uint16_t *wnp = (const uint16_t *)(wn + 2);
+                    const uint16_t *xnp = (const uint16_t *)(xn + 2);
+#pragma unroll
+                    for (int k = 0; k < 16; k++) { wv[k] = wnp[k]; xv[k] = xnp[k]; }
+                    ws = nws;
+                    xs = nxs;
+                    if (i + 64 < row_blocks) {
+                        nws = q35_ld_scale(wn + 32 * 34);
+                        nxs = q35_ld_scale(xn + 32 * 34);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) out[row] = acc;
+        return;
+    }
+
+    // ---------------- B <= 16 : batched matvec (1 warp per (row,batch) pair) -
+    // Each warp runs the EXACT k_matvec_q8 body for pair (r, b): bit-identical
+    // per row for every B in this range.  W rows are L2-hot (re-read B times,
+    // fits in L2), so cost is ~B-independent; this beats any tiled layout at
+    // small B where a 16-wide batch tile would be half-empty.
+    if (B <= 16) {
+        const int warp = threadIdx.x >> 5;
+        const int lane = threadIdx.x & 31;
+        const int npairs = rows * B;
+        const int idx = blockIdx.x * (blockDim.x >> 5) + warp;
+        if (idx >= npairs) return;
+        const int r = idx / B, b = idx - r * B;   // = idx % B
+        const unsigned char *wrow = W + (size_t)r * (size_t)row_blocks * 34;
+        const unsigned char *w0 = wrow + (size_t)lane * 34;
+        const unsigned char *x0 = Xq + (size_t)b * (size_t)row_blocks * 34 + (size_t)lane * 34;
+        float acc = 0.0f;
+        if (lane < row_blocks) {
+            const uint16_t *wp = (const uint16_t *)(w0 + 2);
+            const uint16_t *xp = (const uint16_t *)(x0 + 2);
+            uint16_t wv[16], xv[16];
+#pragma unroll
+            for (int k = 0; k < 16; k++) { wv[k] = wp[k]; xv[k] = xp[k]; }
+            float ws = q35_ld_scale(w0);
+            float xs = q35_ld_scale(x0);
+            float nws = 0.0f, nxs = 0.0f;
+            if (lane + 32 < row_blocks) {
+                nws = q35_ld_scale(w0 + 32 * 34);
+                nxs = q35_ld_scale(x0 + 32 * 34);
+            }
+            for (int i = lane; i < row_blocks; i += 32) {
+                int dot = 0;
+#pragma unroll
+                for (int k = 0; k < 16; k++) {
+                    int lo_w = (int)(signed char)(wv[k] & 0xff);
+                    int hi_w = (int)(signed char)(wv[k] >> 8);
+                    int lo_x = (int)(signed char)(xv[k] & 0xff);
+                    int hi_x = (int)(signed char)(xv[k] >> 8);
+                    dot += lo_w * lo_x + hi_w * hi_x;
+                }
+                acc += (ws * (float)dot) * xs;
+                if (i + 32 < row_blocks) {
+                    const unsigned char *wn = wrow + (size_t)(i + 32) * 34;
+                    const unsigned char *xn = x0 + (size_t)(i + 32) * 34;
+                    const uint16_t *wnp = (const uint16_t *)(wn + 2);
+                    const uint16_t *xnp = (const uint16_t *)(xn + 2);
+#pragma unroll
+                    for (int k = 0; k < 16; k++) { wv[k] = wnp[k]; xv[k] = xnp[k]; }
+                    ws = nws;
+                    xs = nxs;
+                    if (i + 64 < row_blocks) {
+                        nws = q35_ld_scale(wn + 32 * 34);
+                        nxs = q35_ld_scale(xn + 32 * 34);
+                    }
+                }
+            }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1)
+            acc += __shfl_down_sync(0xffffffffu, acc, off);
+        if (lane == 0) out[(size_t)b * rows + r] = acc;
+        return;
+    }
+
+    // ---------------- B > 16 : row-tiled Q8_0 GEMM --------------------------
+    // grid (rows/128, B/32); block 256 = 16x16; per thread: 1 batch row (bx)
+    // x 16 W rows (by*16+j).  K-loop over 32-col chunks (one 34B Q8_0 block):
+    // threads 0..31 load the 32 X rows, threads 32..159 the 128 W rows,
+    // dequantized to f32 in shared (34-word rows -> 128-bit loads are
+    // <=2-way bank conflicts).
+    // DRAM: every W byte is fetched exactly ONCE per launch (W matrix is
+    // 6.7MB, L2-resident); X tiles are re-served from L2 by the other 48
+    // row-tile blocks.  At B>=64 the FMA pipe is the limit (COMPUTE-bound).
+    __shared__ float sX[32][44];
+    __shared__ float sW[128][36];
+    const int bx = threadIdx.x & 31;
+    const int by = threadIdx.x >> 5;
+    const int tid = threadIdx.x;
+    const int b0 = blockIdx.y * 32;
+    const int r0 = blockIdx.x * 128;
+
+    float acc[16];
+#pragma unroll
+    for (int j = 0; j < 16; j++) acc[j] = 0.0f;
+
+    for (int k0 = 0; k0 < row_blocks; k0++) {
+        if (tid < 32) {            // X row tid, block k0
+            const unsigned char *p = Xq + (size_t)(b0 + tid) * (size_t)row_blocks * 34 +
+                                     (size_t)k0 * 34;
+            const uint16_t *pu = (const uint16_t *)(p + 2);
+            uint16_t v[16];
+            float d[32];
+            if (b0 + tid < B) {
+#pragma unroll
+                for (int k = 0; k < 16; k++) v[k] = pu[k];
+                float s = q35_ld_scale(p);
+#pragma unroll
+                for (int k = 0; k < 16; k++) {
+                    d[2 * k] = s * (float)(signed char)(v[k] & 0xff);
+                    d[2 * k + 1] = s * (float)(signed char)(v[k] >> 8);
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < 32; k++) d[k] = 0.0f;
+            }
+            float *row = sX[tid];
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+                ((float4 *)row)[k] = make_float4(d[4 * k], d[4 * k + 1], d[4 * k + 2], d[4 * k + 3]);
+        } else if (tid < 160) {    // W row tid-32, block k0
+            const unsigned char *p = W + (size_t)(r0 + tid - 32) * (size_t)row_blocks * 34 +
+                                     (size_t)k0 * 34;
+            const uint16_t *pu = (const uint16_t *)(p + 2);
+            uint16_t v[16];
+            float d[32];
+            if (r0 + tid - 32 < rows) {
+#pragma unroll
+                for (int k = 0; k < 16; k++) v[k] = pu[k];
+                float s = q35_ld_scale(p);
+#pragma unroll
+                for (int k = 0; k < 16; k++) {
+                    d[2 * k] = s * (float)(signed char)(v[k] & 0xff);
+                    d[2 * k + 1] = s * (float)(signed char)(v[k] >> 8);
+                }
+            } else {
+#pragma unroll
+                for (int k = 0; k < 32; k++) d[k] = 0.0f;
+            }
+            float *row = sW[tid - 32];
+#pragma unroll
+            for (int k = 0; k < 8; k++)
+                ((float4 *)row)[k] = make_float4(d[4 * k], d[4 * k + 1], d[4 * k + 2], d[4 * k + 3]);
+        }
+        __syncthreads();
+#pragma unroll
+        for (int k4 = 0; k4 < 8; k4++) {
+            float4 x4 = ((float4 *)(sX[bx] + 4 * k4))[0];
+#pragma unroll
+            for (int j = 0; j < 16; j++) {
+                float4 w4 = ((float4 *)(sW[by * 16 + j] + 4 * k4))[0];
+                acc[j] = fmaf(x4.x, w4.x, acc[j]);
+                acc[j] = fmaf(x4.y, w4.y, acc[j]);
+                acc[j] = fmaf(x4.z, w4.z, acc[j]);
+                acc[j] = fmaf(x4.w, w4.w, acc[j]);
+            }
+        }
+        __syncthreads();
+    }
+    const int b = b0 + bx;
+    if (b < B) {
+        const float *ac = acc;
+#pragma unroll
+        for (int j = 0; j < 16; j++)
+        if (r0 + by * 16 + j < rows)
+            out[(size_t)b * rows + (r0 + by * 16 + j)] = ac[j];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // (6) flat extern "C" launchers
 // ---------------------------------------------------------------------------
 
@@ -781,6 +1038,24 @@ extern "C" void q35_matvec_q8(const unsigned char *w, const unsigned char *xq,
     if (rows <= 0 || row_blocks <= 0) return;
     int warps = 8;
     k_matvec_q8<<<q35_grid(rows, warps), warps * 32, 0, g_stream>>>(w, xq, out, rows, row_blocks);
+}
+
+extern "C" void q35_matmul_q8(const unsigned char *w, const float *xf, unsigned char *xq,
+                              float *out, int B, int rows, int cols) {
+    if (B <= 0 || rows <= 0 || cols <= 0) return;
+    const int nblocks = cols >> 5;
+    if (B > 1)
+        k_quantize_q8_batch<<<q35_grid(B * nblocks, Q35_BLK), Q35_BLK, 0, g_stream>>>(xf, xq, B, nblocks);
+    else
+        k_quantize_q8<<<q35_grid(nblocks, Q35_BLK), Q35_BLK, 0, g_stream>>>(xf, xq, nblocks);
+    if (B == 1)
+        k_gemm_q8<<<q35_grid(rows, 8), 8 * 32, 0, g_stream>>>(w, xq, out, B, rows, cols);
+    else if (B <= 16)
+        k_gemm_q8<<<q35_grid(rows * B, 8), 8 * 32, 0, g_stream>>>(w, xq, out, B, rows, cols);
+    else {
+        dim3 grid((rows + 127) / 128, (B + 31) / 32);
+        k_gemm_q8<<<grid, 256, 0, g_stream>>>(w, xq, out, B, rows, cols);
+    }
 }
 
 extern "C" void q35_matvec_f32(const float *w, const float *x, float *out,
@@ -821,6 +1096,40 @@ extern "C" void q35_l2norm(float *x, int rows, int n, float eps, float scale) {
         k_l2norm_rows<256><<<rows, 256, 0, g_stream>>>(x, rows, n, eps, scale);
 }
 
+// Batched l2norm for prefill: x is [B][token_stride]; each token has `nheads`
+// rows of `n` floats at offsets 0, n, 2n, ... (token-major).  In place;
+// per-row math == k_l2norm_rows (bit-identical).  grid = B*nheads.
+__global__ void k_l2norm_strided2d(float *x, int B, int nheads, int n,
+                                   int token_stride, float eps, float scale) {
+    int r = blockIdx.x;
+    if (r >= B * nheads) return;
+    int b = r / nheads;
+    int h = r - b * nheads;
+    float *xr = x + (size_t)b * token_stride + (size_t)h * n;
+    __shared__ float red[Q35_BLK];
+    int tid = threadIdx.x;
+    float ss = 0.0f;
+    for (int i = tid; i < n; i += Q35_BLK) {
+        float v = xr[i];
+        ss += v * v;
+    }
+    red[tid] = ss;
+    __syncthreads();
+    for (int s = Q35_BLK / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    float m = 1.0f / sqrtf(red[0] + eps) * scale;
+    for (int i = tid; i < n; i += Q35_BLK) xr[i] *= m;
+}
+
+extern "C" void q35_l2norm_strided2d(float *x, int B, int nheads, int n,
+                                     int token_stride, float eps, float scale) {
+    if (B <= 0 || nheads <= 0 || n <= 0) return;
+    k_l2norm_strided2d<<<B * nheads, Q35_BLK, 0, g_stream>>>(
+        x, B, nheads, n, token_stride, eps, scale);
+}
+
 extern "C" void q35_rope(float *x, int rows, int hd, int rope_dim, int stride,
                          float base) {
     if (rows <= 0 || rope_dim <= 0) return;
@@ -841,6 +1150,63 @@ extern "C" void q35_beta_gamma(const float *a, const float *b, const float *abar
     k_beta_gamma<<<q35_grid(nv, 128), 128, 0, g_stream>>>(a, b, abar, dtb, beta, gamma, nv);
 }
 
+// Batched causal conv1d for prefill: x is [B][conv_dim] token-major; the
+// per-channel history (hist, [conv_dim][K-1]) is shifted after each token, so
+// token t's tap window is the previous K-1 tokens' RAW samples (or hist's
+// pre-existing values) plus its own.  Per-token math == k_conv1d (bit-identical).
+__global__ void k_conv1d_batch(const float *__restrict__ wconv,
+                               float *__restrict__ x, float *hist, int B,
+                               int conv_dim, int K) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= conv_dim) return;
+    const float *w = wconv + (size_t)i * K;
+    float *h = hist + (size_t)i * (K - 1);
+    for (int t = 0; t < B; t++) {
+        float sum = 0.0f;
+        for (int j = 0; j < K - 1; j++) sum += h[j] * w[j];
+        float cur = x[(size_t)t * conv_dim + i];
+        sum += cur * w[K - 1];
+        for (int j = 0; j < K - 2; j++) h[j] = h[j + 1];
+        h[K - 2] = cur;
+        x[(size_t)t * conv_dim + i] = q35_silu(sum);
+    }
+}
+
+extern "C" void q35_conv1d_batch(const float *wconv, float *x, float *hist,
+                                 int B, int conv_dim, int K) {
+    if (conv_dim <= 0 || B <= 0 || K < 2) return;
+    k_conv1d_batch<<<q35_grid(conv_dim, Q35_BLK), Q35_BLK, 0, g_stream>>>(
+        wconv, x, hist, B, conv_dim, K);
+}
+
+// Batched beta/gamma: a/b are [B][nv], abar/dtb [nv]; beta/gamma [B][nv].
+// Per-token math == k_beta_gamma (bit-identical).
+__global__ void k_beta_gamma_batch(const float *__restrict__ a,
+                                  const float *__restrict__ b,
+                                  const float *__restrict__ abar,
+                                  const float *__restrict__ dtb,
+                                  float *__restrict__ beta,
+                                  float *__restrict__ gamma, int nv, int B) {
+    int total = B * nv;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += gridDim.x * blockDim.x) {
+        int h = i % nv;
+        beta[i] = q35_sigmoid(b[i]);
+        float x = a[i] + dtb[h];
+        float sp = x > 20.0f ? x : log1pf(expf(x));
+        gamma[i] = expf(abar[h] * sp);
+    }
+}
+
+extern "C" void q35_beta_gamma_batch(const float *a, const float *b,
+                                     const float *abar, const float *dtb,
+                                     float *beta, float *gamma, int nv, int B) {
+    if (nv <= 0 || B <= 0) return;
+    int total = B * nv;
+    k_beta_gamma_batch<<<q35_grid(total, Q35_BLK), Q35_BLK, 0, g_stream>>>(
+        a, b, abar, dtb, beta, gamma, nv, B);
+}
+
 extern "C" void q35_gdn_state(float *qkv, float *state, const float *beta,
                               const float *gamma, float *out, int nv, int nk,
                               int kd, int vd) {
@@ -859,6 +1225,134 @@ extern "C" void q35_gdn_state(float *qkv, float *state, const float *beta,
     int nsplits = (vd + cvd0 - 1) / cvd0;
     k_gdn_state<<<dim3((unsigned)nsplits, (unsigned)nv), 256, 0, g_stream>>>(
         qkv, state, beta, gamma, out, nv, nk, kd, vd, cvd0);
+}
+
+// Batched RoPE: same memory layout as k_rope (one block per row/head,
+// half = rope_dim/2 threads, interleave at j and j+half), but row b uses
+// position pos0 + b.  Same powf/cosf/sinf math -> bit-identical to calling
+// q35_rope on a single row with pos = pos0 + b.
+__global__ void k_rope_batch(float *__restrict__ x, int rows, int hd, int rope_dim,
+                             int stride, float base, int pos0) {
+    int h = blockIdx.x;
+    if (h >= rows) return;
+    int half = rope_dim / 2;
+    int j = threadIdx.x;
+    if (j >= half) return;
+    int pos = pos0 + h;
+    float *head = x + (size_t)h * stride;
+    float inv = powf(base, -2.0f * (float)j / (float)rope_dim);
+    float theta = (float)pos * inv;
+    float c = cosf(theta);
+    float s = sinf(theta);
+    float a = head[j];
+    float b = head[j + half];
+    head[j] = a * c - b * s;
+    head[j + half] = a * s + b * c;
+}
+
+extern "C" void q35_rope_batch(float *x, int rows, int hd, int rope_dim, int stride,
+                               float base, int pos0) {
+    if (rows <= 0 || rope_dim <= 0) return;
+    int half = rope_dim / 2;
+    k_rope_batch<<<rows, half, 0, g_stream>>>(x, rows, hd, rope_dim, stride, base, pos0);
+}
+
+// Batched gated-delta-net state update (VERBATIM from /tmp/batched_gdn.cu,
+// verified bit-identical to k_gdn_state per token).  grid=(nsplits, nv),
+// block 256; loops t=0..B-1 inside the block; the (kd x cvd0) S tile is
+// loaded from DRAM once and written back once; qkv is token-major with
+// conv_dim = 2*nk*kd + nv*kd per token; out is [B][nv*vd].
+__global__ void __launch_bounds__(256) k_gdn_state_batch(
+    float *__restrict__ qkv, float *__restrict__ state,
+    const float *__restrict__ beta, const float *__restrict__ gamma,
+    float *__restrict__ out, int nv, int nk, int kd, int vd, int cvd0,
+    int B) {
+    __shared__ float Ss[8192]; /* tile, row-major Ss[i*cvd + j] */
+    __shared__ float ksh[512];
+    __shared__ float qsh[512];
+
+    const int tid = threadIdx.x;
+    const int h = blockIdx.y;
+    const int s = blockIdx.x;
+    if (h >= nv) return;
+    const int c0 = s * cvd0;
+    const int c1 = c0 + cvd0 < vd ? c0 + cvd0 : vd;
+    const int cvd = c1 - c0;
+    if (cvd <= 0) return;
+
+    const int kq_dim = nk * kd;
+    const int kh = h % nk;
+    const int conv_dim = 2 * kq_dim + nv * kd;
+    float *S = state + (size_t)h * kd * vd;
+
+    const int n = kd * cvd; /* tile elements */
+
+    /* load the S tile ONCE (ONE DRAM read) */
+    for (int x = tid; x < n; x += 256) {
+        int i = x / cvd;
+        Ss[x] = S[(size_t)i * vd + c0 + (x - i * cvd)];
+    }
+    __syncthreads();
+
+    for (int t = 0; t < B; t++) {
+        const float *qkv_t = qkv + (size_t)t * conv_dim;
+        const float *q_h = qkv_t + (size_t)kh * kd;
+        const float *k_h = qkv_t + (size_t)kq_dim + (size_t)kh * kd;
+        const float *v_h = qkv_t + (size_t)2 * kq_dim + (size_t)h * kd;
+
+        /* k, q to shared (grid-stride since blockDim=256 may exceed kd). */
+        for (int x = tid; x < kd; x += 256) {
+            ksh[x] = k_h[x];
+            qsh[x] = q_h[x];
+        }
+        __syncthreads();
+
+        const float g = gamma[(size_t)t * nv + h];
+        const float bt = beta[(size_t)t * nv + h];
+
+        /* (1) decay: Ss *= g, 256 threads over the tile */
+        for (int x = tid; x < n; x += 256) Ss[x] *= g;
+        __syncthreads();
+
+        /* (2)-(5) one thread per column (tid < cvd), same order as k_gdn_state */
+        if (tid < cvd) {
+            float *Sc = Ss + tid; /* Sc[i*cvd] == Ss[i*cvd + tid] */
+            float km = 0.0f;
+            for (int i = 0; i < kd; i++) km += Sc[i * cvd] * ksh[i];
+            float delta = bt * (v_h[c0 + tid] - km);
+            for (int i = 0; i < kd; i++) Sc[i * cvd] += ksh[i] * delta;
+            float o = 0.0f;
+            for (int i = 0; i < kd; i++) o += Sc[i * cvd] * qsh[i];
+            out[(size_t)t * (nv * vd) + (size_t)h * vd + c0 + tid] = o;
+        }
+        __syncthreads();
+    }
+
+    /* write tile back ONCE (ONE DRAM write) */
+    for (int x = tid; x < n; x += 256) {
+        int i = x / cvd;
+        S[(size_t)i * vd + c0 + (x - i * cvd)] = Ss[x];
+    }
+}
+
+extern "C" void q35_gdn_state_batch(float *qkv, float *state, const float *beta,
+                                    const float *gamma, float *out, int nv, int nk,
+                                    int kd, int vd, int B) {
+    if (nv <= 0) return;
+    if (kd > 512 || vd > 1024 || nk > nv) {
+        fprintf(stderr, "[cuda] gdn_state_batch: kd=%d vd=%d out of range\n", kd, vd);
+        exit(1);
+    }
+    // Same column-tile math as q35_gdn_state: keep the S tile (kd*cvd0
+    // floats) within Ss[8192] (~32KB static shared).
+    int cvd0 = 32;
+    int maxc = 8192 / kd;
+    if (cvd0 > maxc) cvd0 = maxc;
+    if (cvd0 > vd) cvd0 = vd;
+    if (cvd0 < 1) cvd0 = 1;
+    int nsplits = (vd + cvd0 - 1) / cvd0;
+    k_gdn_state_batch<<<dim3((unsigned)nsplits, (unsigned)nv), 256, 0, g_stream>>>(
+        qkv, state, beta, gamma, out, nv, nk, kd, vd, cvd0, B);
 }
 
 extern "C" void q35_gated_rmsnorm(float *out, const float *w, const float *z,
@@ -927,6 +1421,192 @@ __global__ void k_kvstore(float *kvcache, const float *__restrict__ src,
 extern "C" void q35_kvstore(float *kvcache, const float *src, int kv_dim) {
     if (kv_dim <= 0) return;
     k_kvstore<<<1, kv_dim, 0, g_stream>>>(kvcache, src, g_params_dev, kv_dim);
+}
+
+// Batched KV-cache slot store: row b of qkv (kv_dim floats, one token's
+// concatenated k|v row — same layout the engine feeds to q35_kvstore) goes to
+// kc[pos0 + b] and vc[pos0 + b].  One block per row, kv_dim threads, same
+// element-wise copy as k_kvstore -> bit-identical to B separate calls.
+__global__ void k_kvstore_batch(const float *__restrict__ qkv, float *kc, float *vc,
+                                int kv_dim, int B, int pos0) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int i = threadIdx.x;
+    if (i >= kv_dim) return;
+    const float *src = qkv + (size_t)b * kv_dim;
+    float *kdst = kc + (size_t)(pos0 + b) * kv_dim;
+    float *vdst = vc + (size_t)(pos0 + b) * kv_dim;
+    kdst[i] = src[i];
+    vdst[i] = src[i];
+}
+
+extern "C" void q35_kvstore_batch(const float *qkv, float *kc, float *vc,
+                                  int kv_dim, int B, int pos0) {
+    if (kv_dim <= 0 || B <= 0) return;
+    k_kvstore_batch<<<B, kv_dim, 0, g_stream>>>(qkv, kc, vc, kv_dim, B, pos0);
+}
+
+// Batched causal attention (VERBATIM from /tmp/batched_attn.cu): B query
+// tokens at positions pos0..pos0+B-1, causal over token-major KV
+// kc/vc [n_t][kv_dim] where n_t = pos0+B.  q is [B][heads][q_stride] with
+// q[b][h][0..hd) = query and [hd..2hd) = sigmoid gate; out is [B][heads][hd]
+// (sigmoid gate applied in-kernel, same as k_attn).  grid=(B, heads),
+// block Q35_BLK (= hd), dynamic shared (n_t floats) for scores.
+__global__ void k_attn_batch(const float *__restrict__ q, const float *__restrict__ kc,
+                             const float *__restrict__ vc, float *__restrict__ out,
+                             int heads, int kv_heads, int hd, int kv_dim, int q_stride,
+                             int B, int pos0, float scale) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int h = blockIdx.y;
+    int tid = threadIdx.x;
+    int n_t = pos0 + b + 1; // causal length for this query (t = 0..p inclusive)
+    extern __shared__ float shsc[];
+    __shared__ float red[Q35_BLK];
+    int gqa = heads / kv_heads;
+    int kvh = h / gqa;
+    const float *qh = q + ((size_t)b * heads + h) * q_stride;
+    const float *gh = qh + hd;
+    const float *kh = kc + (size_t)kvh * hd;
+    const float *vh = vc + (size_t)kvh * hd;
+    float *orow = out + ((size_t)b * heads + h) * hd;
+
+    // scores: one block-dot per key token (t loop), hd==blockDim.x so 1 elem/thread
+    for (int t = 0; t < n_t; t++) {
+        const float *kt = kh + (size_t)t * kv_dim;
+        float p = 0.0f;
+        for (int i = tid; i < hd; i += blockDim.x) p += qh[i] * kt[i];
+        red[tid] = p;
+        __syncthreads();
+        for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+            if (tid < s) red[tid] += red[tid + s];
+            __syncthreads();
+        }
+        if (tid == 0) shsc[t] = red[0] * scale;
+        __syncthreads();
+    }
+
+    // parallel max
+    float lm = -INFINITY;
+    for (int t = tid; t < n_t; t += blockDim.x) lm = fmaxf(lm, shsc[t]);
+    red[tid] = lm;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+        __syncthreads();
+    }
+    float mx = red[0];
+
+    // exp + sum
+    float ls = 0.0f;
+    for (int t = tid; t < n_t; t += blockDim.x) {
+        float e = expf(shsc[t] - mx);
+        shsc[t] = e;
+        ls += e;
+    }
+    red[tid] = ls;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (tid < s) red[tid] += red[tid + s];
+        __syncthreads();
+    }
+    float sum = red[0];
+    for (int t = tid; t < n_t; t += blockDim.x) shsc[t] /= sum;
+    __syncthreads();
+
+    // weighted V accumulation + sigmoid gate (1 elem per thread, hd==blockDim.x)
+    for (int i = tid; i < hd; i += blockDim.x) {
+        float acc = 0.0f;
+        for (int t = 0; t < n_t; t++) acc += shsc[t] * vh[(size_t)t * kv_dim + i];
+        orow[i] = acc * q35_sigmoid(gh[i]);
+    }
+}
+
+extern "C" void q35_attn_batch(const float *q, const float *kc, const float *vc,
+                               float *out, int heads, int kv_heads, int hd, int kv_dim,
+                               int q_stride, int B, int pos0, float scale) {
+    if (B <= 0 || heads <= 0) return;
+    int n_t = pos0 + B;
+    size_t shmem = (size_t)n_t * sizeof(float);
+    k_attn_batch<<<dim3((unsigned)B, (unsigned)heads), Q35_BLK, shmem, g_stream>>>(
+        q, kc, vc, out, heads, kv_heads, hd, kv_dim, q_stride, B, pos0, scale);
+}
+
+// Batched RoPE for prefill: grid=(B, heads).  Token b uses position pos0 + b
+// for ALL of its heads (unlike k_rope_batch, whose row index IS the position
+// offset and is only correct when one row per token).  Same powf/cosf/sinf
+// math as k_rope -> bit-identical per head.  x is [B][heads][stride].
+__global__ void k_rope2(float *__restrict__ x, int B, int heads, int rope_dim,
+                        int stride, float base, int pos0) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    int h = blockIdx.y;
+    int half = rope_dim / 2;
+    int j = threadIdx.x;
+    if (j >= half) return;
+    int pos = pos0 + b;
+    float *head = x + ((size_t)b * heads + h) * stride;
+    float inv = powf(base, -2.0f * (float)j / (float)rope_dim);
+    float theta = (float)pos * inv;
+    float c = cosf(theta);
+    float s = sinf(theta);
+    float a = head[j];
+    float b2 = head[j + half];
+    head[j] = a * c - b2 * s;
+    head[j + half] = a * s + b2 * c;
+}
+
+extern "C" void q35_rope2(float *x, int B, int heads, int rope_dim, int stride,
+                          float base, int pos0) {
+    if (B <= 0 || heads <= 0 || rope_dim <= 0) return;
+    int half = rope_dim / 2;
+    k_rope2<<<dim3((unsigned)B, (unsigned)heads), half, 0, g_stream>>>(
+        x, B, heads, rope_dim, stride, base, pos0);
+}
+
+// Batched KV-cache store for prefill (ONE cache).  src is [B][kv_dim]
+// token-major; token b goes to slot pos0 + b.  (The in-tree q35_kvstore_batch
+// writes one src to BOTH k and v and is not used by the prefill driver.)
+__global__ void k_kvstore2(const float *__restrict__ src, float *cache,
+                           int kv_dim, int B, int pos0) {
+    int b = blockIdx.x;
+    if (b >= B) return;
+    const float *s = src + (size_t)b * kv_dim;
+    float *dst = cache + (size_t)(pos0 + b) * kv_dim;
+    for (int i = threadIdx.x; i < kv_dim; i += blockDim.x) dst[i] = s[i];
+}
+
+extern "C" void q35_kvstore2(const float *src, float *cache, int kv_dim, int B,
+                             int pos0) {
+    if (B <= 0 || kv_dim <= 0) return;
+    int blk = kv_dim < 256 ? kv_dim : 256;
+    k_kvstore2<<<B, blk, 0, g_stream>>>(src, cache, kv_dim, B, pos0);
+}
+
+// Batched Q8_0 embedding gather for prefill: tok[b] = token id for row b;
+// x is [B][n] f32.  Same dequant math as k_embed_row (scale at bytes [0..4),
+// data at [2..34) of each 34-byte block).
+__global__ void k_embed_rows(const unsigned char *__restrict__ w,
+                             const int *__restrict__ tok, float *__restrict__ x,
+                             int B, int n) {
+    int total = B * n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += gridDim.x * blockDim.x) {
+        int b = i / n;
+        int r = i - b * n;
+        int row = tok[b];
+        int blk = r >> 5;
+        int j = r & 31;
+        const unsigned char *p = w + ((size_t)row * (size_t)(n >> 5) + blk) * 34;
+        x[i] = q35_ld_scale(p) * (float)(signed char)p[2 + j];
+    }
+}
+
+extern "C" void q35_embed_rows(const unsigned char *w, const int *tok, float *x,
+                               int B, int n) {
+    if (B <= 0 || n <= 0) return;
+    int total = B * n;
+    k_embed_rows<<<q35_grid(total, 256), 256, 0, g_stream>>>(w, tok, x, B, n);
 }
 
 extern "C" void q35_argmax(const float *x, int *outidx, int n) {
