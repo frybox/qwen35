@@ -1496,6 +1496,8 @@ __global__ void k_attn_batch(const float *__restrict__ q, const float *__restric
         __syncthreads();
     }
     float mx = red[0];
+    __syncthreads(); // all threads finished reading red[0] as mx before any
+                    // writes red[tid] below (esp. thread 0 overwriting red[0])
 
     // exp + sum
     float ls = 0.0f;
