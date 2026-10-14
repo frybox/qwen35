@@ -879,7 +879,8 @@ __global__ void k_gemm_q8(const unsigned char *__restrict__ W,
         const int r = idx / B, b = idx - r * B;   // = idx % B
         const unsigned char *wrow = W + (size_t)r * (size_t)row_blocks * 34;
         const unsigned char *w0 = wrow + (size_t)lane * 34;
-        const unsigned char *x0 = Xq + (size_t)b * (size_t)row_blocks * 34 + (size_t)lane * 34;
+        const unsigned char *xb = Xq + (size_t)b * (size_t)row_blocks * 34;
+        const unsigned char *x0 = xb + (size_t)lane * 34;
         float acc = 0.0f;
         if (lane < row_blocks) {
             const uint16_t *wp = (const uint16_t *)(w0 + 2);
@@ -907,7 +908,7 @@ __global__ void k_gemm_q8(const unsigned char *__restrict__ W,
                 acc += (ws * (float)dot) * xs;
                 if (i + 32 < row_blocks) {
                     const unsigned char *wn = wrow + (size_t)(i + 32) * 34;
-                    const unsigned char *xn = x0 + (size_t)(i + 32) * 34;
+                    const unsigned char *xn = xb + (size_t)(i + 32) * 34;
                     const uint16_t *wnp = (const uint16_t *)(wn + 2);
                     const uint16_t *xnp = (const uint16_t *)(xn + 2);
 #pragma unroll
