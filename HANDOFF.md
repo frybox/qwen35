@@ -204,4 +204,22 @@ export fn q35_main(argc: c_int, argv: [*] [*]u8) c_int;
   GQA/strided 索引、`k_matvec_q8` 的块累加）。
 - 8 张卡：固定 `CUDA_VISIBLE_DEVICES=0` 跑测试，避免多卡干扰。
 - 别动 `tests/`、`ref/`；`zig build test` 必须保持绿。
-- 提交习惯：每完成一个可验证里程碑就 git commit（.cu 和 Makefile 目前未提交）。
+- 提交习惯：每完成一个可验证里程碑就 git commit。
+- **已修复 (2026-07-14, 32acdc3)**：长 prompt 乱码根因 = `k_gemm_q8` 的
+  `B<=16` 分支（batched matvec）X 的 Q8_0 块指针以 `x0`（含 `lane*34`）
+  为基准做 `i+32` 步进，多带了 lane 偏移：lane 1..31 在 `row_blocks>32`
+  （cols>1024，即 MLP）时读到错误块/标度，只有 lane 0 对。该分支只被
+  prefill 里 `B∈[2,16]` 的尾 chunk 命中（decode 走 B==1、整 chunk 走 B>16
+  tiled），所以仅当 prompt 最后一个 chunk 恰好 ≤16 token 时乱码（517
+  token=4×128+5 → "хар" EOS）。改为与 B==1 一致的绝对指针 `xb+(i+32)*34`。
+  判别特征：乱码与否只取决于 `prompt_tokens % 128`（尾 chunk 大小），与
+  文本内容无关。
+- **注意**：`-n` 是 `max_seq`（总上下文上限，默认 4096），不是"生成 N 个
+  token"。`-n < prompt_len` 时 decode 循环不跑，输出 0 token（是正常行为，
+  不是 bug）。
+- 工作树另有（已随本次提交一并入库）：`src/main.zig`、`src/main_cuda.zig`
+  各加了一段 `TEMP(debug)` token-ID dump（`Q35_DUMP_IDS` 非空时打印
+  `ID <n>`），供对拍用；`src/kernel_gdn.cu`、`src/kernel_matvec.cu` 是
+  WIP 优化内核（自测用、尚未接进 engine，Makefile 不编它们）；
+  `ref/c/qwen35_engine_trace.c` + `trace_first_token.txt` 是逐层数值 trace
+  工具与其首 token 输出。

@@ -1,0 +1,32 @@
+# layer=-1 (embedding) token=248045 pos=0 stream_rms=0.016493792
+layer= 0 type=L attn_delta_rms=0.032108735 mlp_delta_rms=0.032749478 stream_rms=0.047364756
+layer= 1 type=L attn_delta_rms=0.023467204 mlp_delta_rms=0.029849989 stream_rms=0.055202283
+layer= 2 type=L attn_delta_rms=0.0452912 mlp_delta_rms=0.03207086 stream_rms=0.081334651
+layer= 3 type=F attn_delta_rms=0.019318553 mlp_delta_rms=0.074299991 stream_rms=0.095650114
+layer= 4 type=L attn_delta_rms=0.017073208 mlp_delta_rms=0.022870537 stream_rms=0.093088984
+layer= 5 type=L attn_delta_rms=0.017984537 mlp_delta_rms=0.024942592 stream_rms=0.092455529
+layer= 6 type=L attn_delta_rms=0.33662152 mlp_delta_rms=0.031351205 stream_rms=0.40765148
+layer= 7 type=F attn_delta_rms=0.19416745 mlp_delta_rms=0.056308821 stream_rms=0.23226267
+layer= 8 type=L attn_delta_rms=0.012671658 mlp_delta_rms=0.023697138 stream_rms=0.22949699
+layer= 9 type=L attn_delta_rms=0.010421808 mlp_delta_rms=0.01918252 stream_rms=0.22597775
+layer=10 type=L attn_delta_rms=0.027657367 mlp_delta_rms=0.026300762 stream_rms=0.24576972
+layer=11 type=F attn_delta_rms=0.11544699 mlp_delta_rms=0.049596455 stream_rms=0.12543048
+layer=12 type=L attn_delta_rms=0.019009206 mlp_delta_rms=0.032345105 stream_rms=0.10310037
+layer=13 type=L attn_delta_rms=0.014046966 mlp_delta_rms=0.030960655 stream_rms=0.10191602
+layer=14 type=L attn_delta_rms=0.029648926 mlp_delta_rms=0.53840113 stream_rms=0.61545914
+layer=15 type=F attn_delta_rms=0.52533865 mlp_delta_rms=0.041945551 stream_rms=0.12813456
+layer=16 type=L attn_delta_rms=0.020772582 mlp_delta_rms=0.02871171 stream_rms=0.12887944
+layer=17 type=L attn_delta_rms=0.027310133 mlp_delta_rms=0.033772036 stream_rms=0.13445857
+layer=18 type=L attn_delta_rms=0.068341859 mlp_delta_rms=0.070402674 stream_rms=0.18006055
+layer=19 type=F attn_delta_rms=0.063526824 mlp_delta_rms=0.047180612 stream_rms=0.16519456
+layer=20 type=L attn_delta_rms=0.059903905 mlp_delta_rms=0.063282661 stream_rms=0.17389342
+layer=21 type=L attn_delta_rms=0.063245885 mlp_delta_rms=0.08237873 stream_rms=0.19856422
+layer=22 type=L attn_delta_rms=0.12745507 mlp_delta_rms=0.089251205 stream_rms=0.26175043
+layer=23 type=F attn_delta_rms=0.25160095 mlp_delta_rms=0.136016 stream_rms=0.35415441
+layer=23 (pre_final_norm) stream_rms=0.35415441
+layer=-2 (final) post_final_norm_rms=3.1448865
+  top1 id=846 logit=14.953296
+  top2 id=8678 logit=14.347589
+  top3 id=220 logit=10.369477
+  top4 id=97237 logit=9.7234335
+  top5 id=96746 logit=9.656908

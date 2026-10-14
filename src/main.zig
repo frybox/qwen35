@@ -1,6 +1,12 @@
 const std = @import("std");
 const Io = std.Io;
 
+// TEMP(debug): dump token ids when Q35_DUMP_IDS is set non-empty.
+var dbg_dump_ids = false;
+fn dbgIds(token: u32) void {
+    if (dbg_dump_ids) std.debug.print("ID {d}\n", .{token});
+}
+
 const qwen35 = @import("qwen35");
 const gguf = qwen35.gguf;
 
@@ -12,6 +18,7 @@ const StreamCtx = struct {
     arena: std.mem.Allocator,
 
     fn onToken(ctx: ?*anyopaque, token: u32) void {
+        dbgIds(token);
         const self: *StreamCtx = @ptrCast(@alignCast(ctx orelse return));
         const piece = self.tok.decode(self.arena, &.{token}) catch null;
         if (piece) |s| {
@@ -29,6 +36,9 @@ const StreamCtx = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
+    if (init.environ_map.get("Q35_DUMP_IDS")) |ids| {
+        if (ids.len != 0) dbg_dump_ids = true;
+    }
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
 
