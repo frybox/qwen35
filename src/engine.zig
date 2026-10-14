@@ -23,7 +23,11 @@
 
 const std = @import("std");
 const gguf = @import("gguf.zig");
+const sampler = @import("sampler.zig");
 const Io = std.Io;
+
+/// Re-export so the CPU and CUDA hosts share one sampler implementation.
+pub const Sampler = sampler.Sampler;
 
 pub const Config = struct {
     n_layers: u32 = 24,
@@ -341,6 +345,12 @@ pub const Engine = struct {
     logits: []f32,
     delta: []f32, // 128 per-head scratch
     kv_mem: []f32, // 128
+    /// Top-k order-statistic workspace (quickselect); sized vocab.
+    sample_scratch: []f32 = &.{},
+    /// Sampling policy applied to every produced token.  Default is greedy
+    /// (temperature 0), i.e. exactly the historical behaviour; the CLI sets
+    /// it from -t/-k/-s.
+    sampler: Sampler = Sampler.init(.{}),
     prefill_ms: f64 = 0,
 
     /// A linear layer weight: either kept in its native Q8_0 blocks
@@ -598,6 +608,7 @@ pub const Engine = struct {
         e.logits = try alloc.alloc(f32, cfg.vocab);
         e.delta = try alloc.alloc(f32, gdn_kd);
         e.kv_mem = try alloc.alloc(f32, gdn_kd);
+        e.sample_scratch = try alloc.alloc(f32, cfg.vocab);
         return e;
     }
 
@@ -680,7 +691,10 @@ pub const Engine = struct {
     // Forward: one token at position `pos`
     // -----------------------------------------------------------------
 
-    pub fn step(self: *Engine, token: u32, pos: u32) u32 {
+    /// Run the whole model for one token and return the raw logits (no
+    /// sampling, no PRNG draw).  Prefill uses this so the sampler's coin
+    /// stream is untouched by the prompt.
+    pub fn forwardLogits(self: *Engine, token: u32, pos: u32) []f32 {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         // embedding lookup: dequantize the token row straight into x
@@ -712,7 +726,14 @@ pub const Engine = struct {
                 }
             },
         }
-        return self.argmax();
+        return self.logits;
+    }
+
+    /// Forward + sample one token.  Greedy (argmax) when the sampler's
+    /// temperature is 0 — the historical default.
+    pub fn step(self: *Engine, token: u32, pos: u32) u32 {
+        const logits = self.forwardLogits(token, pos);
+        return self.sampler.sample(logits, self.sample_scratch);
     }
 
     pub fn argmax(self: *Engine) u32 {
@@ -970,24 +991,31 @@ pub const Engine = struct {
         hit_eos: bool,
     };
 
-    /// Prefill prompt, then greedy-generate up to max_new_tokens tokens,
-    /// stopping at EOS. Caller owns result.tokens.
+    /// Prefill prompt (forward-only, no PRNG draws), then generate up to
+    /// max_tokens tokens with `self.sampler` (greedy argmax when its
+    /// temperature is 0 — the historical default), stopping at EOS.  The
+    /// first generated token is sampled from the last prefill position, so
+    /// the PRNG stream starts at the same point on CPU and CUDA.  Caller
+    /// owns result.tokens.
     pub fn generate(
         self: *Engine,
         alloc: std.mem.Allocator,
         prompt: []const u32,
         max_tokens: usize,
-        greedy: bool,
         progress: ?*const fn (ctx: ?*anyopaque, tok: u32) void,
         progress_ctx: ?*anyopaque,
     ) !GenResult {
-        _ = greedy; // greedy-only engine; argmax sampling
+        // Restart the PRNG at its seed so every `generate` call (and every
+        // process started with the same -s) samples identically.  The prompt
+        // itself never draws (forwardLogits below), so the first coin spent
+        // is the first generated token — on CPU and CUDA alike.
+        self.sampler.reseed();
         self.reset();
 
         const io = self.io;
         const t_start = Io.Clock.Timestamp.now(io, .awake);
-        var next: u32 = 0;
-        for (prompt, 0..) |t, i| next = self.step(t, @intCast(i));
+        var last_logits: []f32 = &.{};
+        for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
         const t_after = Io.Clock.Timestamp.now(io, .awake);
         self.prefill_ms = @as(f64, @floatFromInt(t_start.durationTo(t_after).raw.nanoseconds)) / 1e6;
 
@@ -996,6 +1024,7 @@ pub const Engine = struct {
         var pos: u32 = @intCast(prompt.len);
         var gen_ns: i96 = 0;
         var hit_eos = false;
+        var next: u32 = self.sampler.sample(last_logits, self.sample_scratch);
         while (pos < max_tokens) : (pos += 1) {
             if (next == self.cfg.eos_token_id) {
                 hit_eos = true;

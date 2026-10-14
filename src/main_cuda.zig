@@ -317,6 +317,13 @@ const Ctx = struct {
     vd: usize,
     conv_dim: usize,
     K: usize,
+
+    // Sampling (set in generate; defaults are harmless for capture).
+    // sampler is shared by value-copied Ctx via pointer so decode and the
+    // first-token draw consume one PRNG stream, exactly like the CPU engine.
+    sampler: *engine.Sampler = undefined,
+    sample_scratch: []f32 = &.{},
+    host_logits: []f32 = &.{},
 };
 
 // Build the CUDA Graph for one whole forward.  Runs runForward under stream
@@ -677,12 +684,22 @@ fn step(ctx: *Ctx, token: u32, pos: u32) u32 {
     const g = ctx.gpu;
     _ = q35_graph_set_params(@as(c_int, @intCast(token)), @as(c_int, @intCast(pos)));
     _ = q35_graph_launch();
-    // Read back the argmax token.  The blocking D2H (cudaMemcpy) implicitly
-    // waits for the stream (and hence the whole graph) to finish, so no
-    // separate device sync is needed.
+    if (ctx.sampler.temperature > 0) {
+        // Sampling: pull the whole logit row back and sample on the host
+        // (same Sampler as the CPU engine, same PRNG stream).  The blocking
+        // D2H implicitly waits for the whole graph, so no extra sync needed.
+        _ = q35_d2h(hostPtr(ctx.host_logits), g.logits, g.vocab * @sizeOf(f32));
+        return ctx.sampler.sample(ctx.host_logits, ctx.sample_scratch);
+    }
+    // Greedy: read back just the 4-byte argmax the graph already computed.
     var idx: i32 = 0;
     _ = q35_d2h(@ptrCast(&idx), g.argmax_buf, 4);
     return @intCast(idx);
+}
+
+/// Pointer to a host f32 slice, as the C d2h routine expects.
+fn hostPtr(s: []f32) *anyopaque {
+    return @ptrCast(s.ptr);
 }
 
 fn resetGdn(gpu: *Gpu) void {
@@ -937,8 +954,18 @@ fn generate(
     prompt: []const u32,
     max_seq: usize,
     stream: *StreamCtx,
+    temp: f32,
+    top_k: usize,
+    seed: u64,
 ) !GenRes {
     var ctx = makeCtx(g);
+
+    // Host-side sampler shared by decode and the first generated token.
+    var sampler = engine.Sampler.init(.{ .temperature = temp, .top_k = top_k, .seed = seed });
+    ctx.sampler = &sampler;
+    sampler.reseed();
+    ctx.sample_scratch = try arena.alloc(f32, g.vocab);
+    ctx.host_logits = try arena.alloc(f32, g.vocab);
 
     resetGdn(g);
 
@@ -957,6 +984,15 @@ fn generate(
     }
     const t_after = Io.Clock.Timestamp.now(io, .awake);
     const prefill_ns: i96 = t_start.durationTo(t_after).raw.nanoseconds;
+
+    // First generated token: when sampling, draw it from the last prefill
+    // position's logits (already on device in g.logits).  Greedy path leaves
+    // `next` as the argmax forwardBatched just returned.  This is exactly
+    // where the CPU engine's PRNG stream begins too.
+    if (sampler.temperature > 0) {
+        _ = q35_d2h(hostPtr(ctx.host_logits), g.logits, g.vocab * @sizeOf(f32));
+        next = sampler.sample(ctx.host_logits, ctx.sample_scratch);
+    }
 
     var out: std.ArrayList(u32) = .empty;
     defer out.deinit(arena);
@@ -1014,7 +1050,46 @@ pub fn main(init: std.process.Init) !void {
     }
     const path = args[2];
     const prompt_text = args[3];
-    const max_seq: usize = engine.Engine.max_seq;
+    var max_seq: usize = engine.Engine.max_seq;
+    var temp: f32 = 0;
+    var top_k: usize = 0;
+    var seed: u64 = 12345;
+    var i: usize = 4;
+    while (i + 1 < args.len + 1 and i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
+            max_seq = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+                err_out.print("error: -n expects a number\n", .{}) catch {};
+                err_out.flush() catch {};
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "-t") and i + 1 < args.len) {
+            temp = std.fmt.parseFloat(f32, args[i + 1]) catch {
+                err_out.print("error: -t expects a number\n", .{}) catch {};
+                err_out.flush() catch {};
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "-k") and i + 1 < args.len) {
+            top_k = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+                err_out.print("error: -k expects a number\n", .{}) catch {};
+                err_out.flush() catch {};
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "-s") and i + 1 < args.len) {
+            seed = std.fmt.parseInt(u64, args[i + 1], 10) catch {
+                err_out.print("error: -s expects a number\n", .{}) catch {};
+                err_out.flush() catch {};
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else {
+            err_out.print("error: unknown argument '{s}'\n", .{args[i]}) catch {};
+            err_out.flush() catch {};
+            return error.InvalidArgument;
+        }
+    }
     var e = engine.Engine.load(arena, path, io) catch |err| {
         err_out.print("error: failed to load '{s}': {s}\n", .{path, @errorName(err)}) catch {};
         return error.LoadFailed;
@@ -1049,7 +1124,7 @@ pub fn main(init: std.process.Init) !void {
     out.flush() catch {};
 
     var stream = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
-    const res = generate(arena, g, io, ptok, max_seq, &stream) catch |err| {
+    const res = generate(arena, g, io, ptok, max_seq, &stream, temp, top_k, seed) catch |err| {
         err_out.print("error: generation failed: {s}\n", .{@errorName(err)}) catch {};
         err_out.flush() catch {};
         return error.GenerationFailed;
