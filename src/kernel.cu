@@ -149,6 +149,19 @@ __device__ __forceinline__ void q35_st_scale(unsigned char *p, float s) {
     p[1] = (unsigned char)(u >> 8);
 }
 
+// SIMD dot of four signed int8 bytes packed in each 32-bit word (a, b are 4
+// little-endian int8s).  sm_61+ uses the __dp4a intrinsic (target is 4090D
+// sm_89); otherwise fall back to four scalar int8 multiplies.
+__device__ __forceinline__ int q35_dp4a(int a, int b, int c) {
+#if __CUDA_ARCH__ >= 610
+    return __dp4a(a, b, c);
+#else
+    const signed char *aa = (const signed char *)&a;
+    const signed char *bb = (const signed char *)&b;
+    return c + aa[0] * bb[0] + aa[1] * bb[1] + aa[2] * bb[2] + aa[3] * bb[3];
+#endif
+}
+
 // ---------------------------------------------------------------------------
 // (2) elementwise + norms
 // ---------------------------------------------------------------------------
@@ -931,15 +944,20 @@ __global__ void k_gemm_q8(const unsigned char *__restrict__ W,
 
     // ---------------- B > 16 : row-tiled Q8_0 GEMM --------------------------
     // grid (rows/128, B/32); block 256 = 16x16; per thread: 1 batch row (bx)
-    // x 16 W rows (by*16+j).  K-loop over 32-col chunks (one 34B Q8_0 block):
-    // threads 0..31 load the 32 X rows, threads 32..159 the 128 W rows,
-    // dequantized to f32 in shared (34-word rows -> 128-bit loads are
-    // <=2-way bank conflicts).
+    // x 16 W rows (by*16+j).  K-loop over 32-col chunks (one 34B Q8_0 block).
+    // Int8 SIMD path: shared keeps RAW signed int8 (no dequant), the 32-wide
+    // dot per k-chunk runs on 8x __dp4a, and each k-chunk result is scaled
+    // once by (sX[bx]*sW[by*16+j]) and accumulated in f32.  Integer dot over
+    // 32 terms is exact (|dot| <= 32*128^2 = 516096, no int32 overflow).
     // DRAM: every W byte is fetched exactly ONCE per launch (W matrix is
     // 6.7MB, L2-resident); X tiles are re-served from L2 by the other 48
     // row-tile blocks.  At B>=64 the FMA pipe is the limit (COMPUTE-bound).
-    __shared__ float sX[32][44];
-    __shared__ float sW[128][36];
+    // int[8 data + 1 pad] per row: odd 9-int stride makes the warp-wide int
+    // reads bank-conflict-free (row offset*9 % 32 cycles through 32 banks).
+    __shared__ int sXi[32][9];
+    __shared__ float sXs[32];
+    __shared__ int sWi[128][9];
+    __shared__ float sWs[128];
     const int bx = threadIdx.x & 31;
     const int by = threadIdx.x >> 5;
     const int tid = threadIdx.x;
@@ -951,65 +969,52 @@ __global__ void k_gemm_q8(const unsigned char *__restrict__ W,
     for (int j = 0; j < 16; j++) acc[j] = 0.0f;
 
     for (int k0 = 0; k0 < row_blocks; k0++) {
-        if (tid < 32) {            // X row tid, block k0
-            const unsigned char *p = Xq + (size_t)(b0 + tid) * (size_t)row_blocks * 34 +
-                                     (size_t)k0 * 34;
-            const uint16_t *pu = (const uint16_t *)(p + 2);
-            uint16_t v[16];
-            float d[32];
-            if (b0 + tid < B) {
+        if (tid < 32) {            // X: 32 rows, 4 threads/row, 4 waves (8 rows each)
+            const int t8 = tid >> 2, c = tid & 3;
+            for (int rr = 0; rr < 4; rr++) {
+                const int row = rr * 8 + t8;
+                const unsigned char *p = Xq + (size_t)(b0 + row) * (size_t)row_blocks * 34 +
+                                         (size_t)k0 * 34;
+                if (b0 + row < B) {
+                    if (c == 0) sXs[row] = q35_ld_scale(p);
+                    const uint16_t *pu = (const uint16_t *)(p + 2);
+                    uint16_t v[16];
 #pragma unroll
-                for (int k = 0; k < 16; k++) v[k] = pu[k];
-                float s = q35_ld_scale(p);
-#pragma unroll
-                for (int k = 0; k < 16; k++) {
-                    d[2 * k] = s * (float)(signed char)(v[k] & 0xff);
-                    d[2 * k + 1] = s * (float)(signed char)(v[k] >> 8);
+                    for (int k = 0; k < 16; k++) v[k] = pu[k];
+                    sXi[row][2 * c] = (int)(v[4 * c] | (v[4 * c + 1] << 16));
+                    sXi[row][2 * c + 1] = (int)(v[4 * c + 2] | (v[4 * c + 3] << 16));
                 }
-            } else {
-#pragma unroll
-                for (int k = 0; k < 32; k++) d[k] = 0.0f;
             }
-            float *row = sX[tid];
+        } else if (tid < 160) {    // W: 128 rows, 4 threads/row, 4 waves (32 rows each)
+            const int t8 = (tid - 32) >> 2, c = (tid - 32) & 3;
+            for (int rr = 0; rr < 4; rr++) {
+                const int row = t8 + rr * 32;
+                const unsigned char *p = W + (size_t)(r0 + row) * (size_t)row_blocks * 34 +
+                                         (size_t)k0 * 34;
+                if (r0 + row < rows) {
+                    if (c == 0) sWs[row] = q35_ld_scale(p);
+                    const uint16_t *pu = (const uint16_t *)(p + 2);
+                    uint16_t v[16];
 #pragma unroll
-            for (int k = 0; k < 8; k++)
-                ((float4 *)row)[k] = make_float4(d[4 * k], d[4 * k + 1], d[4 * k + 2], d[4 * k + 3]);
-        } else if (tid < 160) {    // W row tid-32, block k0
-            const unsigned char *p = W + (size_t)(r0 + tid - 32) * (size_t)row_blocks * 34 +
-                                     (size_t)k0 * 34;
-            const uint16_t *pu = (const uint16_t *)(p + 2);
-            uint16_t v[16];
-            float d[32];
-            if (r0 + tid - 32 < rows) {
-#pragma unroll
-                for (int k = 0; k < 16; k++) v[k] = pu[k];
-                float s = q35_ld_scale(p);
-#pragma unroll
-                for (int k = 0; k < 16; k++) {
-                    d[2 * k] = s * (float)(signed char)(v[k] & 0xff);
-                    d[2 * k + 1] = s * (float)(signed char)(v[k] >> 8);
+                    for (int k = 0; k < 16; k++) v[k] = pu[k];
+                    sWi[row][2 * c] = (int)(v[4 * c] | (v[4 * c + 1] << 16));
+                    sWi[row][2 * c + 1] = (int)(v[4 * c + 2] | (v[4 * c + 3] << 16));
                 }
-            } else {
-#pragma unroll
-                for (int k = 0; k < 32; k++) d[k] = 0.0f;
             }
-            float *row = sW[tid - 32];
-#pragma unroll
-            for (int k = 0; k < 8; k++)
-                ((float4 *)row)[k] = make_float4(d[4 * k], d[4 * k + 1], d[4 * k + 2], d[4 * k + 3]);
         }
         __syncthreads();
+        const float xs = sXs[bx];
+        const int *xp = (const int *)sXi[bx];
 #pragma unroll
-        for (int k4 = 0; k4 < 8; k4++) {
-            float4 x4 = ((float4 *)(sX[bx] + 4 * k4))[0];
+        for (int j = 0; j < 16; j++) {
+            const float ws = sWs[by * 16 + j];
+            const float sxw = xs * ws;
+            const int *wp = (const int *)sWi[by * 16 + j];
+            int dot = 0;
 #pragma unroll
-            for (int j = 0; j < 16; j++) {
-                float4 w4 = ((float4 *)(sW[by * 16 + j] + 4 * k4))[0];
-                acc[j] = fmaf(x4.x, w4.x, acc[j]);
-                acc[j] = fmaf(x4.y, w4.y, acc[j]);
-                acc[j] = fmaf(x4.z, w4.z, acc[j]);
-                acc[j] = fmaf(x4.w, w4.w, acc[j]);
-            }
+            for (int k4 = 0; k4 < 8; k4++)
+                dot = q35_dp4a(xp[k4], wp[k4], dot);
+            acc[j] = fmaf((float)dot, sxw, acc[j]);
         }
         __syncthreads();
     }

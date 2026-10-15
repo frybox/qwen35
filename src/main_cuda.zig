@@ -492,7 +492,7 @@ fn forwardMlp(ctx: *Ctx, lw: *GpuLayer) void {
 // batched prefill (chunks of PREFILL_CHUNK tokens)
 // ---------------------------------------------------------------------------
 
-const PREFILL_CHUNK: usize = 128;
+const PREFILL_CHUNK: usize = 512;
 
 /// Batched linear: out = w @ x over B token-rows.  x is [B][cols] f32
 /// token-major, out is [B][rows] f32 token-major.  Q8_0 weights use the
@@ -810,7 +810,7 @@ fn gpuInit(arena: std.mem.Allocator, e: *engine.Engine) !*Gpu {
 
     // Batched-prefill working buffers.  Each prefill chunk is CHUNK tokens
     // (see prefillChunk); every [B] tensor below is sized for B = CHUNK.
-    const CH: usize = 128;
+    const CH: usize = 512;
     g.pb_x1 = try g.allocF32(arena, CH * hidden);
     g.pb_x1n = try g.allocF32(arena, CH * hidden);
     // gdn qkv is [conv_dim]; full-attn q|gate is [heads*2*hd = 2*q_dim].
