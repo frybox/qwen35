@@ -13,7 +13,7 @@ NVCC := $(shell command -v nvcc || echo /usr/local/cuda/bin/nvcc)
 HOST_OBJ := .zig-cache/qwen35_cuda_host.o
 CUDA_EXE := zig-out/bin/qwen35-cuda
 
-.PHONY: all build cpu cuda test run0.8b run2b run4b run0.8b-cuda run2b-cuda run4b-cuda
+.PHONY: all build cpu cuda test run0.8b run2b run4b run27b run27b-long run0.8b-cuda run2b-cuda run4b-cuda
 
 all: build cpu cuda
 
@@ -46,6 +46,12 @@ run2b:
 
 run4b:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 天空为什么是蓝色的？
+
+run27b:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf 天空为什么是蓝色的？
+
+run27b-long:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf "请介绍一下中国的茶文化。"
 
 run0.8b-cuda:
 	CUDA_VISIBLE_DEVICES=7 $(CUDA_EXE) run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？

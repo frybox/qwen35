@@ -319,7 +319,11 @@ pub const Engine = struct {
     /// set by `load` when it created the Threaded instance; freed in deinit
     owns_io: ?*std.Io.Threaded = null,
 
-    token_embd: LinearW, // [vocab, hidden] row-major (tied output)
+    token_embd: LinearW, // [vocab, hidden] row-major (embedding)
+    /// untied lm_head (27B+); null in the Engine means "tied" -> use
+    /// token_embd.  GGUF `output.weight` has the SAME [vocab, hidden]
+    /// row-major layout as token_embd.
+    output_weight: ?LinearW,
     output_norm: []f32, // [hidden]
     /// Q8 scratch for quantizing activations; sized for the widest matvec
     /// (GDN attn_qkv cols)
@@ -435,12 +439,21 @@ pub const Engine = struct {
         errdefer g.deinit();
 
         var cfg = Config{};
-        if (g.getUint("qwen35.block_count")) |v| cfg.n_layers = @intCast(v);
+        // block_count includes the trailing MTP/nextn prediction layer(s)
+        // (27B: block_count=65, nextn=1 -> main decoder = layers 0..63).
+        // The 0.8B/2B/4B files have no nextn key -> 0 -> unchanged.
+        var n_nextn: u32 = 0;
+        if (g.getUint("qwen35.block_count")) |v| {
+            cfg.n_layers = @intCast(v);
+            if (g.getUint("qwen35.nextn_predict_layers")) |n| n_nextn = @intCast(n);
+        }
+        if (n_nextn > 0 and n_nextn < cfg.n_layers) cfg.n_layers -= n_nextn;
         if (g.getUint("qwen35.embedding_length")) |v| cfg.hidden = @intCast(v);
         if (g.getUint("qwen35.feed_forward_length")) |v| cfg.n_ff = @intCast(v);
         if (g.getUint("qwen35.attention.head_count")) |v| cfg.n_heads = @intCast(v);
         if (g.getUint("qwen35.attention.head_count_kv")) |v| cfg.n_kv_heads = @intCast(v);
         if (g.getUint("qwen35.attention.key_length")) |v| cfg.head_dim = @intCast(v);
+        if (g.getUint("qwen35.full_attention_interval")) |v| cfg.full_attention_interval = @intCast(v);
         if (g.getFloat("qwen35.attention.layer_norm_rms_epsilon")) |v| cfg.rms_eps = @floatCast(v);
         if (g.getUint("qwen35.ssm.state_size")) |v| cfg.gdn_head_dim = @intCast(v);
         if (g.getUint("qwen35.ssm.time_step_rank")) |_| {} // informational
@@ -477,6 +490,7 @@ pub const Engine = struct {
             .io = io,
             .owns_io = null,
             .token_embd = .{ .f32 = &.{} },
+            .output_weight = null,
             .output_norm = &.{},
             .q8_scratch = &.{},
             .layers = &.{},
@@ -502,6 +516,12 @@ pub const Engine = struct {
         errdefer e.freeAll();
 
         e.token_embd = try loadLinear(alloc, &g, "token_embd.weight");
+        // 27B+ has an untied lm_head (`output.weight`, same [vocab,hidden]
+        // layout); 0.8B/2B/4B tie it to the embedding (key absent -> null).
+        e.output_weight = loadLinear(alloc, &g, "output.weight") catch |err| switch (err) {
+            error.MissingTensor => null,
+            else => return err,
+        };
         e.output_norm = try loadTensorF32(alloc, &g, "output_norm.weight");
 
         const n_layers = cfg.n_layers;
@@ -590,9 +610,11 @@ pub const Engine = struct {
         const gdn_value_dim: usize = gdn_nv * gdn_kd;
         // Largest Q8_0 activation row: attn_qkv cols on a GDN layer; on full
         // attention layers attn_q (2*q_dim) is smaller for every known config.
+        // The final untied lm_head matvec uses `hidden` cols, so take the
+        // max over that too (covers any config where hidden is the widest).
         const max_q8_row_bytes = @max(
-            gdn_conv_dim,
-            2 * @as(usize, cfg.n_heads) * @as(usize, cfg.head_dim),
+            @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * @as(usize, cfg.head_dim)),
+            @as(usize, cfg.hidden),
         ) / q8_0_block_elems * q8_0_block_bytes;
         e.qkv = try alloc.alloc(f32, @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * cfg.head_dim));
         e.q8_scratch = try alloc.alloc(u8, max_q8_row_bytes);
@@ -660,6 +682,7 @@ pub const Engine = struct {
     fn freeAll(self: *Engine) void {
         const a = self.alloc;
         freeLinear(a, self.token_embd);
+        if (self.output_weight) |w| freeLinear(a, w);
         if (self.output_norm.len > 0) a.free(self.output_norm);
         if (self.q8_scratch.len > 0) a.free(self.q8_scratch);
         if (self.layers.len > 0) {
@@ -713,18 +736,35 @@ pub const Engine = struct {
         }
 
         rmsNorm(self.x1, self.x, self.output_norm, c.rms_eps);
-        // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
-        switch (self.token_embd) {
-            .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
-            .f32 => |m| {
-                const vocab: usize = c.vocab;
-                for (0..vocab) |vi| {
-                    const rowv = m[vi * hidden ..][0..hidden];
-                    var acc: f32 = 0;
-                    for (rowv, self.x1) |mv, vv| acc += mv * vv;
-                    self.logits[vi] = acc;
-                }
-            },
+        // lm_head: untied `output.weight` when present, else tied token_embd.
+        // Both are [vocab, hidden] row-major.
+        if (self.output_weight) |ow| {
+            switch (ow) {
+                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
+                .f32 => |m| {
+                    const vocab: usize = c.vocab;
+                    for (0..vocab) |vi| {
+                        const rowv = m[vi * hidden ..][0..hidden];
+                        var acc: f32 = 0;
+                        for (rowv, self.x1) |mv, vv| acc += mv * vv;
+                        self.logits[vi] = acc;
+                    }
+                },
+            }
+        } else {
+            // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
+            switch (self.token_embd) {
+                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
+                .f32 => |m| {
+                    const vocab: usize = c.vocab;
+                    for (0..vocab) |vi| {
+                        const rowv = m[vi * hidden ..][0..hidden];
+                        var acc: f32 = 0;
+                        for (rowv, self.x1) |mv, vv| acc += mv * vv;
+                        self.logits[vi] = acc;
+                    }
+                },
+            }
         }
         return self.logits;
     }
@@ -1239,6 +1279,7 @@ test "convStep: causal left-pad semantics" {
         .file = undefined,
         .io = undefined,
         .token_embd = .{ .f32 = &.{} },
+        .output_weight = null,
         .output_norm = &.{},
         .q8_scratch = &.{},
         .layers = &.{},
