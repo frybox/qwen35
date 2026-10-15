@@ -263,10 +263,12 @@ pub fn dequantIQ3S(row: []const u8, out: []f32) void {
             const g2 = ggml_tables.iq3s_grid[qs[16 * p + 2 * l + 1] | bit2];
             const sg = signs[8 * p + l];
             for (0..4) |j| {
-                const b1: u8 = (g1 >> (8 * j)) & 0xFF;
-                const b2: u8 = (g2 >> (8 * j)) & 0xFF;
-                out[y + l * 8 + j] = db1 * @as(f32, @floatFromInt(@as(i32, b1))) * if (sg & kmask_iq2xs[j] != 0) -1.0 else 1.0;
-                out[y + l * 8 + 4 + j] = db1 * @as(f32, @floatFromInt(@as(i32, b2))) * if (sg & kmask_iq2xs[4 + j] != 0) -1.0 else 1.0;
+                const gb1: [4]u8 = @bitCast(g1);
+            const b1: u8 = gb1[j];
+                const gb2: [4]u8 = @bitCast(g2);
+                const b2: u8 = gb2[j];
+                out[y + l * 8 + j] = db1 * @as(f32, @floatFromInt(@as(i32, b1))) * @as(f32, if (sg & kmask_iq2xs[j] != 0) -1.0 else 1.0);
+                out[y + l * 8 + 4 + j] = db1 * @as(f32, @floatFromInt(@as(i32, b2))) * @as(f32, if (sg & kmask_iq2xs[4 + j] != 0) -1.0 else 1.0);
             }
         }
         // block2: qh[2p+1], qs[16p+8..16p+15], signs[8p+4..8p+7]
@@ -281,10 +283,12 @@ pub fn dequantIQ3S(row: []const u8, out: []f32) void {
             const g2 = ggml_tables.iq3s_grid[qs[16 * p + 8 + 2 * l + 1] | bit2];
             const sg = signs[8 * p + 4 + l];
             for (0..4) |j| {
-                const b1: u8 = (g1 >> (8 * j)) & 0xFF;
-                const b2: u8 = (g2 >> (8 * j)) & 0xFF;
-                out[y + 32 + l * 8 + j] = db2 * @as(f32, @floatFromInt(@as(i32, b1))) * if (sg & kmask_iq2xs[j] != 0) -1.0 else 1.0;
-                out[y + 32 + l * 8 + 4 + j] = db2 * @as(f32, @floatFromInt(@as(i32, b2))) * if (sg & kmask_iq2xs[4 + j] != 0) -1.0 else 1.0;
+                const gb1: [4]u8 = @bitCast(g1);
+            const b1: u8 = gb1[j];
+                const gb2: [4]u8 = @bitCast(g2);
+                const b2: u8 = gb2[j];
+                out[y + 32 + l * 8 + j] = db2 * @as(f32, @floatFromInt(@as(i32, b1))) * @as(f32, if (sg & kmask_iq2xs[j] != 0) -1.0 else 1.0);
+                out[y + 32 + l * 8 + 4 + j] = db2 * @as(f32, @floatFromInt(@as(i32, b2))) * @as(f32, if (sg & kmask_iq2xs[4 + j] != 0) -1.0 else 1.0);
             }
         }
         y += 64;

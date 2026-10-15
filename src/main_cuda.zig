@@ -43,6 +43,8 @@ extern "C" fn q35_beta_gamma_batch(a: ?*anyopaque, b: ?*anyopaque, abar: ?*anyop
 extern "C" fn q35_l2norm_strided2d(x: ?*anyopaque, B: c_int, nheads: c_int, n: c_int, token_stride: c_int, eps: f32, scale: f32) void;
 extern "C" fn q35_matvec_f32(w: ?*anyopaque, x: ?*anyopaque, out: ?*anyopaque, rows: c_int, cols: c_int) void;
 extern "C" fn q35_embed_row(w: ?*anyopaque, x: ?*anyopaque, n: c_int) void;
+extern "C" fn q35_embed_row_f32(w: ?*anyopaque, x: ?*anyopaque, n: c_int) void;
+extern "C" fn q35_embed_rows_f32(w: ?*anyopaque, tok: ?*anyopaque, x: ?*anyopaque, B: c_int, n: c_int) void;
 extern "C" fn q35_rmsnorm_rows(x: ?*anyopaque, w: ?*anyopaque, out: ?*anyopaque, rows: c_int, n: c_int, eps: f32) void;
 extern "C" fn q35_rmsnorm_strided(x: ?*anyopaque, w: ?*anyopaque, out: ?*anyopaque, rows: c_int, n: c_int, stride: c_int, eps: f32) void;
 extern "C" fn q35_l2norm(x: ?*anyopaque, rows: c_int, n: c_int, eps: f32, scale: f32) void;
@@ -292,11 +294,16 @@ fn quantInput(g: *Gpu, x: ?*anyopaque, cols: usize) void {
     q35_quantize_q8(cf32(x), g.q8_scratch, toC(cols / 32));
 }
 
-// out[rows] = W @ (already-quantized g.q8_scratch); see quantInput.
-fn matvecQ(g: *Gpu, w: *const LinearGpu, out: ?*anyopaque) void {
+// out[rows] = W @ input.  Q8_0 weights use the already-quantized g.q8_scratch
+// (see quantInput, bit-exact vs re-quantizing per matvec); f32 weights
+// (dequantized K-quant models) read the f32 input directly.
+fn matvecLin(g: *Gpu, w: *const LinearGpu, x: ?*anyopaque, out: ?*anyopaque) void {
     const rows = w.rows;
-    const rb = w.cols / 32;
-    q35_matvec_q8(cu8(w.ptr), cu8(g.q8_scratch), out, toC(rows), toC(rb));
+    if (w.is_q8) {
+        q35_matvec_q8(cu8(w.ptr), cu8(g.q8_scratch), out, toC(rows), toC(w.cols / 32));
+    } else {
+        q35_matvec_f32(cf32(w.ptr), cf32(x), out, toC(rows), toC(w.cols));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -376,13 +383,13 @@ fn forwardGdn(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     // g.q8_scratch (bit-exact vs re-quantizing per matvec, see quantInput).
     quantInput(g, g.x1, hidden);
     // qkv = attn_qkv @ x1   (conv_dim)
-    matvecQ(g, &lw.attn_qkv, g.qkv);
+    matvecLin(g, &lw.attn_qkv, g.x1, g.qkv);
     // z = attn_gate @ x1     (value_dim)
-    matvecQ(g, &lw.attn_gate, g.z);
+    matvecLin(g, &lw.attn_gate, g.x1, g.z);
     // ab[0..nv] = ssm_alpha @ x1 ; ab[nv..] = ssm_beta @ x1
-    matvecQ(g, &lw.ssm_alpha, g.ab);
+    matvecLin(g, &lw.ssm_alpha, g.x1, g.ab);
     const ab_b = offBytes(g.ab, nv * @sizeOf(f32));
-    matvecQ(g, &lw.ssm_beta, ab_b);
+    matvecLin(g, &lw.ssm_beta, g.x1, ab_b);
 
     // causal conv1d (in place qkv, per-layer history; silu in-kernel)
     const conv_hist = g.gdn_conv[li];
@@ -406,7 +413,7 @@ fn forwardGdn(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
 
     // x += ssm_out @ gdn_out
     quantInput(g, g.gdn_out, value_dim);
-    matvecQ(g, &lw.ssm_out, g.x2);
+    matvecLin(g, &lw.ssm_out, g.gdn_out, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
 }
@@ -429,10 +436,10 @@ fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
     // g.q8_scratch (bit-exact vs re-quantizing per matvec, see quantInput).
     quantInput(g, g.x1, hidden);
     // qg = attn_q @ x1  (per-head [q|gate] interleaved in qkv)
-    matvecQ(g, &lw.attn_q, g.qkv);
+    matvecLin(g, &lw.attn_q, g.x1, g.qkv);
     // k = attn_k @ x1 ; v = attn_v @ x1
-    matvecQ(g, &lw.attn_k, g.k);
-    matvecQ(g, &lw.attn_v, g.v);
+    matvecLin(g, &lw.attn_k, g.x1, g.k);
+    matvecLin(g, &lw.attn_v, g.x1, g.v);
 
     // gate section = qg + hd (in f32); rmsnorm_strided/attn take ?*anyopaque
     const gate = offBytes(g.qkv, hd * @sizeOf(f32));
@@ -459,7 +466,7 @@ fn forwardFull(ctx: *Ctx, lw: *GpuLayer, li: usize) void {
 
     // x += attn_output @ gdn_out
     quantInput(g, g.gdn_out, q_dim);
-    matvecQ(g, &lw.attn_output, g.x2);
+    matvecLin(g, &lw.attn_output, g.gdn_out, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
 }
@@ -477,13 +484,13 @@ fn forwardMlp(ctx: *Ctx, lw: *GpuLayer) void {
     // g.q8_scratch (bit-exact vs re-quantizing per matvec, see quantInput).
     quantInput(g, g.x1, hidden);
     // mlp_h = ffn_gate @ x1 ; mlp_h1 = ffn_up @ x1
-    matvecQ(g, &lw.ffn_gate, g.mlp_h);
-    matvecQ(g, &lw.ffn_up, g.mlp_h1);
+    matvecLin(g, &lw.ffn_gate, g.x1, g.mlp_h);
+    matvecLin(g, &lw.ffn_up, g.x1, g.mlp_h1);
     // mlp_h = silu(mlp_h) * mlp_h1
     q35_silu_mul(g.mlp_h, cf32(g.mlp_h1), toC(n_ff));
     // x += ffn_down @ mlp_h
     quantInput(g, g.mlp_h, n_ff);
-    matvecQ(g, &lw.ffn_down, g.x2);
+    matvecLin(g, &lw.ffn_down, g.mlp_h, g.x2);
     // x += x2 (on device)
     q35_add(g.x, g.x2, toC(hidden));
 }
@@ -605,7 +612,11 @@ fn forwardBatched(ctx: *Ctx, tokens: []const u32, pos0: u32) u32 {
     const B = tokens.len;
 
     _ = q35_h2d(g.pb_tok, hsrcC(@ptrCast(tokens.ptr)), B * 4);
-    q35_embed_rows(cu8(g.token_embd), cu8(g.pb_tok), g.pb_x1, @intCast(B), @intCast(hidden));
+    if (g.emb_is_q8) {
+        q35_embed_rows(cu8(g.token_embd), cu8(g.pb_tok), g.pb_x1, @intCast(B), @intCast(hidden));
+    } else {
+        q35_embed_rows_f32(cf32(g.token_embd), cu8(g.pb_tok), g.pb_x1, @intCast(B), @intCast(hidden));
+    }
 
     for (g.layers, 0..) |*lw, li| {
         if (c.isFullAttention(@intCast(li))) {
@@ -646,11 +657,9 @@ fn runForward(ctx: *Ctx) void {
     if (g.emb_is_q8) {
         q35_embed_row(cu8(g.token_embd), g.x, toC(hidden));
     } else {
-        // f32 token_embd would need a host-bounce (not capturable).  Q8_0
-        // models (the ones we ship) use the q8 path above; assert the f32
-        // path is never taken while building a graph.
-        std.debug.assert(false);
-        q35_embed_row(cu8(g.token_embd), g.x, toC(hidden));
+        // f32 weights (dequantized K-quant models): device-side row copy,
+        // graph-capturable (no host bounce).
+        q35_embed_row_f32(cf32(g.token_embd), g.x, toC(hidden));
     }
 
     for (g.layers, 0..) |*lw, li| {

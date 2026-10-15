@@ -1617,6 +1617,41 @@ extern "C" void q35_embed_rows(const unsigned char *w, const int *tok, float *x,
     k_embed_rows<<<q35_grid(total, 256), 256, 0, g_stream>>>(w, tok, x, B, n);
 }
 
+// f32-weight variants (dequantized K-quant models): w is [rows][n] f32, so an
+// embedding lookup is just a device-side row copy (no dequant).
+
+__global__ void k_embed_row_f32(const float *__restrict__ w,
+                                float *__restrict__ x, const int *params, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    int row = params[0];
+    x[i] = w[(size_t)row * n + i];
+}
+
+extern "C" void q35_embed_row_f32(const float *w, float *x, int n) {
+    if (n <= 0) return;
+    k_embed_row_f32<<<q35_grid(n, Q35_BLK), Q35_BLK, 0, g_stream>>>(w, x, g_params_dev, n);
+}
+
+__global__ void k_embed_rows_f32(const float *__restrict__ w,
+                                 const int *__restrict__ tok, float *__restrict__ x,
+                                 int B, int n) {
+    int total = B * n;
+    for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < total;
+         i += gridDim.x * blockDim.x) {
+        int b = i / n;
+        int row = tok[b];
+        x[i] = w[(size_t)row * n + (i - b * n)];
+    }
+}
+
+extern "C" void q35_embed_rows_f32(const float *w, const int *tok, float *x,
+                                   int B, int n) {
+    if (B <= 0 || n <= 0) return;
+    int total = B * n;
+    k_embed_rows_f32<<<q35_grid(total, 256), 256, 0, g_stream>>>(w, tok, x, B, n);
+}
+
 extern "C" void q35_argmax(const float *x, int *outidx, int n) {
     if (n <= 0) return;
     // Single block: one global reduction over the whole vocab.  (A multi-block

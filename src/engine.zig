@@ -24,6 +24,7 @@
 const std = @import("std");
 const gguf = @import("gguf.zig");
 const sampler = @import("sampler.zig");
+const quant = @import("quant_dequant.zig");
 const Io = std.Io;
 
 /// Re-export so the CPU and CUDA hosts share one sampler implementation.
@@ -254,6 +255,54 @@ pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8) void {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Generic per-row dequant: a tensor of a K-quantized type is a sequence of
+// fixed-size rows (each `row_bytes` bytes == 256 elements); dequantize each
+// row into its 256 f32 values and append to `out`. `out.len` must equal the
+// element count of the tensor (rows * 256).
+// ---------------------------------------------------------------------------
+
+const dequantRowFn = *const fn ([]const u8, []f32) void;
+
+fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const u8, out: []f32) !void {
+    const row_bytes: usize = switch (ttype) {
+        .q4_k => 144,
+        .q5_k => 176,
+        .q6_k => 210,
+        .q3_k => 110,
+        .iq4_xs => 136,
+        .iq4_nl => 144,
+        .iq3_s => 110,
+        else => return error.UnsupportedTensorType,
+    };
+    const row_elems = 256; // every K-quant type packs 256 elems per row
+    const nf: usize = out.len;
+    if (nf % row_elems != 0) return error.NotMultipleOfRow;
+    const nrows = nf / row_elems;
+    const expected_bytes = nrows * row_bytes;
+    if (data.len < expected_bytes) return error.SizeMismatch;
+
+    const deq: dequantRowFn = switch (ttype) {
+        .q4_k => &quant.dequantQ4K,
+        .q5_k => &quant.dequantQ5K,
+        .q6_k => &quant.dequantQ6K,
+        .q3_k => &quant.dequantQ3K,
+        .iq4_xs => &quant.dequantIQ4XS,
+        .iq4_nl => &quant.dequantIQ4NL,
+        .iq3_s => &quant.dequantIQ3S,
+        else => return error.UnsupportedTensorType,
+    };
+
+    const row = try alloc.alloc(f32, row_elems);
+    defer alloc.free(row);
+    for (0..nrows) |r| {
+        const in = data[r * row_bytes .. (r + 1) * row_bytes];
+        deq(in, row);
+        const o0 = r * row_elems;
+        @memcpy(out[o0..][0..row_elems], row);
+    }
+}
+
 fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8) ![]f32 {
     const t = g.findTensor(name) orelse return error.MissingTensor;
     const n: usize = @intCast(t.nElems());
@@ -267,6 +316,7 @@ fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8
             for (0..n) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
         },
         .q8_0 => try dequantizeQ8_0(data, out),
+        .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s => try dequantToRows(alloc, t.ttype, data, out),
         else => return error.UnsupportedTensorType,
     }
     return out;
