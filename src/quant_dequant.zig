@@ -295,6 +295,37 @@ pub fn dequantIQ3S(row: []const u8, out: []f32) void {
     }
 }
 
+// ---------------- IQ3_XXS: d @0..1; qs[64] @2..65; scales_and_signs[32] @66..97
+// Port of ggml dequantize_row_iq3_xxs (ggml-quants.c:2575), expression-for-expression:
+//   db    = d * (0.5f + (aux32 >> 28)) * 0.5f          (sub-scale from aux32 top 4 bits)
+//   signs = ksigns_iq2xs[(aux32 >> 7*l) & 127]         (7-bit sign word per 8-element group)
+//   grid  = iq3xxs_grid[qs[2*l+k]] as 4 x u4 values    (byte j = value j)
+//   y     = db * grid[j] * (signs & kmask_iq2xs[...] ? -1 : 1)
+pub fn dequantIQ3XXS(row: []const u8, out: []f32) void {
+    const d = f16_to_f32(row, 0);
+    const qs = row[2..66];
+    const ss = row[66..98]; // scales_and_signs[32]
+    var y: usize = 0;
+    for (0..8) |ib32| {
+        const aux32: u32 = @bitCast([4]u8{ ss[4 * ib32], ss[4 * ib32 + 1], ss[4 * ib32 + 2], ss[4 * ib32 + 3] });
+        const db: f32 = d * (0.5 + @as(f32, @floatFromInt(aux32 >> 28))) * 0.5;
+        for (0..4) |l| {
+            const sidx: u8 = @intCast((aux32 >> @as(u5, @intCast(7 * l))) & 127);
+            const signs: u8 = ggml_tables.ksigns_iq2xs[sidx];
+            // C advances qs by 8 per ib32; grid row index is the 2-bit value.
+            const g1 = ggml_tables.iq3xxs_grid[qs[8 * ib32 + 2 * l]];
+            const g2 = ggml_tables.iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]];
+            const gb1: [4]u8 = @bitCast(g1);
+            const gb2: [4]u8 = @bitCast(g2);
+            for (0..4) |j| {
+                out[y + j] = db * @as(f32, @floatFromInt(gb1[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0);
+                out[y + 4 + j] = db * @as(f32, @floatFromInt(gb2[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[4 + j] != 0) -1.0 else 1.0);
+            }
+            y += 8;
+        }
+    }
+}
+
 // ============================================================ tests
 // Reads the real testdata (testdata/udtest) and verifies every row: dot product
 // of the dequantized row with A_x.f32 vs the C ground-truth *_expected.f32.
@@ -362,6 +393,8 @@ test "quant_dequant: all match C ground-truth (96 rows x 256)" {
     e = try checkType(alloc, io, "IQ4_XS", 136, ax, dequantIQ4XS);
     if (e > worst) worst = e;
     e = try checkType(alloc, io, "IQ4_NL", 144, ax, dequantIQ4NL);
+    if (e > worst) worst = e;
+    e = try checkType(alloc, io, "IQ3_XXS", 98, ax, dequantIQ3XXS);
     if (e > worst) worst = e;
     std.debug.print("  worst overall = {}\n", .{worst});
     try std.testing.expect(worst < 1e-3);
