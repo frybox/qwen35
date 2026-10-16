@@ -50,6 +50,9 @@ run4b:
 run27b:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf 天空为什么是蓝色的？
 
+run27bq4:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q4_0.gguf 天空为什么是蓝色的？
+
 run27b-long:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-Q8_0.gguf "请介绍一下中国的茶文化。"
 

@@ -719,11 +719,18 @@ pub const Engine = struct {
     }
 
     fn freeCachesUpTo(self: *Engine, n: usize) void {
-        for (self.kv[0..n]) |c| {
+        // Robust to partially-constructed state: `load`'s `errdefer freeAll`
+        // may run before kv/gdn are allocated (e.g. an unsupported tensor type
+        // fails at loadLinear before the caches exist), in which case
+        // self.kv/self.gdn are still the empty sentinel.  Clamp to the real
+        // allocated length so a clean error return does not read OOB.
+        const nk = @min(n, self.kv.len);
+        for (self.kv[0..nk]) |c| {
             if (c.k.len > 0) self.alloc.free(c.k);
             if (c.v.len > 0) self.alloc.free(c.v);
         }
-        for (self.gdn[0..n]) |s| {
+        const ng = @min(n, self.gdn.len);
+        for (self.gdn[0..ng]) |s| {
             if (s.conv.len > 0) self.alloc.free(s.conv);
             if (s.state.len > 0) self.alloc.free(s.state);
         }
