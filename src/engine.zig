@@ -117,12 +117,14 @@ pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: u
     }
 }
 
-/// Linear layer with Q8_0-native weights: dispatch to the integer dot-product
-/// path when the weight is kept quantized, plain f32 otherwise. `q8` is the
-/// engine's quantization scratch (must fit ceil(cols/32) blocks).
+/// Linear layer with native quantized weights: Q8_0 and K/IQ types stay in
+/// their packed format (zero-copy mmap) and are dotted in the quantized
+/// domain (no whole-row f32 materialization); f32 is the small/dequant path.
+/// `q8` is the engine's Q8 activation scratch (ceil(cols/32) blocks).
 fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8) void {
     switch (w) {
         .q8 => |row| matvecQ8_0(out, row, x, q8),
+        .quant => |qrow| Engine.matvecQuant(out, qrow, x),
         .f32 => |m| matvec(out, m, x, out.len, x.len),
     }
 }
@@ -273,6 +275,7 @@ fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const
         .iq4_xs => 136,
         .iq4_nl => 144,
         .iq3_s => 110,
+        .iq3_xxs => 98,
         else => return error.UnsupportedTensorType,
     };
     const row_elems = 256; // every K-quant type packs 256 elems per row
@@ -290,6 +293,7 @@ fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const
         .iq4_xs => &quant.dequantIQ4XS,
         .iq4_nl => &quant.dequantIQ4NL,
         .iq3_s => &quant.dequantIQ3S,
+        .iq3_xxs => &quant.dequantIQ3XXS,
         else => return error.UnsupportedTensorType,
     };
 
@@ -322,12 +326,18 @@ fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8
     return out;
 }
 
-/// Load a 2D linear weight: Q8_0 tensors stay quantized (zero-copy view
-/// into the mmap), anything else is dequantized to f32.
+/// Load a 2D linear weight: Q8_0 and K/IQ quant types stay in their native
+/// packed format (zero-copy view into the mmap); F32/F16 load as f32.
 fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine.LinearW {
     const t = g.findTensor(name) orelse return error.MissingTensor;
-    if (t.ttype == .q8_0) return .{ .q8 = try Engine.q8RowOf(g, t) };
-    return .{ .f32 = try loadTensorF32(alloc, g, name) };
+    switch (t.ttype) {
+        .q8_0 => return .{ .q8 = try Engine.q8RowOf(g, t) },
+        .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs => {
+            return .{ .quant = try Engine.quantRowOf(g, t) };
+        },
+        .f32, .f16 => return .{ .f32 = try loadTensorF32(alloc, g, name) },
+        else => return error.UnsupportedTensorType,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -407,13 +417,82 @@ pub const Engine = struct {
     sampler: Sampler = Sampler.init(.{}),
     prefill_ms: f64 = 0,
 
-    /// A linear layer weight: either kept in its native Q8_0 blocks
-    /// (zero-copy view into the mmapped file) or dequantized to f32
-    /// (small tensors already stored as F32 in the GGUF).
+    /// A linear layer weight:
+    ///  - `.q8`    Q8_0 kept in native blocks (zero-copy mmap view);
+    ///  - `.quant` a K/IQ quant type kept in its native packed bytes
+    ///    (zero-copy mmap view); matvec reads the packed bytes directly and
+    ///    accumulates in f32 — no whole-row f32 materialization;
+    ///  - `.f32`  small tensors already F32 in the GGUF, or dequantized copies.
     pub const LinearW = union(enum) {
         q8: Q8Row,
+        quant: QuantRow,
         f32: []f32,
     };
+
+    /// One 2D linear weight held in a K/IQ quantized GGUF type: a zero-copy
+    /// view over the mmapped file.  The GGUF stores a row-major [rows, cols]
+    /// matrix as a flat stream of `blocks_per_row` packed 256-element blocks
+    /// per output row (row r = output channel r).  `rows` * `blocks_per_row`
+    /// blocks of `quantRowBytes(ttype)` bytes each, row-major.
+    pub const QuantRow = struct {
+        data: []const u8,
+        ttype: gguf.TensorType,
+        rows: usize,
+        blocks_per_row: usize, // cols / 256
+    };
+
+    /// Packed bytes for one 256-element K/IQ block of a type (0 = unknown).
+    pub fn quantRowBytes(t: gguf.TensorType) usize {
+        // every supported K/IQ block holds 256 elements
+        return switch (t) {
+            .q4_k => 144,
+            .q5_k => 176,
+            .q6_k => 210,
+            .q3_k => 110,
+            .iq4_xs => 136,
+            .iq4_nl => 144,
+            .iq3_s => 110,
+            .iq3_xxs => 98,
+            else => 0,
+        };
+    }
+
+    /// Packed block `b` of row `r` (one 256-element block).
+    fn quantBlock(w: QuantRow, r: usize, b: usize) []const u8 {
+        const rb = quantRowBytes(w.ttype);
+        const i = r * w.blocks_per_row + b;
+        return w.data[i * rb .. (i + 1) * rb];
+    }
+
+    /// out[r] = sum_c W[r,c] * x[c] for a K/IQ quantized row-major weight,
+    /// reading the packed bytes directly and accumulating in f32 (no whole-row
+    /// f32 materialization).  W is [rows, cols]; each row is `blocks_per_row`
+    /// packed 256-element blocks.  Fallback for the 256-block-aligned case
+    /// uses per-block `quant.rowDotXXX`; partial tail handled in f32.
+    fn matvecQuant(out: []f32, w: QuantRow, x: []const f32) void {
+        const rows = w.rows;
+        const bpr = w.blocks_per_row;
+        const cols = bpr * 256;
+        std.debug.assert(out.len == rows and x.len >= cols);
+        const rowDot: *const fn (row: []const u8, x: []const f32) f32 = switch (w.ttype) {
+            .q4_k => &quant.rowDotQ4K,
+            .q5_k => &quant.rowDotQ5K,
+            .q6_k => &quant.rowDotQ6K,
+            .q3_k => &quant.rowDotQ3K,
+            .iq4_xs => &quant.rowDotIQ4XS,
+            .iq4_nl => &quant.rowDotIQ4NL,
+            .iq3_s => &quant.rowDotIQ3S,
+            .iq3_xxs => &quant.rowDotIQ3XXS,
+            else => unreachable, // only the 8 supported types load as .quant
+        };
+        for (0..rows) |r| {
+            var acc: f32 = 0;
+            for (0..bpr) |b| {
+                acc += rowDot(quantBlock(w, r, b), x[b * 256 .. b * 256 + 256]);
+            }
+            out[r] = acc;
+        }
+    }
 
     fn q8RowOf(g: *gguf.File, t: *const gguf.Tensor) !Q8Row {
         // GGUF dims are innermost-first: dims[0] = contiguous cols, dims[1] = rows
@@ -425,6 +504,29 @@ pub const Engine = struct {
         return .{
             .data = try g.tensorData(t),
             .row_blocks = row_blocks,
+        };
+    }
+
+    /// Zero-copy view of a K/IQ quantized 2D linear weight.  GGUF dims are
+    /// innermost-first: dims[0] = contiguous cols, dims[1] = rows.  Every
+    /// K/IQ row packs exactly 256 elements, so cols must be a multiple of 256
+    /// (true for all Qwen3 linear layers).
+    fn quantRowOf(g: *gguf.File, t: *const gguf.Tensor) !QuantRow {
+        std.debug.assert(t.dims.len == 2);
+        const cols: usize = t.dims[0];
+        if (cols % 256 != 0) return error.NotMultipleOfRow;
+        const bpr: usize = cols / 256;
+        const rows: usize = t.dims[1];
+        const rb = quantRowBytes(t.ttype);
+        if (rb == 0) return error.UnsupportedTensorType;
+        const expected: usize = rows * bpr * rb;
+        const data = try g.tensorData(t);
+        if (data.len < expected) return error.SizeMismatch;
+        return .{
+            .data = data,
+            .ttype = t.ttype,
+            .rows = rows,
+            .blocks_per_row = bpr,
         };
     }
 
@@ -781,6 +883,12 @@ pub const Engine = struct {
         switch (self.token_embd) {
             .q8 => |row| dequantizeQ8_0(row.row(token), self.x[0..hidden]) catch unreachable,
             .f32 => |m| @memcpy(self.x[0..hidden], m[token * hidden ..][0..hidden]),
+            .quant => |qrow| {
+                const rb = quantRowBytes(qrow.ttype);
+                const rb_row = qrow.blocks_per_row * rb;
+                const off = token * rb_row;
+                dequantToRows(self.alloc, qrow.ttype, qrow.data[off .. off + rb_row], self.x[0..hidden]) catch unreachable;
+            },
         }
 
         for (self.layers, 0..) |*lw, li| {
@@ -798,6 +906,7 @@ pub const Engine = struct {
         if (self.output_weight) |ow| {
             switch (ow) {
                 .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -812,6 +921,7 @@ pub const Engine = struct {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
                 .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {

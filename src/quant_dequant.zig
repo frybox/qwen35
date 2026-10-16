@@ -326,10 +326,304 @@ pub fn dequantIQ3XXS(row: []const u8, out: []f32) void {
     }
 }
 
-// ============================================================ tests
-// Reads the real testdata (testdata/udtest) and verifies every row: dot product
-// of the dequantized row with A_x.f32 vs the C ground-truth *_expected.f32.
+// ============================================================
+// Quantized-domain row dot products (Phase 2a).
+//
+// Each rowDotXXX computes sum_c W[c] * x[c] for ONE packed 256-element row,
+// reading the packed GGUF bytes directly and accumulating in f32 — the same
+// per-element expressions as dequantXXX, inlined against x (no whole-row
+// f32 materialization, per the "no dequant-then-matmul" requirement).
+// rowDotXXX(row, x) must equal dot(dequantXXX(row), x).
+// ============================================================
+
+// Q4_K: d/dmin @0,2; scales[12] @4..15; qs[128] @16..143 (per 256-elem row)
+pub fn rowDotQ4K(row: []const u8, x: []const f32) f32 {
+    const d = f16_to_f32(row, 0);
+    const min = f16_to_f32(row, 2);
+    const scales = row[4..16];
+    var q: []const u8 = row[16..144];
+    var y: usize = 0;
+    var is: usize = 0;
+    var acc: f32 = 0;
+    for (0..4) |_| {
+        const p0 = get_scale_min_k4(is, scales);
+        const d1: f32 = d * @as(f32, @floatFromInt(@as(i32, p0.sc)));
+        const m1: f32 = min * @as(f32, @floatFromInt(@as(i32, p0.m)));
+        const p1 = get_scale_min_k4(is + 1, scales);
+        const d2: f32 = d * @as(f32, @floatFromInt(@as(i32, p1.sc)));
+        const m2: f32 = min * @as(f32, @floatFromInt(@as(i32, p1.m)));
+        for (0..32) |l| acc += (d1 * @as(f32, @floatFromInt(@as(i32, q[l] & 0x0F))) - m1) * x[y + l];
+        for (0..32) |l| acc += (d2 * @as(f32, @floatFromInt(@as(i32, q[l] >> 4))) - m2) * x[y + 32 + l];
+        y += 64;
+        q = q[32..];
+        is += 2;
+    }
+    return acc;
+}
+
+// Q5_K: d/dmin @0,2; scales[12] @4..15; qh[32] @16..47; qs[128] @48..175
+pub fn rowDotQ5K(row: []const u8, x: []const f32) f32 {
+    const d = f16_to_f32(row, 0);
+    const min = f16_to_f32(row, 2);
+    const scales = row[4..16];
+    const qh = row[16..48];
+    var ql: []const u8 = row[48..176];
+    var y: usize = 0;
+    var is: usize = 0;
+    var bm1: u16 = 1;
+    var bm2: u16 = 2;
+    var acc: f32 = 0;
+    for (0..4) |_| {
+        const p0 = get_scale_min_k4(is, scales);
+        const d1: f32 = d * @as(f32, @floatFromInt(@as(i32, p0.sc)));
+        const m1: f32 = min * @as(f32, @floatFromInt(@as(i32, p0.m)));
+        const p1 = get_scale_min_k4(is + 1, scales);
+        const d2: f32 = d * @as(f32, @floatFromInt(@as(i32, p1.sc)));
+        const m2: f32 = min * @as(f32, @floatFromInt(@as(i32, p1.m)));
+        for (0..32) |l| {
+            const hi: u8 = if (qh[l] & bm1 != 0) 16 else 0;
+            acc += (d1 * @as(f32, @floatFromInt(@as(i32, ql[l] & 0x0F | hi))) - m1) * x[y + l];
+        }
+        for (0..32) |l| {
+            const hi: u8 = if (qh[l] & bm2 != 0) 16 else 0;
+            acc += (d2 * @as(f32, @floatFromInt(@as(i32, ql[l] >> 4 | hi))) - m2) * x[y + 32 + l];
+        }
+        y += 64;
+        ql = ql[32..];
+        is += 2;
+        bm1 <<= 2;
+        bm2 <<= 2;
+    }
+    return acc;
+}
+
+// Q6_K: ql[128] @0..127; qh[64] @128..191; scales[i8:16] @192..207; d @208..209
+pub fn rowDotQ6K(row: []const u8, x: []const f32) f32 {
+    const d = f16_to_f32(row, 208);
+    const ql = row[0..128];
+    const qh = row[128..192];
+    var sc: [16]i8 = undefined;
+    for (0..16) |i| sc[i] = @as(i8, @bitCast(row[192 + i]));
+    var acc: f32 = 0;
+    var n: usize = 0;
+    while (n < QK_K) : (n += 128) {
+        const qlb: usize = n / 2;
+        const qhb: usize = n / 4;
+        const scb: usize = n / 16;
+        for (0..32) |l| {
+            const is: usize = l / 16;
+            const q1u: u8 = (ql[qlb + l] & 0x0F) | (((qh[qhb + l] >> 0) & 3) << 4);
+            const q2u: u8 = (ql[qlb + l + 32] & 0x0F) | (((qh[qhb + l] >> 2) & 3) << 4);
+            const q3u: u8 = (ql[qlb + l] >> 4) | (((qh[qhb + l] >> 4) & 3) << 4);
+            const q4u: u8 = (ql[qlb + l + 32] >> 4) | (((qh[qhb + l] >> 6) & 3) << 4);
+            const q1: i8 = @as(i8, @bitCast(q1u)) - 32;
+            const q2: i8 = @as(i8, @bitCast(q2u)) - 32;
+            const q3: i8 = @as(i8, @bitCast(q3u)) - 32;
+            const q4: i8 = @as(i8, @bitCast(q4u)) - 32;
+            acc += d * @as(f32, @floatFromInt(sc[scb + is + 0])) * @as(f32, @floatFromInt(q1)) * x[n + l];
+            acc += d * @as(f32, @floatFromInt(sc[scb + is + 2])) * @as(f32, @floatFromInt(q2)) * x[n + l + 32];
+            acc += d * @as(f32, @floatFromInt(sc[scb + is + 4])) * @as(f32, @floatFromInt(q3)) * x[n + l + 64];
+            acc += d * @as(f32, @floatFromInt(sc[scb + is + 6])) * @as(f32, @floatFromInt(q4)) * x[n + l + 96];
+        }
+    }
+    return acc;
+}
+
+// Q3_K: hmask[32] @0..31; qs[64] @32..95; scales[12] @96..107; d @108..109
+pub fn rowDotQ3K(row: []const u8, x: []const f32) f32 {
+    const d_all = f16_to_f32(row, 108);
+    const q = row[32..96];
+    const hm = row[0..32];
+    const s = row[96..108];
+    const kmask1: u32 = 0x03030303;
+    const kmask2: u32 = 0x0F0F0F0F;
+    var aux0: u32 = 0;
+    var aux1: u32 = 0;
+    var aux2: u32 = 0;
+    {
+        var b0: [4]u8 = .{ s[0], s[1], s[2], s[3] };
+        var b1: [4]u8 = .{ s[4], s[5], s[6], s[7] };
+        var b2: [4]u8 = .{ s[8], s[9], s[10], s[11] };
+        aux0 = std.mem.readInt(u32, &b0, .little);
+        aux1 = std.mem.readInt(u32, &b1, .little);
+        aux2 = std.mem.readInt(u32, &b2, .little);
+    }
+    const tmp = aux2;
+    aux2 = ((aux0 >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    const aux3: u32 = ((aux1 >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux0 = (aux0 & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux1 = (aux1 & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    const scales: [16]u8 = blk: {
+        var v: [16]u8 = undefined;
+        std.mem.writeInt(u32, v[0..4], aux0, .little);
+        std.mem.writeInt(u32, v[4..8], aux1, .little);
+        std.mem.writeInt(u32, v[8..12], aux2, .little);
+        std.mem.writeInt(u32, v[12..16], aux3, .little);
+        break :blk v;
+    };
+    var is: usize = 0;
+    var y: usize = 0;
+    var m: u16 = 1; // NOT reset per 128-chunk (matches C): cycles 1..128
+    var q_off: usize = 0;
+    var acc: f32 = 0;
+    var nch: usize = 0;
+    while (nch < QK_K) : (nch += 128) {
+        for (0..4) |j| {
+            const shift: u3 = @intCast(2 * j);
+            const sval: i32 = @as(i32, @as(i8, @bitCast(scales[is]))) - 32;
+            is += 1;
+            const dl: f32 = d_all * @as(f32, @floatFromInt(sval));
+            for (0..16) |l| {
+                const raw: u8 = (q[q_off + l] >> shift) & 3;
+                const vi: i8 = @intCast(raw);
+                const sub: i8 = if (hm[l] & m != 0) 0 else 4;
+                const v: i8 = vi - sub;
+                acc += dl * @as(f32, @floatFromInt(v)) * x[y + l];
+            }
+            y += 16;
+            const sval2: i32 = @as(i32, @as(i8, @bitCast(scales[is]))) - 32;
+            is += 1;
+            const dl2: f32 = d_all * @as(f32, @floatFromInt(sval2));
+            for (0..16) |l| {
+                const raw2: u8 = (q[q_off + l + 16] >> shift) & 3;
+                const vi2: i8 = @intCast(raw2);
+                const sub2: i8 = if (hm[l + 16] & m != 0) 0 else 4;
+                const v2: i8 = vi2 - sub2;
+                acc += dl2 * @as(f32, @floatFromInt(v2)) * x[y + l];
+            }
+            y += 16;
+            m <<= 1;
+        }
+        q_off += 32;
+    }
+    return acc;
+}
+
+// IQ4_XS: d @0..1; scales_h(u16) @2..3; scales_l[4] @4..7; qs[128] @8..135
+pub fn rowDotIQ4XS(row: []const u8, x: []const f32) f32 {
+    const d = f16_to_f32(row, 0);
+    const sh: u16 = @as(u16, row[2]) | (@as(u16, row[3]) << 8);
+    const sl = row[4..8];
+    const qs = row[8..136];
+    var y: usize = 0;
+    var acc: f32 = 0;
+    for (0..8) |ib| {
+        const sl_amt: u3 = @intCast(4 * (ib % 2));
+        const sh_amt: u4 = @intCast(2 * ib);
+        const sl4: u16 = sl[ib / 2] >> sl_amt;
+        const sh4: u16 = sh >> sh_amt;
+        const ls: u16 = (sl4 & 0x0F) | ((sh4 & 3) << 4);
+        const dl: f32 = d * @as(f32, @floatFromInt(@as(i32, ls) - 32));
+        for (0..16) |j| {
+            const q = qs[16 * ib + j];
+            acc += dl * @as(f32, @floatFromInt(kvalues_iq4nl[q & 0x0F])) * x[y + j];
+            acc += dl * @as(f32, @floatFromInt(kvalues_iq4nl[q >> 4])) * x[y + 16 + j];
+        }
+        y += 32;
+    }
+    return acc;
+}
+
+// IQ4_NL: 8 blocks of (d(2) qs[16]) = 18 bytes each
+pub fn rowDotIQ4NL(row: []const u8, x: []const f32) f32 {
+    var y: usize = 0;
+    var acc: f32 = 0;
+    for (0..8) |i| {
+        const base = i * 18;
+        const d = f16_to_f32(row, base);
+        const qs = row[base + 2 .. base + 18];
+        for (0..16) |j| {
+            acc += d * @as(f32, @floatFromInt(kvalues_iq4nl[qs[j] & 0x0F])) * x[y + j];
+            acc += d * @as(f32, @floatFromInt(kvalues_iq4nl[qs[j] >> 4])) * x[y + 16 + j];
+        }
+        y += 32;
+    }
+    return acc;
+}
+
+// IQ3_S: d @0..1; qs[64] @2..65; qh[8] @66..73; signs[32] @74..105; scales[4] @106..109
+pub fn rowDotIQ3S(row: []const u8, x: []const f32) f32 {
+    const d = f16_to_f32(row, 0);
+    const qs = row[2..66];
+    const qh = row[66..74];
+    const signs = row[74..106];
+    const scales = row[106..110];
+    var y: usize = 0;
+    var acc: f32 = 0;
+    for (0..4) |p| { // p = ib32/2 = 0..3; each p covers 64 elements
+        const sbyte = scales[p];
+        const db1: f32 = d * @as(f32, @floatFromInt(1 + 2 * (sbyte & 0x0F)));
+        const db2: f32 = d * @as(f32, @floatFromInt(1 + 2 * (sbyte >> 4)));
+        const qh0: u16 = qh[2 * p];
+        for (0..4) |l| {
+            const b1_amt: u4 = @intCast(8 - 2 * l);
+            const b2_amt: u4 = @intCast(7 - 2 * l);
+            const bit1: u16 = (qh0 << b1_amt) & 0x100;
+            const bit2: u16 = (qh0 << b2_amt) & 0x100;
+            const g1 = ggml_tables.iq3s_grid[qs[16 * p + 2 * l] | bit1];
+            const g2 = ggml_tables.iq3s_grid[qs[16 * p + 2 * l + 1] | bit2];
+            const sg = signs[8 * p + l];
+            for (0..4) |j| {
+                const gb1: [4]u8 = @bitCast(g1);
+                const b1: u8 = gb1[j];
+                const gb2: [4]u8 = @bitCast(g2);
+                const b2: u8 = gb2[j];
+                acc += db1 * @as(f32, @floatFromInt(@as(i32, b1))) * @as(f32, if (sg & kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + l * 8 + j];
+                acc += db1 * @as(f32, @floatFromInt(@as(i32, b2))) * @as(f32, if (sg & kmask_iq2xs[4 + j] != 0) -1.0 else 1.0) * x[y + l * 8 + 4 + j];
+            }
+        }
+        const qh1: u16 = qh[2 * p + 1];
+        for (0..4) |l| {
+            const b1_amt: u4 = @intCast(8 - 2 * l);
+            const b2_amt: u4 = @intCast(7 - 2 * l);
+            const bit1: u16 = (qh1 << b1_amt) & 0x100;
+            const bit2: u16 = (qh1 << b2_amt) & 0x100;
+            const g1 = ggml_tables.iq3s_grid[qs[16 * p + 8 + 2 * l] | bit1];
+            const g2 = ggml_tables.iq3s_grid[qs[16 * p + 8 + 2 * l + 1] | bit2];
+            const sg = signs[8 * p + 4 + l];
+            for (0..4) |j| {
+                const gb1: [4]u8 = @bitCast(g1);
+                const b1: u8 = gb1[j];
+                const gb2: [4]u8 = @bitCast(g2);
+                const b2: u8 = gb2[j];
+                acc += db2 * @as(f32, @floatFromInt(@as(i32, b1))) * @as(f32, if (sg & kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + 32 + l * 8 + j];
+                acc += db2 * @as(f32, @floatFromInt(@as(i32, b2))) * @as(f32, if (sg & kmask_iq2xs[4 + j] != 0) -1.0 else 1.0) * x[y + 32 + l * 8 + 4 + j];
+            }
+        }
+        y += 64;
+    }
+    return acc;
+}
+
+// IQ3_XXS: d @0..1; qs[64] @2..65; scales_and_signs[32] @66..97
+pub fn rowDotIQ3XXS(row: []const u8, x: []const f32) f32 {
+    const d = f16_to_f32(row, 0);
+    const qs = row[2..66];
+    const ss = row[66..98];
+    var y: usize = 0;
+    var acc: f32 = 0;
+    for (0..8) |ib32| {
+        const aux32: u32 = @bitCast([4]u8{ ss[4 * ib32], ss[4 * ib32 + 1], ss[4 * ib32 + 2], ss[4 * ib32 + 3] });
+        const db: f32 = d * (0.5 + @as(f32, @floatFromInt(aux32 >> 28))) * 0.5;
+        for (0..4) |l| {
+            const sidx: u8 = @intCast((aux32 >> @as(u5, @intCast(7 * l))) & 127);
+            const signs: u8 = ggml_tables.ksigns_iq2xs[sidx];
+            const g1 = ggml_tables.iq3xxs_grid[qs[8 * ib32 + 2 * l]];
+            const g2 = ggml_tables.iq3xxs_grid[qs[8 * ib32 + 2 * l + 1]];
+            const gb1: [4]u8 = @bitCast(g1);
+            const gb2: [4]u8 = @bitCast(g2);
+            for (0..4) |j| {
+                acc += db * @as(f32, @floatFromInt(gb1[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + j];
+                acc += db * @as(f32, @floatFromInt(gb2[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[4 + j] != 0) -1.0 else 1.0) * x[y + 4 + j];
+            }
+            y += 8;
+        }
+    }
+    return acc;
+}
+
 const DequantFn = *const fn (row: []const u8, out: []f32) void;
+const RowDotFn = *const fn (row: []const u8, x: []const f32) f32;
 
 const TESTDATA = "/mnt/llm-dev/qwen35/testdata/udtest/";
 
@@ -374,6 +668,53 @@ fn checkType(alloc: std.mem.Allocator, io: std.Io, name: []const u8, rowbytes: u
     return max_err;
 }
 
+test "quant_dequant: rowDot kernels match dot(dequant(row)) (8 types x 96 rows)" {
+    const alloc = std.testing.allocator;
+    const io = std.testing.io;
+    const axb = try readFile(alloc, io, TESTDATA ++ "A_x.f32");
+    defer alloc.free(axb);
+    const ax = asF32(axb);
+
+    var worst: f32 = 0;
+    var worst_name: []const u8 = "";
+    const Case = struct { name: []const u8, rb: usize, dot: RowDotFn, deq: DequantFn };
+    const cases: []const Case = &.{
+        .{ .name = "Q4_K", .rb = 144, .dot = rowDotQ4K, .deq = dequantQ4K },
+        .{ .name = "Q5_K", .rb = 176, .dot = rowDotQ5K, .deq = dequantQ5K },
+        .{ .name = "Q6_K", .rb = 210, .dot = rowDotQ6K, .deq = dequantQ6K },
+        .{ .name = "Q3_K", .rb = 110, .dot = rowDotQ3K, .deq = dequantQ3K },
+        .{ .name = "IQ4_XS", .rb = 136, .dot = rowDotIQ4XS, .deq = dequantIQ4XS },
+        .{ .name = "IQ4_NL", .rb = 144, .dot = rowDotIQ4NL, .deq = dequantIQ4NL },
+        .{ .name = "IQ3_S", .rb = 110, .dot = rowDotIQ3S, .deq = dequantIQ3S },
+        .{ .name = "IQ3_XXS", .rb = 98, .dot = rowDotIQ3XXS, .deq = dequantIQ3XXS },
+    };
+    for (cases) |c| {
+        const pbin = joinPath(alloc, c.name, ".bin");
+        defer alloc.free(pbin);
+        const bin = try readFile(alloc, io, pbin);
+        defer alloc.free(bin);
+        const nrows: usize = bin.len / c.rb;
+        var tmp: [256]f32 = undefined;
+        var max_err: f32 = 0;
+        for (0..nrows) |r| {
+            const row = bin[r * c.rb .. (r + 1) * c.rb];
+            const direct = c.dot(row, ax);
+            c.deq(row, tmp[0..]);
+            var ref: f32 = 0;
+            for (0..256) |i| ref += tmp[i] * ax[i];
+            const e = @abs(direct - ref) / @max(@abs(ref), 1);
+            if (e > max_err) max_err = e;
+        }
+        std.debug.print("  rowDot {s}: max rel err = {}\n", .{ c.name, max_err });
+        if (max_err > worst) {
+            worst = max_err;
+            worst_name = c.name;
+        }
+    }
+    std.debug.print("  rowDot worst overall = {} ({s})\n", .{ worst, worst_name });
+    try std.testing.expect(worst < 1e-3);
+}
+
 test "quant_dequant: all match C ground-truth (96 rows x 256)" {
     const alloc = std.testing.allocator;
     const io = std.testing.io;
@@ -393,6 +734,8 @@ test "quant_dequant: all match C ground-truth (96 rows x 256)" {
     e = try checkType(alloc, io, "IQ4_XS", 136, ax, dequantIQ4XS);
     if (e > worst) worst = e;
     e = try checkType(alloc, io, "IQ4_NL", 144, ax, dequantIQ4NL);
+    if (e > worst) worst = e;
+    e = try checkType(alloc, io, "IQ3_S", 110, ax, dequantIQ3S);
     if (e > worst) worst = e;
     e = try checkType(alloc, io, "IQ3_XXS", 98, ax, dequantIQ3XXS);
     if (e > worst) worst = e;
