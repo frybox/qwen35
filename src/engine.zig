@@ -136,6 +136,42 @@ fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8) void {
 pub const q8_0_block_elems = 32;
 pub const q8_0_block_bytes = 34;
 
+/// Bytes `q8_scratch` must hold to quantize a matvec INPUT of `cols` elements
+/// (ceil(cols/32) blocks of 34 bytes).  Every Q8_0 matvec writes its quantized
+/// input into this scratch, so the scratch is sized by the widest INPUT, never
+/// by an output row.
+pub fn q8ScratchBytes(cols: usize) usize {
+    return (cols + q8_0_block_elems - 1) / q8_0_block_elems * q8_0_block_bytes;
+}
+
+/// The widest Q8_0 matvec INPUT in a model of this shape, derived from the
+/// config.  Each Q8_0 matvec quantizes its input activation into q8_scratch,
+/// so the scratch must cover the widest input:
+///   ffn_down        <- n_ff        (mlp_h)
+///   attn_output     <- q_dim       (gout, full-attention layers)
+///   ssm_out         <- value_dim    (gout, GDN layers)
+///   token_embd / lm_head / in_proj / ffn_gate / ffn_up <- hidden
+/// Sizing to conv_dim / 2*q_dim (the OUTPUT widths of attn_qkv / attn_q) is
+/// the classic miss: n_ff is the widest input in every Qwen3.5 config
+/// (27B: n_ff=17408 > conv_dim=10240 > q_dim=6144 > hidden=5120), so ffn_down
+/// writes past the arena end -- assert in Debug, silent heap corruption in
+/// ReleaseFast.  Same root cause as the CUDA-side 2B/4B fix (main_cuda.zig:
+/// max(hidden, value_dim, q_dim, n_ff)).
+pub fn maxQ8Cols(c: Config) usize {
+    const n_ff: usize = c.n_ff;
+    const hidden: usize = c.hidden;
+    const value_dim: usize = @as(usize, c.gdn_n_heads) * c.gdn_head_dim;
+    const q_dim: usize = @as(usize, c.n_heads) * c.head_dim;
+    return @max(@max(n_ff, hidden), @max(value_dim, q_dim));
+}
+
+/// Anti-regression guard: every Q8_0 matvec's input length must fit in
+/// q8_scratch.  Returns the widest input seen, so a miss is reported at load
+/// time instead of as an out-of-bounds write inside the first matvec.
+pub fn checkQ8Scratch(scratch: []const u8, cols: usize) !void {
+    if (scratch.len < q8ScratchBytes(cols)) return error.Q8ScratchTooSmall;
+}
+
 /// Dequantize Q8_0 into f32 (used for small tensors / tests).
 pub fn dequantizeQ8_0(data: []const u8, out: []f32) !void {
     if (out.len % q8_0_block_elems != 0) return error.NotMultipleOfBlock;
@@ -529,6 +565,17 @@ pub const Engine = struct {
         }
     }
 
+    /// Input width (`cols`) of a linear weight when its output has `out_len`
+    /// elements.  Q8_0 / K-IQ store cols explicitly; the f32 copy is flat
+    /// [rows, cols] so cols = len / rows.
+    fn matvecCols(w: LinearW, out_len: usize) usize {
+        return switch (w) {
+            .q8 => |row| row.row_blocks * q8_0_block_elems,
+            .quant => |q| q.blocks_per_row * 256,
+            .f32 => |m| m.len / out_len,
+        };
+    }
+
     fn q8RowOf(g: *gguf.File, t: *const gguf.Tensor) !Q8Row {
         // GGUF dims are innermost-first: dims[0] = contiguous cols, dims[1] = rows
         std.debug.assert(t.dims.len == 2);
@@ -798,7 +845,8 @@ pub const Engine = struct {
         // q8_scratch holds the Q8_0-quantized INPUT x of each Q8_0 matvec, so
         // its size is driven by the widest matvec INPUT (cols), not by any
         // output row: ffn_down's input is n_ff, attn_output's is q_dim,
-        // ssm_out's is gdn_value_dim, token_embd / lm_head's is hidden.
+        // ssm_out's is gdn_value_dim, token_embd / lm_head / in_proj /
+        // ffn_gate / ffn_up's is hidden.
         // Sizing to conv_dim / 2*q_dim (the OUTPUT widths of attn_qkv / attn_q)
         // under-allocates ffn_down's scratch, because n_ff is the widest input
         // in every Qwen3.5 config (27B: n_ff=17408 vs conv_dim=10240,
@@ -806,14 +854,44 @@ pub const Engine = struct {
         // the arena, so the assert fires in Debug and it silently corrupts the
         // heap in ReleaseFast.  Same root cause as the CUDA-side 2B/4B fix
         // (see main_cuda.zig: max(hidden, value_dim, q_dim, n_ff)).
-        const max_q8_cols = @max(
-            @max(@as(usize, cfg.n_ff), @as(usize, cfg.hidden)),
-            @max(gdn_value_dim, @as(usize, cfg.n_heads) * @as(usize, cfg.head_dim)),
-        );
-        const max_q8_row_bytes =
-            (max_q8_cols + q8_0_block_elems - 1) / q8_0_block_elems * q8_0_block_bytes;
+        //
+        // Size from the config, then MEASURE the widest input over the weights
+        // that were actually loaded and assert the scratch covers it.  A
+        // sizing miss (n_ff left out of the max, a new layer shape, a config
+        // key read wrong) then fails here at load time with a named error,
+        // instead of as an out-of-bounds write inside the first matvec.
+        const max_q8_cols = maxQ8Cols(cfg);
+        e.q8_scratch = try alloc.alloc(u8, q8ScratchBytes(max_q8_cols));
+
+        // measured widest input, straight from the loaded tensors
+        var measured: usize = 0;
+        measured = @max(measured, matvecCols(e.token_embd, cfg.vocab));
+        if (e.output_weight) |ow| measured = @max(measured, matvecCols(ow, cfg.vocab));
+        for (0..n_layers) |li| {
+            const lw = &e.layers[li];
+            if (cfg.isFullAttention(@intCast(li))) {
+                const q_dim: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
+                const o_kv_dim: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
+                measured = @max(measured, matvecCols(lw.attn_q.?, q_dim));
+                measured = @max(measured, matvecCols(lw.attn_k.?, o_kv_dim));
+                measured = @max(measured, matvecCols(lw.attn_v.?, o_kv_dim));
+                measured = @max(measured, matvecCols(lw.attn_output.?, cfg.hidden));
+            } else {
+                const conv_dim: usize = 2 * @as(usize, cfg.gdn_num_k_heads) * cfg.gdn_head_dim + gdn_value_dim;
+                measured = @max(measured, matvecCols(lw.attn_qkv.?, conv_dim));
+                measured = @max(measured, matvecCols(lw.attn_gate.?, gdn_value_dim));
+                measured = @max(measured, matvecCols(lw.ssm_alpha.?, gdn_nv));
+                measured = @max(measured, matvecCols(lw.ssm_beta.?, gdn_nv));
+                measured = @max(measured, matvecCols(lw.ssm_out.?, gdn_value_dim));
+            }
+            measured = @max(measured, matvecCols(lw.ffn_gate, cfg.n_ff));
+            measured = @max(measured, matvecCols(lw.ffn_up, cfg.n_ff));
+            measured = @max(measured, matvecCols(lw.ffn_down, cfg.hidden));
+        }
+        try checkQ8Scratch(e.q8_scratch, measured);
+        std.debug.assert(measured == max_q8_cols);
+
         e.qkv = try alloc.alloc(f32, @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * cfg.head_dim));
-        e.q8_scratch = try alloc.alloc(u8, max_q8_row_bytes);
         e.z = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
         e.ab = try alloc.alloc(f32, 2 * gdn_nv);
         e.gdn_out = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
@@ -1574,4 +1652,70 @@ test "gdn delta rule one step, hand computed" {
     }
     try std.testing.expectEqual(@as(f32, 1.5), o[0]);
     try std.testing.expectEqual(@as(f32, 2), o[1]);
+}
+
+test "q8ScratchBytes: ceil(cols/32) blocks of 34 bytes" {
+    try std.testing.expectEqual(@as(usize, 34), q8ScratchBytes(32));
+    try std.testing.expectEqual(@as(usize, 34), q8ScratchBytes(1));
+    try std.testing.expectEqual(@as(usize, 68), q8ScratchBytes(33));
+    try std.testing.expectEqual(@as(usize, 68), q8ScratchBytes(64));
+    // 27B ffn_down input: n_ff = 17408 = 544 blocks
+    try std.testing.expectEqual(@as(usize, 544 * 34), q8ScratchBytes(17408));
+}
+
+test "maxQ8Cols: widest matvec INPUT is n_ff, not conv_dim / 2*q_dim" {
+    // 27B (read from the GGUF metadata): n_ff=17408 > conv_dim=10240 >
+    // q_dim=value_dim=6144 > hidden=5120
+    const c27 = Config{
+        .hidden = 5120,
+        .n_heads = 24,
+        .head_dim = 256,
+        .n_ff = 17408,
+        .gdn_n_heads = 48,   // ssm.inner_size 6144 / state_size 128
+        .gdn_head_dim = 128,
+        .gdn_num_k_heads = 16, // ssm.group_count
+    };
+    // the old (buggy) sizing: conv_dim = 2*16*128 + 48*128 = 10240
+    const conv_dim27 = 2 * @as(usize, c27.gdn_num_k_heads) * c27.gdn_head_dim +
+        @as(usize, c27.gdn_n_heads) * c27.gdn_head_dim;
+    try std.testing.expectEqual(@as(usize, 10240), conv_dim27);
+    try std.testing.expect(maxQ8Cols(c27) > conv_dim27); // guard: n_ff must win
+    try std.testing.expectEqual(@as(usize, 17408), maxQ8Cols(c27));
+
+    // 0.8B defaults: n_ff=3584 is the widest INPUT (conv_dim=6144 is an
+    // OUTPUT width of attn_qkv, whose input is hidden=1024 -- sizing the
+    // scratch to conv_dim over-allocates here and under-allocates on 27B).
+    const c08 = Config{};
+    try std.testing.expectEqual(@as(usize, 3584), maxQ8Cols(c08));
+    const conv_dim08 = 2 * @as(usize, c08.gdn_num_k_heads) * c08.gdn_head_dim +
+        @as(usize, c08.gdn_n_heads) * c08.gdn_head_dim;
+    try std.testing.expectEqual(@as(usize, 6144), conv_dim08);
+    try std.testing.expect(conv_dim08 > maxQ8Cols(c08)); // old sizing: too big
+}
+
+test "checkQ8Scratch: rejects a scratch too small for the widest input" {
+    const alloc = std.testing.allocator;
+    const need = q8ScratchBytes(17408);
+    const good = try alloc.alloc(u8, need);
+    defer alloc.free(good);
+    try checkQ8Scratch(good, 17408);
+    // the old conv_dim-based sizing (10240 cols) is 2448 bytes short
+    const bad = try alloc.alloc(u8, q8ScratchBytes(10240));
+    defer alloc.free(bad);
+    try std.testing.expectError(error.Q8ScratchTooSmall, checkQ8Scratch(bad, 17408));
+    // exact fit is accepted, one byte short is not
+    try std.testing.expectError(error.Q8ScratchTooSmall, checkQ8Scratch(good[0 .. need - 1], 17408));
+}
+
+test "matvecCols: reads input width from Q8_0 / K-IQ / f32 weights" {
+    // Q8_0: row_blocks * 32
+    const q8 = Engine.LinearW{ .q8 = .{ .data = &.{}, .row_blocks = 544 } };
+    try std.testing.expectEqual(@as(usize, 17408), Engine.matvecCols(q8, 5120));
+    // K/IQ: blocks_per_row * 256
+    const q = Engine.LinearW{ .quant = .{ .data = &.{}, .ttype = .q4_k, .rows = 5120, .blocks_per_row = 68 } };
+    try std.testing.expectEqual(@as(usize, 17408), Engine.matvecCols(q, 5120));
+    // f32: flat [rows, cols] -> len / rows (small shape, 4 rows x 256 cols)
+    var f32buf: [4 * 256]f32 = undefined;
+    const f = Engine.LinearW{ .f32 = &f32buf };
+    try std.testing.expectEqual(@as(usize, 256), Engine.matvecCols(f, 4));
 }
