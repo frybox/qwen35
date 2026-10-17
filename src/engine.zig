@@ -268,6 +268,10 @@ const dequantRowFn = *const fn ([]const u8, []f32) void;
 
 fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const u8, out: []f32) !void {
     const row_bytes: usize = switch (ttype) {
+        // 32-elem-block types stored as 8 sub-blocks per 256-elem row:
+        // Q4_0 = 8*18 = 144, Q4_1 = 8*20 = 160 bytes/row.
+        .q4_0 => 144,
+        .q4_1 => 160,
         .q4_k => 144,
         .q5_k => 176,
         .q6_k => 210,
@@ -276,6 +280,12 @@ fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const
         .iq4_nl => 144,
         .iq3_s => 110,
         .iq3_xxs => 98,
+        .iq2_s => 82,
+        .iq2_xxs => 66,
+        .iq2_xs => 74,
+        .iq1_s => 50,
+        .iq1_m => 56,
+        .q2_k => 84,
         else => return error.UnsupportedTensorType,
     };
     const row_elems = 256; // every K-quant type packs 256 elems per row
@@ -286,6 +296,8 @@ fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const
     if (data.len < expected_bytes) return error.SizeMismatch;
 
     const deq: dequantRowFn = switch (ttype) {
+        .q4_0 => &quant.dequantQ4_0,
+        .q4_1 => &quant.dequantQ4_1,
         .q4_k => &quant.dequantQ4K,
         .q5_k => &quant.dequantQ5K,
         .q6_k => &quant.dequantQ6K,
@@ -294,6 +306,12 @@ fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const
         .iq4_nl => &quant.dequantIQ4NL,
         .iq3_s => &quant.dequantIQ3S,
         .iq3_xxs => &quant.dequantIQ3XXS,
+        .iq2_s => &quant.dequantIQ2S,
+        .iq2_xxs => &quant.dequantIQ2XXS,
+        .iq2_xs => &quant.dequantIQ2XS,
+        .iq1_s => &quant.dequantIQ1S,
+        .iq1_m => &quant.dequantIQ1M,
+        .q2_k => &quant.dequantQ2K,
         else => return error.UnsupportedTensorType,
     };
 
@@ -320,7 +338,7 @@ fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8
             for (0..n) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
         },
         .q8_0 => try dequantizeQ8_0(data, out),
-        .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s => try dequantToRows(alloc, t.ttype, data, out),
+        .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s => try dequantToRows(alloc, t.ttype, data, out),
         else => return error.UnsupportedTensorType,
     }
     return out;
@@ -332,7 +350,7 @@ fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine
     const t = g.findTensor(name) orelse return error.MissingTensor;
     switch (t.ttype) {
         .q8_0 => return .{ .q8 = try Engine.q8RowOf(g, t) },
-        .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs => {
+        .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
             return .{ .quant = try Engine.quantRowOf(g, t) };
         },
         .f32, .f16 => return .{ .f32 = try loadTensorF32(alloc, g, name) },
@@ -443,8 +461,11 @@ pub const Engine = struct {
 
     /// Packed bytes for one 256-element K/IQ block of a type (0 = unknown).
     pub fn quantRowBytes(t: gguf.TensorType) usize {
-        // every supported K/IQ block holds 256 elements
+        // every supported type holds 256 elements per row; Q4_0 (8x18) and
+        // Q4_1 (8x20) are 32-elem-block types framed as one 256-elem row.
         return switch (t) {
+            .q4_0 => 144,
+            .q4_1 => 160,
             .q4_k => 144,
             .q5_k => 176,
             .q6_k => 210,
@@ -453,6 +474,12 @@ pub const Engine = struct {
             .iq4_nl => 144,
             .iq3_s => 110,
             .iq3_xxs => 98,
+            .iq2_s => 82,
+            .iq2_xxs => 66,
+            .q2_k => 84,
+            .iq2_xs => 74,
+            .iq1_s => 50,
+            .iq1_m => 56,
             else => 0,
         };
     }
@@ -475,6 +502,8 @@ pub const Engine = struct {
         const cols = bpr * 256;
         std.debug.assert(out.len == rows and x.len >= cols);
         const rowDot: *const fn (row: []const u8, x: []const f32) f32 = switch (w.ttype) {
+            .q4_0 => &quant.rowDotQ4_0,
+            .q4_1 => &quant.rowDotQ4_1,
             .q4_k => &quant.rowDotQ4K,
             .q5_k => &quant.rowDotQ5K,
             .q6_k => &quant.rowDotQ6K,
@@ -483,7 +512,13 @@ pub const Engine = struct {
             .iq4_nl => &quant.rowDotIQ4NL,
             .iq3_s => &quant.rowDotIQ3S,
             .iq3_xxs => &quant.rowDotIQ3XXS,
-            else => unreachable, // only the 8 supported types load as .quant
+            .iq2_s => &quant.rowDotIQ2S,
+            .iq2_xxs => &quant.rowDotIQ2XXS,
+            .q2_k => &quant.rowDotQ2K,
+            .iq2_xs => &quant.rowDotIQ2XS,
+            .iq1_s => &quant.rowDotIQ1S,
+            .iq1_m => &quant.rowDotIQ1M,
+            else => unreachable, // only supported types load as .quant
         };
         for (0..rows) |r| {
             var acc: f32 = 0;
