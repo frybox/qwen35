@@ -795,14 +795,23 @@ pub const Engine = struct {
         const gdn_nv: usize = @as(usize, cfg.gdn_n_heads);
         const gdn_kd: usize = @as(usize, cfg.gdn_head_dim);
         const gdn_value_dim: usize = gdn_nv * gdn_kd;
-        // Largest Q8_0 activation row: attn_qkv cols on a GDN layer; on full
-        // attention layers attn_q (2*q_dim) is smaller for every known config.
-        // The final untied lm_head matvec uses `hidden` cols, so take the
-        // max over that too (covers any config where hidden is the widest).
-        const max_q8_row_bytes = @max(
-            @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * @as(usize, cfg.head_dim)),
-            @as(usize, cfg.hidden),
-        ) / q8_0_block_elems * q8_0_block_bytes;
+        // q8_scratch holds the Q8_0-quantized INPUT x of each Q8_0 matvec, so
+        // its size is driven by the widest matvec INPUT (cols), not by any
+        // output row: ffn_down's input is n_ff, attn_output's is q_dim,
+        // ssm_out's is gdn_value_dim, token_embd / lm_head's is hidden.
+        // Sizing to conv_dim / 2*q_dim (the OUTPUT widths of attn_qkv / attn_q)
+        // under-allocates ffn_down's scratch, because n_ff is the widest input
+        // in every Qwen3.5 config (27B: n_ff=17408 vs conv_dim=10240,
+        // q_dim=6144, hidden=5120): the quantize loop writes past the end of
+        // the arena, so the assert fires in Debug and it silently corrupts the
+        // heap in ReleaseFast.  Same root cause as the CUDA-side 2B/4B fix
+        // (see main_cuda.zig: max(hidden, value_dim, q_dim, n_ff)).
+        const max_q8_cols = @max(
+            @max(@as(usize, cfg.n_ff), @as(usize, cfg.hidden)),
+            @max(gdn_value_dim, @as(usize, cfg.n_heads) * @as(usize, cfg.head_dim)),
+        );
+        const max_q8_row_bytes =
+            (max_q8_cols + q8_0_block_elems - 1) / q8_0_block_elems * q8_0_block_bytes;
         e.qkv = try alloc.alloc(f32, @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * cfg.head_dim));
         e.q8_scratch = try alloc.alloc(u8, max_q8_row_bytes);
         e.z = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
