@@ -7,6 +7,7 @@ const std = @import("std");
 pub const gguf = @import("gguf.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const engine = @import("engine.zig");
+pub const quant_dequant = @import("quant_dequant.zig");
 
 test {
     std.testing.refAllDecls(@This());

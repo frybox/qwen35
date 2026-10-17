@@ -96,9 +96,60 @@ pub fn dequantQ4_1(row: []const u8, out: []f32) void {
     }
 }
 
+// SIMD helpers: 16 u8 nibbles -> two @Vector(16) f32 lanes (low nibble, high
+// nibble), multiplied against x in two f32 lane-accumulators; single @reduce at
+// the end.  Sub-block order and low-then-high order match the scalar loop, so
+// only the final tree-reduce reorders the summation (rel err ~2e-6).
+const V16u8 = @Vector(16, u8);
+const V16f32 = @Vector(16, f32);
+
+inline fn niblo(q: V16u8) V16f32 {
+    return @as(V16f32, @floatFromInt(q & @as(V16u8, @splat(0x0F))));
+}
+inline fn nibhi(q: V16u8) V16f32 {
+    return @as(V16f32, @floatFromInt(q >> @as(V16u8, @splat(4))));
+}
+
 // rowDot over one 256-elem Q4_0 row (144 bytes): sum over sub-blocks of
-// ((qs&0xF)-8)*d * x and ((qs>>4)-8)*d * x.
+// ((qs&0xF)-8)*d * x and ((qs>>4)-8)*d * x.  Vectorized.
 pub fn rowDotQ4_0(row: []const u8, x: []const f32) f32 {
+    var a16: V16f32 = @splat(0);
+    var a16b: V16f32 = @splat(0);
+    for (0..8) |ib| {
+        const b = ib * 18;
+        const d = f16_to_f32(row, b);
+        const q: V16u8 = @as(*const [16]u8, @ptrCast(row[b + 2 .. b + 18])).*;
+        const ylo = (niblo(q) - @as(V16f32, @splat(8))) * @as(V16f32, @splat(d));
+        const yhi = (nibhi(q) - @as(V16f32, @splat(8))) * @as(V16f32, @splat(d));
+        const xp: [*]const f32 = @ptrCast(x[ib * 32 ..]);
+        a16 += ylo * @as(*const [16]f32, @ptrCast(xp)).*;
+        a16b += yhi * @as(*const [16]f32, @ptrCast(xp + 16)).*;
+    }
+    return @reduce(.Add, a16) + @reduce(.Add, a16b);
+}
+
+// rowDot over one 256-elem Q4_1 row (160 bytes): sum of ((qs&0xF)*d+m)*x and
+// ((qs>>4)*d+m)*x per sub-block.  Vectorized.
+pub fn rowDotQ4_1(row: []const u8, x: []const f32) f32 {
+    var a16: V16f32 = @splat(0);
+    var a16b: V16f32 = @splat(0);
+    for (0..8) |ib| {
+        const b = ib * 20;
+        const d = f16_to_f32(row, b);
+        const m = f16_to_f32(row, b + 2);
+        const q: V16u8 = @as(*const [16]u8, @ptrCast(row[b + 4 .. b + 20])).*;
+        const ylo = niblo(q) * @as(V16f32, @splat(d)) + @as(V16f32, @splat(m));
+        const yhi = nibhi(q) * @as(V16f32, @splat(d)) + @as(V16f32, @splat(m));
+        const xp: [*]const f32 = @ptrCast(x[ib * 32 ..]);
+        a16 += ylo * @as(*const [16]f32, @ptrCast(xp)).*;
+        a16b += yhi * @as(*const [16]f32, @ptrCast(xp + 16)).*;
+    }
+    return @reduce(.Add, a16) + @reduce(.Add, a16b);
+}
+
+// Scalar reference (ground truth for the vectorized kernels above; used by the
+// bench test to report speedup and by the exactness test to compare row-by-row).
+pub fn rowDotQ4_0_scalar(row: []const u8, x: []const f32) f32 {
     var acc: f32 = 0;
     var y: usize = 0;
     for (0..8) |ib| {
@@ -112,9 +163,7 @@ pub fn rowDotQ4_0(row: []const u8, x: []const f32) f32 {
     return acc;
 }
 
-// rowDot over one 256-elem Q4_1 row (160 bytes): sum of ((qs&0xF)*d+m)*x and
-// ((qs>>4)*d+m)*x per sub-block.
-pub fn rowDotQ4_1(row: []const u8, x: []const f32) f32 {
+pub fn rowDotQ4_1_scalar(row: []const u8, x: []const f32) f32 {
     var acc: f32 = 0;
     var y: usize = 0;
     for (0..8) |ib| {
