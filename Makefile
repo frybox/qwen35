@@ -42,8 +42,75 @@ $(HOST_OBJ): src/main_cuda.zig src/engine.zig src/tokenizer.zig src/sampler.zig
 test:
 	$(ZIG) build test $(ZIGCACHE)
 
-run0.8b:
-	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？
+run0.8b: run0.8bq80 run0.8bbf16 run0.8biq4nl run0.8biq4xs run0.8bq3km run0.8bq3ks run0.8bq40 run0.8bq41 run0.8bq4km run0.8bq4ks run0.8bq5km run0.8bq5ks run0.8bq6k run0.8biq2m run0.8biq2xxs run0.8biq3xxs run0.8bq2kxl run0.8bq3kxl run0.8bq4kxl run0.8bq5kxl run0.8bq6kxl run0.8bq8kxl
+
+run0.8bud: run0.8biq2m run0.8biq2xxs run0.8biq3xxs run0.8bq2kxl run0.8bq3kxl run0.8bq4kxl run0.8bq5kxl run0.8bq6kxl run0.8bq8kxl
+
+run0.8bq80:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bbf16:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8biq4nl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_NL.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8biq4xs:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq3km:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq3ks:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq40:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq41:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_1.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq4km:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq4ks:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_S.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq5km:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_M.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq5ks:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_S.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq6k:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q6_K.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8biq2m:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_M.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8biq2xxs:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_XXS.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8biq3xxs:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq2kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q2_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq3kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q3_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq4kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq5kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q5_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq6kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q6_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+run0.8bq8kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q8_K_XL.gguf 天空为什么是蓝色的？ -n 48
 
 run2b:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 天空为什么是蓝色的？

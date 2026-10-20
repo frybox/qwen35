@@ -22,7 +22,7 @@
 //!   Q4_1   20 B / 32 el : d(f16) m(f16) qs[16]     v = nib * d + m
 //!   Q5_0   22 B / 32 el : d(f16) qh(u32) qs[16]    v = ((nib | bit<<4) - 16) * d
 //!   Q5_1   24 B / 32 el : d(f16) m(f16) qh(u32) qs[16]  v = (nib | bit<<4) * d + m
-//!   Q1_0   10 B / 128 el: d(f16) bits[8]           v = +-1 * d
+//!   Q1_0   18 B / 128 el: d(f16) qs[16] (1 bit each) v = +-1 * d  (ggml-common.h block_q1_0: d(2)+qs[16]=18)
 //!   Q2_0   18 B / 64 el : d(f16) qs[16]            v = (2bit - 1) * d
 //!   IQ4_NL 18 B / 32 el : d(f16) qs[16]            v = kvalues[nib] * d
 
@@ -376,7 +376,7 @@ pub fn q1_0_q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     var sumf: f32 = 0;
     var ib: usize = 0;
     while (ib < nb) : (ib += 1) {
-        const x = vx + ib * 10;
+        const x = vx + ib * 18; // block_q1_0 = d(2) + qs[16] = 18 bytes
         const d0 = util.f16At(x, 0);
         var sumi: f32 = 0;
         for (0..4) |k| {
@@ -396,7 +396,7 @@ pub fn q1_0_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f3
     var sumf: f32 = 0;
     var ib: usize = 0;
     while (ib < nb) : (ib += 1) {
-        const x = vx + ib * 10;
+        const x = vx + ib * 18; // block_q1_0 = d(2) + qs[16] = 18 bytes
         const d0 = util.f16At(x, 0);
         var sumi: f32 = 0;
         for (0..4) |k| {
@@ -797,7 +797,7 @@ pub fn mxfp4_q8_0_row_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.
 pub fn q1_0_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     var acc: V16f32 = @splat(0);
     for (0..n / 128) |ib| {
-        const x = vx + ib * 10;
+        const x = vx + ib * 18; // block_q1_0 = d(2) + qs[16] = 18 bytes
         var inner: V16f32 = @splat(0);
         for (0..4) |k| {
             const y = vy + (ib * 4 + k) * q8_bytes;

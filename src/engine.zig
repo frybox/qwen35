@@ -362,6 +362,12 @@ fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8
             const src: [*]const u16 = @ptrCast(@alignCast(data));
             for (0..n) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
         },
+        .bf16 => {
+            // BF16 is the high 16 bits of an f32: widen by shifting into the
+            // top half of the significand (exact, no rounding).
+            const src: [*]const u16 = @ptrCast(@alignCast(data));
+            for (0..n) |i| out[i] = @as(f32, @bitCast(@as(u32, @intCast(src[i])) << 16));
+        },
         .q8_0 => try dequantizeQ8_0(data, out),
         .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s => try dequantToRows(alloc, t.ttype, data, out),
         else => return error.UnsupportedTensorType,
@@ -378,7 +384,7 @@ fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine
         .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
             return .{ .quant = try Engine.quantRowOf(g, t) };
         },
-        .f32, .f16 => return .{ .f32 = try loadTensorF32(alloc, g, name) },
+        .f32, .f16, .bf16 => return .{ .f32 = try loadTensorF32(alloc, g, name) },
         else => return error.UnsupportedTensorType,
     }
 }

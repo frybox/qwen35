@@ -8,7 +8,7 @@
 //! becomes ymm code on the AVX2 tier and zmm code on the AVX-512 tier.
 //!
 //! Block layouts (ggml-common.h), all 256 elements per super-block:
-//!   Q2_K  84 B : d(f16)@0 dmin(f16)@2 scales[16]@3  qs[64]@19
+//!   Q2_K  84 B : scales[16]@0 qs[64]@16 d(f16)@80 dmin(f16)@82
 //!   Q3_K 110 B : hmask[32]@0 qs[64]@32 scales[12]@96 d(f16)@108
 //!   Q4_K 144 B : d(f16)@0 dmin(f16)@2 scales[12]@4 qs[128]@16
 //!   Q5_K 176 B : d(f16)@0 dmin(f16)@2 scales[12]@4 qh[32]@16 qs[128]@48
@@ -456,10 +456,10 @@ pub fn q2_k_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     while (i < nb) : (i += 1) {
         const x = vx + i * 84;
         const y = vy + i * q8k_bytes;
-        const sc: *const [16]u8 = @ptrCast(x + 3);
+        const sc: *const [16]u8 = @ptrCast(x + 0);
         var aux8: [256]i8 = undefined;
         for (0..2) |k| {
-            const q2: V32u8 = @as(*const [32]u8, @ptrCast(x + 19 + k * 32)).*;
+            const q2: V32u8 = @as(*const [32]u8, @ptrCast(x + 16 + k * 32)).*;
             inline for (0..4) |j| {
                 const sh: V32u5 = @splat(@as(u5, @intCast(2 * j)));
                 @memcpy(aux8[k * 128 + j * 32 ..][0..32], &arr32u8((q2 >> sh) & @as(V32u8, @splat(0x03))));
@@ -470,8 +470,8 @@ pub fn q2_k_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
         var scv: [16]i32 = undefined;
         for (0..16) |g| scv[g] = @as(i32, sc[g] & 0x0F);
         const isum = dotScaled(&aux8, q8kQs(y), &scv);
-        const dall = q8kD(y) * util.f16At(x, 0);
-        const dmin = q8kD(y) * util.f16At(x, 2);
+        const dall = q8kD(y) * util.f16At(x, 80);
+        const dmin = q8kD(y) * util.f16At(x, 82);
         sumf += dall * @as(f32, @floatFromInt(isum)) - dmin * @as(f32, @floatFromInt(summs));
     }
     return sumf;
@@ -484,9 +484,9 @@ pub fn q2_k_q8_k_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f3
     while (i < nb) : (i += 1) {
         const x = vx + i * 84;
         const y = vy + i * q8k_bytes;
-        const q2 = x + 19;
+        const q2 = x + 16;
         const q8 = q8kQs(y);
-        const sc: *const [16]u8 = @ptrCast(x + 3);
+        const sc: *const [16]u8 = @ptrCast(x + 0);
         var summs: i32 = 0;
         for (0..16) |j| summs += @as(i32, q8kBsum(y, j)) * @as(i32, sc[j] >> 4);
         var isum: i32 = 0;
@@ -504,8 +504,8 @@ pub fn q2_k_q8_k_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f3
                 is += 1;
             }
         }
-        const dall = q8kD(y) * util.f16At(x, 0);
-        const dmin = q8kD(y) * util.f16At(x, 2);
+        const dall = q8kD(y) * util.f16At(x, 80);
+        const dmin = q8kD(y) * util.f16At(x, 82);
         sumf += dall * @as(f32, @floatFromInt(isum)) - dmin * @as(f32, @floatFromInt(summs));
     }
     return sumf;

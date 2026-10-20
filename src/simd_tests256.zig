@@ -51,7 +51,7 @@ fn fillWeight(alloc: std.mem.Allocator, rb: usize, seed: u64, comptime scales: [
 }
 
 const cases = .{
-    .{ .name = "q2_k_q8_k", .rb = 84, .scales = &[_]usize{ 0, 2 } },
+    .{ .name = "q2_k_q8_k", .rb = 84, .scales = &[_]usize{ 80, 82 } },
     .{ .name = "q3_k_q8_k", .rb = 110, .scales = &[_]usize{0} },
     .{ .name = "q4_k_q8_k", .rb = 144, .scales = &[_]usize{ 0, 2 } },
     .{ .name = "q5_k_q8_k", .rb = 176, .scales = &[_]usize{ 0, 2 } },
