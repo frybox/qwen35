@@ -756,8 +756,8 @@ pub fn dequantIQ2XXS(row: []const u8, out: []f32) void {
             for (0..8) |j| {
                 out[y + j] = db * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0);
             }
+            y += 8;
         }
-        y += 32;
     }
 }
 
@@ -776,8 +776,8 @@ pub fn rowDotIQ2XXS(row: []const u8, x: []const f32) f32 {
             for (0..8) |j| {
                 acc += db * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + j];
             }
+            y += 8;
         }
-        y += 32;
     }
     return acc;
 }
@@ -801,8 +801,8 @@ pub fn dequantIQ2XS(row: []const u8, out: []f32) void {
             for (0..8) |j| {
                 out[y + j] = db * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0);
             }
+            y += 8;
         }
-        y += 32;
     }
 }
 
@@ -824,8 +824,8 @@ pub fn rowDotIQ2XS(row: []const u8, x: []const f32) f32 {
             for (0..8) |j| {
                 acc += db * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + j];
             }
+            y += 8;
         }
-        y += 32;
     }
     return acc;
 }
@@ -851,8 +851,8 @@ pub fn dequantIQ2S(row: []const u8, out: []f32) void {
             for (0..8) |j| {
                 out[y + j] = dl * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (sign_byte & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0);
             }
+            y += 8;
         }
-        y += 32;
     }
 }
 
@@ -875,8 +875,8 @@ pub fn rowDotIQ2S(row: []const u8, x: []const f32) f32 {
             for (0..8) |j| {
                 acc += dl * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (sign_byte & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + j];
             }
+            y += 8;
         }
-        y += 32;
     }
     return acc;
 }
@@ -960,8 +960,8 @@ pub fn dequantIQ1S(row: []const u8, out: []f32) void {
             for (0..8) |j| {
                 out[y + j] = dl * (@as(f32, @floatFromInt(grid[j])) + delta);
             }
+            y += 8;
         }
-        y += 32;
     }
 }
 
@@ -981,8 +981,8 @@ pub fn rowDotIQ1S(row: []const u8, x: []const f32) f32 {
             for (0..8) |j| {
                 acc += dl * (@as(f32, @floatFromInt(grid[j])) + delta) * x[y + j];
             }
+            y += 8;
         }
-        y += 32;
     }
     return acc;
 }

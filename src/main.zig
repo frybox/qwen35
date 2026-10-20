@@ -39,6 +39,7 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("Q35_DUMP_IDS")) |ids| {
         if (ids.len != 0) dbg_dump_ids = true;
     }
+    if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
 

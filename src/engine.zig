@@ -25,6 +25,8 @@ const std = @import("std");
 const gguf = @import("gguf.zig");
 const sampler = @import("sampler.zig");
 const quant = @import("quant_dequant.zig");
+const simd = @import("simd_dispatch.zig");
+const simd_api = @import("simd_api.zig");
 const Io = std.Io;
 
 /// Re-export so the CPU and CUDA hosts share one sampler implementation.
@@ -121,10 +123,10 @@ pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: u
 /// their packed format (zero-copy mmap) and are dotted in the quantized
 /// domain (no whole-row f32 materialization); f32 is the small/dequant path.
 /// `q8` is the engine's Q8 activation scratch (ceil(cols/32) blocks).
-fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8) void {
+fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8, q8k: []u8) void {
     switch (w) {
         .q8 => |row| matvecQ8_0(out, row, x, q8),
-        .quant => |qrow| Engine.matvecQuant(out, qrow, x),
+        .quant => |qrow| Engine.matvecQuant(out, qrow, x, q8k, q8),
         .f32 => |m| matvec(out, m, x, out.len, x.len),
     }
 }
@@ -142,6 +144,12 @@ pub const q8_0_block_bytes = 34;
 /// by an output row.
 pub fn q8ScratchBytes(cols: usize) usize {
     return (cols + q8_0_block_elems - 1) / q8_0_block_elems * q8_0_block_bytes;
+}
+
+/// Bytes `q8k_scratch` must hold to Q8_K-quantize a matvec INPUT of `cols`
+/// elements (292 bytes per 256 elements: f32 scale + 256 x i8 + 16 x i16 bsums).
+pub fn q8kScratchBytes(cols: usize) usize {
+    return (cols + 255) / 256 * 292;
 }
 
 /// The widest Q8_0 matvec INPUT in a model of this shape, derived from the
@@ -245,46 +253,27 @@ pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8) void {
     std.debug.assert(x.len == cols);
     std.debug.assert(q8.len >= w.row_blocks * q8_0_block_bytes);
 
-    // quantize x into scratch (same scale rule as quantizeQ8_0)
-    var qblocks: usize = 0;
-    var qi: usize = 0;
-    while (qi < x.len) : ({
-        qi += q8_0_block_elems;
-        qblocks += 1;
-    }) {
-        const xblk = x[qi..][0..q8_0_block_elems];
-        const qbase = q8[qblocks * q8_0_block_bytes ..][0..q8_0_block_bytes];
-        var max: f32 = 0;
-        for (xblk) |v| {
-            const a = @abs(v);
-            if (a > max) max = a;
-        }
-        const scale32: f32 = if (max > 0) max / 127.0 else 1.0;
-        const scale: f16 = @floatCast(scale32);
-        std.mem.writeInt(u16, qbase[0..2], @bitCast(scale), .little);
-        for (0..q8_0_block_elems) |j| {
-            const q: i32 = if (max > 0) @intFromFloat(@round(xblk[j] / scale32)) else 0;
-            qbase[2 + j] = @bitCast(@as(i8, @intCast(std.math.clamp(q, -128, 127))));
-        }
-    }
+    // Quantize the activation once (shared by all rows), then dot each row.
+    //
+    // The dot stays a scalar i32 loop HERE ON PURPOSE: measured on this box,
+    // the SIMD kern32 kernels are memory-bandwidth-bound on a 4.5 GB mmap'd
+    // weight file and AVX-512-heavy code downclocks, so the vector row kernel
+    // measured ~2x SLOWER than this loop in-engine (0.74 vs 1.51 tok/s on
+    // 4B-Q8_0), even though it wins in a cache-resident microbenchmark.
+    // The K-quant 256-block path (matvecQuant) is where SIMD pays off.
+    simd.actQ8_0(x.len, x.ptr, q8.ptr);
 
-    // dot products: per-block i32 accumulation, rescale, sum in f32
     for (out, 0..) |*o, r| {
         const wrow = w.row(r);
         var acc: f32 = 0;
-        var wb: usize = 0;
-        var xb: usize = 0;
-        while (wb < w.row_blocks) : ({
-            wb += 1;
-            xb += 1;
-        }) {
-            const wb_slice = wrow[wb * q8_0_block_bytes ..][0..q8_0_block_bytes];
+        for (0..w.row_blocks) |b| {
+            const wb_slice = wrow[b * q8_0_block_bytes ..][0..q8_0_block_bytes];
             const wscale: f16 = @bitCast(std.mem.readInt(u16, wb_slice[0..2], .little));
-            const xscale: f16 = @bitCast(std.mem.readInt(u16, q8[xb * q8_0_block_bytes ..][0..2], .little));
+            const xscale: f16 = @bitCast(std.mem.readInt(u16, q8[b * q8_0_block_bytes ..][0..2], .little));
             var dot: i32 = 0;
             inline for (0..q8_0_block_elems) |j| {
                 const wq: i8 = @bitCast(wb_slice[2 + j]);
-                const xq: i8 = @bitCast(q8[xb * q8_0_block_bytes + 2 + j]);
+                const xq: i8 = @bitCast(q8[b * q8_0_block_bytes + 2 + j]);
                 dot += @as(i32, wq) * @as(i32, xq);
             }
             acc += @as(f32, @floatCast(wscale)) * @as(f32, @floatFromInt(dot)) * @as(f32, @floatCast(xscale));
@@ -442,6 +431,9 @@ pub const Engine = struct {
     /// Q8 scratch for quantizing activations; sized for the widest matvec
     /// (GDN attn_qkv cols)
     q8_scratch: []u8,
+    /// Q8_K scratch for quantizing the input of the K-quant matvecs (one
+    /// quantization per layer, reused across all output rows).
+    q8k_scratch: []u8,
     layers: []LayerWeights,
     kv: []KvCache,
     gdn: []GdnState,
@@ -532,25 +524,85 @@ pub const Engine = struct {
     /// f32 materialization).  W is [rows, cols]; each row is `blocks_per_row`
     /// packed 256-element blocks.  Fallback for the 256-block-aligned case
     /// uses per-block `quant.rowDotXXX`; partial tail handled in f32.
-    fn matvecQuant(out: []f32, w: QuantRow, x: []const f32) void {
+    fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8) void {
         const rows = w.rows;
         const bpr = w.blocks_per_row;
         const cols = bpr * 256;
         std.debug.assert(out.len == rows and x.len >= cols);
+        std.debug.assert(q8k.len >= q8kScratchBytes(cols));
+
+        // Types with a ported SIMD kernel (src/simd/kern256.zig): quantize the
+        // activation ONCE to Q8_K and reuse it across every row.  This is the
+        // llama.cpp vec_dot path -- integer dot products instead of per-element
+        // f32 dequant.
+        const dot256: ?simd_api.Dot256 = switch (w.ttype) {
+            .q2_k => simd.d256.q2_k_q8_k,
+            .q3_k => simd.d256.q3_k_q8_k,
+            .q4_k => simd.d256.q4_k_q8_k,
+            .q5_k => simd.d256.q5_k_q8_k,
+            .q6_k => simd.d256.q6_k_q8_k,
+            // Importance-sampled types: same Q8_K activation framing, codebook
+            // gather instead of bit-unpacking (src/simd/kerniq*.zig).
+            .iq2_xxs => simd.diq.iq2_xxs_q8_k,
+            .iq2_xs => simd.diq.iq2_xs_q8_k,
+            .iq2_s => simd.diq.iq2_s_q8_k,
+            .iq3_xxs => simd.diq.iq3_xxs_q8_k,
+            .iq3_s => simd.diq.iq3_s_q8_k,
+            .iq1_s => simd.diq.iq1_s_q8_k,
+            .iq1_m => simd.diq.iq1_m_q8_k,
+            .iq4_xs => simd.diq.iq4_xs_q8_k,
+            else => null,
+        };
+        if (dot256) |dot| {
+            simd.actQ8_K(cols, x.ptr, q8k.ptr);
+            for (0..rows) |r| {
+                out[r] = dot(cols, w.data[r * bpr * quantRowBytes(w.ttype) ..].ptr, q8k.ptr);
+            }
+            return;
+        }
+
+        // 32-element-block types framed as 256-element rows (Q4_0 = 8x18,
+        // Q4_1 = 8x20, IQ4_NL = 8x18): quantize the activation to Q8_0 once and
+        // do 8 SIMD 32-block dots per row (src/simd/kern32.zig).
+        const dot32: ?simd_api.Dot32 = switch (w.ttype) {
+            .q4_0 => simd.d32.q4_0_q8_0,
+            .q4_1 => simd.d32.q4_1_q8_0,
+            .iq4_nl => simd.d32.iq4_nl_q8_0,
+            else => null,
+        };
+        if (dot32 != null) {
+            const rb32 = quantRowBytes(w.ttype) / 8; // bytes per 32-element block
+            simd.actQ8_0(cols, x.ptr, q8.ptr);
+            const dotr: simd_api.Dot32 = switch (w.ttype) {
+                .q4_0 => simd.d32row.q4_0_q8_0,
+                .q4_1 => simd.d32row.q4_1_q8_0,
+                .iq4_nl => simd.d32row.iq4_nl_q8_0,
+                else => unreachable,
+            };
+            for (0..rows) |r| {
+                const row = w.data[r * bpr * quantRowBytes(w.ttype) ..];
+                // A 256-element row is 8 blocks of 32; the row kernel wants a
+                // contiguous weight-block array, so dot per 32-element block.
+                var acc: f32 = 0;
+                for (0..8 * bpr) |k| {
+                    acc += dotr(32, row[k * rb32 ..].ptr, q8[k * 34 ..].ptr);
+                }
+                out[r] = acc;
+            }
+            return;
+        }
+
+        // Remaining types (IQ family) keep the scalar per-block rowDot until
+        // their SIMD kernels land.
         const rowDot: *const fn (row: []const u8, x: []const f32) f32 = switch (w.ttype) {
             .q4_0 => &quant.rowDotQ4_0,
             .q4_1 => &quant.rowDotQ4_1,
-            .q4_k => &quant.rowDotQ4K,
-            .q5_k => &quant.rowDotQ5K,
-            .q6_k => &quant.rowDotQ6K,
-            .q3_k => &quant.rowDotQ3K,
             .iq4_xs => &quant.rowDotIQ4XS,
             .iq4_nl => &quant.rowDotIQ4NL,
             .iq3_s => &quant.rowDotIQ3S,
             .iq3_xxs => &quant.rowDotIQ3XXS,
             .iq2_s => &quant.rowDotIQ2S,
             .iq2_xxs => &quant.rowDotIQ2XXS,
-            .q2_k => &quant.rowDotQ2K,
             .iq2_xs => &quant.rowDotIQ2XS,
             .iq1_s => &quant.rowDotIQ1S,
             .iq1_m => &quant.rowDotIQ1M,
@@ -655,7 +707,23 @@ pub const Engine = struct {
 
     pub const max_seq: u32 = 4096;
 
+    /// TEMP(debug): force a SIMD tier (baseline|avx2|avx512) before load.
+    pub fn setSimdTier(name: []const u8) void {
+        const t: simd.Tier = if (std.mem.eql(u8, name, "baseline"))
+            .baseline
+        else if (std.mem.eql(u8, name, "avx2"))
+            .avx2
+        else if (std.mem.eql(u8, name, "avx512"))
+            .avx512
+        else
+            return;
+        simd.force_tier = t;
+    }
+
     pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io) !Engine {
+        // Bind the SIMD kernels to the widest ISA tier this CPU supports
+        // (CPUID + XGETBV).  Idempotent; before this, pointers are baseline.
+        simd.init();
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.OpenFailed;
         errdefer file.close(io);
         const stat = file.stat(io) catch return error.OpenFailed;
@@ -727,6 +795,7 @@ pub const Engine = struct {
             .output_weight = null,
             .output_norm = &.{},
             .q8_scratch = &.{},
+            .q8k_scratch = &.{},
             .layers = &.{},
             .kv = &.{},
             .gdn = &.{},
@@ -862,6 +931,7 @@ pub const Engine = struct {
         // instead of as an out-of-bounds write inside the first matvec.
         const max_q8_cols = maxQ8Cols(cfg);
         e.q8_scratch = try alloc.alloc(u8, q8ScratchBytes(max_q8_cols));
+        e.q8k_scratch = try alloc.alloc(u8, q8kScratchBytes(max_q8_cols));
 
         // measured widest input, straight from the loaded tensors
         var measured: usize = 0;
@@ -966,6 +1036,7 @@ pub const Engine = struct {
         if (self.output_weight) |w| freeLinear(a, w);
         if (self.output_norm.len > 0) a.free(self.output_norm);
         if (self.q8_scratch.len > 0) a.free(self.q8_scratch);
+        if (self.q8k_scratch.len > 0) a.free(self.q8k_scratch);
         if (self.layers.len > 0) {
             for (self.layers) |lw| freeLayerWeights(a, lw);
             for (self.layers) |*lw| freeLayerTyped(a, lw);
@@ -1028,7 +1099,7 @@ pub const Engine = struct {
         if (self.output_weight) |ow| {
             switch (ow) {
                 .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
-                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -1043,7 +1114,7 @@ pub const Engine = struct {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
                 .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
-                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -1095,18 +1166,18 @@ pub const Engine = struct {
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
         const qkv = self.qkv[0..conv_dim];
-        linMatvec(qkv, lw.attn_qkv.?, self.x1, self.q8_scratch);
+        linMatvec(qkv, lw.attn_qkv.?, self.x1, self.q8_scratch, self.q8k_scratch);
 
         // z projection (attn_gate [hidden, value_dim])
         const z = self.z[0..value_dim];
-        linMatvec(z, lw.attn_gate.?, self.x1, self.q8_scratch);
+        linMatvec(z, lw.attn_gate.?, self.x1, self.q8_scratch, self.q8k_scratch);
 
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
         // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
         // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
         const ab = self.ab[0 .. 2 * nv];
-        linMatvec(ab[0..nv], lw.ssm_alpha.?, self.x1, self.q8_scratch);
-        linMatvec(ab[nv..], lw.ssm_beta.?, self.x1, self.q8_scratch);
+        linMatvec(ab[0..nv], lw.ssm_alpha.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(ab[nv..], lw.ssm_beta.?, self.x1, self.q8_scratch, self.q8k_scratch);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all channels; beta/gamma
@@ -1178,7 +1249,7 @@ pub const Engine = struct {
         }
 
         // out projection [2048 -> 1024]
-        linMatvec(self.x2[0..hidden], lw.ssm_out.?, gout, self.q8_scratch);
+        linMatvec(self.x2[0..hidden], lw.ssm_out.?, gout, self.q8_scratch, self.q8k_scratch);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1218,7 +1289,7 @@ pub const Engine = struct {
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv[0 .. 2 * q_dim];
-        linMatvec(qg, lw.attn_q.?, self.x1, self.q8_scratch);
+        linMatvec(qg, lw.attn_q.?, self.x1, self.q8_scratch, self.q8k_scratch);
         const q = self.q[0..q_dim];
         const gate = self.z[0..q_dim];
         for (0..heads) |h| {
@@ -1226,8 +1297,8 @@ pub const Engine = struct {
             @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
             @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
         }
-        linMatvec(self.k[0..kv_dim], lw.attn_k.?, self.x1, self.q8_scratch);
-        linMatvec(self.v[0..kv_dim], lw.attn_v.?, self.x1, self.q8_scratch);
+        linMatvec(self.k[0..kv_dim], lw.attn_k.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(self.v[0..kv_dim], lw.attn_v.?, self.x1, self.q8_scratch, self.q8k_scratch);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
@@ -1279,7 +1350,7 @@ pub const Engine = struct {
 
         // sigmoid gate (B14), then o_proj [2048 -> 1024]
         for (0..q_dim) |i| gout[i] *= sigmoid(gate[i]);
-        linMatvec(self.x2[0..hidden], lw.attn_output.?, gout, self.q8_scratch);
+        linMatvec(self.x2[0..hidden], lw.attn_output.?, gout, self.q8_scratch, self.q8k_scratch);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1289,10 +1360,10 @@ pub const Engine = struct {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         rmsNorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
-        linMatvec(self.mlp_h, lw.ffn_gate, self.x1, self.q8_scratch);
-        linMatvec(self.mlp_h1, lw.ffn_up, self.x1, self.q8_scratch);
+        linMatvec(self.mlp_h, lw.ffn_gate, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(self.mlp_h1, lw.ffn_up, self.x1, self.q8_scratch, self.q8k_scratch);
         for (0..c.n_ff) |i| self.mlp_h[i] = silu(self.mlp_h[i]) * self.mlp_h1[i];
-        linMatvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h, self.q8_scratch);
+        linMatvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h, self.q8_scratch, self.q8k_scratch);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1571,6 +1642,7 @@ test "convStep: causal left-pad semantics" {
         .output_weight = null,
         .output_norm = &.{},
         .q8_scratch = &.{},
+        .q8k_scratch = &.{},
         .layers = &.{},
         .kv = &.{},
         .gdn = &.{},
