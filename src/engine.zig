@@ -1189,6 +1189,8 @@ pub const Engine = struct {
             .avx512
         else if (std.mem.eql(u8, name, "avx512vnni"))
             .avx512vnni
+        else if (std.mem.eql(u8, name, "avx512vbmi"))
+            .avx512vbmi
         else
             return;
         simd.force_tier = t;

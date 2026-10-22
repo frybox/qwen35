@@ -39,6 +39,11 @@ const tiers = [_]Tier{
     // inline-asm VNNI bodies compile; simd_dispatch binds it only when the
     // CPUID bit + XCR0 check pass.
     .{ .name = "avx512vnni", .feats = &.{ .avx512f, .avx512bw, .avx512vl, .avx512dq, .avx512vnni, .fma, .f16c } },
+    // VBMI tier: VNNI set + avx512vbmi.  VBMI's cross-lane byte permutes
+    // (vpermi2b/vpermb) are what the IQ kernels need to look up the 128-entry
+    // ksigns/grid tables in-register; without them the sign lookup is a scalar
+    // table read.  Gate on the CPUID bit (leaf 7, sub 0, EBX bit 31).
+    .{ .name = "avx512vbmi", .feats = &.{ .avx512f, .avx512bw, .avx512vl, .avx512dq, .avx512vnni, .avx512vbmi, .fma, .f16c } },
 };
 
 /// Contents of the generated tier.zig for one ISA tier.
@@ -54,8 +59,9 @@ fn tierSource(comptime name: []const u8) []const u8 {
         \\";
         \\pub const isBaseline = std.mem.eql(u8, tier, "baseline");
         \\pub const isAvx2 = std.mem.eql(u8, tier, "avx2");
-        \\pub const isAvx512 = std.mem.eql(u8, tier, "avx512") or std.mem.eql(u8, tier, "avx512vnni");
-        \\pub const isAvx512Vnni = std.mem.eql(u8, tier, "avx512vnni");
+        \\pub const isAvx512 = std.mem.eql(u8, tier, "avx512") or std.mem.eql(u8, tier, "avx512vnni") or std.mem.eql(u8, tier, "avx512vbmi");
+        \\pub const isAvx512Vnni = std.mem.eql(u8, tier, "avx512vnni") or std.mem.eql(u8, tier, "avx512vbmi");
+        \\pub const isAvx512Vbmi = std.mem.eql(u8, tier, "avx512vbmi");
         \\pub const lane_bytes = if (isAvx512) 64 else if (isAvx2) 32 else 16;
         \\
     ;

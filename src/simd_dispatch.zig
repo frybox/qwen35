@@ -19,8 +19,9 @@ const simd_base = @import("simd_baseline");
 const simd_avx2 = @import("simd_avx2");
 const simd_avx512 = @import("simd_avx512");
 const simd_avx512vnni = @import("simd_avx512vnni");
+const simd_avx512vbmi = @import("simd_avx512vbmi");
 
-pub const Tier = enum { baseline, avx2, avx512, avx512vnni };
+pub const Tier = enum { baseline, avx2, avx512, avx512vnni, avx512vbmi };
 
 pub var tier: Tier = .baseline;
 
@@ -72,6 +73,7 @@ pub const Features = struct {
     avx512vl: bool = false,
     avx512dq: bool = false,
     avx512vnni: bool = false,
+    avx512vbmi: bool = false,
     f16c: bool = false,
     fma: bool = false,
     ssse3: bool = false,
@@ -92,6 +94,7 @@ pub fn detect() Features {
     f.avx512bw = c7[1] & (1 << 30) != 0;
     f.avx512vl = c7[1] & (1 << 31) != 0;
     f.avx512vnni = c7[1] & (1 << 11) != 0;
+    f.avx512vbmi = c7[1] & (1 << 31) != 0;
 
     // OS state: AVX2 needs YMM, AVX-512 needs opmask + the two ZMM halves.
     if (!(avx and f.fma and f.f16c and xcr0Ok(0x6))) {
@@ -252,6 +255,7 @@ fn bindTier(comptime t: Tier) void {
         .avx2 => simd_avx2,
         .avx512 => simd_avx512,
         .avx512vnni => simd_avx512vnni,
+        .avx512vbmi => simd_avx512vbmi,
     };
     d32 = makeDot32(m);
     d256 = makeDot256(m);
@@ -269,6 +273,7 @@ pub fn init() void {
             .avx2 => bindTier(.avx2),
             .avx512 => bindTier(.avx512),
             .avx512vnni => bindTier(.avx512vnni),
+            .avx512vbmi => bindTier(.avx512vbmi),
         }
         return;
     }
@@ -276,7 +281,7 @@ pub fn init() void {
     if (f.avx512f and f.avx512bw and f.avx512vl and f.avx512dq) {
         // module selection must be comptime-known, so bind through the
         // comptime-compliant bindTier on each runtime branch
-        if (f.avx512vnni) bindTier(.avx512vnni) else bindTier(.avx512);
+        if (f.avx512vbmi) bindTier(.avx512vbmi) else if (f.avx512vnni) bindTier(.avx512vnni) else bindTier(.avx512);
     } else if (f.avx2) {
         tier = .avx2;
         d32 = makeDot32(simd_avx2);
