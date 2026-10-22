@@ -229,9 +229,182 @@ pub fn iq3_xxs_q8_k_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c)
 /// codebook gather (`iq4xs_grid[q16&511]`) which Zig 0.17 `@Vector` cannot
 /// express portably (no gather/intrinsic index load), so the dequant stays
 /// scalar; the 256-wide dot's multiply-accumulate is the vectorized part.
+// ---------------------------------------------------------------------------
+// AVX-512 VNNI path for IQ4_XS x Q8_K (vpdpbusd int8 dot-product accumulators)
+// ---------------------------------------------------------------------------
+// Same trick as q4_k_q8_k in kern256.zig, adapted to IQ4_XS: the codebook is
+// a 16-entry LUT (`kvalues_iq4nl`), made unsigned by adding 128, replicated 4x
+// into one zmm so `vpshufb` (per-128-bit-lane) can index it.  Because the
+// weights are +128-offset, every lane's contribution carries 128*(sum of that
+// lane's 4 activation bytes), which is subtracted with a second vpdpbusd using
+// an all-ones multiplier (llama.cpp's standard compensation).
+//
+// The asm helpers are private to this file and are only *analyzed* when
+// reached, i.e. from the `comptime tier.isAvx512Vnni and mode != .debug`
+// branch below.  In the baseline/avx2/avx512 tiers and in Debug builds the
+// bodies are never semanalyzed, which is what keeps the zmm-only
+// "=v"/"+v" register constraints legal (see src/simd/kern256.zig:158-166).
+//
+// Lane layout derived from the IQ4_XS block layout (qs byte p -> lo nibble is
+// element (p/16)*32 + p%16, hi nibble is element (p/16)*32 + 16 + p%16):
+//   E0 = elements   0..63  -> lanes 0..7 = ib0, lanes 8..15 = ib1
+//   E1 = elements  64..127 -> lanes 0..7 = ib2, lanes 8..15 = ib3
+//   E2 = elements 128..191 -> lanes 0..7 = ib4, lanes 8..15 = ib5
+//   E3 = elements 192..255 -> lanes 0..7 = ib6, lanes 8..15 = ib7
+// q8 loads q0..q3 are the activation qs[256] in element order, so they align
+// 1:1 with E0..E3; sc0..sc3 broadcast the two per-vector sub-block scales.
+
+const Z = @Vector(64, i8);
+const U = @Vector(64, u8);
+const I32 = @Vector(16, i32);
+const F32 = @Vector(16, f32);
+
+inline fn vload64(p: [*]const u8) Z {
+    return asm ("vmovdqu8 (%[src]), %[dst]" : [dst] "=v" (-> Z) : [src] "r" (p));
+}
+inline fn vandd(a: Z, b: Z) Z {
+    return asm ("vpandd %[b], %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a), [b] "v" (b));
+}
+inline fn vsrlw4(a: Z) Z { // 16-bit lanes >> 4
+    return asm ("vpsrlw $4, %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a));
+}
+inline fn vsrlw12(a: Z) Z { // 16-bit lanes >> 12
+    return asm ("vpsrlw $12, %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a));
+}
+inline fn vsllw8(a: Z) Z { // 16-bit lanes << 8
+    return asm ("vpsllw $8, %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a));
+}
+/// byte-granular high nibbles.  `vpsrlw $4` + `&0x0f` puts hi(b_even) into the
+/// even byte of each 16-bit pair and ZERO into the odd byte; the odd-byte hi
+/// nibbles are recovered with `vpsrlw $12` << 8.  (A plain i8-lane `A >> 4` is
+/// an arithmetic shift, so the word-lane pair is the cheap way out.)
+inline fn hiNibble(a: Z) Z {
+    return (vsrlw4(a) & v_m4) | vsllw8(vsrlw12(a));
+}
+inline fn vshufb(idx: Z, tab: Z) Z { // dst[i] = tab[idx[i]] per 128-bit lane
+    return asm ("vpshufb %[idx], %[tab], %[dst]" : [dst] "=v" (-> Z) : [idx] "v" (idx), [tab] "v" (tab));
+}
+/// qword-granularity 2-source permute, VERIFIED AT&T form (see /tmp/ZIGFACTS.md):
+/// Intel `VPERMT2Q zmm1, zmm2, zmm3` prints AT&T as `vpermt2q %zmm3, %zmm2, %zmm1`
+/// and zmm1 (= dst) *is* the index vector, zmm2/3 the two sources.  So
+/// `out qword j = (idx[j] < 8) ? a[idx[j]] : b[idx[j] & 7]`, with `out` seeded
+/// from `idx`.
+inline fn vpermt2q(idx: Z, a: Z, b: Z) Z {
+    var out: Z = idx;
+    asm ("vpermt2q %[b], %[a], %[out]" : [out] "+v" (out) : [a] "v" (a), [b] "v" (b));
+    return out;
+}
+/// dword-granularity permute: dst[i] = src[idx[i]]
+inline fn vpermd(src: Z, idx: Z) Z {
+    return asm ("vpermd %[src], %[idx], %[dst]" : [dst] "=v" (-> Z) : [src] "v" (src), [idx] "v" (idx));
+}
+inline fn vdpbusd(acc: Z, a: Z, b: Z) Z { // acc += (unsigned a) * (signed b)
+    var out: Z = acc;
+    asm ("vpdpbusd %[b], %[a], %[out]" : [out] "+v" (out) : [a] "v" (a), [b] "v" (b));
+    return out;
+}
+inline fn vpaddd(a: Z, b: Z) Z {
+    return asm ("vpaddd %[b], %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a), [b] "v" (b));
+}
+inline fn vpsubd(a: Z, b: Z) Z {
+    return asm ("vpsubd %[b], %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a), [b] "v" (b));
+}
+inline fn vmulld(a: Z, b: Z) Z {
+    return asm ("vpmulld %[b], %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a), [b] "v" (b));
+}
+inline fn vpslld7(a: Z) Z { // i32 lanes << 7 == *128
+    return asm ("vpslld $7, %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a));
+}
+
+// nibble mask / all-ones multiplier / zero accumulator seed
+const v_m4: Z = @bitCast(@as(U, @splat(@as(u8, 0x0f))));
+const v_ones: Z = @bitCast(@as(U, @splat(@as(u8, 1))));
+const v_zero: Z = @splat(0);
+
+// qword permute indices: E0/E2 (even) and E1/E3 (odd) -- see header comment
+const v_pA: Z = @bitCast([8]i64{ 0, 1, 8, 9, 2, 3, 10, 11 });
+const v_pB: Z = @bitCast([8]i64{ 4, 5, 12, 13, 6, 7, 14, 15 });
+const v_sc0: Z = @bitCast([16]i32{ 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1 });
+const v_sc1: Z = @bitCast([16]i32{ 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3 });
+const v_sc2: Z = @bitCast([16]i32{ 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5 });
+const v_sc3: Z = @bitCast([16]i32{ 6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7 });
+
+/// kvalues_iq4nl + 128 (unsigned), replicated 4x so every 128-bit lane of the
+/// zmm holds the full 16-entry table for vpshufb.  Built with a comptime loop
+/// (array repetition `tab16 ** 4` does not compile on Zig 0.17).
+const tab16x4: Z = blk: {
+    var a: [64]u8 = undefined;
+    for (0..4) |i| {
+        for (0..16) |j| {
+            a[i * 16 + j] = @as(u8, @intCast(@as(i32, kvalues_iq4nl[j]) + 128));
+        }
+    }
+    break :blk @bitCast(a);
+};
+
+fn iq4_xs_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / 256;
+        // Per-block f32 contributions accumulate in zmm lanes; the horizontal
+        // reduction happens ONCE after the block loop.
+        var acc_out: F32 = @splat(0);
+        for (0..nb) |b| {
+            const x = vx + b * 136;
+            const y = vy + b * 292;
+            // 128 qs bytes -> lo/hi nibbles, then qword permute into element order
+            const A0 = vload64(x + 8);
+            const A1 = vload64(x + 72);
+            const lo0 = vandd(A0, v_m4);
+            const hi0 = hiNibble(A0);
+            const lo1 = vandd(A1, v_m4);
+            const hi1 = hiNibble(A1);
+            const w0 = vshufb(vpermt2q(v_pA, lo0, hi0), tab16x4);
+            const w1 = vshufb(vpermt2q(v_pB, lo0, hi0), tab16x4);
+            const w2 = vshufb(vpermt2q(v_pA, lo1, hi1), tab16x4);
+            const w3 = vshufb(vpermt2q(v_pB, lo1, hi1), tab16x4);
+            const q0 = vload64(y + 4);
+            const q1 = vload64(y + 68);
+            const q2 = vload64(y + 132);
+            const q3 = vload64(y + 196);
+            // scales: ls[ib] - 32, ib = 0..8, in lanes 0..7 (8..15 unused)
+            var ls16: [16]i32 = @splat(0);
+            const sh: u16 = @as(u16, x[2]) | (@as(u16, x[3]) << 8);
+            for (0..8) |ib| {
+                const sl4: u16 = x[4 + ib / 2] >> @as(u3, @intCast(4 * (ib % 2)));
+                const sh4: u16 = sh >> @as(u4, @intCast(2 * ib));
+                const ls: u16 = (sl4 & 0x0F) | ((sh4 & 3) << 4);
+                ls16[ib] = @as(i32, ls) - 32;
+            }
+            const lsv: Z = @bitCast(ls16);
+            const sc0 = vpermd(lsv, v_sc0);
+            const sc1 = vpermd(lsv, v_sc1);
+            const sc2 = vpermd(lsv, v_sc2);
+            const sc3 = vpermd(lsv, v_sc3);
+            // per lane: scale * (sum(lut+128)*q8 - 128*sum(q8))
+            var acc = vpsubd(vmulld(vdpbusd(v_zero, w0, q0), sc0), vpslld7(vmulld(vdpbusd(v_zero, v_ones, q0), sc0)));
+            acc = vpaddd(acc, vpsubd(vmulld(vdpbusd(v_zero, w1, q1), sc1), vpslld7(vmulld(vdpbusd(v_zero, v_ones, q1), sc1))));
+            acc = vpaddd(acc, vpsubd(vmulld(vdpbusd(v_zero, w2, q2), sc2), vpslld7(vmulld(vdpbusd(v_zero, v_ones, q2), sc2))));
+            acc = vpaddd(acc, vpsubd(vmulld(vdpbusd(v_zero, w3, q3), sc3), vpslld7(vmulld(vdpbusd(v_zero, v_ones, q3), sc3))));
+            const dy = @as(f32, @bitCast(util.u32At(y)));
+            const dv: F32 = @splat(util.f16At(x, 0) * dy);
+            acc_out = acc_out + dv * @as(F32, @floatFromInt(@as(I32, @bitCast(acc))));
+        }
+        return @reduce(.Add, acc_out);
+    }
+    return 0;
+}
+
 /// Math is element-identical to `iq4_xs_q8_k_ref` (same dequant, only the
 /// accumulation order differs, so tests bound it to the 1e-3/5e-3 parity).
+/// The AVX-512 VNNI kernel (above) runs in the vnni tier at non-Debug
+/// optimization; every other tier/mode uses the @Vector f32 path below.
 pub fn iq4_xs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    // The VNNI kernel is only analyzed in the vnni module at non-Debug
+    // optimization; Debug builds and the other tiers fall through to the
+    // @Vector f32 path below, which is element-identical.
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return iq4_xs_q8_k_vnni_impl(n, vx, vy);
+    }
     const rb: usize = 136;
     const V8f32 = @Vector(8, f32);
     var w: [256]f32 = undefined;

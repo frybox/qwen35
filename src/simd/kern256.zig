@@ -574,7 +574,136 @@ inline fn unpackQ3KScales(scales12: *const [12]u8) [16]i8 {
     return out;
 }
 
+// AVX-512 VNNI path for Q3_K x Q8_K (vpdpbusd int8 dot-product accumulators).
+// Same gate/structure as q4_k_q8_k above: the zmm-only asm helpers below are
+// private to this file and are only semanalyzed inside the
+// `tier.isAvx512Vnni and mode != .debug` branch; Debug tests use the @Vector
+// path, which is bit-identical to q3_k_q8_k_ref.
+//
+// aux8[f] (f = h*128 + g'*32 + l') = nib - sub, nib = (qs[h*32+l'] >> 2*g') & 3,
+// sub = (hmask[l'] & (1 << (4h + g'))) != 0 ? 0 : 4.
+// Feed dpbusd the UNSIGNED value aux8 + 4 = nib + 4*bit in [0,7]; then
+//   sum_g scale'_g * sum(aux8*q8) = sum_g scale'_g * (dpbusd_g - 4 * bsums_g)
+// with scale'_g = sc[g] - 32 and bsums_g = sum q8[g*16..g*16+15] (the Q8_K
+// bsums at y+260), so the hmask "min" term comes from bsums, exactly like the
+// q4_k min term.  Byte layout: aux vector k's 16-byte chunks are groups
+//   aux0: g0,g1,g2,g3   aux1: g8,g9,g10,g11   aux2: g4..g7   aux3: g12..g15
+// (f = h*128 + g'*32 + l' maps to group h*8 + 2*g' + (l'/16)), paired with the
+// q8 loads y+4 (g0..3), y+68 (g4..7), y+132 (g8..11), y+196 (g12..15).
+inline fn vporz(a: Z, b: Z) Z {
+    return asm ("vpord %[b], %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a), [b] "v" (b));
+}
+inline fn vpsubd(a: Z, b: Z) Z {
+    return asm ("vpsubd %[b], %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a), [b] "v" (b));
+}
+inline fn vsrlw2(a: Z) Z {          // 16-bit lanes shifted right by 2
+    return asm ("vpsrlw $2, %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a));
+}
+inline fn vsrlw6(a: Z) Z {          // 16-bit lanes shifted right by 6
+    return asm ("vpsrlw $6, %[a], %[dst]" : [dst] "=v" (-> Z) : [a] "v" (a));
+}
+
+/// broadcast hmask[0..15] / hmask[16..31] over both 32-byte halves
+const v_hbcast: Z = @bitCast([16]i32{ 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 4, 5, 6, 7 });
+/// scale broadcast: each 4-lane chunk = one 16-element group
+const v_sg0: Z = @bitCast([16]i32{ 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3 });
+const v_sg1: Z = @bitCast([16]i32{ 4, 4, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6, 7, 7, 7, 7 });
+const v_sg2: Z = @bitCast([16]i32{ 8, 8, 8, 8, 9, 9, 9, 9, 10, 10, 10, 10, 11, 11, 11, 11 });
+const v_sg3: Z = @bitCast([16]i32{ 12, 12, 12, 12, 13, 13, 13, 13, 14, 14, 14, 14, 15, 15, 15, 15 });
+
+/// hmask bit masks per (g'): low 32 bytes = h = 0 (bits 0..3), high 32 bytes =
+/// h = 1 (bits 4..7); value 4*bit, OR-ed into the 0..3 nibble (no carry).
+const cmask0: Z = blk: {
+    var a: [64]u8 = undefined;
+    for (0..32) |i| {
+        a[i] = 4;
+        a[32 + i] = 16;
+    }
+    break :blk @bitCast(a);
+};
+const cmask1: Z = blk: {
+    var a: [64]u8 = undefined;
+    for (0..32) |i| {
+        a[i] = 8;
+        a[32 + i] = 32;
+    }
+    break :blk @bitCast(a);
+};
+const cmask2: Z = blk: {
+    var a: [64]u8 = undefined;
+    for (0..32) |i| {
+        a[i] = 16;
+        a[32 + i] = 64;
+    }
+    break :blk @bitCast(a);
+};
+const cmask3: Z = blk: {
+    var a: [64]u8 = undefined;
+    for (0..32) |i| {
+        a[i] = 32;
+        a[32 + i] = 128;
+    }
+    break :blk @bitCast(a);
+};
+
+fn q3_k_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / qk_k;
+        var i: usize = 0;
+        const z0: Z = @splat(0);
+        const m3: Z = @splat(3);
+        const v32z: Z = @splat(32);
+        const v4z: Z = @splat(4);
+        // per-block f32 contributions kept as 16-lane vectors; the two lane
+        // reductions happen ONCE per row, after the block loop
+        var acc_out: F32 = @splat(0);
+        var acc_min: F32 = @splat(0);
+        while (i < nb) : (i += 1) {
+            const x = vx + i * 110;
+            const y = vy + i * q8k_bytes;
+            const A = vload64(x + 32);
+            const H = vpermd(vload64(x), v_hbcast);
+            const n0 = vandd(A, m3);
+            const n1 = vandd(vsrlw2(A), m3);
+            const n2 = vandd(vsrlw4(A), m3);
+            const n3 = vandd(vsrlw6(A), m3);
+            const a0 = vporz(n0, vandd(H, cmask0));
+            const a1 = vporz(n1, vandd(H, cmask1));
+            const a2 = vporz(n2, vandd(H, cmask2));
+            const a3 = vporz(n3, vandd(H, cmask3));
+            const aux0 = vpermi2d(v_idxA, a0, a1);
+            const aux1 = vpermi2d(v_idxB, a0, a1);
+            const aux2 = vpermi2d(v_idxA, a2, a3);
+            const aux3 = vpermi2d(v_idxB, a2, a3);
+            const dp0 = vdpbusd(z0, aux0, vload64(y + 4));
+            const dp1 = vdpbusd(z0, aux1, vload64(y + 132));
+            const dp2 = vdpbusd(z0, aux2, vload64(y + 68));
+            const dp3 = vdpbusd(z0, aux3, vload64(y + 196));
+            const sc16: [16]u8 = @bitCast(unpackQ3KScales(@ptrCast(x + 96)));
+            const scv = vpsubd(vzxbd16(@as([*]const u8, @ptrCast(&sc16))), v32z);
+            const sc4 = vmulld(scv, v4z);
+            var acc = vaddd(vmulld(dp0, vpermd(scv, v_sg0)), vmulld(dp3, vpermd(scv, v_sg3)));
+            acc = vaddd(acc, vaddd(vmulld(dp2, vpermd(scv, v_sg1)), vmulld(dp1, vpermd(scv, v_sg2))));
+            const bs = vsxwd16(y + 260);
+            var mn = vaddd(vmulld(bs, vpermd(sc4, v_sg0)), vmulld(bs, vpermd(sc4, v_sg3)));
+            mn = vaddd(mn, vaddd(vmulld(bs, vpermd(sc4, v_sg1)), vmulld(bs, vpermd(sc4, v_sg2))));
+            const dy: f32 = @bitCast(util.u32At(y));
+            const dv: F32 = @splat(util.f16At(x, 108) * dy);
+            // d_b * isum_b and d_b * 4*sum_g bsums_g*scale'_g as 16-lane f32
+            // vectors: no cross-lane reduction inside the block loop, two
+            // independent accumulator chains keep ILP exposed.
+            acc_out = acc_out + dv * @as(F32, @floatFromInt(@as(I32, @bitCast(acc))));
+            acc_min = acc_min + dv * @as(F32, @floatFromInt(@as(I32, @bitCast(mn))));
+        }
+        return @reduce(.Add, acc_out) - @reduce(.Add, acc_min);
+    }
+    return 0;
+}
+
 pub fn q3_k_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return q3_k_q8_k_vnni_impl(n, vx, vy);
+    }
     const nb = n / qk_k;
     var sumf: f32 = 0;
     var i: usize = 0;
