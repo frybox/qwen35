@@ -33,6 +33,12 @@ const tiers = [_]Tier{
     // future VNNI tier on the CPUID bit; kernels must not use vdpbusd unless
     // the tier name says so.
     .{ .name = "avx512", .feats = &.{ .avx512f, .avx512bw, .avx512vl, .avx512dq, .fma, .f16c } },
+    // VNNI tier: superset of avx512 (f/bw/vl/dq) + avx512vnni.  Kernels that
+    // use vpdpbusd (the int8 dot-product accumulators) are guarded by
+    // `isAvx512Vnni` comptime gates, so this tier is the only one where the
+    // inline-asm VNNI bodies compile; simd_dispatch binds it only when the
+    // CPUID bit + XCR0 check pass.
+    .{ .name = "avx512vnni", .feats = &.{ .avx512f, .avx512bw, .avx512vl, .avx512dq, .avx512vnni, .fma, .f16c } },
 };
 
 /// Contents of the generated tier.zig for one ISA tier.
@@ -48,7 +54,8 @@ fn tierSource(comptime name: []const u8) []const u8 {
         \\";
         \\pub const isBaseline = std.mem.eql(u8, tier, "baseline");
         \\pub const isAvx2 = std.mem.eql(u8, tier, "avx2");
-        \\pub const isAvx512 = std.mem.eql(u8, tier, "avx512");
+        \\pub const isAvx512 = std.mem.eql(u8, tier, "avx512") or std.mem.eql(u8, tier, "avx512vnni");
+        \\pub const isAvx512Vnni = std.mem.eql(u8, tier, "avx512vnni");
         \\pub const lane_bytes = if (isAvx512) 64 else if (isAvx2) 32 else 16;
         \\
     ;

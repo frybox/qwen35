@@ -56,11 +56,24 @@ pub inline fn u32At(p: anytype) u32 {
 
 /// Dequantize one 256-element Q8_K activation block (d(f32)@0, qs[256] i8@4)
 /// to f32: out[i] = d * qs[i].  Matches the engine's exact f32 view.
+///
+/// Vectorized: 8 chunks of 32 i8, each sign-extended to i32 lane-by-lane
+/// (`@as`, which is the vpmovsxbd/vpmovsxwd family on AVX2/AVX-512) and
+/// multiplied by the broadcast d.  |qs| <= 127 is exactly representable in
+/// f32, and f32 multiplication is bit-commutative, so every element is
+/// bit-identical to the scalar `d * @floatFromInt(q)` form.
 pub inline fn deqQ8K(p: [*]const u8, a: *[256]f32) void {
     const d: f32 = @bitCast(u32At(p));
-    for (0..256) |i| {
-        const q: i8 = @bitCast(p[4 + i]);
-        a[i] = d * @as(f32, @floatFromInt(q));
+    const dv16: V16f32 = @splat(d);
+    const qs: [*]const u8 = p + 4;
+    inline for (0..8) |c| {
+        const q8: V32i8 = load(V32i8, qs + c * 32);
+        const q32: V32i32 = @as(V32i32, q8);
+        const arr: [32]i32 = @bitCast(q32);
+        const lo: @Vector(16, i32) = @bitCast(arr[0..16].*);
+        const hi: @Vector(16, i32) = @bitCast(arr[16..32].*);
+        storeF32(a[c * 32 ..], @as(V16f32, @floatFromInt(lo)) * dv16);
+        storeF32(a[c * 32 + 16 ..], @as(V16f32, @floatFromInt(hi)) * dv16);
     }
 }
 

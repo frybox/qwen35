@@ -13,6 +13,7 @@ const quant = @import("quant_dequant.zig");
 const simd_base = @import("simd_baseline");
 const simd_avx2 = @import("simd_avx2");
 const simd_avx512 = @import("simd_avx512");
+const simd_avx512vnni = @import("simd_avx512vnni");
 
 const TESTDATA = "/mnt/llm-dev/qwen35/testdata/udtest/";
 const q8_bytes = 34;
@@ -22,6 +23,7 @@ const tier_list = .{
     .{ .name = "baseline", .m = simd_base },
     .{ .name = "avx2", .m = simd_avx2 },
     .{ .name = "avx512", .m = simd_avx512 },
+    .{ .name = "avx512vnni", .m = simd_avx512vnni },
 };
 
 fn relErr(a: f32, b: f32) f32 {

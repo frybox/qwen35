@@ -18,8 +18,9 @@ const api = @import("simd_api.zig");
 const simd_base = @import("simd_baseline");
 const simd_avx2 = @import("simd_avx2");
 const simd_avx512 = @import("simd_avx512");
+const simd_avx512vnni = @import("simd_avx512vnni");
 
-pub const Tier = enum { baseline, avx2, avx512 };
+pub const Tier = enum { baseline, avx2, avx512, avx512vnni };
 
 pub var tier: Tier = .baseline;
 
@@ -250,6 +251,7 @@ fn bindTier(comptime t: Tier) void {
         .baseline => simd_base,
         .avx2 => simd_avx2,
         .avx512 => simd_avx512,
+        .avx512vnni => simd_avx512vnni,
     };
     d32 = makeDot32(m);
     d256 = makeDot256(m);
@@ -266,18 +268,15 @@ pub fn init() void {
             .baseline => bindTier(.baseline),
             .avx2 => bindTier(.avx2),
             .avx512 => bindTier(.avx512),
+            .avx512vnni => bindTier(.avx512vnni),
         }
         return;
     }
     const f = detect();
     if (f.avx512f and f.avx512bw and f.avx512vl and f.avx512dq) {
-        tier = .avx512;
-        d32 = makeDot32(simd_avx512);
-        d256 = makeDot256(simd_avx512);
-        d32row = makeDot32Row(simd_avx512);
-        diq = makeDotIq(simd_avx512);
-        actQ8_0 = &simd_avx512.act.quantizeQ8_0;
-        actQ8_K = &simd_avx512.act.quantizeQ8_K;
+        // module selection must be comptime-known, so bind through the
+        // comptime-compliant bindTier on each runtime branch
+        if (f.avx512vnni) bindTier(.avx512vnni) else bindTier(.avx512);
     } else if (f.avx2) {
         tier = .avx2;
         d32 = makeDot32(simd_avx2);

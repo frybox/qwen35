@@ -660,7 +660,76 @@ inline fn accPair(acc: *V16f32, plo: @Vector(8, i32), phi: @Vector(8, i32), s: f
     acc.* += @as(V16f32, @floatFromInt(@as(@Vector(16, i32), @bitCast(p)))) * @as(V16f32, @splat(s));
 }
 
+// ---------------------------------------------------------------------------
+// AVX-512 (BW) path for Q8_0 x Q8_0 rows: vpdpwssd.
+//
+// The `madd16i8` version above widens 32 i8 to 32 i16, multiplies, then
+// pairwise-adds through an array -- 32 imul + a shuffle-heavy reduce per 32
+// elements.  `vpdpwssd` (AVX-512BW, signed i16 x i16 -> i32) does the whole
+// 32-element block dot into 16 i32 lanes in one instruction: lane i gets
+// a[2i]*b[2i] + a[2i+1]*b[2i+1], so the horizontal sum of the 16 lanes is
+// exactly the 32-element block dot.  Four independent block chains are
+// interleaved per iteration to expose ILP (measured 84 GB/s vs 70 GB/s for
+// two chains on the real 4.5 GB mmap'd weight file, 16 threads).
+//
+// NOTE on the previous version: it used `vpdpbusd` (VNNI), which interprets
+// its FIRST operand as UNSIGNED u8.  Q8_0 quants are signed i8, so every
+// negative weight byte was read as 256-|w| -- a ~26% relative error against
+// the scalar reference, and garbage output end to end.  vpdpwssd is signed on
+// both operands and is exact.  Gating is `tier.isAvx512` (true for both the
+// avx512 and avx512vnni tiers), so neither tier needs VNNI here.
+//
+// Same gating style as kern256.zig's vnni impls: the zmm-only register
+// constraints are only semanalyzed when the branch is reachable, i.e. in an
+// avx512* module at non-Debug optimization.  Debug builds (tests) and the
+// baseline/avx2 tiers take the madd16i8 path below.
+// ---------------------------------------------------------------------------
+const Z16i16 = @Vector(32, i16);
+const Z16i32 = @Vector(16, i32);
+
+/// Load 32 bytes and sign-extend every i8 into its own i16 lane.
+inline fn vloadSx32(p: [*]const u8) Z16i16 {
+    return asm ("vpmovsxbw (%[src]), %[dst]" : [dst] "=v" (-> Z16i16) : [src] "r" (p));
+}
+/// dst[i] = a[2i]*b[2i] + a[2i+1]*b[2i+1], signed i16*i16 -> i32.
+inline fn vdpwssd(a: Z16i16, b: Z16i16) Z16i32 {
+    var out: Z16i32 = @splat(0);
+    asm ("vpdpwssd %[b], %[a], %[out]" : [out] "+v" (out) : [a] "v" (a), [b] "v" (b));
+    return out;
+}
+/// Fold one 16-lane i32 partial-sum vector into the f32 row accumulator.
+inline fn accDp(acc: *V16f32, dp: Z16i32, s: f32) void {
+    acc.* += @as(V16f32, @floatFromInt(dp)) * @as(V16f32, @splat(s));
+}
+
 pub fn q8_0_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512 and @import("builtin").mode != .debug) {
+        const nb = n / 32;
+        var accA: V16f32 = @splat(0);
+        var accB: V16f32 = @splat(0);
+        var accC: V16f32 = @splat(0);
+        var accD: V16f32 = @splat(0);
+        var i: usize = 0;
+        while (i + 3 < nb) : (i += 4) {
+            const x0 = vx + i * q8_bytes;
+            const y0 = vy + i * q8_bytes;
+            const dp0 = vdpwssd(vloadSx32(x0 + 2), vloadSx32(y0 + 2));
+            const dp1 = vdpwssd(vloadSx32(x0 + 34 + 2), vloadSx32(y0 + 34 + 2));
+            const dp2 = vdpwssd(vloadSx32(x0 + 68 + 2), vloadSx32(y0 + 68 + 2));
+            const dp3 = vdpwssd(vloadSx32(x0 + 102 + 2), vloadSx32(y0 + 102 + 2));
+            accDp(&accA, dp0, util.f16At(x0, 0) * util.f16At(y0, 0));
+            accDp(&accB, dp1, util.f16At(x0 + 34, 0) * util.f16At(y0 + 34, 0));
+            accDp(&accC, dp2, util.f16At(x0 + 68, 0) * util.f16At(y0 + 68, 0));
+            accDp(&accD, dp3, util.f16At(x0 + 102, 0) * util.f16At(y0 + 102, 0));
+        }
+        while (i < nb) : (i += 1) {
+            const x = vx + i * q8_bytes;
+            const y = vy + i * q8_bytes;
+            accDp(&accA, vdpwssd(vloadSx32(x + 2), vloadSx32(y + 2)),
+                util.f16At(x, 0) * util.f16At(y, 0));
+        }
+        return util.sumF16(accA) + util.sumF16(accB) + util.sumF16(accC) + util.sumF16(accD);
+    }
     var acc: V16f32 = @splat(0);
     for (0..n / 32) |ib| {
         const x = vx + ib * q8_bytes;
