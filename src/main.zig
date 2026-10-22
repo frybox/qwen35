@@ -20,6 +20,13 @@ const StreamCtx = struct {
     fn onToken(ctx: ?*anyopaque, token: u32) void {
         dbgIds(token);
         const self: *StreamCtx = @ptrCast(@alignCast(ctx orelse return));
+        if (qwen35.pool.stat_on) {
+            const s = qwen35.pool.snapshot();
+            qwen35.pool.reset();
+            std.debug.print("STATS tok={d} k256={d} k32={d} ksc={d} kq8={d} kf32={d} total={d}\n", .{
+                token, s.k256, s.k32, s.ksc, s.kq8, s.kf32, s.k256 + s.k32 + s.ksc + s.kq8 + s.kf32,
+            });
+        }
         const piece = self.tok.decode(self.arena, &.{token}) catch null;
         if (piece) |s| {
             if (s.len > 0) {
@@ -40,6 +47,10 @@ pub fn main(init: std.process.Init) !void {
         if (ids.len != 0) dbg_dump_ids = true;
     }
     if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
+    if (init.environ_map.get("QWEN35_NO_BATCH") != null) qwen35.engine.no_batch = true;
+    if (init.environ_map.get("QWEN35_PROF") != null) qwen35.engine.prof = true;
+    if (init.environ_map.get("QWEN35_PROF_POST") != null) qwen35.pool.prof_post_only = true;
+    if (init.environ_map.get("QWEN35_STAT") != null) qwen35.pool.stat_on = true;
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
 
@@ -116,9 +127,17 @@ fn runInference(
     var temp: f32 = 0;
     var top_k: usize = 0;
     var seed: u64 = 12345;
+    var n_threads: usize = 0; // 0 = default (min(16, cpus))
     var i: usize = 4;
     while (i + 1 < args.len + 1 and i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
+            n_threads = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+                try err_out.print("error: --threads expects a number, got '{s}'\n", .{args[i + 1]});
+                try err_out.flush();
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
             max_seq = std.fmt.parseInt(usize, args[i + 1], 10) catch {
                 try err_out.print("error: -n expects a number, got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
@@ -153,7 +172,7 @@ fn runInference(
         }
     }
 
-    var e = engine.Engine.load(arena, path, io) catch |e2| {
+    var e = engine.Engine.load(arena, path, io, n_threads) catch |e2| {
         try err_out.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(e2) });
         try err_out.flush();
         return e2;
@@ -185,6 +204,7 @@ fn runInference(
         if (res.decode_ms > 0) @as(f64, @floatFromInt(res.tokens.len)) / (res.decode_ms / 1000.0) else 0.0,
     });
     try out.print("{s}\n", .{if (res.hit_eos) "Stop reason: EOS" else "Stop reason: max tokens reached"});
+    if (qwen35.engine.prof) { qwen35.engine.profReport(); qwen35.engine.profReportMatvec(); }
     try out.flush();
 }
 

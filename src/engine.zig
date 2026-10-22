@@ -1,4 +1,4 @@
-//! Qwen3.5-0.8B CPU scalar inference engine (Q8_0 GGUF only).
+//! Qwen3.5 CPU scalar inference engine (Q8_0 GGUF only).
 //!
 //! Linear weights stay in their native Q8_0 blocks (zero-copy views into the
 //! mmapped GGUF); matvecs quantize the activation on the fly and accumulate
@@ -27,6 +27,7 @@ const sampler = @import("sampler.zig");
 const quant = @import("quant_dequant.zig");
 const simd = @import("simd_dispatch.zig");
 const simd_api = @import("simd_api.zig");
+const pool_mod = @import("pool.zig");
 const Io = std.Io;
 
 /// Re-export so the CPU and CUDA hosts share one sampler implementation.
@@ -68,16 +69,48 @@ pub const Config = struct {
 // ---------------------------------------------------------------------------
 
 /// RMSNorm, out = x * rsqrt(mean(x^2) + eps) * w. eps inside the sum (SPEC).
+/// The sum of squares stays scalar (exact order); the elementwise scale is
+/// vectorized.
 pub fn rmsNorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
     std.debug.assert(out.len == x.len and out.len == w.len);
     var ss: f32 = 0;
     for (x) |v| ss += v * v;
     const scale = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(x.len)) + eps);
-    for (out, x, w) |*o, v, wi| o.* = v * scale * wi;
+    const sv: @Vector(GV, f32) = @splat(scale);
+    const xp: [*]const f32 = x.ptr;
+    const wp: [*]const f32 = w.ptr;
+    const op: [*]f32 = out.ptr;
+    for (0 .. out.len / GV) |b| {
+        const o = b * GV;
+        vstoreF32(GV, op + o, vloadF32(GV, xp + o) * sv * vloadF32(GV, wp + o));
+    }
+    for (out.len - out.len % GV .. out.len) |i| out[i] = x[i] * scale * w[i];
 }
 
 pub fn sigmoid(x: f32) f32 {
     return 1.0 / (1.0 + @exp(-x));
+}
+
+/// Elementwise sigmoid over a whole slice (bit-identical to the scalar form).
+fn sigmoidVec(x: []f32) void {
+    const one: @Vector(GV, f32) = @splat(1.0);
+    const p: [*]f32 = x.ptr;
+    for (0 .. x.len / GV) |b| {
+        const o = b * GV;
+        vstoreF32(GV, p + o, one / (one + @exp(-vloadF32(GV, p + o))));
+    }
+}
+
+/// out[i] *= silu(g[i]) for the whole slice.
+fn mulSiluVec(out: []f32, gate: []const f32) void {
+    const one: @Vector(GV, f32) = @splat(1.0);
+    const op: [*]f32 = out.ptr;
+    const gp: [*]const f32 = gate.ptr;
+    for (0 .. out.len / GV) |b| {
+        const o = b * GV;
+        const g = vloadF32(GV, gp + o);
+        vstoreF32(GV, op + o, vloadF32(GV, op + o) * (g / (one + @exp(-g))));
+    }
 }
 
 pub fn silu(x: f32) f32 {
@@ -101,34 +134,232 @@ pub fn softmax(x: []f32) void {
 }
 
 /// FLA l2norm (SPEC A3): x * rsqrt(sum(x^2) + eps), eps inside the sum.
+/// Sum of squares stays scalar (exact order); the scale is vectorized.
 pub fn l2norm(x: []f32) void {
     var ss: f32 = 0;
     for (x) |v| ss += v * v;
     const inv = 1.0 / @sqrt(ss + 1e-6);
-    for (x) |*v| v.* *= inv;
+    scaleVec(x, inv);
+}
+
+// ---------------------------------------------------------------------------
+// GDN delta-rule state kernels, @Vector-ized (SPEC A4)
+// ---------------------------------------------------------------------------
+//
+// The state is [nv, kd, vd] row-major with kd == vd == 128, so every row is
+// an exact number of 16-element f32 vectors.  All four per-head operations
+// (decay, S^T k, outer-product update, S^T q) are written as @Vector(16, f32)
+// loads/stores; the accumulation order per output element is unchanged from
+// the scalar version, so results are bit-identical.  Loads/stores are
+// unaligned because the state buffer is only 4-byte aligned.
+
+inline fn vloadF32(comptime N: usize, p: [*]const f32) @Vector(N, f32) {
+    const ptr: *align(1) const [N]f32 = @ptrCast(p);
+    return @bitCast(ptr.*);
+}
+
+inline fn vstoreF32(comptime N: usize, p: [*]f32, v: @Vector(N, f32)) void {
+    const ptr: *align(1) [N]f32 = @ptrCast(p);
+    ptr.* = @bitCast(v);
+}
+
+const GV = 16; // f32 lanes per vector used by the GDN kernels
+
+/// Elementwise x *= s (order-preserving, bit-identical to the scalar loop).
+fn scaleVec(x: []f32, s: f32) void {
+    const sv: @Vector(GV, f32) = @splat(s);
+    const p: [*]f32 = x.ptr;
+    for (0 .. x.len / GV) |b| {
+        const o = b * GV;
+        vstoreF32(GV, p + o, vloadF32(GV, p + o) * sv);
+    }
+    for (x.len - x.len % GV .. x.len) |i| x[i] *= s;
+}
+
+/// (1) S *= gamma.
+fn gdnDecay(sh: []f32, gamma: f32) void {
+    const g: @Vector(GV, f32) = @splat(gamma);
+    const p: [*]f32 = sh.ptr;
+    for (0 .. sh.len / GV) |b| {
+        const o = b * GV;
+        vstoreF32(GV, p + o, vloadF32(GV, p + o) * g);
+    }
+    for (sh.len - sh.len % GV .. sh.len) |i| sh[i] *= gamma;
+}
+
+/// (2) km[j] = sum_i sh[i*vd + j] * k[i].  km must be vd long; vd % GV == 0.
+/// Accumulates in place in km (same per-element order as the scalar loop).
+fn gdnKvMem(sh: []const f32, k: []const f32, km: []f32, vd: usize) void {
+    std.debug.assert(vd % GV == 0 and km.len == vd);
+    @memset(km, 0);
+    const p: [*]const f32 = sh.ptr;
+    const q: [*]f32 = km.ptr;
+    for (0 .. k.len) |i| {
+        const ki: @Vector(GV, f32) = @splat(k[i]);
+        const row = p + i * vd;
+        for (0 .. vd / GV) |b| {
+            const o = b * GV;
+            vstoreF32(GV, q + o, vloadF32(GV, q + o) + vloadF32(GV, row + o) * ki);
+        }
+    }
+}
+
+/// (3) delta = beta * (v - km);  S += k (outer) delta.
+fn gdnOuter(sh: []f32, k: []const f32, v: []const f32, km: []const f32, delta: []f32, beta: f32, vd: usize) void {
+    const b16: @Vector(GV, f32) = @splat(beta);
+    const vp: [*]const f32 = v.ptr;
+    const kp: [*]const f32 = km.ptr;
+    const dp: [*]f32 = delta.ptr;
+    for (0 .. vd / GV) |b| {
+        const o = b * GV;
+        vstoreF32(GV, dp + o, (vloadF32(GV, vp + o) - vloadF32(GV, kp + o)) * b16);
+    }
+    const p: [*]f32 = sh.ptr;
+    for (0 .. k.len) |i| {
+        const ki: @Vector(GV, f32) = @splat(k[i]);
+        const row = p + i * vd;
+        for (0 .. vd / GV) |b| {
+            const o = b * GV;
+            vstoreF32(GV, row + o, vloadF32(GV, row + o) + ki * vloadF32(GV, dp + o));
+        }
+    }
+}
+
+/// (4) out[j] = sum_i sh[i*vd + j] * q[i]  (row-wise accumulation, same order
+/// as the scalar column loop).  Accumulates in place in out.
+fn gdnStateOut(sh: []const f32, q: []const f32, out: []f32, vd: usize) void {
+    std.debug.assert(vd % GV == 0 and out.len == vd);
+    @memset(out, 0);
+    const p: [*]const f32 = sh.ptr;
+    const o: [*]f32 = out.ptr;
+    for (0 .. q.len) |i| {
+        const qi: @Vector(GV, f32) = @splat(q[i]);
+        const row = p + i * vd;
+        for (0 .. vd / GV) |b| {
+            const ob = b * GV;
+            vstoreF32(GV, o + ob, vloadF32(GV, o + ob) + vloadF32(GV, row + ob) * qi);
+        }
+    }
+}
+
+/// Fused GDN state update: (1) decay + (2) kv-mem in ONE pass over the state,
+/// then (3) delta + outer-update and (4) S^T q in a SECOND pass.  Semantically
+/// the same as gdnDecay; gdnKvMem; gdnOuter; gdnStateOut back to back, but the
+/// 128x128 (2.1 MB) state is traversed twice instead of four times, and km/out
+/// are accumulated in vector registers rather than load/store'd per row.
+/// Fast path requires vd == 128 (all Qwen3.5 variants); otherwise it falls back
+/// to the four separate kernels.
+inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32,
+    km: []f32, delta: []f32, out: []f32, gamma: f32, beta: f32, vd: usize) void {
+    std.debug.assert(k.len == q.len and km.len == vd and out.len == vd and delta.len == vd);
+    if (vd != 128) {
+        gdnDecay(sh, gamma);
+        gdnKvMem(sh, k, km, vd);
+        gdnOuter(sh, k, v, km, delta, beta, vd);
+        gdnStateOut(sh, q, out, vd);
+        return;
+    }
+    const W = 4; // 128 / 32 lanes per @Vector(32, f32)
+    const sp: [*]f32 = sh.ptr;
+    const gp: [*]f32 = km.ptr;
+    const op: [*]f32 = out.ptr;
+    const g: @Vector(32, f32) = @splat(gamma);
+
+    // Pass 1: read-only sweep, km += (S[i] * gamma) * k[i], accumulated in
+    // registers.  The decayed rows are NOT stored: pass 2 recomputes them.
+    var acc: [W]@Vector(32, f32) = undefined;
+    for (0..W) |b| acc[b] = @splat(@as(f32, 0.0));
+    for (0 .. k.len) |i| {
+        const row = sp + i * vd;
+        const ki: @Vector(32, f32) = @splat(k[i]);
+        for (0..W) |b| acc[b] += vloadF32(32, row + b * 32) * ki;
+    }
+    // km is stored already decayed (S is overwritten below), so callers that
+    // read km afterwards see the same value as gdnKvMem after gdnDecay.
+    for (0..W) |b| {
+        acc[b] *= g;
+        vstoreF32(32, gp + b * 32, acc[b]);
+    }
+
+    // delta = beta * (v - km)
+    const bp: [*]const f32 = v.ptr;
+    const dp: [*]f32 = delta.ptr;
+    const bb: @Vector(32, f32) = @splat(beta);
+    for (0..W) |b| {
+        const o = b * 32;
+        vstoreF32(32, dp + o, (vloadF32(32, bp + o) - vloadF32(32, gp + o)) * bb);
+    }
+
+    // Pass 2: S[i] = S[i] * gamma + k[i] * delta (one store), out += S[i] * q[i].
+    var dvec: [W]@Vector(32, f32) = undefined;
+    for (0..W) |b| dvec[b] = vloadF32(32, dp + b * 32);
+    var oacc: [W]@Vector(32, f32) = undefined;
+    for (0..W) |b| oacc[b] = @splat(@as(f32, 0.0));
+    for (0 .. k.len) |i| {
+        const row = sp + i * vd;
+        const ki: @Vector(32, f32) = @splat(k[i]);
+        const qi: @Vector(32, f32) = @splat(q[i]);
+        for (0..W) |b| {
+            const o = b * 32;
+            const r = vloadF32(32, row + o) * g + ki * dvec[b];
+            vstoreF32(32, row + o, r);
+            oacc[b] += r * qi;
+        }
+    }
+    for (0..W) |b| vstoreF32(32, op + b * 32, oacc[b]);
+}
+
+/// Vectorized silu over a whole slice: x / (1 + exp(-x)).
+fn siluVec(x: []f32) void {
+    const p: [*]f32 = x.ptr;
+    const one: @Vector(GV, f32) = @splat(1.0);
+    for (0 .. x.len / GV) |b| {
+        const o = b * GV;
+        const xv = vloadF32(GV, p + o);
+        vstoreF32(GV, p + o, xv / (one + @exp(-xv)));
+    }
+    for (x.len - x.len % GV .. x.len) |i| x[i] = silu(x[i]);
+}
+
+/// out[i] *= sigmoid(g[i]) for the whole slice.
+fn mulSigmoidVec(out: []f32, gate: []const f32) void {
+    const one: @Vector(GV, f32) = @splat(1.0);
+    const op: [*]f32 = out.ptr;
+    const gp: [*]const f32 = gate.ptr;
+    for (0 .. out.len / GV) |b| {
+        const o = b * GV;
+        const g = vloadF32(GV, gp + o);
+        vstoreF32(GV, op + o, vloadF32(GV, op + o) * (one / (one + @exp(-g))));
+    }
+    for (out.len - out.len % GV .. out.len) |i| out[i] *= sigmoid(gate[i]);
 }
 
 /// Row-major [rows, cols] matvec: out[r] = sum_c mat[r*cols + c] * x[c].
-pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: usize) void {
+pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: usize, pool: ?*pool_mod.Pool) void {
     std.debug.assert(mat.len == rows * cols and out.len == rows and x.len == cols);
-    for (0..rows) |r| {
-        var acc: f32 = 0;
-        const row = mat[r * cols ..][0..cols];
-        for (row, x) |m, v| acc += m * v;
-        out[r] = acc;
-    }
+    pool_mod.parallel(pool, .{ .f32 = .{
+        .out = out.ptr, .mat = mat, .x = x, .cols = cols, .rows = rows,
+    } });
 }
 
 /// Linear layer with native quantized weights: Q8_0 and K/IQ types stay in
 /// their packed format (zero-copy mmap) and are dotted in the quantized
 /// domain (no whole-row f32 materialization); f32 is the small/dequant path.
 /// `q8` is the engine's Q8 activation scratch (ceil(cols/32) blocks).
-fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8, q8k: []u8) void {
+fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8, q8k: []u8, pool: ?*pool_mod.Pool) void {
     switch (w) {
-        .q8 => |row| matvecQ8_0(out, row, x, q8),
-        .quant => |qrow| Engine.matvecQuant(out, qrow, x, q8k, q8),
-        .f32 => |m| matvec(out, m, x, out.len, x.len),
+        .q8 => |row| matvecQ8_0(out, row, x, q8, pool),
+        .quant => |qrow| Engine.matvecQuant(out, qrow, x, q8k, q8, pool),
+        .f32 => |m| matvec(out, m, x, out.len, x.len, pool),
     }
+}
+
+/// Batched twin of `linMatvec`: `out` is [k, rows] and `xK` is [k, cols]
+/// row-major, with per-token Q8/Q8_K slots in q8K/q8kK.
+fn linMatvecBatchK(out: []f32, w: Engine.LinearW, xK: []const f32, k: usize,
+    q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void
+{
+    Engine.matvecBatchK(out, w, xK, k, q8K, q8kK, pool);
 }
 
 // ---------------------------------------------------------------------------
@@ -247,7 +478,16 @@ pub const Q8Row = struct {
 /// out[r] = sum_c W[r,c] * x[c], W row-major Q8_0 blocks. Scratch q8 must
 /// hold ceil(cols / 32) blocks (x quantized per block with round-to-nearest,
 /// matching quantizeQ8_0 semantics).
-pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8) void {
+pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8, pool: ?*pool_mod.Pool) void {
+    var pidx: usize = undefined;
+    var pt0: Io.Clock.Timestamp = undefined;
+    if (prof) {
+        var kbuf: [64]u8 = undefined;
+        const key = std.fmt.bufPrint(&kbuf, "q8:{d}", .{w.rows()}) catch "q8?";
+        pidx = profStart(key[0..@min(key.len, 64)]);
+        pt0 = Io.Clock.Timestamp.now(prof_io, .awake);
+        defer profEnd(pidx, profNs(prof_io, pt0));
+    }
     std.debug.assert(w.rows() == out.len);
     const cols = w.row_blocks * q8_0_block_elems;
     std.debug.assert(x.len == cols);
@@ -263,23 +503,10 @@ pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8) void {
     // The K-quant 256-block path (matvecQuant) is where SIMD pays off.
     simd.actQ8_0(x.len, x.ptr, q8.ptr);
 
-    for (out, 0..) |*o, r| {
-        const wrow = w.row(r);
-        var acc: f32 = 0;
-        for (0..w.row_blocks) |b| {
-            const wb_slice = wrow[b * q8_0_block_bytes ..][0..q8_0_block_bytes];
-            const wscale: f16 = @bitCast(std.mem.readInt(u16, wb_slice[0..2], .little));
-            const xscale: f16 = @bitCast(std.mem.readInt(u16, q8[b * q8_0_block_bytes ..][0..2], .little));
-            var dot: i32 = 0;
-            inline for (0..q8_0_block_elems) |j| {
-                const wq: i8 = @bitCast(wb_slice[2 + j]);
-                const xq: i8 = @bitCast(q8[b * q8_0_block_bytes + 2 + j]);
-                dot += @as(i32, wq) * @as(i32, xq);
-            }
-            acc += @as(f32, @floatCast(wscale)) * @as(f32, @floatFromInt(dot)) * @as(f32, @floatCast(xscale));
-        }
-        o.* = acc;
-    }
+    pool_mod.parallel(pool, .{ .q8_0 = .{
+        .out = out.ptr, .data = w.data, .q8 = q8.ptr,
+        .row_blocks = w.row_blocks, .rows = w.rows(),
+    } });
 }
 
 // ---------------------------------------------------------------------------
@@ -418,6 +645,70 @@ pub fn applyRope64(x: []f32, pos: u32, base: f32) void {
 // Engine
 // ---------------------------------------------------------------------------
 
+pub var no_batch = false;
+pub var prof = false;
+pub var prof_io: Io = undefined;
+
+pub fn profReport() void {
+    const tot: f64 = prof_emb + prof_gdn + prof_full + prof_mlp + prof_lm;
+    std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6});
+    pool_mod.profReport();
+}
+
+
+pub const ProfEntry = struct { key: [64]u8 = undefined, klen: usize = 0, ns: f64 = 0, calls: usize = 0 };
+pub var prof_entries: [64]ProfEntry = std.mem.zeroes([64]ProfEntry);
+pub var prof_n: usize = 0;
+
+fn profStart(key: []const u8) usize {
+    const n = prof_n;
+    for (0..n) |i| {
+        if (prof_entries[i].klen == key.len and std.mem.eql(u8, prof_entries[i].key[0..prof_entries[i].klen], key))
+            return i;
+    }
+    var e = &prof_entries[n];
+    e.klen = @min(key.len, 64);
+    @memcpy(e.key[0..e.klen], key[0..e.klen]);
+    e.ns = 0;
+    e.calls = 0;
+    prof_n = n + 1;
+    return n;
+}
+
+fn profEnd(idx: usize, ns: f64) void {
+    prof_entries[idx].ns += ns;
+    prof_entries[idx].calls += 1;
+}
+
+pub fn profReportMatvec() void {
+    // selection sort by ns desc
+    var idx: [64]usize = undefined;
+    for (0..prof_n) |i| idx[i] = i;
+    for (0..prof_n) |i| {
+        var best = i;
+        for (i + 1..prof_n) |j| {
+            if (prof_entries[idx[j]].ns > prof_entries[idx[best]].ns) best = j;
+        }
+        const t = idx[i]; idx[i] = idx[best]; idx[best] = t;
+    }
+    for (0..prof_n) |i| {
+        const e = &prof_entries[idx[i]];
+        std.debug.print("PROF-M {s} calls={d} ms={d:.2}\n", .{ e.key[0..e.klen], e.calls, e.ns / 1e6 });
+    }
+}
+
+fn profNs(io: Io, t0: Io.Clock.Timestamp) f64 {
+    return @as(f64, @floatFromInt(t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds));
+}
+
+
+pub var prof_gdn: f64 = 0;
+pub var prof_full: f64 = 0;
+pub var prof_mlp: f64 = 0;
+pub var prof_lm: f64 = 0;
+pub var prof_emb: f64 = 0;
+
+
 pub const Engine = struct {
     alloc: std.mem.Allocator,
     cfg: Config,
@@ -443,6 +734,10 @@ pub const Engine = struct {
     layers: []LayerWeights,
     kv: []KvCache,
     gdn: []GdnState,
+    /// row-parallel matvec pool; null => serial
+    pool: ?*pool_mod.Pool = null,
+    /// worker count (1 = serial); set by load from `n_threads`
+    n_threads: usize = 1,
 
     // scratch
     x: []f32, // hidden residual stream
@@ -461,6 +756,30 @@ pub const Engine = struct {
     logits: []f32,
     delta: []f32, // 128 per-head scratch
     kv_mem: []f32, // 128
+    /// Number of tokens batched per prefill chunk (K-token batched projection:
+    /// each layer's weights are read once per chunk and reused across K tokens
+    /// through cache).  0 => the batched path is unavailable.
+    k_tokens: usize = 0,
+    /// K-slot scratch for the batched prefill path.  `xK[t*hidden..]` is the
+    /// residual stream of token t of the current chunk; `x1K[t*hidden..]` the
+    /// RMS-normed input; `qkvK/gateK/abK/qK/kK/vK` the batched projection
+    /// outputs; `goutK/x2K` per-token attention/GDN output and out-projection
+    /// result; `mlpK/mlpK1` the ffn intermediates; `q8kK/q8K` the per-token
+    /// quantized activations for the batched matvecs.
+    xK: []f32 = &.{},
+    x1K: []f32 = &.{},
+    qkvK: []f32 = &.{},
+    gateK: []f32 = &.{},
+    abK: []f32 = &.{},
+    qK: []f32 = &.{},
+    kK: []f32 = &.{},
+    vK: []f32 = &.{},
+    goutK: []f32 = &.{},
+    x2K: []f32 = &.{},
+    mlpK: []f32 = &.{},
+    mlpK1: []f32 = &.{},
+    q8kK: []u8 = &.{},
+    q8K: []u8 = &.{},
     /// Top-k order-statistic workspace (quickselect); sized vocab.
     sample_scratch: []f32 = &.{},
     /// Sampling policy applied to every produced token.  Default is greedy
@@ -468,6 +787,37 @@ pub const Engine = struct {
     /// it from -t/-k/-s.
     sampler: Sampler = Sampler.init(.{}),
     prefill_ms: f64 = 0,
+
+    // ---- MTP / nextn speculative decoding (blk.64, present only on 27B) ----
+    /// nextn decoder-layer weights (blk.64, full-attention; same shape as a main
+    /// full-attn layer).  Null when the model has no nextn layer (0.8B/2B/4B).
+    nextn_layer: ?LayerWeights = null,
+    /// Independent KV cache for the nextn layer (blk.64 full attention).
+    nextn_kv: ?KvCache = null,
+    /// nextn-specific tensors (blk.64.nextn.*).
+    nextn_eh_proj: ?LinearW = null, // [2*hidden, hidden]
+    nextn_enorm: ?[]f32 = null, // [hidden]
+    nextn_hnorm: ?[]f32 = null, // [hidden]
+    nextn_shnorm: ?[]f32 = null, // [hidden] shared_head_norm
+    /// true once the model's nextn layer is loaded (27B).
+    has_nextn: bool = false,
+    /// scratch for nextn_forward: concat (2*hidden) + h/e/z rows (hidden each).
+    nxt_concat: []f32 = &.{},
+    nxt_h: []f32 = &.{},
+    nxt_e: []f32 = &.{},
+    nxt_z: []f32 = &.{},
+    /// per-position final-normed hidden states from the last batched verify
+    /// (K rows of `hidden`), plus per-position logits row for argmax.
+    verify_h: []f32 = &.{}, // [K*hidden]
+    verify_logits: []f32 = &.{}, // [K*vocab]
+    /// GDN rollback snapshots: `mtp_snap` holds, per GDN layer, K copies of the
+    /// state (delta-rule [nv*kd*kd] + conv [conv_dim*(conv_kernel-1)]) taken
+    /// after each consumed token during the batched verify.
+    mtp_snap_state: [][]f32 = &.{}, // [gdn_layers][K] state snapshots
+    mtp_snap_conv: [][]f32 = &.{}, // [gdn_layers][K] conv snapshots
+    mtp_snap_len: []u32 = &.{}, // [K] full-attn kv.len after each consumed token
+    /// number of draft tokens per MTP step (N).
+    mtp_n: usize = 3,
 
     /// A linear layer weight:
     ///  - `.q8`    Q8_0 kept in native blocks (zero-copy mmap view);
@@ -530,7 +880,16 @@ pub const Engine = struct {
     /// f32 materialization).  W is [rows, cols]; each row is `blocks_per_row`
     /// packed 256-element blocks.  Fallback for the 256-block-aligned case
     /// uses per-block `quant.rowDotXXX`; partial tail handled in f32.
-    fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8) void {
+    fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, pool: ?*pool_mod.Pool) void {
+        var pidx: usize = undefined;
+        var pt0: Io.Clock.Timestamp = undefined;
+        if (prof) {
+            var kbuf: [64]u8 = undefined;
+            const key = std.fmt.bufPrint(&kbuf, "{s}:{d}", .{ @tagName(w.ttype), w.rows }) catch "q?";
+            pidx = profStart(key[0..@min(key.len, 64)]);
+            pt0 = Io.Clock.Timestamp.now(prof_io, .awake);
+            defer profEnd(pidx, profNs(prof_io, pt0));
+        }
         const rows = w.rows;
         const bpr = w.blocks_per_row;
         const cols = bpr * 256;
@@ -561,9 +920,11 @@ pub const Engine = struct {
         };
         if (dot256) |dot| {
             simd.actQ8_K(cols, x.ptr, q8k.ptr);
-            for (0..rows) |r| {
-                out[r] = dot(cols, w.data[r * bpr * quantRowBytes(w.ttype) ..].ptr, q8k.ptr);
-            }
+            const rb256 = quantRowBytes(w.ttype);
+            pool_mod.parallel(pool, .{ .quant256 = .{
+                .out = out.ptr, .data = w.data, .q8k = q8k.ptr,
+                .row_bytes = rb256, .bpr = bpr, .rows = rows, .dot = dot,
+            } });
             return;
         }
 
@@ -585,16 +946,10 @@ pub const Engine = struct {
                 .iq4_nl => simd.d32row.iq4_nl_q8_0,
                 else => unreachable,
             };
-            for (0..rows) |r| {
-                const row = w.data[r * bpr * quantRowBytes(w.ttype) ..];
-                // A 256-element row is 8 blocks of 32; the row kernel wants a
-                // contiguous weight-block array, so dot per 32-element block.
-                var acc: f32 = 0;
-                for (0..8 * bpr) |k| {
-                    acc += dotr(32, row[k * rb32 ..].ptr, q8[k * 34 ..].ptr);
-                }
-                out[r] = acc;
-            }
+            pool_mod.parallel(pool, .{ .quant32 = .{
+                .out = out.ptr, .data = w.data, .q8 = q8.ptr,
+                .rb32 = rb32, .bpr = bpr, .rows = rows, .dot = dotr,
+            } });
             return;
         }
 
@@ -614,17 +969,128 @@ pub const Engine = struct {
             .iq1_m => &quant.rowDotIQ1M,
             else => unreachable, // only supported types load as .quant
         };
-        for (0..rows) |r| {
-            var acc: f32 = 0;
-            for (0..bpr) |b| {
-                acc += rowDot(quantBlock(w, r, b), x[b * 256 .. b * 256 + 256]);
-            }
-            out[r] = acc;
+        pool_mod.parallel(pool, .{ .quant_scalar = .{
+            .out = out.ptr, .data = w.data, .x = x,
+            .row_bytes = quantRowBytes(w.ttype), .bpr = bpr,
+            .rows = rows, .dot = rowDot,
+        } });
+    }
+
+    /// Batched K-token matvec: `out` is [K, rows] row-major, `xK` is
+    /// [K, cols] row-major.  The activation is quantized once per token into
+    /// that token's slot of q8K/q8kK, then a single pool task covers K*rows
+    /// virtual rows (`t = r/rows`, `rr = r%rows`).  The per-row dot call is
+    /// identical to the serial matvec, so out[t*rows+rr] is bit-identical to
+    /// `linMatvec(out[t*rows .. t*rows+rows], w, xK[t*cols..])` run per token.
+    fn matvecBatchK(out: []f32, w: LinearW, xK: []const f32, k: usize,
+        q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void
+    {
+        const rows = out.len / k;
+        std.debug.assert(out.len % k == 0);
+        switch (w) {
+            .q8 => |row| {
+                const cols = row.row_blocks * q8_0_block_elems;
+                const blen = row.row_blocks * q8_0_block_bytes;
+                std.debug.assert(xK.len >= k * cols);
+                std.debug.assert(q8K.len >= k * blen);
+                var t: usize = 0;
+                while (t < k) : (t += 1)
+                    simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen ..].ptr);
+                pool_mod.parallel(pool, .{ .q8_0b = .{
+                    .out = out.ptr, .data = row.data, .q8 = q8K.ptr, .q8_len = blen,
+                    .row_blocks = row.row_blocks, .rows = rows, .k = k,
+                } });
+            },
+            .quant => |qrow| {
+                const cols = qrow.blocks_per_row * 256;
+                const klen = q8kScratchBytes(cols);
+                const rb32 = quantRowBytes(qrow.ttype) / 8;
+                std.debug.assert(q8kK.len >= k * klen);
+                // 256-block SIMD dot types: one Q8_K per token, reused across rows
+                const dot256: ?simd_api.Dot256 = switch (qrow.ttype) {
+                    .q2_k => simd.d256.q2_k_q8_k,
+                    .q3_k => simd.d256.q3_k_q8_k,
+                    .q4_k => simd.d256.q4_k_q8_k,
+                    .q5_k => simd.d256.q5_k_q8_k,
+                    .q6_k => simd.d256.q6_k_q8_k,
+                    .iq2_xxs => simd.diq.iq2_xxs_q8_k,
+                    .iq2_xs => simd.diq.iq2_xs_q8_k,
+                    .iq2_s => simd.diq.iq2_s_q8_k,
+                    .iq3_xxs => simd.diq.iq3_xxs_q8_k,
+                    .iq3_s => simd.diq.iq3_s_q8_k,
+                    .iq1_s => simd.diq.iq1_s_q8_k,
+                    .iq1_m => simd.diq.iq1_m_q8_k,
+                    .iq4_xs => simd.diq.iq4_xs_q8_k,
+                    else => null,
+                };
+                if (dot256) |dot| {
+                    var t: usize = 0;
+                    while (t < k) : (t += 1)
+                        simd.actQ8_K(cols, xK[t * cols ..].ptr, q8kK[t * klen ..].ptr);
+                    pool_mod.parallel(pool, .{ .quant256b = .{
+                        .out = out.ptr, .data = qrow.data, .q8k = q8kK.ptr, .q8k_len = klen,
+                        .row_bytes = quantRowBytes(qrow.ttype), .bpr = qrow.blocks_per_row,
+                        .rows = rows, .k = k, .dot = dot,
+                    } });
+                    return;
+                }
+                const dot32: ?simd_api.Dot32 = switch (qrow.ttype) {
+                    .q4_0 => simd.d32.q4_0_q8_0,
+                    .q4_1 => simd.d32.q4_1_q8_0,
+                    .iq4_nl => simd.d32.iq4_nl_q8_0,
+                    else => null,
+                };
+                if (dot32 != null) {
+                    const blen32 = q8ScratchBytes(cols);
+                    std.debug.assert(q8K.len >= k * blen32);
+                    var t: usize = 0;
+                    while (t < k) : (t += 1)
+                        simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen32 ..].ptr);
+                    const dotr: simd_api.Dot32 = switch (qrow.ttype) {
+                        .q4_0 => simd.d32row.q4_0_q8_0,
+                        .q4_1 => simd.d32row.q4_1_q8_0,
+                        .iq4_nl => simd.d32row.iq4_nl_q8_0,
+                        else => unreachable,
+                    };
+                    pool_mod.parallel(pool, .{ .quant32b = .{
+                        .out = out.ptr, .data = qrow.data, .q8 = q8K.ptr, .q8_len = blen32,
+                        .rb32 = rb32, .bpr = qrow.blocks_per_row, .rows = rows, .k = k,
+                        .dot = dotr,
+                    } });
+                    return;
+                }
+                const rowDot: *const fn (row: []const u8, x: []const f32) f32 = switch (qrow.ttype) {
+                    .q4_0 => &quant.rowDotQ4_0,
+                    .q4_1 => &quant.rowDotQ4_1,
+                    .iq4_xs => &quant.rowDotIQ4XS,
+                    .iq4_nl => &quant.rowDotIQ4NL,
+                    .iq3_s => &quant.rowDotIQ3S,
+                    .iq3_xxs => &quant.rowDotIQ3XXS,
+                    .iq2_s => &quant.rowDotIQ2S,
+                    .iq2_xxs => &quant.rowDotIQ2XXS,
+                    .iq2_xs => &quant.rowDotIQ2XS,
+                    .iq1_s => &quant.rowDotIQ1S,
+                    .iq1_m => &quant.rowDotIQ1M,
+                    else => unreachable,
+                };
+                pool_mod.parallel(pool, .{ .quant_scalarb = .{
+                    .out = out.ptr, .data = qrow.data, .x = xK.ptr, .x_len = cols,
+                    .row_bytes = quantRowBytes(qrow.ttype), .bpr = qrow.blocks_per_row,
+                    .rows = rows, .k = k, .dot = rowDot,
+                } });
+            },
+            .f32 => |m| {
+                const cols = m.len / rows;
+                std.debug.assert(xK.len >= k * cols);
+                pool_mod.parallel(pool, .{ .f32b = .{
+                    .out = out.ptr, .mat = m, .x = xK.ptr, .x_len = cols,
+                    .cols = cols, .rows = rows, .k = k,
+                } });
+            },
         }
     }
 
-    /// Input width (`cols`) of a linear weight when its output has `out_len`
-    /// elements.  Q8_0 / K-IQ store cols explicitly; the f32 copy is flat
+
     /// [rows, cols] so cols = len / rows.
     fn matvecCols(w: LinearW, out_len: usize) usize {
         return switch (w) {
@@ -721,15 +1187,22 @@ pub const Engine = struct {
             .avx2
         else if (std.mem.eql(u8, name, "avx512"))
             .avx512
+        else if (std.mem.eql(u8, name, "avx512vnni"))
+            .avx512vnni
         else
             return;
         simd.force_tier = t;
     }
 
-    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io) !Engine {
+    pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io, n_threads: usize) !Engine {
         // Bind the SIMD kernels to the widest ISA tier this CPU supports
         // (CPUID + XGETBV).  Idempotent; before this, pointers are baseline.
         simd.init();
+        var nt = n_threads;
+        if (nt == 0) {
+            const ncpu = std.Thread.getCpuCount() catch 1;
+            nt = @min(16, ncpu);
+        }
         const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return error.OpenFailed;
         errdefer file.close(io);
         const stat = file.stat(io) catch return error.OpenFailed;
@@ -805,6 +1278,8 @@ pub const Engine = struct {
             .layers = &.{},
             .kv = &.{},
             .gdn = &.{},
+            .pool = null,
+            .n_threads = 1,
             .x = &.{},
             .x1 = &.{},
             .x2 = &.{},
@@ -823,6 +1298,12 @@ pub const Engine = struct {
             .kv_mem = &.{},
         };
         errdefer e.freeAll();
+
+        e.n_threads = nt;
+        e.pool = pool_mod.init(io, alloc, nt) catch null; // fall back to serial if spawn fails
+        // wire the pool's three-segment prof hooks to the engine's prof flag
+        pool_mod.prof = prof;
+        pool_mod.prof_io = io;
 
         e.token_embd = try loadLinear(alloc, &g, "token_embd.weight");
         // 27B+ has an untied lm_head (`output.weight`, same [vocab,hidden]
@@ -981,6 +1462,27 @@ pub const Engine = struct {
         e.delta = try alloc.alloc(f32, gdn_kd);
         e.kv_mem = try alloc.alloc(f32, gdn_kd);
         e.sample_scratch = try alloc.alloc(f32, cfg.vocab);
+
+        // ---- K-token batched prefill scratch (K = 16) ----
+        const K: usize = 16;
+        const q_dimK: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
+        const kv_dimK: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
+        e.k_tokens = if (no_batch) 0 else K;
+        e.xK = try alloc.alloc(f32, K * cfg.hidden);
+        e.x1K = try alloc.alloc(f32, K * cfg.hidden);
+        e.qkvK = try alloc.alloc(f32, K * @max(gdn_conv_dim, 2 * q_dimK));
+        e.gateK = try alloc.alloc(f32, K * @max(gdn_value_dim, q_dimK));
+        e.abK = try alloc.alloc(f32, K * 2 * gdn_nv);
+        e.qK = try alloc.alloc(f32, K * q_dimK);
+        e.kK = try alloc.alloc(f32, K * kv_dimK);
+        e.vK = try alloc.alloc(f32, K * kv_dimK);
+        e.goutK = try alloc.alloc(f32, K * @max(gdn_value_dim, q_dimK));
+        e.x2K = try alloc.alloc(f32, K * cfg.hidden);
+        e.mlpK = try alloc.alloc(f32, K * cfg.n_ff);
+        e.mlpK1 = try alloc.alloc(f32, K * cfg.n_ff);
+        e.q8kK = try alloc.alloc(u8, K * q8kScratchBytes(max_q8_cols));
+        e.q8K = try alloc.alloc(u8, K * q8ScratchBytes(max_q8_cols));
+        prof_io = io;
         return e;
     }
 
@@ -1051,12 +1553,16 @@ pub const Engine = struct {
         self.freeCachesUpTo(self.cfg.n_layers);
         if (self.kv.len > 0) a.free(self.kv);
         if (self.gdn.len > 0) a.free(self.gdn);
-        for ([_]*[]f32{ &self.x, &self.x1, &self.x2, &self.qkv, &self.z, &self.ab, &self.gdn_out, &self.q, &self.k, &self.v, &self.attn, &self.mlp_h, &self.mlp_h1, &self.logits, &self.delta, &self.kv_mem }) |p| {
+        for ([_]*[]f32{ &self.x, &self.x1, &self.x2, &self.qkv, &self.z, &self.ab, &self.gdn_out, &self.q, &self.k, &self.v, &self.attn, &self.mlp_h, &self.mlp_h1, &self.logits, &self.delta, &self.kv_mem, &self.xK, &self.x1K, &self.qkvK, &self.gateK, &self.abK, &self.qK, &self.kK, &self.vK, &self.goutK, &self.x2K, &self.mlpK, &self.mlpK1 }) |p| {
             if (p.len > 0) a.free(p.*);
         }
+        if (self.q8kK.len > 0) a.free(self.q8kK);
+        if (self.q8K.len > 0) a.free(self.q8K);
     }
 
     pub fn deinit(self: *Engine) void {
+        if (self.pool) |p| pool_mod.deinit(p, self.alloc);
+        self.pool = null;
         self.freeAll();
         self.g.deinit();
         self.mm.destroy(self.io);
@@ -1078,34 +1584,45 @@ pub const Engine = struct {
     pub fn forwardLogits(self: *Engine, token: u32, pos: u32) []f32 {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        // embedding lookup: dequantize the token row straight into x
-        switch (self.token_embd) {
-            .q8 => |row| dequantizeQ8_0(row.row(token), self.x[0..hidden]) catch unreachable,
-            .f32 => |m| @memcpy(self.x[0..hidden], m[token * hidden ..][0..hidden]),
-            .quant => |qrow| {
-                const rb = quantRowBytes(qrow.ttype);
-                const rb_row = qrow.blocks_per_row * rb;
-                const off = token * rb_row;
-                dequantToRows(self.alloc, qrow.ttype, qrow.data[off .. off + rb_row], self.x[0..hidden]) catch unreachable;
-            },
+        const io = self.io;
+        if (prof) {
+            prof_gdn = 0; prof_full = 0; prof_mlp = 0; prof_lm = 0; prof_emb = 0;
         }
+        const te = Io.Clock.Timestamp.now(io, .awake);
+        // embedding lookup: dequantize the token row straight into x
+        self.embedTo(token, self.x[0..hidden]);
+        if (prof) prof_emb += profNs(io, te);
 
         for (self.layers, 0..) |*lw, li| {
             if (c.isFullAttention(@intCast(li))) {
+                const a = Io.Clock.Timestamp.now(io, .awake);
                 self.forwardFull(lw, li, pos);
+                if (prof) prof_full += profNs(io, a);
             } else {
+                const a = Io.Clock.Timestamp.now(io, .awake);
                 self.forwardGdn(lw, li);
+                if (prof) prof_gdn += profNs(io, a);
             }
+            const a = Io.Clock.Timestamp.now(io, .awake);
             self.forwardMlp(lw);
+            if (prof) prof_mlp += profNs(io, a);
         }
+        const b = Io.Clock.Timestamp.now(io, .awake);
 
         rmsNorm(self.x1, self.x, self.output_norm, c.rms_eps);
         // lm_head: untied `output.weight` when present, else tied token_embd.
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
             switch (ow) {
-                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
-                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch),
+                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
+                .f32 => |m| matvec(self.logits, m, self.x1, c.vocab, hidden, self.pool),
+            }
+        } else {
+            // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
+            switch (self.token_embd) {
+                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -1116,11 +1633,131 @@ pub const Engine = struct {
                     }
                 },
             }
+        }
+        if (prof) prof_lm += profNs(io, b);
+        return self.logits;
+    }
+
+    pub fn profReport() void {
+        const tot: f64 = prof_gdn + prof_full + prof_mlp + prof_lm;
+        std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6});
+    }
+
+    /// Forward + sample one token.  Greedy (argmax) when the sampler's
+    /// temperature is 0 — the historical default.
+    pub fn step(self: *Engine, token: u32, pos: u32) u32 {
+        const logits = self.forwardLogits(token, pos);
+        return self.sampler.sample(logits, self.sample_scratch);
+    }
+
+    /// Dequantize the embedding row of `token` into `dst` (hidden wide).
+    fn embedTo(self: *Engine, token: u32, dst: []f32) void {
+        const hidden: usize = self.cfg.hidden;
+        std.debug.assert(dst.len == hidden);
+        switch (self.token_embd) {
+            .q8 => |row| dequantizeQ8_0(row.row(token), dst) catch unreachable,
+            .f32 => |m| @memcpy(dst, m[token * hidden ..][0..hidden]),
+            .quant => |qrow| {
+                const rb = quantRowBytes(qrow.ttype);
+                const rb_row = qrow.blocks_per_row * rb;
+                const off = token * rb_row;
+                dequantToRows(self.alloc, qrow.ttype, qrow.data[off .. off + rb_row], dst) catch unreachable;
+            },
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // K-token batched prefill chunk
+    // -----------------------------------------------------------------
+
+    /// Run `tokens.len` (<= K) tokens of prefill starting at position `pos0`
+    /// and return the logits of the LAST token.  Every weight-reading linear
+    /// projection (qkv / gate / alpha-beta / q / k / v / out-proj / ffn
+    /// gate-up-down) is executed ONCE per chunk as a K-token batched matvec,
+    /// so each layer's weight bytes pass through cache once for K tokens; the
+    /// state kernels (GDN conv + 128x128 state, full-attention scores, KV
+    /// cache writes) run token-by-token in exactly the serial order, so the
+    /// KV cache and GDN state end up bit-identical to the serial prefill.
+    pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) []f32 {
+        const k = tokens.len;
+        std.debug.assert(k > 0 and k <= self.k_tokens);
+        if (k == 1) return self.forwardLogits(tokens[0], pos0);
+
+        const c = self.cfg;
+        const hidden: usize = c.hidden;
+        const q_dim: usize = @as(usize, c.n_heads) * c.head_dim;
+        const kv_dim: usize = @as(usize, c.n_kv_heads) * c.head_dim;
+        const nv: usize = c.gdn_n_heads;
+        const nk: usize = c.gdn_num_k_heads;
+        const kd: usize = c.gdn_head_dim;
+        const conv_dim: usize = 2 * nk * kd + nv * kd;
+        const value_dim: usize = nv * kd;
+        const n_ff: usize = c.n_ff;
+
+        var t: usize = 0;
+        while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK[t * hidden ..][0..hidden]);
+
+        for (self.layers, 0..) |*lw, li| {
+            // ---- per-token RMSNorm of the residual stream, then the batched
+            // projections (weight bytes read once for the whole chunk) ----
+            t = 0;
+            while (t < k) : (t += 1)
+                rmsNorm(self.x1K[t * hidden ..][0..hidden], self.xK[t * hidden ..][0..hidden], lw.attn_norm, c.rms_eps);
+
+            if (c.isFullAttention(@intCast(li))) {
+                linMatvecBatchK(self.qkvK[0 .. k * 2 * q_dim], lw.attn_q.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                linMatvecBatchK(self.kK[0 .. k * kv_dim], lw.attn_k.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                linMatvecBatchK(self.vK[0 .. k * kv_dim], lw.attn_v.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                t = 0;
+                while (t < k) : (t += 1) self.forwardFullCore(lw, li, t, pos0 + @as(u32, @intCast(t)));
+                linMatvecBatchK(self.x2K[0 .. k * hidden], lw.attn_output.?, self.goutK, k, self.q8K, self.q8kK, self.pool);
+            } else {
+                linMatvecBatchK(self.qkvK[0 .. k * conv_dim], lw.attn_qkv.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                linMatvecBatchK(self.gateK[0 .. k * value_dim], lw.attn_gate.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                linMatvecBatchK(self.abK[0 .. k * nv], lw.ssm_alpha.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                linMatvecBatchK(self.abK[k * nv ..][0 .. k * nv], lw.ssm_beta.?, self.x1K, k, self.q8K, self.q8kK, self.pool);
+                t = 0;
+                while (t < k) : (t += 1) self.forwardGdnCore(lw, li, t, k);
+                linMatvecBatchK(self.x2K[0 .. k * hidden], lw.ssm_out.?, self.goutK, k, self.q8K, self.q8kK, self.pool);
+            }
+
+            // ---- per-token residual add ----
+            t = 0;
+            while (t < k) : (t += 1) {
+                for (self.xK[t * hidden ..][0..hidden], self.x2K[t * hidden ..][0..hidden]) |*xo, v| xo.* += v;
+            }
+
+            // ---- MLP: norm, batched gate/up, per-token SwiGLU, batched down, residual ----
+            t = 0;
+            while (t < k) : (t += 1)
+                rmsNorm(self.x1K[t * hidden ..][0..hidden], self.xK[t * hidden ..][0..hidden], lw.post_attention_norm, c.rms_eps);
+            linMatvecBatchK(self.mlpK[0 .. k * n_ff], lw.ffn_gate, self.x1K, k, self.q8K, self.q8kK, self.pool);
+            linMatvecBatchK(self.mlpK1[0 .. k * n_ff], lw.ffn_up, self.x1K, k, self.q8K, self.q8kK, self.pool);
+            t = 0;
+            while (t < k) : (t += 1) {
+                for (self.mlpK[t * n_ff ..][0..n_ff], self.mlpK1[t * n_ff ..][0..n_ff]) |*gi, uv|
+                    gi.* = silu(gi.*) * uv;
+            }
+            linMatvecBatchK(self.x2K[0 .. k * hidden], lw.ffn_down, self.mlpK, k, self.q8K, self.q8kK, self.pool);
+            t = 0;
+            while (t < k) : (t += 1) {
+                for (self.xK[t * hidden ..][0..hidden], self.x2K[t * hidden ..][0..hidden]) |*xo, v| xo.* += v;
+            }
+        }
+
+        // ---- last token: final RMSNorm + lm_head on a single token (serial
+        // path, so the first sampled logits are bit-identical) ----
+        rmsNorm(self.x1, self.xK[(k - 1) * hidden ..][0..hidden], self.output_norm, c.rms_eps);
+        if (self.output_weight) |ow| {
+            switch (ow) {
+                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
+                .f32 => |m| matvec(self.logits, m, self.x1, c.vocab, hidden, self.pool),
+            }
         } else {
-            // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
-                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch),
-                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch),
+                .q8 => |row| matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool),
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -1133,13 +1770,6 @@ pub const Engine = struct {
             }
         }
         return self.logits;
-    }
-
-    /// Forward + sample one token.  Greedy (argmax) when the sampler's
-    /// temperature is 0 — the historical default.
-    pub fn step(self: *Engine, token: u32, pos: u32) u32 {
-        const logits = self.forwardLogits(token, pos);
-        return self.sampler.sample(logits, self.sample_scratch);
     }
 
     pub fn argmax(self: *Engine) u32 {
@@ -1172,18 +1802,18 @@ pub const Engine = struct {
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
         const qkv = self.qkv[0..conv_dim];
-        linMatvec(qkv, lw.attn_qkv.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(qkv, lw.attn_qkv.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
 
         // z projection (attn_gate [hidden, value_dim])
         const z = self.z[0..value_dim];
-        linMatvec(z, lw.attn_gate.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(z, lw.attn_gate.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
 
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
         // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
         // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
         const ab = self.ab[0 .. 2 * nv];
-        linMatvec(ab[0..nv], lw.ssm_alpha.?, self.x1, self.q8_scratch, self.q8k_scratch);
-        linMatvec(ab[nv..], lw.ssm_beta.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(ab[0..nv], lw.ssm_alpha.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
+        linMatvec(ab[nv..], lw.ssm_beta.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all channels; beta/gamma
@@ -1218,32 +1848,13 @@ pub const Engine = struct {
             l2norm(q_h);
             l2norm(k_h);
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            for (q_h) |*p| p.* *= qscale;
+            scaleVec(q_h, qscale);
 
-            // (1) decay
-            for (sh) |*p| p.* *= gamma[h];
-            // (2) kv_mem = S^T k (sum over k axis)
+            // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q
+            // in a second pass (see gdnFused).
             const km = self.kv_mem[0..vd];
-            @memset(km, 0);
-            for (0..kd) |i| {
-                const ki = k_h[i];
-                const row = sh[i * vd ..][0..vd];
-                for (row, 0..) |sv, j| km[j] += sv * ki;
-            }
-            // (3) delta = beta*(v - kv_mem); S += outer(k, delta)
-            for (0..vd) |j| self.delta[j] = (v_h[j] - km[j]) * beta[h];
-            for (0..kd) |i| {
-                const ki = k_h[i];
-                const row = sh[i * vd ..][0..vd];
-                for (row, 0..) |*sv, j| sv.* += ki * self.delta[j];
-            }
-            // (4) o = S^T q with the UPDATED state (SPEC A4.6)
             const out_h = gout[h * vd ..][0..vd];
-            for (0..vd) |j| {
-                var sum: f32 = 0;
-                for (0..kd) |i| sum += sh[i * vd + j] * q_h[i];
-                out_h[j] = sum;
-            }
+            gdnFused(sh, k_h, v_h, q_h, km, self.delta[0..vd], out_h, gamma[h], beta[h], vd);
         }
 
         // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6)
@@ -1251,11 +1862,11 @@ pub const Engine = struct {
             const out_h = gout[h * vd ..][0..vd];
             const zh = z[h * vd ..][0..vd];
             rmsNorm(out_h, out_h, lw.ssm_norm.?, c.rms_eps);
-            for (out_h, zh) |*o, g| o.* *= silu(g);
+            mulSiluVec(out_h, zh);
         }
 
         // out projection [2048 -> 1024]
-        linMatvec(self.x2[0..hidden], lw.ssm_out.?, gout, self.q8_scratch, self.q8k_scratch);
+        linMatvec(self.x2[0..hidden], lw.ssm_out.?, gout, self.q8_scratch, self.q8k_scratch, self.pool);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1263,23 +1874,155 @@ pub const Engine = struct {
     /// [3 previous raw samples (oldest..newest), current raw sample].
     fn convStep(self: *Engine, st: *GdnState, qkv: []f32, wconv: []const f32, K: usize) void {
         _ = self;
-        for (0..qkv.len) |i| {
-            const hist = st.conv[i * (K - 1) ..][0 .. K - 1];
-            const cur = qkv[i];
-            var sum: f32 = hist[0] * wconv[i * K + 0] +
-                hist[1] * wconv[i * K + 1] +
-                hist[2] * wconv[i * K + 2] +
-                cur * wconv[i * K + 3];
-            sum = silu(sum);
+        std.debug.assert(K == 4);
+        const h: [*]f32 = st.conv.ptr;
+        const w: [*]const f32 = wconv.ptr;
+        const out: [*]f32 = qkv.ptr;
+        for (0 .. qkv.len) |i| {
+            const hp = h + i * 3;
+            const cur = out[i];
+            // 4 taps per channel in one @Vector multiply; the sum keeps the
+            // exact scalar order so results are bit-identical.
+            const hv: @Vector(4, f32) = .{ hp[0], hp[1], hp[2], cur };
+            const wv: @Vector(4, f32) = .{ w[i * 4], w[i * 4 + 1], w[i * 4 + 2], w[i * 4 + 3] };
+            const prod: [4]f32 = @bitCast(hv * wv);
+            out[i] = prod[0] + prod[1] + prod[2] + prod[3];
             // shift: drop oldest, append current raw
-            hist[0] = hist[1];
-            hist[1] = hist[2];
-            hist[2] = cur;
-            qkv[i] = sum;
+            hp[0] = hp[1];
+            hp[1] = hp[2];
+            hp[2] = cur;
         }
+        siluVec(qkv);
     }
 
     // ------------- Full attention block (SPEC B) -------------
+
+    /// Batched-chunk twin of `forwardFull`: the q / k / v projections have
+    /// already been run as K-token batched matvecs into qkvK / kK / vK; this
+    /// runs the per-token attention kernel for slot `t`, writing KV at
+    /// position `pos`, and leaves the gated attention output in goutK[t].
+    fn forwardFullCore(self: *Engine, lw: *LayerWeights, li: usize, t: usize, pos: u32) void {
+        const c = self.cfg;
+        const heads: usize = c.n_heads;
+        const kv_heads: usize = c.n_kv_heads;
+        const hd: usize = c.head_dim;
+        const q_dim: usize = heads * hd;
+        const kv_dim: usize = kv_heads * hd;
+        const gqa: usize = heads / kv_heads;
+
+        const qg = self.qkvK[t * 2 * q_dim ..][0 .. 2 * q_dim];
+        const q = self.qK[t * q_dim ..][0..q_dim];
+        const gate = self.gateK[t * q_dim ..][0..q_dim];
+        for (0..heads) |h| {
+            @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
+            @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
+        }
+        const k = self.kK[t * kv_dim ..][0..kv_dim];
+        const v = self.vK[t * kv_dim ..][0..kv_dim];
+
+        // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
+        for (0..heads) |h| {
+            const qs = q[h * hd ..][0..hd];
+            rmsNorm(qs, qs, lw.attn_q_norm.?, c.rms_eps);
+        }
+        for (0..kv_heads) |h| {
+            const ks = k[h * hd ..][0..hd];
+            rmsNorm(ks, ks, lw.attn_k_norm.?, c.rms_eps);
+        }
+        for (0..heads) |h| applyRope64(q[h * hd ..][0..hd], pos, c.rope_freq_base);
+        for (0..kv_heads) |h| applyRope64(k[h * hd ..][0..hd], pos, c.rope_freq_base);
+
+        // KV cache: slot == cache.len, exactly as the serial path
+        const cache = &self.kv[li];
+        std.debug.assert(cache.len < max_seq);
+        const slot: usize = cache.len;
+        @memcpy(cache.k[slot * kv_dim ..][0..kv_dim], k);
+        @memcpy(cache.v[slot * kv_dim ..][0..kv_dim], v);
+        cache.len += 1;
+
+        const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+        const gout = self.goutK[t * q_dim ..][0..q_dim];
+        for (0..heads) |h| {
+            const kvh = h / gqa;
+            const qs = q[h * hd ..][0..hd];
+            const att = self.attn[0 .. slot + 1];
+            for (0..slot + 1) |ti| {
+                const ks = cache.k[ti * kv_dim + kvh * hd ..][0..hd];
+                var acc: f32 = 0;
+                for (qs, ks) |a, b| acc += a * b;
+                att[ti] = acc * scale;
+            }
+            softmax(att);
+            var accv: [256]f32 = @splat(0);
+            for (0..slot + 1) |ti| {
+                const w = att[ti];
+                const vs = cache.v[ti * kv_dim + kvh * hd ..][0..hd];
+                for (vs, 0..) |vv, j| accv[j] += w * vv;
+            }
+            @memcpy(gout[h * hd ..][0..hd], accv[0..hd]);
+        }
+        mulSigmoidVec(gout[0..q_dim], gate[0..q_dim]);
+    }
+
+    /// Batched-chunk twin of `forwardGdn`: qkv / gate / alpha / beta were
+    /// batched into qkvK / gateK / abK; this runs the per-token conv + GDN
+    /// state kernel for slot `t` (updating the shared conv history and 128x128
+    /// state in serial order), writing the gated RMS-normed output to goutK[t].
+    fn forwardGdnCore(self: *Engine, lw: *LayerWeights, li: usize, t: usize, k: usize) void {
+        const c = self.cfg;
+        const nv: usize = c.gdn_n_heads;
+        const nk: usize = c.gdn_num_k_heads;
+        const kd: usize = c.gdn_head_dim;
+        const vd: usize = c.gdn_head_dim;
+        const conv_dim: usize = 2 * nk * kd + nv * kd;
+        const kq_dim: usize = nk * kd;
+        const value_dim: usize = nv * vd;
+
+        const qkv = self.qkvK[t * conv_dim ..][0..conv_dim];
+        const z = self.gateK[t * value_dim ..][0..value_dim];
+        // forwardChunk wrote alpha as abK[0..k*nv] (token t at t*nv) and beta
+        // as abK[k*nv..2*k*nv] (token t at k*nv + t*nv) — two half-regions,
+        // matching the two linMatvecBatchK calls.  Read them back in exactly
+        // that layout; beta is stored in place (same order as the serial path).
+        const ab_a = self.abK[t * nv ..][0..nv];
+        const beta = self.abK[k * nv + t * nv ..][0..nv];
+        const st = &self.gdn[li];
+        self.convStep(st, qkv, lw.ssm_conv1d.?, c.conv_kernel);
+        var gamma: [64]f32 = undefined;
+        for (0..nv) |h| {
+            const a_raw = ab_a[h];
+            const b_raw = beta[h];
+            beta[h] = sigmoid(b_raw);
+            const g = lw.ssm_a.?[h] * softplus(a_raw + lw.ssm_dt_bias.?[h]);
+            gamma[h] = @exp(g);
+        }
+
+        const state = st.state;
+        const gout = self.goutK[t * value_dim ..][0..value_dim];
+        for (0..nv) |h| {
+            const kh = h % nk;
+            const q_h = qkv[kh * kd ..][0..kd];
+            const k_h = qkv[kq_dim + kh * kd ..][0..kd];
+            const v_h = qkv[2 * kq_dim + h * kd ..][0..kd];
+            const sh = state[h * kd * vd ..][0 .. kd * vd];
+
+            l2norm(q_h);
+            l2norm(k_h);
+            const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+            scaleVec(q_h, qscale);
+
+            const km = self.kv_mem[0..vd];
+            const out_h = gout[h * vd ..][0..vd];
+            gdnFused(sh, k_h, v_h, q_h, km, self.delta[0..vd], out_h, gamma[h], beta[h], vd);
+        }
+
+        for (0..nv) |h| {
+            const out_h = gout[h * vd ..][0..vd];
+            const zh = z[h * vd ..][0..vd];
+            rmsNorm(out_h, out_h, lw.ssm_norm.?, c.rms_eps);
+            mulSiluVec(out_h, zh);
+        }
+    }
 
     fn forwardFull(self: *Engine, lw: *LayerWeights, li: usize, pos: u32) void {
         const c = self.cfg;
@@ -1295,7 +2038,7 @@ pub const Engine = struct {
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv[0 .. 2 * q_dim];
-        linMatvec(qg, lw.attn_q.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(qg, lw.attn_q.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
         const q = self.q[0..q_dim];
         const gate = self.z[0..q_dim];
         for (0..heads) |h| {
@@ -1303,8 +2046,8 @@ pub const Engine = struct {
             @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
             @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
         }
-        linMatvec(self.k[0..kv_dim], lw.attn_k.?, self.x1, self.q8_scratch, self.q8k_scratch);
-        linMatvec(self.v[0..kv_dim], lw.attn_v.?, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(self.k[0..kv_dim], lw.attn_k.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
+        linMatvec(self.v[0..kv_dim], lw.attn_v.?, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
@@ -1355,8 +2098,8 @@ pub const Engine = struct {
         }
 
         // sigmoid gate (B14), then o_proj [2048 -> 1024]
-        for (0..q_dim) |i| gout[i] *= sigmoid(gate[i]);
-        linMatvec(self.x2[0..hidden], lw.attn_output.?, gout, self.q8_scratch, self.q8k_scratch);
+        mulSigmoidVec(gout[0..q_dim], gate[0..q_dim]);
+        linMatvec(self.x2[0..hidden], lw.attn_output.?, gout, self.q8_scratch, self.q8k_scratch, self.pool);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1366,10 +2109,10 @@ pub const Engine = struct {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         rmsNorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
-        linMatvec(self.mlp_h, lw.ffn_gate, self.x1, self.q8_scratch, self.q8k_scratch);
-        linMatvec(self.mlp_h1, lw.ffn_up, self.x1, self.q8_scratch, self.q8k_scratch);
+        linMatvec(self.mlp_h, lw.ffn_gate, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
+        linMatvec(self.mlp_h1, lw.ffn_up, self.x1, self.q8_scratch, self.q8k_scratch, self.pool);
         for (0..c.n_ff) |i| self.mlp_h[i] = silu(self.mlp_h[i]) * self.mlp_h1[i];
-        linMatvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h, self.q8_scratch, self.q8k_scratch);
+        linMatvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h, self.q8_scratch, self.q8k_scratch, self.pool);
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1421,7 +2164,21 @@ pub const Engine = struct {
         const io = self.io;
         const t_start = Io.Clock.Timestamp.now(io, .awake);
         var last_logits: []f32 = &.{};
-        for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
+        if (self.k_tokens == 0) {
+            for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
+        } else {
+            // K-token batched prefill: every layer's weights are read once per
+            // chunk (batched projections) and reused across the chunk's K
+            // tokens; the KV cache / GDN state updates happen token-by-token in
+            // the same order as the serial loop, so the resulting logits of the
+            // last prompt token are bit-identical to the serial prefill.
+            var i: usize = 0;
+            while (i < prompt.len) {
+                const n = @min(self.k_tokens, prompt.len - i);
+                last_logits = self.forwardChunk(prompt[i .. i + n], @intCast(i));
+                i += n;
+            }
+        }
         const t_after = Io.Clock.Timestamp.now(io, .awake);
         self.prefill_ms = @as(f64, @floatFromInt(t_start.durationTo(t_after).raw.nanoseconds)) / 1e6;
 
@@ -1430,6 +2187,9 @@ pub const Engine = struct {
         var pos: u32 = @intCast(prompt.len);
         var gen_ns: i96 = 0;
         var hit_eos = false;
+        // prof: accumulate pool parallel() segments over the decode loop only
+        pool_mod.profReset();
+        pool_mod.prof_phase = true;
         var next: u32 = self.sampler.sample(last_logits, self.sample_scratch);
         while (pos < max_tokens) : (pos += 1) {
             if (next == self.cfg.eos_token_id) {
@@ -1442,6 +2202,7 @@ pub const Engine = struct {
             next = self.step(next, pos);
             gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
         }
+        pool_mod.prof_phase = false;
         const per: f64 = if (out.items.len > 0)
             @as(f64, @floatFromInt(gen_ns)) / 1e6 / @as(f64, @floatFromInt(out.items.len))
         else
@@ -1572,7 +2333,7 @@ test "matvec 2x3 hand computed" {
     const m = [_]f32{ 1, 2, 3, 4, 5, 6 };
     const x = [_]f32{ 7, 8, 9 };
     var out: [2]f32 = undefined;
-    matvec(&out, &m, &x, 2, 3);
+    matvec(&out, &m, &x, 2, 3, null);
     try std.testing.expectEqual(@as(f32, 50), out[0]);
     try std.testing.expectEqual(@as(f32, 122), out[1]);
 }
@@ -1599,7 +2360,7 @@ test "matvecQ8_0 matches f32 matvec on dequantized weights" {
     const w: Q8Row = .{ .data = &wq, .row_blocks = cols / q8_0_block_elems };
     var out_q8: [rows]f32 = undefined;
     var q8scratch: [cols / q8_0_block_elems * q8_0_block_bytes]u8 = undefined;
-    matvecQ8_0(&out_q8, w, &x, &q8scratch);
+    matvecQ8_0(&out_q8, w, &x, &q8scratch, null);
 
     // reference: f32 matvec over dequantized weights AND dequantized x
     // (the q8 path necessarily quantizes x, so feed the same values in)
@@ -1608,7 +2369,7 @@ test "matvecQ8_0 matches f32 matvec on dequantized weights" {
         try dequantizeQ8_0(q8scratch[blk * q8_0_block_bytes ..][0..q8_0_block_bytes], xq[blk * q8_0_block_elems ..][0..q8_0_block_elems]);
     }
     var out_f32: [rows]f32 = undefined;
-    matvec(&out_f32, &wf, &xq, rows, cols);
+    matvec(&out_f32, &wf, &xq, rows, cols, null);
 
     for (out_q8, out_f32) |a, b| {
         // same math (i32 exact per block vs f32 accumulate): tiny rounding only
@@ -1625,7 +2386,7 @@ test "matvecQ8_0 zero x gives zero out" {
     var x: [cols]f32 = @splat(0);
     var out: [2]f32 = undefined;
     var scratch: [q8_0_block_bytes]u8 = undefined;
-    matvecQ8_0(&out, .{ .data = &wq, .row_blocks = 1 }, &x, &scratch);
+    matvecQ8_0(&out, .{ .data = &wq, .row_blocks = 1 }, &x, &scratch, null);
     try std.testing.expectEqual(@as(f32, 0), out[0]);
     try std.testing.expectEqual(@as(f32, 0), out[1]);
 }
