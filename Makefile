@@ -17,7 +17,7 @@ ZIGCACHE := --cache-dir /tmp/qwen35-cache
 HOST_OBJ := .zig-cache/qwen35_cuda_host.o
 CUDA_EXE := zig-out/bin/qwen35-cuda
 
-.PHONY: all build cpu cpufast cuda test run0.8b run2b run4b run27bq8 run27bq4 run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
+.PHONY: all build cpu cpufast cuda test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
 
 all: build cpu cuda
 
@@ -139,6 +139,21 @@ run27biq2xxs:
 
 run27biq1s:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ1_S.gguf 天空为什么是蓝色的？ -n 48
+
+run27biq4xs:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf 天空为什么是蓝色的？ -n 48
+
+run27bq4kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q4_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+run27bq8kl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_L.gguf 天空为什么是蓝色的？ -n 48
+
+run27bq8kxl:
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-Q8_K_XL.gguf 天空为什么是蓝色的？ -n 48
+
+# 27B 全量聚合（对齐 run0.8b 模式）：按 0.8b 顺序覆盖目录里全部 9 个量化。
+run27b: run27bq8 run27bq4 run27biq4xs run27biq3xxs run27biq2xxs run27biq1s run27bq4kxl run27bq8kl run27bq8kxl
 
 run0.8b-cuda:
 	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？
