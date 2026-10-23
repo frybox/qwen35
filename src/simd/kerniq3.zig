@@ -133,6 +133,7 @@ fn iq1_s_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c)
         const nb = n / 256;
         var acc_out: Q1F32 = @splat(0);
         for (0..nb) |b| {
+            var row_acc: Q1F32 = @splat(0);
             const x = vx + b * 50;
             const y = vy + b * 292;
             const d = util.f16At(x, 0);
@@ -165,11 +166,11 @@ fn iq1_s_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c)
                     cv[k] = dls[ib];
                     cvd[k] = dls[ib] * dlt[ib];
                 }
-                acc_out = acc_out + @as(Q1F32, @bitCast(cv)) * @as(Q1F32, @floatFromInt(dot)) +
+                row_acc = row_acc + @as(Q1F32, @bitCast(cv)) * @as(Q1F32, @floatFromInt(dot)) +
                     @as(Q1F32, @bitCast(cvd)) * @as(Q1F32, @floatFromInt(gsum));
             }
             const dy: Q1F32 = @splat(@as(f32, @bitCast(util.u32At(y))));
-            acc_out = dy * acc_out;
+            acc_out = acc_out + dy * row_acc;
         }
         return @reduce(.Add, acc_out);
     }
@@ -219,6 +220,7 @@ fn iq1_m_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c)
         const nb = n / 256;
         var acc_out: Q1F32 = @splat(0);
         for (0..nb) |b| {
+            var row_acc: Q1F32 = @splat(0);
             const x = vx + b * 56;
             const y = vy + b * 292;
             const sc0: u16 = util.u16At(x + 48);
@@ -270,11 +272,11 @@ fn iq1_m_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c)
                     cv[k] = sc;
                     cvd[k] = sc * dlt[ib][l];
                 }
-                acc_out = acc_out + @as(Q1F32, @bitCast(cv)) * @as(Q1F32, @floatFromInt(dot)) +
+                row_acc = row_acc + @as(Q1F32, @bitCast(cv)) * @as(Q1F32, @floatFromInt(dot)) +
                     @as(Q1F32, @bitCast(cvd)) * @as(Q1F32, @floatFromInt(gsum));
             }
             const dy: Q1F32 = @splat(@as(f32, @bitCast(util.u32At(y))));
-            acc_out = dy * acc_out;
+            acc_out = acc_out + dy * row_acc;
         }
         return @reduce(.Add, acc_out);
     }
