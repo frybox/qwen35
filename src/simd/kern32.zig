@@ -49,6 +49,151 @@ inline fn sumI8(v: V32i8) i32 {
     return @reduce(.Add, @as(@Vector(32, i32), v));
 }
 
+// ---------------------------------------------------------------------------
+// IQ4_NL x Q8_0 -- AVX-512 path (zmm, VNNI)
+// ---------------------------------------------------------------------------
+// The scalar version needs 32 codebook lookups per 32-element block, which is
+// why iq4_nl (17.6 ns/element) was 3x the cost of q4_0 (5.5) on the same
+// payload.  Here the codebook is a 16-byte vpshufb table replicated to all four
+// 128-bit lanes, the qs bytes are broadcast to a full zmm so each lane
+// independently shuffles the lo and hi nibbles, and vpdpbusd accumulates the
+// codebook bytes against the Q8_0 qs bytes.
+//
+// vpdpbusd treats its first operand as UNSIGNED, so codebook entries are
+// stored as (kvalue + 128) in u8 and the +128 bias is removed once per
+// sub-block from the i32 accumulator (see kerniq.zig's iq4_xs/iq3_xxs paths,
+// which use the same correction).
+//
+// Layout: the zmm lanes 0..15 carry the lo nibbles (block elements 0..15),
+// lanes 16..31 the hi nibbles (elements 16..31).  Lanes 32..63 are a copy of
+// lanes 0..31 (vbroadcasti32x4 replicates the 16-byte qs group four times), so
+// vpdpbusd sums four identical 16-element partial dot products.  The Q8_0 side
+// is built from two 16-byte broadcasts (qs[0..15] into lanes 0..15 + 32..47,
+// qs[16..31] into lanes 16..31 + 48..63), giving 2x the true block sum in the
+// lanes that carry nibbles; the +128 bias and the doubled partial sums are
+// folded out in f32 by the factor 0.5.  No 64-byte read past the Q8_0 block
+// (34 bytes) is needed.
+const IQZ = @Vector(64, u8);
+const IQI32 = @Vector(16, i32);
+
+inline fn iqnBcast128(p: [*]const u8) IQZ {
+    return asm ("vbroadcasti32x4 (%[src]), %[dst]" : [dst] "=v" (-> IQZ) : [src] "r" (p));
+}
+inline fn iqnBcast256(p: [*]const u8) IQZ {
+    return asm ("vbroadcasti32x8 (%[src]), %[dst]" : [dst] "=v" (-> IQZ) : [src] "r" (p));
+}
+inline fn iqnPsrld4(a: IQZ) IQZ {
+    return asm ("vpsrld $4, %[a], %[dst]" : [dst] "=v" (-> IQZ) : [a] "v" (a));
+}
+inline fn iqnPand(a: IQZ, b: IQZ) IQZ {
+    return asm ("vpandd %[b], %[a], %[dst]" : [dst] "=v" (-> IQZ) : [a] "v" (a), [b] "v" (b));
+}
+inline fn iqnPor(a: IQZ, b: IQZ) IQZ {
+    return asm ("vpord %[b], %[a], %[dst]" : [dst] "=v" (-> IQZ) : [a] "v" (a), [b] "v" (b));
+}
+inline fn iqnPaddb(a: IQZ, b: IQZ) IQZ {
+    return asm ("vpaddb %[b], %[a], %[dst]" : [dst] "=v" (-> IQZ) : [a] "v" (a), [b] "v" (b));
+}
+inline fn iqnShufb(idx: IQZ, tab: IQZ) IQZ {
+    return asm ("vpshufb %[idx], %[tab], %[dst]" : [dst] "=v" (-> IQZ) : [idx] "v" (idx), [tab] "v" (tab));
+}
+inline fn iqnDpbusd0(a: IQZ, b: IQZ) IQI32 {
+    var out: IQI32 = @splat(0);
+    asm ("vpdpbusd %[b], %[a], %[out]" : [out] "+v" (out) : [a] "v" (a), [b] "v" (b));
+    return out;
+}
+inline fn iqnPslld7(a: IQI32) IQI32 {
+    return asm ("vpslld $7, %[a], %[dst]" : [dst] "=v" (-> IQI32) : [a] "v" (a));
+}
+inline fn iqnPsubd(a: IQI32, b: IQI32) IQI32 {
+    return asm ("vpsubd %[b], %[a], %[dst]" : [dst] "=v" (-> IQI32) : [a] "v" (a), [b] "v" (b));
+}
+inline fn iqnPandI(a: IQI32, b: IQI32) IQI32 {
+    return asm ("vpandd %[b], %[a], %[dst]" : [dst] "=v" (-> IQI32) : [a] "v" (a), [b] "v" (b));
+}
+
+/// Codebook stored as (kvalue + 128) in u8 so vpshufb yields the biased byte
+/// directly; vpdpbusd reads its first operand as unsigned, and the +128 bias is
+/// removed from the i32 accumulator once per block (see the loop).
+const iqn_tab: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = @as(u8, @intCast(@as(i16, kvalues_iq4nl[i % 16]) + 128));
+    break :blk @bitCast(a);
+};
+const iqn_m0f: IQZ = @splat(@as(u8, 0x0f));
+const iqn_ones: IQZ = @splat(@as(u8, 1));
+/// x side: keep shuffled lo nibbles in lanes 0..15, hi nibbles in lanes 16..31.
+const iqn_mlo: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = if (i < 16) @as(u8, 0xff) else 0;
+    break :blk @bitCast(a);
+};
+const iqn_mhi: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = if (i >= 16 and i < 32) @as(u8, 0xff) else 0;
+    break :blk @bitCast(a);
+};
+/// +128 bias only applies to the lanes carrying codebook bytes.
+const iqn_add128: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = if (i < 32) @as(u8, 128) else 0;
+    break :blk @bitCast(a);
+};
+const iqn_lanes07: IQI32 = @bitCast([16]i32{ -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0 });
+
+fn iq4_nl_q8_0_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / 32;
+        var acc_out: V16f32 = @splat(0);
+        for (0..nb) |ib| {
+            const x = vx + ib * 18;
+            const y = vy + ib * q8_bytes;
+            // vbroadcasti32x8 copies the 16 qs bytes into the low 256 bits and
+            // leaves the high 256 bits zero, so the shuffled nibbles in the
+            // upper lanes (masked out below) and their Q8_0 counterparts cost
+            // nothing, and the i32 lane sums of the upper half are zero.
+            const xq = iqnBcast128(x + 2);
+            const lo = iqnPand(xq, iqn_m0f);
+            const hi = iqnPand(iqnPsrld4(xq), iqn_m0f);
+            const w = iqnPor(iqnPand(iqnShufb(lo, iqn_tab), iqn_mlo),
+                iqnPand(iqnShufb(hi, iqn_tab), iqn_mhi));
+            const wu = w; // table already carries the +128 bias
+            const yq = iqnBcast256(y + 2);
+            const acc = iqnDpbusd0(wu, yq);
+            // upper lanes of yq are zero => gsum already holds the block sum in
+            // lanes 0..7 with no extra masking.
+            const dot = iqnPsubd(acc, iqnPslld7(iqnDpbusd0(iqn_ones, yq)));
+            const dv: V16f32 = @splat(util.f16At(x, 0) * util.f16At(y, 0));
+            acc_out = acc_out + dv * @as(V16f32, @floatFromInt(dot));
+        }
+        return @reduce(.Add, acc_out);
+    }
+    return 0;
+}
+
+pub fn iq4_nl_q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return iq4_nl_q8_0_vnni_impl(n, vx, vy);
+    }
+    const nb = n / 32;
+    var acc: f32 = 0;
+    var ib: usize = 0;
+    while (ib < nb) : (ib += 1) {
+        const x = vx + ib * 18;
+        const y = vy + ib * q8_bytes;
+        var qx: [32]i8 = undefined;
+        for (0..16) |j| {
+            const b = x[2 + j];
+            qx[j] = kvalues_iq4nl[b & 0x0F];
+            qx[16 + j] = kvalues_iq4nl[b >> 4];
+        }
+        const qv: V32i8 = @bitCast(qx);
+        const sumi = util.dot32i8(qv, loadQy(y + 2));
+        acc += util.f16At(x, 0) * @as(f32, @floatFromInt(sumi)) * util.f16At(y, 0);
+    }
+    return acc;
+}
+
 inline fn loadQs8(p: anytype) @Vector(8, u8) {
     return util.load(@Vector(8, u8), p);
 }
@@ -467,33 +612,8 @@ pub fn q2_0_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f3
     return sumf;
 }
 
-// ---------------------------------------------------------------------------
-// IQ4_NL x Q8_0
-// ---------------------------------------------------------------------------
-// C: ggml_vec_dot_iq4_nl_q8_0_generic (quants.c:1254), AVX2 arch/x86/quants.c:3984
-// Codebook lookup is a 16-entry i8 table; the products stay in i8 so the dot is
-// still vpmaddwd-shaped (the table read is scalar, the multiply-accumulate is
-// vector).
-pub fn iq4_nl_q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
-    const nb = n / 32;
-    var acc: f32 = 0;
-    var ib: usize = 0;
-    while (ib < nb) : (ib += 1) {
-        const x = vx + ib * 18;
-        const y = vy + ib * q8_bytes;
-        var qx: [32]i8 = undefined;
-        for (0..16) |j| {
-            const b = x[2 + j];
-            qx[j] = kvalues_iq4nl[b & 0x0F];
-            qx[16 + j] = kvalues_iq4nl[b >> 4];
-        }
-        const qv: V32i8 = @bitCast(qx);
-        const sumi = util.dot32i8(qv, loadQy(y + 2));
-        acc += util.f16At(x, 0) * @as(f32, @floatFromInt(sumi)) * util.f16At(y, 0);
-    }
-    return acc;
-}
-
+// IQ4_NL x Q8_0: C ggml_vec_dot_iq4_nl_q8_0_generic (quants.c:1254).  The
+// implementation (with its AVX-512 VNNI path) is above, next to the codebook.
 pub fn iq4_nl_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     const nb = n / 32;
     var sumf: f32 = 0;
