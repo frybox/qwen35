@@ -116,13 +116,217 @@ fn deqIQ4XS(row: [*]const u8, out: *[256]f32) void {
 }
 
 // ---------------------------------------------------------------------------
-// kernels: SIMD (currently forwards to _ref) + scalar _ref twin
+// AVX-512 VNNI paths for IQ2_XXS / IQ2_XS / IQ3_XXS x Q8_K
 // ---------------------------------------------------------------------------
+// Same structure as iq2_s_q8_k_vnni_impl in src/simd/kerniq2.zig (commit
+// e982273, measured 5.44x): scalar codebook lookup fills a 256-byte `gb`
+// buffer in ELEMENT order; vectorized `vpdpbusd` accumulation with the +128
+// trick (subtract 128 * per-lane qs sum via an all-ones multiplier), integer
+// scale coefficient c per lane, common factor d*dy folded in f32 once per
+// block.  Codebook bytes are SCALAR loads (grids exceed 128 entries, no
+// gather).  Sign bytes sit in contiguous 8-byte groups per zmm ->
+// `vpbroadcastq` + `vpshufb` expansion (BW-only, no VBMI needed).
+//
+// Lane layout (all three kernels): zmm zi (0..3) carries elements
+// 64*zi..64*zi+63 in element order; i32 lane k = elements 4k..4k+3.  The
+// group (ib32, l) covers elements ib32*32 + l*8 .. +7, so lanes 0..7 of zmm
+// zi carry ib32 = 2*zi and lanes 8..15 carry ib32 = 2*zi+1.  Q8_K qs loads
+// are element order, so they align 1:1.
+//
+// These zmm-only helpers are private and only semantic-analyzed from the
+// `comptime tier.isAvx512Vnni and mode != .debug` branches below (same
+// pattern as iq4_xs_q8_k above); `signs` is the sign byte for elements
+// 8*ib32..+7, so element k tests bit k%8 -- identical to the kmask_pat
+// expansion kerniq2.zig uses.
+
+inline fn vpbroadcastqZ(x: u64) Z {
+    return asm ("vpbroadcastq (%[src]), %[dst]" : [dst] "=v" (-> Z) : [src] "r" (@as([*]const u8, @ptrCast(&x))));
+}
+
+const v_128: U = @splat(@as(u8, 128));
+const v_zero_u: U = @splat(@as(u8, 0));
+
+/// kmask_iq2xs replicated 8x (element k tests bit k % 8).
+const kmask_pat: U = blk: {
+    var a: [64]u8 = undefined;
+    for (0..8) |i| {
+        for (0..8) |j| {
+            a[i * 8 + j] = tables.kmask_iq2xs[j];
+        }
+    }
+    break :blk @bitCast(a);
+};
+
+/// vpshufb expansion: one sign byte g -> 8 copies (byte k selects g = k / 8).
+const v_expand8: Z = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |k| {
+        a[k] = @as(u8, @intCast(k / 8));
+    }
+    break :blk @bitCast(a);
+};
+
+fn bcast8(x: [*]const u8, off: usize) u64 {
+    return @bitCast(@as(*align(1) const [8]u8, @ptrCast(x + off)).*);
+}
+
+/// IQ2_XXS: mirrors deqIQ2XXS exactly -- group (ib, l) -> elements ib*32 + l*8,
+/// grid bytes written to gb in element order, one sign byte per 8 elements into
+/// sb[4*ib + l], integer coefficient c = 1 + 2*(aux1 >> 28) per ib into cs.
+/// zmm zi holds elements 64*zi..+63 in element order, so the sign bytes of
+/// those elements are the contiguous 8 bytes sb[8*zi..+7] (`vpbroadcastq` +
+/// `vpshufb`), and i32 lane k covers elements 4k..4k+3 -> ib = 2*zi + k/8.
+fn iq2_xxs_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / 256;
+        var acc_out: F32 = @splat(0);
+        for (0..nb) |b| {
+            const x = vx + b * 66;
+            const y = vy + b * 292;
+            var gb: [256]u8 = undefined;
+            var sb: [32]u8 = undefined;
+            var cs: [8]i32 = undefined;
+            for (0..8) |ib| {
+                const aux1: u32 = util.u32At(x + 6 + 8 * ib);
+                cs[ib] = 1 + 2 * @as(i32, @intCast(aux1 >> 28));
+                for (0..4) |l| {
+                    @as(*align(1) u64, @ptrCast(&gb[32 * ib + 8 * l])).* =
+                        tables.iq2xxs_grid[x[2 + 8 * ib + l]];
+                    sb[4 * ib + l] = tables.ksigns_iq2xs[(aux1 >> @as(u5, @intCast(7 * l))) & 127];
+                }
+            }
+            const gptr: [*]const u8 = @as([*]const u8, @ptrCast(&gb));
+            const sptr: [*]const u8 = @as([*]const u8, @ptrCast(&sb));
+            var acc: Z = v_zero;
+            for (0..4) |zi| {
+                const g = vload64(gptr + 64 * zi);
+                const sg = vshufb(v_expand8, vpbroadcastqZ(bcast8(sptr, 8 * zi)));
+                const m: @Vector(64, bool) = (@as(U, @bitCast(sg)) & kmask_pat) != v_zero_u;
+                const wu: U = @as(U, @bitCast(@select(i8, m, v_zero - g, g))) +% v_128;
+                const q = vload64(y + 4 + 64 * zi);
+                const dot = vpsubd(vdpbusd(v_zero, @bitCast(wu), q),
+                    vpslld7(vdpbusd(v_zero, v_ones, q)));
+                var cv: [16]i32 = undefined;
+                for (0..16) |k| {
+                    cv[k] = cs[2 * zi + k / 8];
+                }
+                acc = vpaddd(acc, vmulld(dot, @bitCast(cv)));
+            }
+            const dv: F32 = @splat(0.25 * util.f16At(x, 0) * @as(f32, @bitCast(util.u32At(y))));
+            acc_out = acc_out + dv * @as(F32, @floatFromInt(@as(I32, @bitCast(acc))));
+        }
+        return @reduce(.Add, acc_out);
+    }
+    return 0;
+}
+
+/// IQ2_XS: mirrors deqIQ2XS -- q16 = u16 @ 2 + 2*(4*ib + l), grid index q16 & 511
+/// (u64, 8 bytes in element order), signs = ksigns[q16 >> 9] into sb[4*ib + l],
+/// scale nibble db0 (sc & 0x0f) for l < 2 and db1 (sc >> 4) for l >= 2,
+/// c = 1 + 2*nibble, common factor 0.25.  lane k -> ib = 2*zi + k/8,
+/// l = (k/2) % 4.
+fn iq2_xs_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / 256;
+        var acc_out: F32 = @splat(0);
+        for (0..nb) |b| {
+            const x = vx + b * 74;
+            const y = vy + b * 292;
+            var gb: [256]u8 = undefined;
+            var sb: [32]u8 = undefined;
+            for (0..8) |ib| {
+                for (0..4) |l| {
+                    const q16: u16 = util.u16At(x + 2 + 2 * (4 * ib + l));
+                    @as(*align(1) u64, @ptrCast(&gb[32 * ib + 8 * l])).* =
+                        tables.iq2xs_grid[q16 & 511];
+                    sb[4 * ib + l] = tables.ksigns_iq2xs[q16 >> 9];
+                }
+            }
+            const gptr: [*]const u8 = @as([*]const u8, @ptrCast(&gb));
+            const sptr: [*]const u8 = @as([*]const u8, @ptrCast(&sb));
+            var acc: Z = v_zero;
+            for (0..4) |zi| {
+                const g = vload64(gptr + 64 * zi);
+                const sg = vshufb(v_expand8, vpbroadcastqZ(bcast8(sptr, 8 * zi)));
+                const m: @Vector(64, bool) = (@as(U, @bitCast(sg)) & kmask_pat) != v_zero_u;
+                const wu: U = @as(U, @bitCast(@select(i8, m, v_zero - g, g))) +% v_128;
+                const q = vload64(y + 4 + 64 * zi);
+                const dot = vpsubd(vdpbusd(v_zero, @bitCast(wu), q),
+                    vpslld7(vdpbusd(v_zero, v_ones, q)));
+                var cv: [16]i32 = undefined;
+                for (0..16) |k| {
+                    const sc: u8 = x[66 + 2 * zi + k / 8];
+                    const nib = if ((k / 2 % 4) < 2) sc & 0x0f else sc >> 4;
+                    cv[k] = 1 + 2 * @as(i32, nib);
+                }
+                acc = vpaddd(acc, vmulld(dot, @bitCast(cv)));
+            }
+            const dv: F32 = @splat(0.25 * util.f16At(x, 0) * @as(f32, @bitCast(util.u32At(y))));
+            acc_out = acc_out + dv * @as(F32, @floatFromInt(@as(I32, @bitCast(acc))));
+        }
+        return @reduce(.Add, acc_out);
+    }
+    return 0;
+}
+
+/// IQ3_XXS: mirrors deqIQ3XXS -- aux32 = u32 @ 66 + 4*ib, c = 1 + 2*(aux32 >> 28)
+/// (factor 0.5), two u32 grid entries per l written to gb[32*ib + 8*l .. +7],
+/// signs = ksigns[(aux32 >> 7l) & 127] into sb[4*ib + l].  Same lane layout.
+fn iq3_xxs_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / 256;
+        var acc_out: F32 = @splat(0);
+        for (0..nb) |b| {
+            const x = vx + b * 98;
+            const y = vy + b * 292;
+            var gb: [256]u8 = undefined;
+            var sb: [32]u8 = undefined;
+            var cs: [8]i32 = undefined;
+            for (0..8) |ib| {
+                const aux32: u32 = util.u32At(x + 66 + 4 * ib);
+                cs[ib] = 1 + 2 * @as(i32, @intCast(aux32 >> 28));
+                for (0..4) |l| {
+                    @as(*align(1) u32, @ptrCast(&gb[32 * ib + 8 * l])).* =
+                        tables.iq3xxs_grid[x[2 + 8 * ib + 2 * l]];
+                    @as(*align(1) u32, @ptrCast(&gb[32 * ib + 8 * l + 4])).* =
+                        tables.iq3xxs_grid[x[2 + 8 * ib + 2 * l + 1]];
+                    sb[4 * ib + l] = tables.ksigns_iq2xs[(aux32 >> @as(u5, @intCast(7 * l))) & 127];
+                }
+            }
+            const gptr: [*]const u8 = @as([*]const u8, @ptrCast(&gb));
+            const sptr: [*]const u8 = @as([*]const u8, @ptrCast(&sb));
+            var acc: Z = v_zero;
+            for (0..4) |zi| {
+                const g = vload64(gptr + 64 * zi);
+                const sg = vshufb(v_expand8, vpbroadcastqZ(bcast8(sptr, 8 * zi)));
+                const m: @Vector(64, bool) = (@as(U, @bitCast(sg)) & kmask_pat) != v_zero_u;
+                const wu: U = @as(U, @bitCast(@select(i8, m, v_zero - g, g))) +% v_128;
+                const q = vload64(y + 4 + 64 * zi);
+                const dot = vpsubd(vdpbusd(v_zero, @bitCast(wu), q),
+                    vpslld7(vdpbusd(v_zero, v_ones, q)));
+                var cv: [16]i32 = undefined;
+                for (0..16) |k| {
+                    cv[k] = cs[2 * zi + k / 8];
+                }
+                acc = vpaddd(acc, vmulld(dot, @bitCast(cv)));
+            }
+            const dv: F32 = @splat(0.5 * util.f16At(x, 0) * @as(f32, @bitCast(util.u32At(y))));
+            acc_out = acc_out + dv * @as(F32, @floatFromInt(@as(I32, @bitCast(acc))));
+        }
+        return @reduce(.Add, acc_out);
+    }
+    return 0;
+}
 
 /// True SIMD IQ2_XXS: scalar codebook dequant (both sides) + 8-wide `@Vector`
 /// FMA accumulate with horizontal reduction (pattern as iq4_xs_q8_k).  Math is
-/// element-identical to `iq2_xxs_q8_k_ref`.
+/// element-identical to `iq2_xxs_q8_k_ref`.  The AVX-512 VNNI kernel above runs
+/// in the vnni/vbmi tiers at non-Debug optimization; other tiers and Debug
+/// builds use the element-identical f32 path below.
 pub fn iq2_xxs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return iq2_xxs_q8_k_vnni_impl(n, vx, vy);
+    }
     const rb: usize = 66;
     const V8f32 = @Vector(8, f32);
     var w: [256]f32 = undefined;
@@ -158,6 +362,9 @@ pub fn iq2_xxs_q8_k_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c)
 /// FMA accumulate with horizontal reduction (pattern as iq4_xs_q8_k).  Math is
 /// element-identical to `iq2_xs_q8_k_ref`.
 pub fn iq2_xs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return iq2_xs_q8_k_vnni_impl(n, vx, vy);
+    }
     const rb: usize = 74;
     const V8f32 = @Vector(8, f32);
     var w: [256]f32 = undefined;
@@ -193,6 +400,9 @@ pub fn iq2_xs_q8_k_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) 
 /// FMA accumulate with horizontal reduction (pattern as iq4_xs_q8_k).  Math is
 /// element-identical to `iq3_xxs_q8_k_ref`.
 pub fn iq3_xxs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return iq3_xxs_q8_k_vnni_impl(n, vx, vy);
+    }
     const rb: usize = 98;
     const V8f32 = @Vector(8, f32);
     var w: [256]f32 = undefined;
