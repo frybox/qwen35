@@ -141,6 +141,67 @@ const iqn_add128: IQZ = blk: {
 };
 const iqn_lanes07: IQI32 = @bitCast([16]i32{ -1, -1, -1, -1, -1, -1, -1, -1, 0, 0, 0, 0, 0, 0, 0, 0 });
 
+/// Q4_0 nibble table: nibble -> (nib - 8 + 128) = nib + 120, replicated to all
+/// four 128-bit lanes so one vpshufb resolves the 16 qs bytes.  The +128 bias is
+/// folded out below by `pslld7(dpbusd(ones, yq))` = 128 * S.
+const q40_tab: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = @as(u8, @intCast(i % 16 + 120));
+    break :blk @bitCast(a);
+};
+/// Q4_1 nibble table: nibble -> nib + 128 (no -8, Q4_1 keeps the min term).
+const q41_tab: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = @as(u8, @intCast(i % 16 + 128));
+    break :blk @bitCast(a);
+};
+/// ones in lanes 0..31 only: vpdpbusd against the Q8_0 zmm broadcast (which
+/// replicates the 32 qs bytes into both halves) sums the block exactly once.
+/// A full-lane ones table would count every byte twice.
+const iqn_ones32: IQZ = blk: {
+    var a: [64]u8 = undefined;
+    for (0..64) |i| a[i] = if (i < 32) @as(u8, 1) else 0;
+    break :blk @bitCast(a);
+};
+
+/// Q4_0 / Q4_1 x Q8_0, zmm + VNNI.  Same shape as `iq4_nl_q8_0_vnni_impl`: the
+/// 16 qs bytes are broadcast to every 128-bit lane, each lane shuffles its own
+/// nibble, lo nibbles land in lanes 0..15 and hi nibbles in lanes 16..31, and
+/// the Q8_0 side is broadcast into the low 256 bits (upper lanes zero, so no
+/// read past the 34-byte block and no double counting).
+/// `gs` = dpbusd(ones, yq): lanes 0..31 carry the 4-byte partial sums of the
+/// block, which sum to S over the 16 lanes, and lanes 32..63 are zero.  So
+/// `pslld7(gs)` = 128*S is exactly the bias to fold out of dpbusd(w, yq), and
+/// floatFromInt(gs) feeds the f32 accumulator as S once per block (Q4_1's
+/// min term m_x * d_y * S).
+fn q4_vnni_impl(comptime tab: IQZ, comptime rb: usize, comptime m_off: usize, n: usize, vx: [*]const u8, vy: [*]const u8) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        const nb = n / 32;
+        var acc_out: V16f32 = @splat(0);
+        var accmin: V16f32 = @splat(0);
+        for (0..nb) |ib| {
+            const x = vx + ib * rb;
+            const y = vy + ib * q8_bytes;
+            const xq = iqnBcast128(x + 2 + m_off);
+            const lo = iqnPand(xq, iqn_m0f);
+            const hi = iqnPand(iqnPsrld4(xq), iqn_m0f);
+            const w = iqnPor(iqnPand(iqnShufb(lo, tab), iqn_mlo),
+                iqnPand(iqnShufb(hi, tab), iqn_mhi));
+            const yq = iqnBcast256(y + 2);
+            const gs = iqnDpbusd0(iqn_ones32, yq);
+            const dot = iqnPsubd(iqnDpbusd0(w, yq), iqnPslld7(gs));
+            acc_out = acc_out + @as(V16f32, @splat(util.f16At(x, 0) * util.f16At(y, 0))) *
+                @as(V16f32, @floatFromInt(dot));
+            if (comptime m_off != 0) {
+                accmin = accmin + @as(V16f32, @splat(util.f16At(x, 2) * util.f16At(y, 0))) *
+                    @as(V16f32, @floatFromInt(gs));
+            }
+        }
+        return @reduce(.Add, acc_out) + @reduce(.Add, accmin);
+    }
+    return 0;
+}
+
 fn iq4_nl_q8_0_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
         const nb = n / 32;
@@ -160,9 +221,11 @@ fn iq4_nl_q8_0_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c
             const wu = w; // table already carries the +128 bias
             const yq = iqnBcast256(y + 2);
             const acc = iqnDpbusd0(wu, yq);
-            // upper lanes of yq are zero => gsum already holds the block sum in
-            // lanes 0..7 with no extra masking.
-            const dot = iqnPsubd(acc, iqnPslld7(iqnDpbusd0(iqn_ones, yq)));
+            // vbroadcasti32x8 replicates the 32 qs bytes into BOTH 256-bit
+            // halves, so a full ones table would see the block sum twice.
+            // ones32 leaves the upper 256 bits masked: S lands in lanes 0..7,
+            // lanes 8..15 stay zero, and pslld7 gives exactly the 128*S bias.
+            const dot = iqnPsubd(acc, iqnPslld7(iqnDpbusd0(iqn_ones32, yq)));
             const dv: V16f32 = @splat(util.f16At(x, 0) * util.f16At(y, 0));
             acc_out = acc_out + dv * @as(V16f32, @floatFromInt(dot));
         }
@@ -863,6 +926,9 @@ pub fn q8_0_q8_0_row_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c
 }
 
 pub fn q4_0_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return q4_vnni_impl(q40_tab, 18, 0, n, vx, vy);
+    }
     var acc: V16f32 = @splat(0);
     for (0..n / 32) |ib| {
         const x = vx + ib * 18;
@@ -881,6 +947,9 @@ pub fn q4_0_q8_0_row_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c
 }
 
 pub fn q4_1_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return q4_vnni_impl(q41_tab, 20, 2, n, vx, vy);
+    }
     var acc: V16f32 = @splat(0);
     var accmin: V16f32 = @splat(0);
     for (0..n / 32) |ib| {
@@ -944,6 +1013,9 @@ pub fn q5_1_q8_0_row_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c
 }
 
 pub fn iq4_nl_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
+        return iq4_nl_q8_0_vnni_impl(n, vx, vy);
+    }
     var acc: V16f32 = @splat(0);
     for (0..n / 32) |ib| {
         const x = vx + ib * 18;
