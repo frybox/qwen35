@@ -318,31 +318,131 @@ fn iq3_xxs_q8_k_vnni_impl(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.
     return 0;
 }
 
-/// True SIMD IQ2_XXS: scalar codebook dequant (both sides) + 8-wide `@Vector`
-/// FMA accumulate with horizontal reduction (pattern as iq4_xs_q8_k).  Math is
-/// element-identical to `iq2_xxs_q8_k_ref`.  The AVX-512 VNNI kernel above runs
+/// True SIMD IQ2_XXS: AVX2 integer-domain dot product.
+/// Ported from llama.cpp `ggml_vec_dot_iq2_xxs_q8_K` (arch/x86/quants.c L2724-2778).
+/// Math is element-identical to `iq2_xxs_q8_k_ref`.  The AVX-512 VNNI kernel above runs
 /// in the vnni/vbmi tiers at non-Debug optimization; other tiers and Debug
 /// builds use the element-identical f32 path below.
 pub fn iq2_xxs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     if (comptime tier.isAvx512Vnni and @import("builtin").mode != .debug) {
         return iq2_xxs_q8_k_vnni_impl(n, vx, vy);
     }
-    const rb: usize = 66;
+    const nb = n / 256;
+    const V32i8 = @Vector(32, i8);
+    const V32u8 = @Vector(32, u8);
+    const V16i16 = @Vector(16, i16);
+    const V8i32 = @Vector(8, i32);
     const V8f32 = @Vector(8, f32);
-    var w: [256]f32 = undefined;
-    var a: [256]f32 = undefined;
-    var accv: V8f32 = @splat(0);
-    for (0 .. n / 256) |b| {
-        deqIQ2XXS(vx + b * rb, &w);
-        util.deqQ8K(vy + b * 292, &a);
-        var i: usize = 0;
-        while (i < 256) : (i += 8) {
-            const wv = util.loadF32(8, &w[i]);
-            const av = util.loadF32(8, &a[i]);
-            accv = accv + wv * av;
+
+    var accf: V8f32 = @splat(0);
+    for (0..nb) |b| {
+        const x = vx + b * 66;
+        const y = vy + b * 292;
+        const d = util.f16At(x, 0) * util.f32At(y, 0);
+
+        var sumi: V8i32 = @splat(0);
+        var q8: [*]const i8 = @ptrCast(y + 4);
+        var q2: [*]const u8 = x + 2;
+
+        // Process 8 blocks of 32 elements each (4 iterations, 2 blocks per iteration)
+        for (0..4) |_| {
+            // Load 2 x 32 q8 values
+            const q8_1: V32i8 = util.load(V32i8, q8);
+            q8 += 32;
+            const q8_2: V32i8 = util.load(V32i8, q8);
+            q8 += 32;
+
+            // memcpy(aux32, q2, 4*sizeof(uint32_t)); q2 += 8;
+            // 8 u16 -> 4 u32 via raw memory copy (little-endian)
+            var aux32: [4]u32 = undefined;
+            @memcpy(@as([*]u8, @ptrCast(&aux32))[0..16], q2[0..16]);
+            q2 += 16;
+            
+            // aux8 is u8 view of aux32
+            const aux8: [16]u8 = @bitCast(aux32);
+
+            // Build q2_1 from aux8[3,2,1,0] in that order (reverse for _mm256_set_epi64x)
+            // Each iq2xxs_grid entry is u64 = 8 u8 in little-endian memory order
+            var q2_1: V32u8 = undefined;
+            {
+                const g0: u64 = tables.iq2xxs_grid[aux8[3]];
+                const g1: u64 = tables.iq2xxs_grid[aux8[2]];
+                const g2: u64 = tables.iq2xxs_grid[aux8[1]];
+                const g3: u64 = tables.iq2xxs_grid[aux8[0]];
+                // Combine into 32 u8: g0 goes to bytes [24..31], g1 to [16..23], g2 to [8..15], g3 to [0..7]
+                var arr: [32]u8 = undefined;
+                @memcpy(arr[0..8], @as([*]const u8, @ptrCast(&g3))[0..8]);
+                @memcpy(arr[8..16], @as([*]const u8, @ptrCast(&g2))[0..8]);
+                @memcpy(arr[16..24], @as([*]const u8, @ptrCast(&g1))[0..8]);
+                @memcpy(arr[24..32], @as([*]const u8, @ptrCast(&g0))[0..8]);
+                q2_1 = @bitCast(arr);
+            }
+
+            // Build q2_2 from aux8[11,10,9,8]
+            var q2_2: V32u8 = undefined;
+            {
+                const g0: u64 = tables.iq2xxs_grid[aux8[11]];
+                const g1: u64 = tables.iq2xxs_grid[aux8[10]];
+                const g2: u64 = tables.iq2xxs_grid[aux8[9]];
+                const g3: u64 = tables.iq2xxs_grid[aux8[8]];
+                var arr: [32]u8 = undefined;
+                @memcpy(arr[0..8], @as([*]const u8, @ptrCast(&g3))[0..8]);
+                @memcpy(arr[8..16], @as([*]const u8, @ptrCast(&g2))[0..8]);
+                @memcpy(arr[16..24], @as([*]const u8, @ptrCast(&g1))[0..8]);
+                @memcpy(arr[24..32], @as([*]const u8, @ptrCast(&g0))[0..8]);
+                q2_2 = @bitCast(arr);
+            }
+
+            // Build s2_1 from aux32[1] >> 21, 14, 7, 0
+            var s2_1: V32i8 = undefined;
+            {
+                const signs = tables.keven_signs_q2xs;
+                var arr: [32]i8 = undefined;
+                @memcpy(arr[0..8], signs[8 * @as(usize, @intCast((aux32[1] >> 0) & 127)) ..][0..8]);
+                @memcpy(arr[8..16], signs[8 * @as(usize, @intCast((aux32[1] >> 7) & 127)) ..][0..8]);
+                @memcpy(arr[16..24], signs[8 * @as(usize, @intCast((aux32[1] >> 14) & 127)) ..][0..8]);
+                @memcpy(arr[24..32], signs[8 * @as(usize, @intCast((aux32[1] >> 21) & 127)) ..][0..8]);
+                s2_1 = @bitCast(arr);
+            }
+
+            // Build s2_2 from aux32[3] >> 21, 14, 7, 0
+            var s2_2: V32i8 = undefined;
+            {
+                const signs = tables.keven_signs_q2xs;
+                var arr: [32]i8 = undefined;
+                @memcpy(arr[0..8], signs[8 * @as(usize, @intCast((aux32[3] >> 0) & 127)) ..][0..8]);
+                @memcpy(arr[8..16], signs[8 * @as(usize, @intCast((aux32[3] >> 7) & 127)) ..][0..8]);
+                @memcpy(arr[16..24], signs[8 * @as(usize, @intCast((aux32[3] >> 14) & 127)) ..][0..8]);
+                @memcpy(arr[24..32], signs[8 * @as(usize, @intCast((aux32[3] >> 21) & 127)) ..][0..8]);
+                s2_2 = @bitCast(arr);
+            }
+
+            // Apply sign to q8: q8s = sign_epi8(q8, s2) - flip sign where s2 < 0
+            const q8s_1: V32i8 = @select(i8, s2_1 < @as(V32i8, @splat(0)), -q8_1, q8_1);
+            const q8s_2: V32i8 = @select(i8, s2_2 < @as(V32i8, @splat(0)), -q8_2, q8_2);
+
+            // maddubs_epi16: u8 * i8 -> i16 pairs, then add pairs -> i16
+            const dot1: V16i16 = util.dot32u8i16(q2_1, q8s_1);
+            const dot2: V16i16 = util.dot32u8i16(q2_2, q8s_2);
+
+            // Apply scale: ls = aux32[1] >> 28, scale = 2*ls + 1
+            const ls1: i16 = @intCast(aux32[1] >> 28);
+            const ls2: i16 = @intCast(aux32[3] >> 28);
+            const scale1: V16i16 = @splat(2 * ls1 + 1);
+            const scale2: V16i16 = @splat(2 * ls2 + 1);
+
+            // madd_epi16: i16 * i16 -> i32 pairs, then add -> i32
+            const p1: V8i32 = util.madd16(dot1, scale1);
+            const p2: V8i32 = util.madd16(dot2, scale2);
+
+            sumi += p1 + p2;
         }
+
+        // Accumulate with scale factor
+        accf += @as(V8f32, @floatFromInt(sumi)) * @as(V8f32, @splat(d * 0.125));
     }
-    return @reduce(.Add, accv);
+
+    return @reduce(.Add, accf);
 }
 
 pub fn iq2_xxs_q8_k_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {

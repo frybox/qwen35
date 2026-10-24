@@ -238,6 +238,30 @@ pub inline fn madd8i8(x: @Vector(16, i8), y: @Vector(16, i8)) @Vector(8, i32) {
     return @bitCast(s);
 }
 
+/// 32 u8*i8 products as 16 i16 (pairs summed).
+pub inline fn dot32u8i16(x: @Vector(32, u8), y: @Vector(32, i8)) @Vector(16, i16) {
+    const p: @Vector(32, i16) = @as(@Vector(32, i16), x) *% @as(@Vector(32, i16), y);
+    const pa: [32]i16 = @bitCast(p);
+    var s: [16]i16 = undefined;
+    for (0..16) |i| s[i] = pa[2 * i] +% pa[2 * i + 1];
+    return @bitCast(s);
+}
+
+/// 16 i16*i16 products as 8 i32 (pairs summed).
+pub inline fn madd16(x: @Vector(16, i16), y: @Vector(16, i16)) @Vector(8, i32) {
+    const p: @Vector(16, i32) = @as(@Vector(16, i32), x) *% @as(@Vector(16, i32), y);
+    const pa: [16]i32 = @bitCast(p);
+    var s: [8]i32 = undefined;
+    for (0..8) |i| s[i] = pa[2 * i] +% pa[2 * i + 1];
+    return @bitCast(s);
+}
+
+/// Load f32 from unaligned pointer with offset.
+pub inline fn f32At(p: anytype, offset: usize) f32 {
+    const ptr: *align(1) const f32 = @ptrCast(@alignCast(p + offset));
+    return ptr.*;
+}
+
 /// Horizontal sum of a 16-lane f32 accumulator.
 pub inline fn sumF16(v: @Vector(16, f32)) f32 {
     const a: [16]f32 = @bitCast(v);
