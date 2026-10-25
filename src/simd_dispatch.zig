@@ -279,18 +279,13 @@ pub fn init() void {
     }
     const f = detect();
     if (f.avx512f and f.avx512bw and f.avx512vl and f.avx512dq) {
-        // Split tier selection: Q-family (kern256) can use VNNI safely,
-        // but IQ-family (kerniq/kerniq2/kerniq3) VNNI kernels have bugs.
-        // This gives ~2x speedup for Q-family while keeping IQ correct.
-        const use_vnni = f.avx512vnni;
-        if (use_vnni) {
-            tier = .avx512vnni;
-            d32 = makeDot32(simd_avx512vnni);
-            d256 = makeDot256(simd_avx512vnni);
-            d32row = makeDot32Row(simd_avx512vnni);
-            diq = makeDotIq(simd_avx512vnni); // enable VNNI for IQ
-            actQ8_0 = &simd_avx512vnni.act.quantizeQ8_0;
-            actQ8_K = &simd_avx512vnni.act.quantizeQ8_K;
+        // VBMI tier: VNNI + avx512vbmi. IQ kernels need VBMI's vpermb for
+        // in-register table lookups (ksigns/grid), avoiding scalar memory reads.
+        // This gives ~3x speedup for IQ-family.
+        if (f.avx512vbmi and f.avx512vnni) {
+            bindTier(.avx512vbmi);
+        } else if (f.avx512vnni) {
+            bindTier(.avx512vnni);
         } else {
             bindTier(.avx512);
         }
