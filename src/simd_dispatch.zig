@@ -288,7 +288,7 @@ pub fn init() void {
             d32 = makeDot32(simd_avx512vnni);
             d256 = makeDot256(simd_avx512vnni);
             d32row = makeDot32Row(simd_avx512vnni);
-            diq = makeDotIq(simd_avx512); // force avx512 for IQ
+            diq = makeDotIq(simd_avx512vnni); // enable VNNI for IQ
             actQ8_0 = &simd_avx512vnni.act.quantizeQ8_0;
             actQ8_K = &simd_avx512vnni.act.quantizeQ8_K;
         } else {

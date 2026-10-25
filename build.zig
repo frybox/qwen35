@@ -131,6 +131,30 @@ pub fn build(b: *std.Build) void {
         .target = target,
     });
 
+    // ---------------------------------------------------------------------------
+    // C kernels for SIMD-optimized IQ quantization (ported from llama.cpp)
+    // ---------------------------------------------------------------------------
+    const c_kernels = b.addLibrary(.{
+        .name = "iq_kernels",
+        .linkage = .static,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    c_kernels.root_module.addCSourceFile(.{
+        .file = b.path("src/c_kernels/iq_kernels.c"),
+        .flags = &.{
+            "-std=c11",
+            "-O3",
+            "-mavx2",
+            "-mfma",
+            "-mf16c",
+        },
+    });
+    c_kernels.root_module.link_libc = true;
+    b.installArtifact(c_kernels);
+
     // ISA-tier copies of the ported quantization kernels.  `mod` imports them
     // by name; simd/dispatch.zig binds the function pointers to whichever tier
     // the running CPU supports (CPUID + XGETBV, checked at runtime).
@@ -179,6 +203,9 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+
+    // Link C kernels library
+    exe.root_module.linkLibrary(c_kernels);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

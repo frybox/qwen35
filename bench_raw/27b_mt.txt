@@ -1,0 +1,18 @@
+=== threads 1 ===
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是因为**瑞利散射（Rayleigh Scattering）**
+
+-------------------
+Prefill: 17 tokens in 182.748 s  (0.09 tok/s)
+Generate: 15 tokens in 165.774 s  (0.09 tok/s)
+Stop reason: max tokens reached
+real 349.689 s
+=== threads 16 ===
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是因为**瑞利散射（Rayleigh Scattering）**
+
+-------------------
+Prefill: 17 tokens in 12.878 s  (1.32 tok/s)
+Generate: 15 tokens in 13.401 s  (1.12 tok/s)
+Stop reason: max tokens reached
+real 27.511 s

@@ -1,0 +1,204 @@
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**现象造成的，这一现象在物理学中被称为**瑞利散射**（Rayleigh Scattering）。
+
+
+
+-------------------
+Prefill: 17 tokens in 0.221 s  (76.98 tok/s)
+Generate: 31 tokens in 0.752 s  (41.21 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**现象造成的，这一现象在物理学中被称为**瑞利散射**（Rayleigh Scattering）。
+
+
+
+-------------------
+Prefill: 17 tokens in 0.973 s  (17.47 tok/s)
+Generate: 31 tokens in 8.254 s  (3.76 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_NL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空之所以呈现**蓝色**，主要是由**光的散射**现象引起的，具体原理如下：
+
+1.  **瑞利散射（Rayleigh
+
+-------------------
+Prefill: 17 tokens in 0.577 s  (29.46 tok/s)
+Generate: 31 tokens in 1.352 s  (22.93 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空之所以呈现蓝色，主要归功于**瑞利散射**（Rayleigh Scattering）这一物理现象。
+
+简单来说，当太阳光穿过大气层
+
+-------------------
+Prefill: 17 tokens in 0.445 s  (38.18 tok/s)
+Generate: 31 tokens in 1.148 s  (27.01 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空之所以呈现蓝色，并不是因为天空本身是蓝色的，而是由于**大气散射**（光污染）和**瑞利散射**（瑞利
+
+-------------------
+Prefill: 17 tokens in 0.329 s  (51.73 tok/s)
+Generate: 31 tokens in 0.935 s  (33.17 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**散射光**（Scattering）现象引起的。这并非天空本身“天生”是蓝色的，而是大气层中的
+
+-------------------
+Prefill: 17 tokens in 0.434 s  (39.21 tok/s)
+Generate: 31 tokens in 1.172 s  (26.45 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空之所以呈现蓝色，主要归功于**瑞利散射**（Rayleigh Scattering）现象。
+
+简单来说，当太阳光穿过大气层时，
+
+-------------------
+Prefill: 17 tokens in 0.380 s  (44.79 tok/s)
+Generate: 31 tokens in 1.038 s  (29.86 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_1.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**（Scattering）现象造成的，具体原因如下：
+
+1.  **光的波长特性**：
+
+-------------------
+Prefill: 17 tokens in 0.529 s  (32.16 tok/s)
+Generate: 31 tokens in 1.306 s  (23.74 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**（Scattering）现象造成的，这主要涉及光的物理特性。以下是详细的科学解释：
+
+###
+
+-------------------
+Prefill: 17 tokens in 0.233 s  (72.90 tok/s)
+Generate: 31 tokens in 0.705 s  (44.00 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_S.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**（Scattering）现象造成的，这主要与**瑞利散射**（Rayleigh Scattering）
+
+-------------------
+Prefill: 17 tokens in 0.216 s  (78.52 tok/s)
+Generate: 31 tokens in 0.687 s  (45.10 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_M.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气层中的散射现象**造成的，这一现象在物理学和天文学中被称为**瑞利散射**（Ray
+
+-------------------
+Prefill: 17 tokens in 0.240 s  (70.92 tok/s)
+Generate: 31 tokens in 0.737 s  (42.08 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_S.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由大气层中的**瑞利散射**（Rayleigh Scattering）现象引起的。这是一个关于大气物理的经典问题，其
+
+-------------------
+Prefill: 17 tokens in 0.234 s  (72.55 tok/s)
+Generate: 31 tokens in 0.729 s  (42.52 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q6_K.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气中的散射现象**造成的，这一现象在物理学中被称为**瑞利散射**（Rayleigh Scattering）。
+
+-------------------
+Prefill: 17 tokens in 0.243 s  (69.90 tok/s)
+Generate: 31 tokens in 0.757 s  (40.97 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_M.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空之所以呈现蓝色，主要源于**大气散射作用**，具体过程如下：
+
+1.  **大气层结构**：大气层分为空气
+
+-------------------
+Prefill: 17 tokens in 0.725 s  (23.43 tok/s)
+Generate: 31 tokens in 1.653 s  (18.75 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_XXS.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: <think>
+用户可能希望了解一些科学事实，比如为什么天空是蓝色的。所以，我假设用户可能想知道一些科学事实。
+那么，我
+
+-------------------
+Prefill: 17 tokens in 0.831 s  (20.46 tok/s)
+Generate: 31 tokens in 1.923 s  (16.12 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空之所以呈现蓝色，主要是因为**大气散射**（Scattering）现象。具体来说，主要有两种原因：
+
+### 1. 瑞利散射
+
+-------------------
+Prefill: 17 tokens in 0.713 s  (23.84 tok/s)
+Generate: 31 tokens in 1.638 s  (18.93 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q2_K_XL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，这主要与**光的散射**有关。
+
+当阳光穿过大气层时，它实际上会穿过空气，但不会直接穿过
+
+-------------------
+Prefill: 17 tokens in 0.420 s  (40.44 tok/s)
+Generate: 31 tokens in 1.046 s  (29.64 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q3_K_XL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**（光污染）和**瑞利散射**共同作用的结果，具体原因如下：
+
+### 
+
+-------------------
+Prefill: 17 tokens in 0.351 s  (48.40 tok/s)
+Generate: 31 tokens in 0.960 s  (32.30 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气层中的光散射现象**造成的，这一现象在物理学和天文学中被称为**瑞利散射**（
+
+-------------------
+Prefill: 17 tokens in 0.240 s  (70.73 tok/s)
+Generate: 31 tokens in 0.749 s  (41.40 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q5_K_XL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**（Rayleigh 散射）现象造成的，这一现象最早由英国天文学家**罗伯特·阿瑟
+
+-------------------
+Prefill: 17 tokens in 0.227 s  (75.00 tok/s)
+Generate: 31 tokens in 0.751 s  (41.26 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q6_K_XL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**现象造成的，这一现象在物理学中被称为**瑞利散射**（Rayleigh Scattering）。
+
+
+
+-------------------
+Prefill: 17 tokens in 0.255 s  (66.63 tok/s)
+Generate: 31 tokens in 0.809 s  (38.31 tok/s)
+Stop reason: max tokens reached
+zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q8_K_XL.gguf 天空为什么是蓝色的？ -n 48
+[prompt: 17 tokens]
+Output: 天空呈现蓝色，主要是由**大气散射**现象造成的，这一现象在物理学中被称为**瑞利散射**（Rayleigh Scattering）。
+
+
+
+-------------------
+Prefill: 17 tokens in 0.753 s  (22.58 tok/s)
+Generate: 31 tokens in 7.740 s  (4.00 tok/s)
+Stop reason: max tokens reached

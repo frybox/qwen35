@@ -333,6 +333,8 @@ pub fn iq2_xxs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32
     const V16i16 = @Vector(16, i16);
     const V8i32 = @Vector(8, i32);
     const V8f32 = @Vector(8, f32);
+    const V8i8 = @Vector(8, i8);
+    const V8u8 = @Vector(8, u8);
 
     var accf: V8f32 = @splat(0);
     for (0..nb) |b| {
@@ -363,59 +365,111 @@ pub fn iq2_xxs_q8_k(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32
 
             // Build q2_1 from aux8[3,2,1,0] in that order (reverse for _mm256_set_epi64x)
             // Each iq2xxs_grid entry is u64 = 8 u8 in little-endian memory order
-            var q2_1: V32u8 = undefined;
-            {
-                const g0: u64 = tables.iq2xxs_grid[aux8[3]];
-                const g1: u64 = tables.iq2xxs_grid[aux8[2]];
-                const g2: u64 = tables.iq2xxs_grid[aux8[1]];
-                const g3: u64 = tables.iq2xxs_grid[aux8[0]];
-                // Combine into 32 u8: g0 goes to bytes [24..31], g1 to [16..23], g2 to [8..15], g3 to [0..7]
-                var arr: [32]u8 = undefined;
-                @memcpy(arr[0..8], @as([*]const u8, @ptrCast(&g3))[0..8]);
-                @memcpy(arr[8..16], @as([*]const u8, @ptrCast(&g2))[0..8]);
-                @memcpy(arr[16..24], @as([*]const u8, @ptrCast(&g1))[0..8]);
-                @memcpy(arr[24..32], @as([*]const u8, @ptrCast(&g0))[0..8]);
-                q2_1 = @bitCast(arr);
-            }
+            const q2_1: V32u8 = std.simd.join(
+                std.simd.join(
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[0]])),
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[1]])),
+                ),
+                std.simd.join(
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[2]])),
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[3]])),
+                ),
+            );
+            //const q2_1: V32u8 = @bitCast(@Vector(4, u64){
+            //    tables.iq2xxs_grid[aux8[0]],
+            //    tables.iq2xxs_grid[aux8[1]],
+            //    tables.iq2xxs_grid[aux8[2]],
+            //    tables.iq2xxs_grid[aux8[3]],
+            //});
+//            var q2_1: V32u8 = undefined;
+//            {
+//                const g0: u64 = tables.iq2xxs_grid[aux8[3]];
+//                const g1: u64 = tables.iq2xxs_grid[aux8[2]];
+//                const g2: u64 = tables.iq2xxs_grid[aux8[1]];
+//                const g3: u64 = tables.iq2xxs_grid[aux8[0]];
+//                // Combine into 32 u8: g0 goes to bytes [24..31], g1 to [16..23], g2 to [8..15], g3 to [0..7]
+//                var arr: [32]u8 = undefined;
+//                @memcpy(arr[0..8], @as([*]const u8, @ptrCast(&g3))[0..8]);
+//                @memcpy(arr[8..16], @as([*]const u8, @ptrCast(&g2))[0..8]);
+//                @memcpy(arr[16..24], @as([*]const u8, @ptrCast(&g1))[0..8]);
+//                @memcpy(arr[24..32], @as([*]const u8, @ptrCast(&g0))[0..8]);
+//                q2_1 = @bitCast(arr);
+//            }
 
             // Build q2_2 from aux8[11,10,9,8]
-            var q2_2: V32u8 = undefined;
-            {
-                const g0: u64 = tables.iq2xxs_grid[aux8[11]];
-                const g1: u64 = tables.iq2xxs_grid[aux8[10]];
-                const g2: u64 = tables.iq2xxs_grid[aux8[9]];
-                const g3: u64 = tables.iq2xxs_grid[aux8[8]];
-                var arr: [32]u8 = undefined;
-                @memcpy(arr[0..8], @as([*]const u8, @ptrCast(&g3))[0..8]);
-                @memcpy(arr[8..16], @as([*]const u8, @ptrCast(&g2))[0..8]);
-                @memcpy(arr[16..24], @as([*]const u8, @ptrCast(&g1))[0..8]);
-                @memcpy(arr[24..32], @as([*]const u8, @ptrCast(&g0))[0..8]);
-                q2_2 = @bitCast(arr);
-            }
+            const q2_2: V32u8 = std.simd.join(
+                std.simd.join(
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[8]])),
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[9]])),
+                ),
+                std.simd.join(
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[10]])),
+                    @as(V8u8, @bitCast(tables.iq2xxs_grid[aux8[11]])),
+                ),
+            );
+            //const q2_2: V32u8 = @bitCast(@Vector(4, u64){
+            //    tables.iq2xxs_grid[aux8[8]],
+            //    tables.iq2xxs_grid[aux8[9]],
+            //    tables.iq2xxs_grid[aux8[10]],
+            //    tables.iq2xxs_grid[aux8[11]],
+            //});
+//            var q2_2: V32u8 = undefined;
+//            {
+//                const g0: u64 = tables.iq2xxs_grid[aux8[11]];
+//                const g1: u64 = tables.iq2xxs_grid[aux8[10]];
+//                const g2: u64 = tables.iq2xxs_grid[aux8[9]];
+//                const g3: u64 = tables.iq2xxs_grid[aux8[8]];
+//                var arr: [32]u8 = undefined;
+//                @memcpy(arr[0..8], @as([*]const u8, @ptrCast(&g3))[0..8]);
+//                @memcpy(arr[8..16], @as([*]const u8, @ptrCast(&g2))[0..8]);
+//                @memcpy(arr[16..24], @as([*]const u8, @ptrCast(&g1))[0..8]);
+//                @memcpy(arr[24..32], @as([*]const u8, @ptrCast(&g0))[0..8]);
+//                q2_2 = @bitCast(arr);
+//            }
 
             // Build s2_1 from aux32[1] >> 21, 14, 7, 0
-            var s2_1: V32i8 = undefined;
-            {
-                const signs = tables.keven_signs_q2xs;
-                var arr: [32]i8 = undefined;
-                @memcpy(arr[0..8], signs[8 * @as(usize, @intCast((aux32[1] >> 0) & 127)) ..][0..8]);
-                @memcpy(arr[8..16], signs[8 * @as(usize, @intCast((aux32[1] >> 7) & 127)) ..][0..8]);
-                @memcpy(arr[16..24], signs[8 * @as(usize, @intCast((aux32[1] >> 14) & 127)) ..][0..8]);
-                @memcpy(arr[24..32], signs[8 * @as(usize, @intCast((aux32[1] >> 21) & 127)) ..][0..8]);
-                s2_1 = @bitCast(arr);
-            }
+            const s2_1: V32i8 = std.simd.join(
+                std.simd.join(
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[1]>>0)&127))..][0..8].*)),
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[1]>>7)&127))..][0..8].*)),
+                ),
+                std.simd.join(
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[1]>>14)&127))..][0..8].*)),
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[1]>>21)&127))..][0..8].*)),
+                ),
+            );
+//            var s2_1: V32i8 = undefined;
+//            {
+//                const signs = tables.keven_signs_q2xs;
+//                var arr: [32]i8 = undefined;
+//                @memcpy(arr[0..8], signs[8 * @as(usize, @intCast((aux32[1] >> 0) & 127)) ..][0..8]);
+//                @memcpy(arr[8..16], signs[8 * @as(usize, @intCast((aux32[1] >> 7) & 127)) ..][0..8]);
+//                @memcpy(arr[16..24], signs[8 * @as(usize, @intCast((aux32[1] >> 14) & 127)) ..][0..8]);
+//                @memcpy(arr[24..32], signs[8 * @as(usize, @intCast((aux32[1] >> 21) & 127)) ..][0..8]);
+//                s2_1 = @bitCast(arr);
+//            }
 
             // Build s2_2 from aux32[3] >> 21, 14, 7, 0
-            var s2_2: V32i8 = undefined;
-            {
-                const signs = tables.keven_signs_q2xs;
-                var arr: [32]i8 = undefined;
-                @memcpy(arr[0..8], signs[8 * @as(usize, @intCast((aux32[3] >> 0) & 127)) ..][0..8]);
-                @memcpy(arr[8..16], signs[8 * @as(usize, @intCast((aux32[3] >> 7) & 127)) ..][0..8]);
-                @memcpy(arr[16..24], signs[8 * @as(usize, @intCast((aux32[3] >> 14) & 127)) ..][0..8]);
-                @memcpy(arr[24..32], signs[8 * @as(usize, @intCast((aux32[3] >> 21) & 127)) ..][0..8]);
-                s2_2 = @bitCast(arr);
-            }
+            const s2_2: V32i8 = std.simd.join(
+                std.simd.join(
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[3]>>0)&127))..][0..8].*)),
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[3]>>7)&127))..][0..8].*)),
+                ),
+                std.simd.join(
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[3]>>14)&127))..][0..8].*)),
+                    @as(V8i8, @bitCast(tables.keven_signs_q2xs[8*@as(usize, @intCast((aux32[3]>>21)&127))..][0..8].*)),
+                ),
+            );
+//            var s2_2: V32i8 = undefined;
+//            {
+//                const signs = tables.keven_signs_q2xs;
+//                var arr: [32]i8 = undefined;
+//                @memcpy(arr[0..8], signs[8 * @as(usize, @intCast((aux32[3] >> 0) & 127)) ..][0..8]);
+//                @memcpy(arr[8..16], signs[8 * @as(usize, @intCast((aux32[3] >> 7) & 127)) ..][0..8]);
+//                @memcpy(arr[16..24], signs[8 * @as(usize, @intCast((aux32[3] >> 14) & 127)) ..][0..8]);
+//                @memcpy(arr[24..32], signs[8 * @as(usize, @intCast((aux32[3] >> 21) & 127)) ..][0..8]);
+//                s2_2 = @bitCast(arr);
+//            }
 
             // Apply sign to q8: q8s = sign_epi8(q8, s2) - flip sign where s2 < 0
             const q8s_1: V32i8 = @select(i8, s2_1 < @as(V32i8, @splat(0)), -q8_1, q8_1);
