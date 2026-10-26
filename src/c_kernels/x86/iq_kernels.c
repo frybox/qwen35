@@ -1160,12 +1160,12 @@ float iq4_xs_q8_k(int n, const void* vx, const void* vy) {
                 const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
                 
                 // Calculate scales
-                const int16_t ls1 = ((x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30)) - 32;
-                const int16_t ls2 = ((x[ibl].scales_l[ib/2] >> 4) | ((sh << 2) & 0x30)) - 32;
+                const uint8_t ls1 = (x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30);
+                const uint8_t ls2 = (x[ibl].scales_l[ib/2] >> 4) | ((sh << 2) & 0x30);
                 sh >>= 4;
                 
-                const __m256i p_1 = _mm256_madd_epi16(p16_1, _mm256_set1_epi16(ls1));
-                const __m256i p_2 = _mm256_madd_epi16(p16_2, _mm256_set1_epi16(ls2));
+                const __m256i p_1 = _mm256_madd_epi16(p16_1, _mm256_set1_epi16((int16_t)(ls1 - 32)));
+                const __m256i p_2 = _mm256_madd_epi16(p16_2, _mm256_set1_epi16((int16_t)(ls2 - 32)));
                 
                 sumi1 = _mm256_add_epi32(p_1, sumi1);
                 sumi2 = _mm256_add_epi32(p_2, sumi2);
