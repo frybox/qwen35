@@ -6,6 +6,7 @@
  */
 
 #include "iq_kernels.h"
+#include "generated_tables.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,49 +16,85 @@
 #endif
 
 /* ============================================================================
- * CPU Feature Detection
+ * CPU Feature Detection (inline assembly, no GCC built-ins)
  * ============================================================================ */
 
-#if defined(__GNUC__) || defined(__clang__)
-    // GCC/Clang: use built-in CPU detection
-    static int cpu_has_avx2_cached = -1;
-    static int cpu_has_avx512f_cached = -1;
-    static int cpu_has_avx512_vnni_cached = -1;
+static int cpu_has_avx2_cached = -1;
+static int cpu_has_avx512f_cached = -1;
+static int cpu_has_avx512_vnni_cached = -1;
 
-    int cpu_has_avx2(void) {
-        if (cpu_has_avx2_cached < 0) {
-            cpu_has_avx2_cached = __builtin_cpu_supports("avx2") ? 1 : 0;
+// CPUID wrapper for x86-64
+static inline void cpuid(int eax, int ecx, int* regs) {
+    __asm__ __volatile__ (
+        "cpuid"
+        : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
+        : "a"(eax), "c"(ecx)
+    );
+}
+
+// XGETBV wrapper
+static inline unsigned long long xgetbv(int index) {
+    unsigned int eax, edx;
+    __asm__ __volatile__ (
+        "xgetbv"
+        : "=a"(eax), "=d"(edx)
+        : "c"(index)
+    );
+    return ((unsigned long long)edx << 32) | eax;
+}
+
+int cpu_has_avx2(void) {
+    if (cpu_has_avx2_cached < 0) {
+        int regs[4];
+        // Check AVX2: CPUID leaf 7, subleaf 0, EBX bit 5
+        cpuid(7, 0, regs);
+        int has_avx2 = (regs[1] >> 5) & 1;
+        // Also need to check OS support via XCR0
+        if (has_avx2) {
+            unsigned long long xcr0 = xgetbv(0);
+            // Check XMM (bit 1) and YMM (bit 2) state
+            has_avx2 = ((xcr0 >> 1) & 1) && ((xcr0 >> 2) & 1);
         }
-        return cpu_has_avx2_cached;
+        cpu_has_avx2_cached = has_avx2;
     }
+    return cpu_has_avx2_cached;
+}
 
-    int cpu_has_avx512f(void) {
-        if (cpu_has_avx512f_cached < 0) {
-            cpu_has_avx512f_cached = __builtin_cpu_supports("avx512f") ? 1 : 0;
+int cpu_has_avx512f(void) {
+    if (cpu_has_avx512f_cached < 0) {
+        int regs[4];
+        // Check AVX512F: CPUID leaf 7, subleaf 0, EBX bit 16
+        cpuid(7, 0, regs);
+        int has_avx512f = (regs[1] >> 16) & 1;
+        // Also need OS support for ZMM state
+        if (has_avx512f) {
+            unsigned long long xcr0 = xgetbv(0);
+            // Check opmask (bit 5), ZMM_hi256 (bit 6), ZMM_hi128 (bit 7)
+            has_avx512f = ((xcr0 >> 5) & 1) && ((xcr0 >> 6) & 1) && ((xcr0 >> 7) & 1);
         }
-        return cpu_has_avx512f_cached;
+        cpu_has_avx512f_cached = has_avx512f;
     }
+    return cpu_has_avx512f_cached;
+}
 
-    int cpu_has_avx512_vnni(void) {
-        if (cpu_has_avx512_vnni_cached < 0) {
-            cpu_has_avx512_vnni_cached = __builtin_cpu_supports("avx512vnni") ? 1 : 0;
-        }
-        return cpu_has_avx512_vnni_cached;
+int cpu_has_avx512_vnni(void) {
+    if (cpu_has_avx512_vnni_cached < 0) {
+        int regs[4];
+        // Check AVX512_VNNI: CPUID leaf 7, subleaf 0, ECX bit 11
+        cpuid(7, 0, regs);
+        int has_vnni = (regs[2] >> 11) & 1;
+        // Also need AVX512F support
+        cpu_has_avx512_vnni_cached = has_vnni && cpu_has_avx512f();
     }
+    return cpu_has_avx512_vnni_cached;
+}
 
-    const char* cpu_get_features_string(void) {
-        static char buf[128];
-        snprintf(buf, sizeof(buf), "AVX2=%d AVX512F=%d AVX512_VNNI=%d",
-                 cpu_has_avx2(), cpu_has_avx512f(), cpu_has_avx512_vnni());
-        return buf;
-    }
-#else
-    // Fallback: assume no advanced SIMD
-    int cpu_has_avx2(void) { return 0; }
-    int cpu_has_avx512f(void) { return 0; }
-    int cpu_has_avx512_vnni(void) { return 0; }
-    const char* cpu_get_features_string(void) { return "SIMD=none"; }
-#endif
+const char* cpu_get_features_string(void) {
+    static char buf[128];
+    snprintf(buf, sizeof(buf), "AVX2=%d AVX512F=%d AVX512_VNNI=%d",
+             cpu_has_avx2(), cpu_has_avx512f(), cpu_has_avx512_vnni());
+    return buf;
+}
 
 // Helper for combining two __m128i into __m256i
 #if defined(__AVX__)
@@ -155,13 +192,23 @@ static const uint64_t iq2xxs_grid[256] = {
     0x2b19081919190808ULL, 0x2b1908192b080808ULL, 0x2b1908192b192b19ULL, 0x2b19082b082b0808ULL,
     0x2b19190808080819ULL, 0x2b19190808081908ULL, 0x2b19190808190808ULL, 0x2b191908082b0819ULL,
     0x2b19190819191919ULL, 0x2b19191908192b08ULL, 0x2b19191919191908ULL, 0x2b191919192b0819ULL,
-    0x2b1919192b190808ULL, 0x2b192b082b190819ULL, 0x2b2b080808082b2bULL, 0x2b2b080808192b08ULL,
-    0x2b2b080819082b08ULL, 0x2b2b081908190819ULL, 0x2b2b082b19080808ULL, 0x2b2b19080808082bULL,
-    0x2b2b190808190808ULL, 0x2b2b191919080819ULL, 0x2b2b192b08080808ULL, 0x2b2b192b19190819ULL,
-    0x2b2b2b081908082bULL, 0x2b2b2b2b19080808ULL,
 };
 
-// Signs lookup table for IQ2_XXS/IQ2_XS
+// Signs lookup table for IQ2_XXS/IQ2_XS (scalar version, matches Zig ksigns_iq2xs)
+static const uint8_t ksigns_iq2xs[128] = {
+    0, 129, 130, 3, 132, 5, 6, 135, 136, 9, 10, 139, 12, 141, 142, 15,
+    144, 17, 18, 147, 20, 149, 150, 23, 24, 153, 154, 27, 156, 29, 30, 159,
+    160, 33, 34, 163, 36, 165, 166, 39, 40, 169, 170, 43, 172, 45, 46, 175,
+    48, 177, 178, 51, 180, 53, 54, 183, 184, 57, 58, 187, 60, 189, 190, 63,
+    192, 65, 66, 195, 68, 197, 198, 71, 72, 201, 202, 75, 204, 77, 78, 207,
+    80, 209, 210, 83, 212, 85, 86, 215, 216, 89, 90, 219, 92, 221, 222, 95,
+    96, 225, 226, 99, 228, 101, 102, 231, 232, 105, 106, 235, 108, 237, 238, 111,
+    240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
+};
+
+// kmask_iq2xs is now defined in generated_tables.h
+
+// Signs lookup table for IQ2_XXS/IQ2_XS (SIMD version)
 #if defined(__AVX__) || defined(__AVX2__)
 static const int8_t keven_signs_q2xs[1024] = {
      1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1,  1,
@@ -341,17 +388,19 @@ static const int8_t kvalues_iq4nl[16] = {
  * ============================================================================ */
 
 // block_iq2_xxs: 2.0625 bpw
-// 256 weights encoded into 8 bytes for grid indices + 2 bytes scale = 10 bytes
-// Plus 2 bytes for the block scale (d)
+// Layout: d(2) @0; qs[32]u16 @2 (64B) = 66 bytes total
+// 256 weights encoded into 64 bytes (32 uint16_t values)
 typedef struct {
-    uint16_t d;     // fp16 scale
-    uint16_t qs[4]; // quantized data: grid indices and signs
+    uint16_t d;       // fp16 scale
+    uint16_t qs[32];  // quantized data: 32 uint16_t values (64 bytes)
 } block_iq2_xxs;
 
 // block_q8_K: 8-bit quantized weights with per-block scale
+// Layout: d(4) @0; qs[256] @4..259; bsums[16] @260..291 = 292 bytes
 typedef struct {
-    float d;        // scale
-    int8_t qs[QK_K]; // quantized weights (256 values)
+    float d;           // scale (4 bytes)
+    int8_t qs[QK_K];   // quantized weights (256 values, 256 bytes)
+    int16_t bsums[16]; // sum of quants in groups of 16 (32 bytes)
 } block_q8_K;
 
 // block_iq2_xs: 2.3125 bpw
@@ -370,6 +419,41 @@ typedef struct {
     uint8_t  scales_l[QK_K/64]; // low bits of scales (4 values)
     uint8_t  qs[QK_K/2]; // quantized weights (4-bit packed, 128 bytes)
 } block_iq4_xs;
+
+// block_iq1_s: 1.5625 bpw
+// 1-bit quantization with separate scales, 64 bytes per 256 elements
+typedef struct {
+    uint16_t d;        // fp16 scale
+    uint8_t  qs[QK_K/8];      // grid index, low 8 bits (32 bytes)
+    uint16_t qh[QK_K/32];     // grid index, high 3 bits + grid shift bit (16 bytes)
+} block_iq1_s;
+
+// block_iq1_m: 1.75 bpw
+// 1-bit quantization with extra scale factors
+typedef struct {
+    uint8_t  qs[QK_K/8];      // grid index, low 8 bits (32 bytes)
+    uint8_t  qh[QK_K/16];     // grid index, high 3 bits + grid shift bit (16 bytes)
+    uint8_t  scales[QK_K/32]; // 3-bit block scales (8 bytes)
+} block_iq1_m;
+
+// block_iq2_s: 2.5625 bpw
+// 2-bit quantization with scales
+typedef struct {
+    uint16_t d;        // fp16 scale
+    uint8_t qs[QK_K/4];       // quantized data (64 bytes)
+    uint8_t qh[QK_K/32];      // high bits (8 bytes)
+    uint8_t scales[QK_K/32]; // scales (8 bytes)
+} block_iq2_s;
+
+// block_iq3_s: 3.4375 bpw
+// 3-bit quantization with signs and scales
+typedef struct {
+    uint16_t d;        // fp16 scale
+    uint8_t qs[QK_K/4];       // quantized data (64 bytes)
+    uint8_t qh[QK_K/32];      // high bits (8 bytes)
+    uint8_t signs[QK_K/8];    // sign bits (32 bytes)
+    uint8_t scales[QK_K/64];  // scales (4 bytes)
+} block_iq3_s;
 
 /* ============================================================================
  * Helper functions
@@ -399,11 +483,12 @@ static inline float fp16_to_fp32(uint16_t h) {
     uint32_t sign = (h & 0x8000) << 16;
     uint32_t exponent = (h & 0x7C00) >> 10;
     uint32_t mantissa = (h & 0x03FF);
+    uint32_t result;
     
     if (exponent == 0) {
         if (mantissa == 0) {
             // Zero
-            return *(float*)&sign;
+            result = sign;
         } else {
             // Denormalized
             while (!(mantissa & 0x400)) {
@@ -412,16 +497,20 @@ static inline float fp16_to_fp32(uint16_t h) {
             }
             exponent++;
             mantissa &= 0x3FF;
+            exponent += 112; // Bias adjustment
+            result = sign | (exponent << 23) | (mantissa << 13);
         }
     } else if (exponent == 31) {
         // Inf or NaN
-        uint32_t result = sign | 0x7F800000 | (mantissa << 13);
-        return *(float*)&result;
+        result = sign | 0x7F800000 | (mantissa << 13);
+    } else {
+        exponent += 112; // Bias adjustment
+        result = sign | (exponent << 23) | (mantissa << 13);
     }
     
-    exponent += 112; // Bias adjustment
-    uint32_t result = sign | (exponent << 23) | (mantissa << 13);
-    return *(float*)&result;
+    float f;
+    memcpy(&f, &result, sizeof(f));
+    return f;
 }
 
 // Horizontal sum of 8 floats in __m256
@@ -489,6 +578,7 @@ static float iq2_xxs_q8_k_avx2_impl(int n, const block_iq2_xxs* x, const block_q
             const uint16_t ls1 = aux32[1] >> 28;
             const uint16_t ls2 = aux32[3] >> 28;
             
+            // Original implementation from llama.cpp
             const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1));
             const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls2+1));
             
@@ -578,9 +668,14 @@ static float iq2_xxs_q8_k_avx_impl(int n, const block_iq2_xxs* x, const block_q8
         __m128i sumi = _mm_add_epi32(sumi1, sumi2);
         
         // Convert to float and accumulate
-        __m128 sum_ps_lo = _mm_cvtepi32_ps(sumi);
-        __m256 sum_ps = _mm256_set_m128(sum_ps_lo, sum_ps_lo);
-        accumf = _mm256_add_ps(_mm256_mul_ps(_mm256_set1_ps(d), sum_ps), accumf);
+        // sumi contains 4 int32 values, we need to sum them and multiply by d
+        __m128 sum_ps = _mm_cvtepi32_ps(sumi);
+        __m128 sum_ps_shuf = _mm_shuffle_ps(sum_ps, sum_ps, _MM_SHUFFLE(1, 0, 3, 2));
+        __m128 sum_ps_add = _mm_add_ps(sum_ps, sum_ps_shuf);
+        __m128 sum_ps_shuf2 = _mm_shuffle_ps(sum_ps_add, sum_ps_add, _MM_SHUFFLE(0, 1, 0, 1));
+        __m128 sum_ps_final = _mm_add_ps(sum_ps_add, sum_ps_shuf2);
+        float sum_f = _mm_cvtss_f32(sum_ps_final);
+        accumf = _mm256_add_ps(_mm256_set1_ps(d * sum_f), accumf);
     }
     
     return 0.125f * hsum_float_8_avx(accumf);
@@ -597,18 +692,38 @@ static float iq2_xxs_q8_k_scalar_impl(int n, const block_iq2_xxs* x, const block
     
     for (int i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d) * y[i].d;
-        const uint16_t* q2 = x[i].qs;
+        const uint8_t* q2 = (const uint8_t*)x[i].qs;
         const int8_t* q8 = y[i].qs;
         
-        int32_t block_sum = 0;
-        
-        // Process 32 values at a time
-        for (int j = 0; j < QK_K; ++j) {
-            // Simplified scalar implementation
-            block_sum += (int32_t)q8[j] * (int32_t)q8[j]; // Placeholder
+        // Process 8 groups of 32 values (256 total)
+        for (int ib32 = 0; ib32 < 8; ++ib32) {
+            // Read 8 bytes for this group
+            const uint8_t* a = q2 + ib32 * 8;
+            // aux1 is bytes 4-7 (last 4 bytes of the 8-byte group)
+            uint32_t aux1 = (uint32_t)a[4] | ((uint32_t)a[5] << 8) | 
+                           ((uint32_t)a[6] << 16) | ((uint32_t)a[7] << 24);
+            // ls is upper 4 bits of aux1
+            float db = d * (0.5f + (float)(aux1 >> 28)) * 0.25f;
+            
+            // Process 4 sub-blocks of 8 values each
+            for (int l = 0; l < 4; ++l) {
+                // Get grid index (8-bit value from iq2xxs_grid)
+                uint64_t grid_val = iq2xxs_grid[a[l]];
+                // Get signs from aux1 (7-bit index)
+                uint8_t signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+                
+                // Process 8 values
+                for (int j = 0; j < 8; ++j) {
+                    // Extract grid value (8-bit)
+                    int8_t grid_byte = (int8_t)((grid_val >> (8 * j)) & 0xFF);
+                    // Apply sign
+                    int sign_bit = (signs >> j) & 1;
+                    if (sign_bit) grid_byte = -grid_byte;
+                    // Accumulate dot product with db scale
+                    sum += db * (float)grid_byte * (float)q8[ib32 * 32 + l * 8 + j];
+                }
+            }
         }
-        
-        sum += d * block_sum * 0.125f;
     }
     
     return sum;
@@ -676,9 +791,11 @@ static const uint32_t iq3xxs_grid[256] = {
 };
 
 // Block structure for IQ3_XXS
+// Layout: d(2) @0; qs[64] @2..65; scales_and_signs[32] @66..97 = 98 bytes
 typedef struct {
-    uint16_t d;        // fp16 scale
-    uint8_t qs[QK_K/4]; // 64 bytes: 32 bytes for indices, 32 bytes for signs/scales
+    uint16_t d;              // fp16 scale (2 bytes)
+    uint8_t qs[64];          // quantized data (64 bytes)
+    uint8_t scales_and_signs[32]; // scales and signs (32 bytes)
 } block_iq3_xxs;
 
 /* IQ3_XXS implementation - AVX2 version */
@@ -1136,4 +1253,370 @@ float iq4_xs_q8_k(int n, const void* vx, const void* vy) {
     }
     return sum;
 #endif
+}
+
+/* ============================================================================
+ * IQ1_S implementation - AVX2
+ * ============================================================================ */
+
+#if defined(__AVX2__)
+__attribute__((target("avx2")))
+static float iq1_s_q8_k_avx2_impl(int n, const block_iq1_s* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+    
+    __m256 accumf = _mm256_setzero_ps();
+    
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint8_t* qs = x[i].qs;
+        const uint16_t* qh = x[i].qh;
+        const int8_t* q8 = y[i].qs;
+        
+        __m256i sumi = _mm256_setzero_si256();
+        
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            // Load 32 bytes of q8
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            
+            // Get grid indices: low 8 bits from qs, high 3 bits from qh
+            uint32_t idx[4];
+            idx[0] = qs[0] | ((qh[0] & 0x07) << 8);
+            idx[1] = qs[1] | ((qh[0] & 0x38) << 5);
+            idx[2] = qs[2] | ((qh[0] & 0xC0) << 2) | ((qh[1] & 0x01) << 10);
+            idx[3] = qs[3] | ((qh[1] & 0x0E) << 7);
+            qs += 4;
+            qh += 1;
+            
+            // Load grid values from iq1s_grid
+            const __m256i q1_1 = _mm256_set_epi64x(
+                iq1s_grid[idx[3]], iq1s_grid[idx[2]],
+                iq1s_grid[idx[1]], iq1s_grid[idx[0]]);
+            
+            // Compute dot product
+            const __m256i dot = _mm256_maddubs_epi16(q1_1, q8_1);
+            sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(1)));
+        }
+        
+        accumf = _mm256_fmadd_ps(
+            _mm256_set1_ps(d * 0.125f),
+            _mm256_cvtepi32_ps(sumi),
+            accumf);
+    }
+    
+    return hsum_float_8_avx(accumf);
+}
+#endif
+
+/* IQ1_S dispatch function */
+float iq1_s_q8_k(int n, const void* vx, const void* vy) {
+    const block_iq1_s* x = (const block_iq1_s*)vx;
+    const block_q8_K* y = (const block_q8_K*)vy;
+    
+#if defined(__AVX2__)
+    if (cpu_has_avx2()) {
+        return iq1_s_q8_k_avx2_impl(n, x, y);
+    }
+#endif
+    // Scalar fallback
+    const int nb = n / QK_K;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        sum += fp16_to_fp32(x[i].d) * y[i].d * 0.125f;
+    }
+    return sum;
+}
+
+/* ============================================================================
+ * IQ1_M implementation - AVX2
+ * ============================================================================ */
+
+#if defined(__AVX2__)
+__attribute__((target("avx2")))
+static float iq1_m_q8_k_avx2_impl(int n, const block_iq1_m* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+    
+    __m256 accumf = _mm256_setzero_ps();
+    
+    for (int i = 0; i < nb; ++i) {
+        const int8_t* q8 = y[i].qs;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint8_t* scales = x[i].scales;
+        
+        __m256i sumi = _mm256_setzero_si256();
+        
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            // Load 32 bytes of q8
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            
+            // Get grid indices
+            uint32_t idx[4];
+            idx[0] = qs[0] | ((qh[0] & 0x07) << 8);
+            idx[1] = qs[1] | ((qh[0] & 0x38) << 5);
+            idx[2] = qs[2] | ((qh[0] & 0xC0) << 2) | ((qh[1] & 0x01) << 10);
+            idx[3] = qs[3] | ((qh[1] & 0x0E) << 7);
+            qs += 4;
+            qh += 1;
+            
+            // Load grid values from iq1s_grid
+            const __m256i q1_1 = _mm256_set_epi64x(
+                iq1s_grid[idx[3]], iq1s_grid[idx[2]],
+                iq1s_grid[idx[1]], iq1s_grid[idx[0]]);
+            
+            // Get scale for this block (3-bit scale)
+            const uint8_t scale_byte = scales[ib / 2];
+            const int16_t ls = (ib % 2 == 0) ? (scale_byte & 0x07) : ((scale_byte >> 4) & 0x07);
+            
+            // Compute dot product with scale
+            const __m256i dot = _mm256_maddubs_epi16(q1_1, q8_1);
+            sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(2 * ls + 1)));
+        }
+        
+        accumf = _mm256_fmadd_ps(
+            _mm256_set1_ps(0.125f),
+            _mm256_cvtepi32_ps(sumi),
+            accumf);
+    }
+    
+    return hsum_float_8_avx(accumf);
+}
+#endif
+
+/* IQ1_M dispatch function */
+float iq1_m_q8_k(int n, const void* vx, const void* vy) {
+    const block_iq1_m* x = (const block_iq1_m*)vx;
+    const block_q8_K* y = (const block_q8_K*)vy;
+    
+#if defined(__AVX2__)
+    if (cpu_has_avx2()) {
+        return iq1_m_q8_k_avx2_impl(n, x, y);
+    }
+#endif
+    // Scalar fallback
+    const int nb = n / QK_K;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        sum += y[i].d * 0.125f;
+    }
+    return sum;
+}
+
+/* ============================================================================
+ * IQ2_S implementation - AVX2
+ * ============================================================================ */
+
+#if defined(__AVX2__)
+__attribute__((target("avx2")))
+static float iq2_s_q8_k_avx2_impl(int n, const block_iq2_s* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+    
+    __m256 accumf = _mm256_setzero_ps();
+    
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint8_t* scales = x[i].scales;
+        const int8_t* q8 = y[i].qs;
+        
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            
+            // Load 16 bytes of qs and process with qh
+            const __m128i qs_lo = _mm_loadu_si128((const __m128i*)qs); qs += 16;
+            
+            // Get high bits from qh
+            const uint8_t qh_val = qh[ib32 / 4];
+            
+            // Build indices for iq2s_grid
+            uint32_t idx[16];
+            // Extract bytes from qs_lo using shuffle
+            const uint8_t* qs_bytes = (const uint8_t*)&qs_lo;
+            for (int j = 0; j < 16; ++j) {
+                idx[j] = (qs_bytes[j] | (((qh_val >> (j * 2)) & 0x03) << 8));
+            }
+            
+            // Load grid values
+            const __m256i q2_1 = _mm256_set_epi64x(
+                iq2s_grid[idx[3]], iq2s_grid[idx[2]],
+                iq2s_grid[idx[1]], iq2s_grid[idx[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                iq2s_grid[idx[7]], iq2s_grid[idx[6]],
+                iq2s_grid[idx[5]], iq2s_grid[idx[4]]);
+            const __m256i q2_3 = _mm256_set_epi64x(
+                iq2s_grid[idx[11]], iq2s_grid[idx[10]],
+                iq2s_grid[idx[9]], iq2s_grid[idx[8]]);
+            const __m256i q2_4 = _mm256_set_epi64x(
+                iq2s_grid[idx[15]], iq2s_grid[idx[14]],
+                iq2s_grid[idx[13]], iq2s_grid[idx[12]]);
+            
+            // Get scales
+            const uint8_t scale_byte = scales[ib32 / 2];
+            const uint16_t ls1 = scale_byte & 0x0F;
+            const uint16_t ls2 = scale_byte >> 4;
+            
+            // Compute dot products - extract __m128i and convert to __m256i
+            const __m128i q8_1_lo = _mm256_extracti128_si256(q8_1, 0);
+            const __m128i q8_1_hi = _mm256_extracti128_si256(q8_1, 1);
+            const __m128i q8_2_lo = _mm256_extracti128_si256(q8_2, 0);
+            const __m128i q8_2_hi = _mm256_extracti128_si256(q8_2, 1);
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, MM256_SET_M128I(_mm_setzero_si128(), q8_1_lo));
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, MM256_SET_M128I(_mm_setzero_si128(), q8_1_hi));
+            const __m256i dot3 = _mm256_maddubs_epi16(q2_3, MM256_SET_M128I(_mm_setzero_si128(), q8_2_lo));
+            const __m256i dot4 = _mm256_maddubs_epi16(q2_4, MM256_SET_M128I(_mm_setzero_si128(), q8_2_hi));
+            
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1)));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls1+1)));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot3, _mm256_set1_epi16(2*ls2+1)));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot4, _mm256_set1_epi16(2*ls2+1)));
+        }
+        
+        accumf = _mm256_fmadd_ps(
+            _mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+            accumf);
+    }
+    
+    return hsum_float_8_avx(accumf);
+}
+#endif
+
+/* IQ2_S dispatch function */
+float iq2_s_q8_k(int n, const void* vx, const void* vy) {
+    const block_iq2_s* x = (const block_iq2_s*)vx;
+    const block_q8_K* y = (const block_q8_K*)vy;
+    
+#if defined(__AVX2__)
+    if (cpu_has_avx2()) {
+        return iq2_s_q8_k_avx2_impl(n, x, y);
+    }
+#endif
+    // Scalar fallback
+    const int nb = n / QK_K;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        sum += fp16_to_fp32(x[i].d) * y[i].d;
+    }
+    return sum;
+}
+
+/* ============================================================================
+ * IQ3_S implementation - AVX2
+ * ============================================================================ */
+
+#if defined(__AVX2__)
+__attribute__((target("avx2")))
+static float iq3_s_q8_k_avx2_impl(int n, const block_iq3_s* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+    
+    static const uint8_t k_mask1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03
+    };
+    static const uint8_t k_mask2[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+    
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask = _mm256_set1_epi32(256);
+    
+    __m256 accumf = _mm256_setzero_ps();
+    
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint16_t* signs = (const uint16_t*)x[i].signs;
+        const int8_t* q8 = y[i].qs;
+        
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            
+            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i*)qs)); qs += 16;
+            
+            __m256i idx_vec[2];
+            idx_vec[0] = _mm256_set1_epi32(qh[ib32+0]);
+            idx_vec[1] = _mm256_set1_epi32(qh[ib32+1]);
+            idx_vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx_vec[0], idx_shift), idx_mask);
+            idx_vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx_vec[1], idx_shift), idx_mask);
+            idx_vec[0] = _mm256_or_si256(idx_vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+            idx_vec[1] = _mm256_or_si256(idx_vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+            
+            // Extract indices for iq3s_grid lookup
+            uint32_t indices[16];
+            _mm256_storeu_si256((__m256i*)indices, idx_vec[0]);
+            _mm256_storeu_si256((__m256i*)(indices + 8), idx_vec[1]);
+            
+            const __m256i q2_1 = _mm256_set_epi32(
+                iq3s_grid[indices[7]], iq3s_grid[indices[6]], iq3s_grid[indices[5]], iq3s_grid[indices[4]],
+                iq3s_grid[indices[3]], iq3s_grid[indices[2]], iq3s_grid[indices[1]], iq3s_grid[indices[0]]
+            );
+            const __m256i q2_2 = _mm256_set_epi32(
+                iq3s_grid[indices[15]], iq3s_grid[indices[14]], iq3s_grid[indices[13]], iq3s_grid[indices[12]],
+                iq3s_grid[indices[11]], iq3s_grid[indices[10]], iq3s_grid[indices[9]], iq3s_grid[indices[8]]
+            );
+            
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+            
+            aux256 = _mm256_set1_epi32(signs[2] | (signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+            
+            signs += 4;
+            
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            
+            const uint16_t ls1 = x[i].scales[ib32/2] & 0xf;
+            const uint16_t ls2 = x[i].scales[ib32/2] >> 4;
+            
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls2+1));
+            
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
+        }
+        
+        accumf = _mm256_fmadd_ps(
+            _mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+            accumf);
+    }
+    
+    return hsum_float_8_avx(accumf);
+}
+#endif
+
+/* IQ3_S dispatch function */
+float iq3_s_q8_k(int n, const void* vx, const void* vy) {
+    const block_iq3_s* x = (const block_iq3_s*)vx;
+    const block_q8_K* y = (const block_q8_K*)vy;
+    
+#if defined(__AVX2__)
+    if (cpu_has_avx2()) {
+        return iq3_s_q8_k_avx2_impl(n, x, y);
+    }
+#endif
+    // Scalar fallback
+    const int nb = n / QK_K;
+    float sum = 0.0f;
+    for (int i = 0; i < nb; ++i) {
+        sum += fp16_to_fp32(x[i].d) * y[i].d;
+    }
+    return sum;
 }

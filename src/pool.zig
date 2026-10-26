@@ -57,10 +57,8 @@ pub fn reset() void {
 }
 
 /// The AVX-512 VNNI row kernel (vpdpbusd, two interleaved block chains).
-/// `null` when the runtime tier is the baseline one, in which case the Q8_0
-/// branches below keep their scalar per-block loop.
+/// Always returns the C kernel for maximum performance.
 inline fn q8RowDot() ?simd_api.Dot32 {
-    if (simd.tier == .baseline) return null;
     return simd.d32row.q8_0_q8_0;
 }
 

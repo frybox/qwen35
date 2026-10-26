@@ -99,6 +99,84 @@ float iq3_xxs_q8_k(int n, const void* vx, const void* vy);
  */
 float iq4_xs_q8_k(int n, const void* vx, const void* vy);
 
+/**
+ * @brief Compute dot product of TQ2_0 quantized vector with Q8_K quantized vector.
+ *
+ * TQ2_0: 2-bit ternary-ish quantization, 66 bytes per 256 elements.
+ * Value = ((qs >> 2*l) & 3) - 1, giving {-1, 0, 1, 2}.
+ *
+ * @param n   Number of elements (must be a multiple of 256).
+ * @param vx  Pointer to TQ2_0 quantized data.
+ * @param vy  Pointer to Q8_K quantized data (block_q8_K format).
+ * @return    The dot product as a float.
+ */
+float tq2_0_q8_k(int n, const void* vx, const void* vy);
+
+/**
+ * @brief Compute dot product of TQ1_0 quantized vector with Q8_K quantized vector.
+ *
+ * TQ1_0: Base-5 packing ternary quantization, 54 bytes per 256 elements.
+ * Value = (((qs * pow3[l]) & 0xFF) * 3 >> 8) - 1, giving {-1, 0, 1}.
+ *
+ * @param n   Number of elements (must be a multiple of 256).
+ * @param vx  Pointer to TQ1_0 quantized data.
+ * @param vy  Pointer to Q8_K quantized data (block_q8_K format).
+ * @return    The dot product as a float.
+ */
+float tq1_0_q8_k(int n, const void* vx, const void* vy);
+
+/**
+ * @brief Compute dot product of IQ1_S quantized vector with Q8_K quantized vector.
+ *
+ * IQ1_S: 1-bit quantization with separate scales, 64 bytes per 256 elements.
+ * Uses iq1s_grid lookup table with delta=0.125f.
+ *
+ * @param n   Number of elements (must be a multiple of 256).
+ * @param vx  Pointer to IQ1_S quantized data (block_iq1_s format).
+ * @param vy  Pointer to Q8_K quantized data (block_q8_K format).
+ * @return    The dot product as a float.
+ */
+float iq1_s_q8_k(int n, const void* vx, const void* vy);
+
+/**
+ * @brief Compute dot product of IQ1_M quantized vector with Q8_K quantized vector.
+ *
+ * IQ1_M: 1-bit quantization with extra scale factors, 64 bytes per 256 elements.
+ * Uses iq1s_grid lookup table with delta=0.125f.
+ *
+ * @param n   Number of elements (must be a multiple of 256).
+ * @param vx  Pointer to IQ1_M quantized data (block_iq1_m format).
+ * @param vy  Pointer to Q8_K quantized data (block_q8_K format).
+ * @return    The dot product as a float.
+ */
+float iq1_m_q8_k(int n, const void* vx, const void* vy);
+
+/**
+ * @brief Compute dot product of IQ2_S quantized vector with Q8_K quantized vector.
+ *
+ * IQ2_S: 2-bit quantization with scales, 128 bytes per 256 elements.
+ * Uses iq2s_grid and kmask_iq2xs lookup tables.
+ *
+ * @param n   Number of elements (must be a multiple of 256).
+ * @param vx  Pointer to IQ2_S quantized data (block_iq2_s format).
+ * @param vy  Pointer to Q8_K quantized data (block_q8_K format).
+ * @return    The dot product as a float.
+ */
+float iq2_s_q8_k(int n, const void* vx, const void* vy);
+
+/**
+ * @brief Compute dot product of IQ3_S quantized vector with Q8_K quantized vector.
+ *
+ * IQ3_S: 3-bit quantization with scales, 160 bytes per 256 elements.
+ * Uses iq3s_grid and kmask_iq2xs lookup tables.
+ *
+ * @param n   Number of elements (must be a multiple of 256).
+ * @param vx  Pointer to IQ3_S quantized data (block_iq3_s format).
+ * @param vy  Pointer to Q8_K quantized data (block_q8_K format).
+ * @return    The dot product as a float.
+ */
+float iq3_s_q8_k(int n, const void* vx, const void* vy);
+
 #ifdef __cplusplus
 }
 #endif
