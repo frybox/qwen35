@@ -405,7 +405,13 @@ static float k32_q8_0_q8_0_scalar(int n, const void* vx, const void* vy) {
     return sumf;
 }
 
+/* VNNI kernel lives in kernels512.c (its own -mavx512vnni compile unit);
+ * kernels32.c is compiled with AVX2 flags only, so declare it extern. */
+float k512_q8_0_q8_0_vnni(int n, const void* vx, const void* vy);
+
 float q8_0_q8_0(int n, const void* vx, const void* vy) {
+    if (cpu_has_avx512_vnni())
+        return k512_q8_0_q8_0_vnni(n, vx, vy);
     return cpu_has_avx2() ? k32_q8_0_q8_0_avx2(n, vx, vy) : k32_q8_0_q8_0_scalar(n, vx, vy);
 }
 

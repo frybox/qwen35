@@ -89,6 +89,21 @@ pub fn build(b: *std.Build) void {
             "-mf16c",
         },
     });
+    // AVX-512 VNNI kernels are a SEPARATE compile unit so the AVX2 units above
+    // keep their own codegen (adding -mavx512vnni to them would change the
+    // AVX2 kernels' output). Dispatch is runtime (cpu_has_avx512_vnni()).
+    c_kernels.root_module.addCSourceFile(.{
+        .file = b.path("src/c_kernels/x86/kernels512.c"),
+        .flags = &.{
+            "-std=c11",
+            "-O3",
+            "-mavx512f",
+            "-mavx512bw",
+            "-mavx512dq",
+            "-mavx512vl",
+            "-mavx512vnni",
+        },
+    });
     c_kernels.root_module.link_libc = true;
     b.installArtifact(c_kernels);
 
