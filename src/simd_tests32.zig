@@ -5,27 +5,20 @@
 //!   2. the scalar `_ref` vs the engine's existing scalar `rowDot*` on real
 //!      packed rows from testdata/udtest (where such data exists).
 //!
-//! The tier modules (`simd_baseline` / `simd_avx2` / `simd_avx512`) are injected
-//! by build.zig, so these tests run under `zig build test`, not bare `zig test`.
+//! The `simd_c` module (C kernels) and `simd_ref` module (scalar oracle) are
+//! injected by build.zig, so these tests run under `zig build test`.
 
 const std = @import("std");
 const quant = @import("quant_dequant.zig");
-const simd_base = @import("simd_baseline");
-const simd_avx2 = @import("simd_avx2");
-const simd_avx512 = @import("simd_avx512");
-const simd_avx512vnni = @import("simd_avx512vnni");
-const simd_avx512vbmi = @import("simd_avx512vbmi");
+const simd_c = @import("simd_c.zig");
+const simd_ref = @import("simd_ref.zig");
 
 const TESTDATA = "/mnt/llm-dev/qwen35/testdata/udtest/";
 const q8_bytes = 34;
 const DotFn = *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32;
 
 const tier_list = .{
-    .{ .name = "baseline", .m = simd_base },
-    .{ .name = "avx2", .m = simd_avx2 },
-    .{ .name = "avx512", .m = simd_avx512 },
-    .{ .name = "avx512vnni", .m = simd_avx512vnni },
-    .{ .name = "avx512vbmi", .m = simd_avx512vbmi },
+    .{ .name = "c", .m = simd_c },
 };
 
 fn relErr(a: f32, b: f32) f32 {
@@ -69,6 +62,7 @@ const cases = .{
 
 fn runCase(
     comptime m: type,
+    comptime refm: type,
     comptime name: []const u8,
     comptime elems: usize,
     comptime rb: usize,
@@ -77,7 +71,7 @@ fn runCase(
     alloc: std.mem.Allocator,
 ) !f32 {
     const simd_f: DotFn = @field(m.dot32, name);
-    const ref_f: DotFn = @field(m.dot32, name ++ "_ref");
+    const ref_f: DotFn = @field(refm.dot32, name ++ "_ref");
     const nblocks = 256 / elems;
     const w = try alloc.alloc(u8, nblocks * rb);
     defer alloc.free(w);
@@ -101,14 +95,14 @@ test "simd kern32: SIMD (3 tiers) vs scalar ref" {
     makeX(&x, 0xC0FFEE);
     const q8 = try alloc.alloc(u8, (256 / 32) * q8_bytes);
     defer alloc.free(q8);
-    simd_base.act.quantizeQ8_0(x.len, &x, q8.ptr);
+    simd_c.act.quantizeQ8_0(x.len, &x, q8.ptr);
 
     var worst: f32 = 0;
     var worst_case: []const u8 = "";
     var worst_tier: []const u8 = "";
     inline for (tier_list) |t| {
         inline for (cases) |c| {
-            const e = try runCase(t.m, c.name, c.elems, c.rb, c.scales, q8, alloc);
+            const e = try runCase(t.m, simd_ref, c.name, c.elems, c.rb, c.scales, q8, alloc);
             std.debug.print("    {s}/{s} = {}\n", .{ c.name, t.name, e });
             if (e > worst) {
                 worst = e;
@@ -126,9 +120,9 @@ test "simd kern32: SIMD (3 tiers) vs scalar ref" {
 const Case2 = struct { file: []const u8, rb: usize, simd: DotFn, rowdot: *const fn (row: []const u8, x: []const f32) f32 };
 
 const cases2 = [_]Case2{
-    .{ .file = "Q4_0.bin", .rb = 144, .simd = &simd_base.dot32.q4_0_q8_0, .rowdot = &quant.rowDotQ4_0 },
-    .{ .file = "Q4_1.bin", .rb = 160, .simd = &simd_base.dot32.q4_1_q8_0, .rowdot = &quant.rowDotQ4_1 },
-    .{ .file = "IQ4_NL.bin", .rb = 144, .simd = &simd_base.dot32.iq4_nl_q8_0, .rowdot = &quant.rowDotIQ4NL },
+    .{ .file = "Q4_0.bin", .rb = 144, .simd = &simd_c.dot32.q4_0_q8_0, .rowdot = &quant.rowDotQ4_0 },
+    .{ .file = "Q4_1.bin", .rb = 160, .simd = &simd_c.dot32.q4_1_q8_0, .rowdot = &quant.rowDotQ4_1 },
+    .{ .file = "IQ4_NL.bin", .rb = 144, .simd = &simd_c.dot32.iq4_nl_q8_0, .rowdot = &quant.rowDotIQ4NL },
 };
 
 test "simd kern32: real testdata rows vs engine rowDot" {
@@ -141,7 +135,7 @@ test "simd kern32: real testdata rows vs engine rowDot" {
 
     const q8 = try alloc.alloc(u8, (256 / 32) * q8_bytes);
     defer alloc.free(q8);
-    simd_base.act.quantizeQ8_0(256, ax.ptr, q8.ptr);
+    simd_c.act.quantizeQ8_0(256, ax.ptr, q8.ptr);
 
     // Exact f32 view of the Q8_0 activation (d * q): feeding this to the engine's
     // scalar rowDot isolates kernel error from activation-quantization error.
@@ -239,7 +233,7 @@ test "simd kern32: row kernels == sum of block kernels (3 tiers)" {
     };
     const q8 = try alloc.alloc(u8, (n / 32) * q8_bytes);
     defer alloc.free(q8);
-    simd_base.act.quantizeQ8_0(n, &x, q8.ptr);
+    simd_c.act.quantizeQ8_0(n, &x, q8.ptr);
 
     inline for (tier_list) |t| {
         inline for (rc) |c| {

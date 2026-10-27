@@ -190,6 +190,11 @@ pub fn build(b: *std.Build) void {
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
+    // The test-only helpers src/simd_c.zig declare extern C symbols, so the
+    // test binary must link the C kernels library (undefined symbol:
+    // cpu_has_avx2 / q4_0_q8_0 otherwise). The helper files are imported by
+    // path from files already in `mod`, so no separate module is needed.
+    mod_tests.root_module.linkLibrary(c_kernels);
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);

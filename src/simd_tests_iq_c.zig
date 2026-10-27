@@ -11,11 +11,8 @@
 
 const std = @import("std");
 const quant = @import("quant_dequant.zig");
-const simd_base = @import("simd_baseline");
-const simd_avx2 = @import("simd_avx2");
-const simd_avx512 = @import("simd_avx512");
-const simd_avx512vnni = @import("simd_avx512vnni");
-const simd_avx512vbmi = @import("simd_avx512vbmi");
+const simd_c = @import("simd_c.zig");
+const simd_ref = @import("simd_ref.zig");
 
 const TESTDATA = "/mnt/llm-dev/qwen35/testdata/udtest/";
 const q8k_bytes = 292;
@@ -23,11 +20,7 @@ const DotFn = *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c
 const RowDotFn = *const fn (row: []const u8, x: []const f32) f32;
 
 const tier_list = .{
-    .{ .name = "baseline", .m = simd_base },
-    .{ .name = "avx2", .m = simd_avx2 },
-    .{ .name = "avx512", .m = simd_avx512 },
-    .{ .name = "avx512vnni", .m = simd_avx512vnni },
-    .{ .name = "avx512vbmi", .m = simd_avx512vbmi },
+    .{ .name = "c", .m = simd_c },
 };
 
 fn relErr(a: f32, b: f32) f32 {
@@ -57,8 +50,8 @@ fn fillWeight(alloc: std.mem.Allocator, rb: usize, seed: u64, comptime scales: [
 const Case = struct { name: []const u8, rb: usize, rowdot: RowDotFn, file: []const u8, scales: []const usize, simd: DotFn };
 
 const cases = [_]Case{
-    .{ .name = "iq1_s_q8_k", .rb = 50, .rowdot = &quant.rowDotIQ1S, .file = "IQ1_S.bin", .scales = &[_]usize{0}, .simd = &simd_base.dotiq3.iq1_s_q8_k },
-    .{ .name = "iq1_m_q8_k", .rb = 56, .rowdot = &quant.rowDotIQ1M, .file = "IQ1_M.bin", .scales = &[_]usize{ 48, 50, 52, 54 }, .simd = &simd_base.dotiq3.iq1_m_q8_k },
+    .{ .name = "iq1_s_q8_k", .rb = 50, .rowdot = &quant.rowDotIQ1S, .file = "IQ1_S.bin", .scales = &[_]usize{0}, .simd = &simd_c.dotiq3.iq1_s_q8_k },
+    .{ .name = "iq1_m_q8_k", .rb = 56, .rowdot = &quant.rowDotIQ1M, .file = "IQ1_M.bin", .scales = &[_]usize{ 48, 50, 52, 54 }, .simd = &simd_c.dotiq3.iq1_m_q8_k },
 };
 
 test "simd kerniq3: SIMD (3 tiers) + _ref vs engine rowDot (synthetic)" {
@@ -67,7 +60,7 @@ test "simd kerniq3: SIMD (3 tiers) + _ref vs engine rowDot (synthetic)" {
     makeX(&x, 0xBEEF);
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, &x, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, &x, q8k.ptr);
     var xq: [256]f32 = undefined;
     const d: f32 = @bitCast(std.mem.readInt(u32, q8k[0..4], .little));
     for (0..256) |j| xq[j] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(q8k[4 + j]))));
@@ -101,7 +94,7 @@ test "simd kerniq3: real testdata rows vs engine rowDot" {
     const ax = asF32(axb);
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, ax.ptr, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, ax.ptr, q8k.ptr);
     var xq: [256]f32 = undefined;
     const d: f32 = @bitCast(std.mem.readInt(u32, q8k[0..4], .little));
     for (0..256) |j| xq[j] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(q8k[4 + j]))));

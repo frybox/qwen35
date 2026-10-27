@@ -13,11 +13,8 @@
 
 const std = @import("std");
 const quant = @import("quant_dequant.zig");
-const simd_base = @import("simd_baseline");
-const simd_avx2 = @import("simd_avx2");
-const simd_avx512 = @import("simd_avx512");
-const simd_avx512vnni = @import("simd_avx512vnni");
-const simd_avx512vbmi = @import("simd_avx512vbmi");
+const simd_c = @import("simd_c.zig");
+const simd_ref = @import("simd_ref.zig");
 
 const TESTDATA = "/mnt/llm-dev/qwen35/testdata/udtest/";
 const q8k_bytes = 292;
@@ -25,11 +22,7 @@ const DotFn = *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c
 const RowDotFn = *const fn (row: []const u8, x: []const f32) f32;
 
 const tier_list = .{
-    .{ .name = "baseline", .m = simd_base },
-    .{ .name = "avx2", .m = simd_avx2 },
-    .{ .name = "avx512", .m = simd_avx512 },
-    .{ .name = "avx512vnni", .m = simd_avx512vnni },
-    .{ .name = "avx512vbmi", .m = simd_avx512vbmi },
+    .{ .name = "c", .m = simd_c },
 };
 
 fn relErr(a: f32, b: f32) f32 {
@@ -60,10 +53,10 @@ fn fillWeight(alloc: std.mem.Allocator, rb: usize, seed: u64, comptime scales: [
 const Case = struct { name: []const u8, rb: usize, rowdot: RowDotFn, file: []const u8, simd: DotFn };
 
 const cases = [_]Case{
-    .{ .name = "iq2_xxs_q8_k", .rb = 66, .rowdot = &quant.rowDotIQ2XXS, .file = "IQ2_XXS.bin", .simd = &simd_base.dotiq.iq2_xxs_q8_k },
-    .{ .name = "iq2_xs_q8_k", .rb = 74, .rowdot = &quant.rowDotIQ2XS, .file = "IQ2_XS.bin", .simd = &simd_base.dotiq.iq2_xs_q8_k },
-    .{ .name = "iq3_xxs_q8_k", .rb = 98, .rowdot = &quant.rowDotIQ3XXS, .file = "IQ3_XXS.bin", .simd = &simd_base.dotiq.iq3_xxs_q8_k },
-    .{ .name = "iq4_xs_q8_k", .rb = 136, .rowdot = &quant.rowDotIQ4XS, .file = "IQ4_XS.bin", .simd = &simd_base.dotiq.iq4_xs_q8_k },
+    .{ .name = "iq2_xxs_q8_k", .rb = 66, .rowdot = &quant.rowDotIQ2XXS, .file = "IQ2_XXS.bin", .simd = &simd_c.dotiq.iq2_xxs_q8_k },
+    .{ .name = "iq2_xs_q8_k", .rb = 74, .rowdot = &quant.rowDotIQ2XS, .file = "IQ2_XS.bin", .simd = &simd_c.dotiq.iq2_xs_q8_k },
+    .{ .name = "iq3_xxs_q8_k", .rb = 98, .rowdot = &quant.rowDotIQ3XXS, .file = "IQ3_XXS.bin", .simd = &simd_c.dotiq.iq3_xxs_q8_k },
+    .{ .name = "iq4_xs_q8_k", .rb = 136, .rowdot = &quant.rowDotIQ4XS, .file = "IQ4_XS.bin", .simd = &simd_c.dotiq.iq4_xs_q8_k },
 };
 
 test "simd kerniq: SIMD (3 tiers) + _ref vs engine rowDot (synthetic)" {
@@ -72,7 +65,7 @@ test "simd kerniq: SIMD (3 tiers) + _ref vs engine rowDot (synthetic)" {
     makeX(&x, 0xBEEF);
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, &x, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, &x, q8k.ptr);
 
     var xq: [256]f32 = undefined;
     const d: f32 = @bitCast(std.mem.readInt(u32, q8k[0..4], .little));
@@ -86,7 +79,7 @@ test "simd kerniq: SIMD (3 tiers) + _ref vs engine rowDot (synthetic)" {
         const ref: f32 = c.rowdot(w, &xq);
         inline for (tier_list) |t| {
             const simd_f: DotFn = @field(t.m.dotiq, c.name);
-            const ref_f: DotFn = @field(t.m.dotiq, c.name ++ "_ref");
+            const ref_f: DotFn = @field(simd_ref.dotiq, c.name ++ "_ref");
             const got = simd_f(256, w.ptr, q8k.ptr);
             _ = ref_f(256, w.ptr, q8k.ptr); // exercised via `got` (forwards to _ref)
             const e = relErr(got, ref);
@@ -110,7 +103,7 @@ test "simd kerniq: real testdata rows vs engine rowDot" {
     const ax = asF32(axb);
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, ax.ptr, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, ax.ptr, q8k.ptr);
     var xq: [256]f32 = undefined;
     const d: f32 = @bitCast(std.mem.readInt(u32, q8k[0..4], .little));
     for (0..256) |j| xq[j] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(q8k[4 + j]))));
@@ -163,7 +156,7 @@ test "simd kerniq: runtime path -- IQ kernel on Q8_K(true x) vs rowDot on full-p
     makeX(&x, 0xC0FFEE);
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, &x, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, &x, q8k.ptr);
 
     var worst: f32 = 0;
     var worst_name: []const u8 = "";

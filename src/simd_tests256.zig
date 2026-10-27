@@ -11,22 +11,15 @@
 
 const std = @import("std");
 const quant = @import("quant_dequant.zig");
-const simd_base = @import("simd_baseline");
-const simd_avx2 = @import("simd_avx2");
-const simd_avx512 = @import("simd_avx512");
-const simd_avx512vnni = @import("simd_avx512vnni");
-const simd_avx512vbmi = @import("simd_avx512vbmi");
+const simd_c = @import("simd_c.zig");
+const simd_ref = @import("simd_ref.zig");
 
 const TESTDATA = "/mnt/llm-dev/qwen35/testdata/udtest/";
 const q8k_bytes = 292;
 const DotFn = *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32;
 
 const tier_list = .{
-    .{ .name = "baseline", .m = simd_base },
-    .{ .name = "avx2", .m = simd_avx2 },
-    .{ .name = "avx512", .m = simd_avx512 },
-    .{ .name = "avx512vnni", .m = simd_avx512vnni },
-    .{ .name = "avx512vbmi", .m = simd_avx512vbmi },
+    .{ .name = "c", .m = simd_c },
 };
 
 fn relErr(a: f32, b: f32) f32 {
@@ -66,6 +59,7 @@ const cases = .{
 
 fn runCase(
     comptime m: type,
+    comptime refm: type,
     comptime name: []const u8,
     comptime rb: usize,
     comptime scales: []const usize,
@@ -73,7 +67,7 @@ fn runCase(
     alloc: std.mem.Allocator,
 ) !f32 {
     const simd_f: DotFn = @field(m.dot256, name);
-    const ref_f: DotFn = @field(m.dot256, name ++ "_ref");
+    const ref_f: DotFn = @field(refm.dot256, name ++ "_ref");
     const w = try fillWeight(alloc, rb, 0x2000, scales);
     defer alloc.free(w);
     const got = simd_f(256, w.ptr, q8k.ptr);
@@ -89,14 +83,14 @@ test "simd kern256: SIMD (3 tiers) vs scalar ref" {
     makeX(&x, 0xBEEF);
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, &x, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, &x, q8k.ptr);
 
     var worst: f32 = 0;
     var worst_case: []const u8 = "";
     var worst_tier: []const u8 = "";
     inline for (tier_list) |t| {
         inline for (cases) |c| {
-            const e = try runCase(t.m, c.name, c.rb, c.scales, q8k, alloc);
+            const e = try runCase(t.m, simd_ref, c.name, c.rb, c.scales, q8k, alloc);
             std.debug.print("    {s}/{s} = {}\n", .{ c.name, t.name, e });
             if (e > worst) {
                 worst = e;
@@ -117,10 +111,10 @@ const Case2 = struct {
 };
 
 const cases2 = [_]Case2{
-    .{ .file = "Q4_K.bin", .rb = 144, .simd = &simd_base.dot256.q4_k_q8_k, .rowdot = &quant.rowDotQ4K },
-    .{ .file = "Q5_K.bin", .rb = 176, .simd = &simd_base.dot256.q5_k_q8_k, .rowdot = &quant.rowDotQ5K },
-    .{ .file = "Q6_K.bin", .rb = 210, .simd = &simd_base.dot256.q6_k_q8_k, .rowdot = &quant.rowDotQ6K },
-    .{ .file = "Q3_K.bin", .rb = 110, .simd = &simd_base.dot256.q3_k_q8_k, .rowdot = &quant.rowDotQ3K },
+    .{ .file = "Q4_K.bin", .rb = 144, .simd = &simd_c.dot256.q4_k_q8_k, .rowdot = &quant.rowDotQ4K },
+    .{ .file = "Q5_K.bin", .rb = 176, .simd = &simd_c.dot256.q5_k_q8_k, .rowdot = &quant.rowDotQ5K },
+    .{ .file = "Q6_K.bin", .rb = 210, .simd = &simd_c.dot256.q6_k_q8_k, .rowdot = &quant.rowDotQ6K },
+    .{ .file = "Q3_K.bin", .rb = 110, .simd = &simd_c.dot256.q3_k_q8_k, .rowdot = &quant.rowDotQ3K },
 };
 
 test "simd kern256: real testdata rows vs engine rowDot" {
@@ -133,7 +127,7 @@ test "simd kern256: real testdata rows vs engine rowDot" {
 
     const q8k = try alloc.alloc(u8, q8k_bytes);
     defer alloc.free(q8k);
-    simd_base.act.quantizeQ8_K(256, ax.ptr, q8k.ptr);
+    simd_c.act.quantizeQ8_K(256, ax.ptr, q8k.ptr);
 
     // exact f32 view of the Q8_K activation
     var xq: [256]f32 = undefined;
