@@ -6,10 +6,18 @@
 
 const std = @import("std");
 
-// C function declarations
+// C function declarations (probes come from src/c_kernels/x86/cpu_caps.c,
+// the single source of truth for x86 feature detection — do not cpuid in Zig)
 extern fn cpu_has_avx2() c_int;
 extern fn cpu_has_avx512f() c_int;
+extern fn cpu_has_avx512bw() c_int;
+extern fn cpu_has_avx512vl() c_int;
+extern fn cpu_has_avx512dq() c_int;
 extern fn cpu_has_avx512_vnni() c_int;
+extern fn cpu_has_avx512_vbmi() c_int;
+extern fn cpu_has_fma() c_int;
+extern fn cpu_has_f16c() c_int;
+extern fn cpu_has_ssse3() c_int;
 extern fn cpu_get_features_string() [*:0]const u8;
 
 // 256-element IQ dot-product kernels (Q8_K activation)
@@ -43,6 +51,21 @@ extern fn nvfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32
 extern fn quantize_q8_0(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
 extern fn quantize_q8_K(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
 
+/// Probes, forwarded to the C single source of truth (cpu_caps.c). These are
+/// the only Zig-visible entry points for x86 feature detection; the extern
+/// declarations below live here so no other Zig file needs `extern fn cpuid`.
+pub fn cpuHasAvx2() bool { return cpu_has_avx2() != 0; }
+pub fn cpuHasAvx512f() bool { return cpu_has_avx512f() != 0; }
+pub fn cpuHasAvx512bw() bool { return cpu_has_avx512bw() != 0; }
+pub fn cpuHasAvx512vl() bool { return cpu_has_avx512vl() != 0; }
+pub fn cpuHasAvx512dq() bool { return cpu_has_avx512dq() != 0; }
+pub fn cpuHasAvx512Vnni() bool { return cpu_has_avx512_vnni() != 0; }
+pub fn cpuHasAvx512Vbmi() bool { return cpu_has_avx512_vbmi() != 0; }
+pub fn cpuHasFma() bool { return cpu_has_fma() != 0; }
+pub fn cpuHasF16c() bool { return cpu_has_f16c() != 0; }
+pub fn cpuHasSsse3() bool { return cpu_has_ssse3() != 0; }
+pub fn featuresString() []const u8 { return std.mem.span(cpu_get_features_string()); }
+
 /// CPU feature detection results
 pub const CpuFeatures = struct {
     avx2: bool,
@@ -51,15 +74,14 @@ pub const CpuFeatures = struct {
 
     pub fn detect() CpuFeatures {
         return .{
-            .avx2 = cpu_has_avx2() != 0,
-            .avx512f = cpu_has_avx512f() != 0,
-            .avx512_vnni = cpu_has_avx512_vnni() != 0,
+            .avx2 = cpuHasAvx2(),
+            .avx512f = cpuHasAvx512f(),
+            .avx512_vnni = cpuHasAvx512Vnni(),
         };
     }
 
     pub fn format(_: CpuFeatures, writer: anytype) !void {
-        const str = cpu_get_features_string();
-        try writer.print("{s}", .{std.mem.span(str)});
+        try writer.print("{s}", .{featuresString()});
     }
 };
 

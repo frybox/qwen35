@@ -28,29 +28,11 @@ extern "C" {
  * CPU Feature Detection
  * ============================================================================ */
 
-/**
- * @brief Check if the CPU supports AVX2 instructions.
- * @return 1 if AVX2 is supported, 0 otherwise.
- */
-int cpu_has_avx2(void);
-
-/**
- * @brief Check if the CPU supports AVX-512F instructions.
- * @return 1 if AVX-512F is supported, 0 otherwise.
- */
-int cpu_has_avx512f(void);
-
-/**
- * @brief Check if the CPU supports AVX-512 VNNI instructions.
- * @return 1 if AVX-512 VNNI is supported, 0 otherwise.
- */
-int cpu_has_avx512_vnni(void);
-
-/**
- * @brief Get a string describing the CPU features.
- * @return A static string describing detected CPU features.
- */
-const char* cpu_get_features_string(void);
+/* Declarations live in cpu_caps.h (single source of truth for x86 probes):
+ * cpu_has_avx2 / cpu_has_avx512f / cpu_has_avx512bw / cpu_has_avx512vl /
+ * cpu_has_avx512dq / cpu_has_avx512_vnni / cpu_has_avx512_vbmi /
+ * cpu_get_features_string. */
+#include "cpu_caps.h"
 
 /* ============================================================================
  * IQ Quantization Kernels

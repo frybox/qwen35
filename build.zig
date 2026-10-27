@@ -53,6 +53,13 @@ pub fn build(b: *std.Build) void {
         }),
     });
     c_kernels.root_module.addCSourceFile(.{
+        .file = b.path("src/c_kernels/x86/cpu_caps.c"),
+        .flags = &.{
+            "-std=c11",
+            "-O3",
+        },
+    });
+    c_kernels.root_module.addCSourceFile(.{
         .file = b.path("src/c_kernels/x86/iq_kernels.c"),
         .flags = &.{
             "-std=c11",

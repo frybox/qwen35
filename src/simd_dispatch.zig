@@ -15,41 +15,12 @@ pub var tier: Tier = .baseline;
 pub var force_tier: ?Tier = null;
 
 // ---------------------------------------------------------------------------
-// CPUID / XGETBV
+// CPU feature probing
 // ---------------------------------------------------------------------------
-
-inline fn cpuid(eax_in: u32, ecx_in: u32) [4]u32 {
-    var eax: u32 = eax_in;
-    var ebx: u32 = 0;
-    var ecx: u32 = ecx_in;
-    var edx: u32 = 0;
-    asm volatile ("cpuid"
-        : [eax] "+{eax}" (eax),
-          [ebx] "={ebx}" (ebx),
-          [ecx] "+{ecx}" (ecx),
-          [edx] "={edx}" (edx),
-    );
-    return .{ eax, ebx, ecx, edx };
-}
-
-inline fn xgetbv(ecx_in: u32) u32 {
-    return asm volatile ("xgetbv"
-        : [a] "={eax}" (-> u32),
-        : [c] "{ecx}" (ecx_in),
-    );
-}
-
-inline fn hasOsxsave() bool {
-    return cpuid(1, 0)[2] & (1 << 27) != 0;
-}
-
-/// XCR0 bits the OS has enabled: x87(0) SSE(1) YMM(2) opmask(5) ZMM_hi256(6)
-/// Hi16_ZMM(7).  AVX2 needs 0x7, AVX-512 needs 0xE6, both plus x87/SSE.
-inline fn xcr0Ok(mask: u32) bool {
-    if (!hasOsxsave()) return false;
-    const xcr0 = xgetbv(0);
-    return (xcr0 & 0x6) == 0x6 and (xcr0 & mask) == mask;
-}
+//
+// All probing is delegated to src/c_kernels/x86/cpu_caps.c (probed once at
+// load time). No cpuid/xgetbv is done in Zig: a single source of truth keeps
+// the C dispatchers and the tier selection agreeing on the same bits.
 
 pub const Features = struct {
     avx2: bool = false,
@@ -65,35 +36,18 @@ pub const Features = struct {
 };
 
 pub fn detect() Features {
-    var f: Features = .{};
-    const c1 = cpuid(1, 0);
-    f.ssse3 = c1[2] & (1 << 9) != 0;
-    f.fma = c1[2] & (1 << 12) != 0;
-    const avx = c1[2] & (1 << 28) != 0;
-    f.f16c = c1[2] & (1 << 29) != 0;
-
-    const c7 = cpuid(7, 0);
-    f.avx2 = c7[1] & (1 << 5) != 0;
-    f.avx512f = c7[1] & (1 << 16) != 0;
-    f.avx512dq = c7[1] & (1 << 17) != 0;
-    f.avx512bw = c7[1] & (1 << 30) != 0;
-    f.avx512vl = c7[1] & (1 << 31) != 0;
-    f.avx512vnni = c7[1] & (1 << 11) != 0;
-    f.avx512vbmi = c7[1] & (1 << 31) != 0;
-
-    // OS state: AVX2 needs YMM, AVX-512 needs opmask + the two ZMM halves.
-    if (!(avx and f.fma and f.f16c and xcr0Ok(0x6))) {
-        f.avx2 = false;
-        f.fma = false;
-    }
-    if (!(f.avx2 and f.avx512f and f.avx512bw and f.avx512vl and f.avx512dq and xcr0Ok(0xE6))) {
-        f.avx512f = false;
-        f.avx512bw = false;
-        f.avx512vl = false;
-        f.avx512dq = false;
-        f.avx512vnni = false;
-    }
-    return f;
+    return .{
+        .avx2 = c_kernels.cpuHasAvx2(),
+        .avx512f = c_kernels.cpuHasAvx512f(),
+        .avx512bw = c_kernels.cpuHasAvx512bw(),
+        .avx512vl = c_kernels.cpuHasAvx512vl(),
+        .avx512dq = c_kernels.cpuHasAvx512dq(),
+        .avx512vnni = c_kernels.cpuHasAvx512Vnni(),
+        .avx512vbmi = c_kernels.cpuHasAvx512Vbmi(),
+        .f16c = c_kernels.cpuHasF16c(),
+        .fma = c_kernels.cpuHasFma(),
+        .ssse3 = c_kernels.cpuHasSsse3(),
+    };
 }
 
 // ---------------------------------------------------------------------------

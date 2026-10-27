@@ -7,6 +7,7 @@
 
 #include "iq_kernels.h"
 #include "generated_tables.h"
+#include "cpu_caps.h"
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -15,86 +16,9 @@
 #include <immintrin.h>
 #endif
 
-/* ============================================================================
- * CPU Feature Detection (inline assembly, no GCC built-ins)
- * ============================================================================ */
+/* CPU feature probes live in cpu_caps.c (shared, probed once at load */
+/* time); this file includes cpu_caps.h. Do not re-implement cpuid here. */
 
-static int cpu_has_avx2_cached = -1;
-static int cpu_has_avx512f_cached = -1;
-static int cpu_has_avx512_vnni_cached = -1;
-
-// CPUID wrapper for x86-64
-static inline void cpuid(int eax, int ecx, int* regs) {
-    __asm__ __volatile__ (
-        "cpuid"
-        : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
-        : "a"(eax), "c"(ecx)
-    );
-}
-
-// XGETBV wrapper
-static inline unsigned long long xgetbv(int index) {
-    unsigned int eax, edx;
-    __asm__ __volatile__ (
-        "xgetbv"
-        : "=a"(eax), "=d"(edx)
-        : "c"(index)
-    );
-    return ((unsigned long long)edx << 32) | eax;
-}
-
-int cpu_has_avx2(void) {
-    if (cpu_has_avx2_cached < 0) {
-        int regs[4];
-        // Check AVX2: CPUID leaf 7, subleaf 0, EBX bit 5
-        cpuid(7, 0, regs);
-        int has_avx2 = (regs[1] >> 5) & 1;
-        // Also need to check OS support via XCR0
-        if (has_avx2) {
-            unsigned long long xcr0 = xgetbv(0);
-            // Check XMM (bit 1) and YMM (bit 2) state
-            has_avx2 = ((xcr0 >> 1) & 1) && ((xcr0 >> 2) & 1);
-        }
-        cpu_has_avx2_cached = has_avx2;
-    }
-    return cpu_has_avx2_cached;
-}
-
-int cpu_has_avx512f(void) {
-    if (cpu_has_avx512f_cached < 0) {
-        int regs[4];
-        // Check AVX512F: CPUID leaf 7, subleaf 0, EBX bit 16
-        cpuid(7, 0, regs);
-        int has_avx512f = (regs[1] >> 16) & 1;
-        // Also need OS support for ZMM state
-        if (has_avx512f) {
-            unsigned long long xcr0 = xgetbv(0);
-            // Check opmask (bit 5), ZMM_hi256 (bit 6), ZMM_hi128 (bit 7)
-            has_avx512f = ((xcr0 >> 5) & 1) && ((xcr0 >> 6) & 1) && ((xcr0 >> 7) & 1);
-        }
-        cpu_has_avx512f_cached = has_avx512f;
-    }
-    return cpu_has_avx512f_cached;
-}
-
-int cpu_has_avx512_vnni(void) {
-    if (cpu_has_avx512_vnni_cached < 0) {
-        int regs[4];
-        // Check AVX512_VNNI: CPUID leaf 7, subleaf 0, ECX bit 11
-        cpuid(7, 0, regs);
-        int has_vnni = (regs[2] >> 11) & 1;
-        // Also need AVX512F support
-        cpu_has_avx512_vnni_cached = has_vnni && cpu_has_avx512f();
-    }
-    return cpu_has_avx512_vnni_cached;
-}
-
-const char* cpu_get_features_string(void) {
-    static char buf[128];
-    snprintf(buf, sizeof(buf), "AVX2=%d AVX512F=%d AVX512_VNNI=%d",
-             cpu_has_avx2(), cpu_has_avx512f(), cpu_has_avx512_vnni());
-    return buf;
-}
 
 // Helper for combining two __m128i into __m256i
 #if defined(__AVX__)
@@ -480,7 +404,7 @@ static inline __m128i mul_add_epi8_sse(const __m128i x, const __m128i y) {
 // Convert fp16 to fp32
 static inline float fp16_to_fp32(uint16_t h) {
     // Simple conversion (not handling all corner cases)
-    uint32_t sign = (h & 0x8000) << 16;
+    uint32_t sign = ((uint32_t)h & 0x8000u) << 16;
     uint32_t exponent = (h & 0x7C00) >> 10;
     uint32_t mantissa = (h & 0x03FF);
     uint32_t result;
@@ -1567,12 +1491,12 @@ static float iq3_s_q8_k_avx2_impl(int n, const block_iq3_s* x, const block_q8_K*
                 iq3s_grid[indices[11]], iq3s_grid[indices[10]], iq3s_grid[indices[9]], iq3s_grid[indices[8]]
             );
             
-            __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
+            __m256i aux256 = _mm256_set1_epi32((int)((uint32_t)signs[0] | ((uint32_t)signs[1] << 16)));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
             const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
             const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
             
-            aux256 = _mm256_set1_epi32(signs[2] | (signs[3] << 16));
+            aux256 = _mm256_set1_epi32((int)((uint32_t)signs[2] | ((uint32_t)signs[3] << 16)));
             aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
             const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
             const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);

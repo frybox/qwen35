@@ -30,44 +30,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <immintrin.h>
+#include "cpu_caps.h"
 
 /* ------------------------------------------------------------------ */
-/* runtime dispatch                                                   */
+/* runtime dispatch: cpu_has_avx2() is the shared probe in cpu_caps.c, */
+/* probed once at load time. Do NOT re-implement cpuid/xgetbv here.    */
 /* ------------------------------------------------------------------ */
-
-/* CPUID wrapper for x86-64 */
-static inline void k32_cpuid(int eax, int ecx, int* regs) {
-    __asm__ __volatile__ (
-        "cpuid"
-        : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
-        : "a"(eax), "c"(ecx)
-    );
-}
-
-/* XGETBV wrapper */
-static inline unsigned long long k32_xgetbv(int index) {
-    unsigned int eax, edx;
-    __asm__ __volatile__ (
-        "xgetbv"
-        : "=a"(eax), "=d"(edx)
-        : "c"(index)
-    );
-    return ((unsigned long long)edx << 32) | eax;
-}
-
-static int k32_cpu_has_avx2(void) {
-    int regs[4];
-    // Check AVX2: CPUID leaf 7, subleaf 0, EBX bit 5
-    k32_cpuid(7, 0, regs);
-    int has_avx2 = (regs[1] >> 5) & 1;
-    // Also need to check OS support via XCR0
-    if (has_avx2) {
-        unsigned long long xcr0 = k32_xgetbv(0);
-        // Check XMM (bit 1) and YMM (bit 2) state
-        has_avx2 = ((xcr0 >> 1) & 1) && ((xcr0 >> 2) & 1);
-    }
-    return has_avx2;
-}
 
 /* ------------------------------------------------------------------ */
 /* f16 <-> f32 bit conversions (exact; matches zig f16At / f32ToF16)  */
@@ -345,15 +313,15 @@ static float k32_iq4_nl_q8_0_scalar(int n, const void* vx, const void* vy) {
 /* ------------------------------------------------------------------ */
 
 float q4_0_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q4_0_q8_0_avx2(n, vx, vy) : k32_q4_0_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q4_0_q8_0_avx2(n, vx, vy) : k32_q4_0_q8_0_scalar(n, vx, vy);
 }
 
 float q4_1_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q4_1_q8_0_avx2(n, vx, vy) : k32_q4_1_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q4_1_q8_0_avx2(n, vx, vy) : k32_q4_1_q8_0_scalar(n, vx, vy);
 }
 
 float iq4_nl_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_iq4_nl_q8_0_avx2(n, vx, vy) : k32_iq4_nl_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_iq4_nl_q8_0_avx2(n, vx, vy) : k32_iq4_nl_q8_0_scalar(n, vx, vy);
 }
 
 /*
@@ -438,7 +406,7 @@ static float k32_q8_0_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float q8_0_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q8_0_q8_0_avx2(n, vx, vy) : k32_q8_0_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q8_0_q8_0_avx2(n, vx, vy) : k32_q8_0_q8_0_scalar(n, vx, vy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -528,7 +496,7 @@ static float k32_q5_0_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float q5_0_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q5_0_q8_0_avx2(n, vx, vy) : k32_q5_0_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q5_0_q8_0_avx2(n, vx, vy) : k32_q5_0_q8_0_scalar(n, vx, vy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -604,7 +572,7 @@ static float k32_q5_1_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float q5_1_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q5_1_q8_0_avx2(n, vx, vy) : k32_q5_1_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q5_1_q8_0_avx2(n, vx, vy) : k32_q5_1_q8_0_scalar(n, vx, vy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -693,7 +661,7 @@ static float k32_q1_0_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float q1_0_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q1_0_q8_0_avx2(n, vx, vy) : k32_q1_0_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q1_0_q8_0_avx2(n, vx, vy) : k32_q1_0_q8_0_scalar(n, vx, vy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -786,7 +754,7 @@ static float k32_q2_0_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float q2_0_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_q2_0_q8_0_avx2(n, vx, vy) : k32_q2_0_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_q2_0_q8_0_avx2(n, vx, vy) : k32_q2_0_q8_0_scalar(n, vx, vy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -872,7 +840,7 @@ static float k32_mxfp4_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float mxfp4_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_mxfp4_q8_0_avx2(n, vx, vy) : k32_mxfp4_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_mxfp4_q8_0_avx2(n, vx, vy) : k32_mxfp4_q8_0_scalar(n, vx, vy);
 }
 
 /* ------------------------------------------------------------------ */
@@ -969,7 +937,7 @@ static float k32_nvfp4_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 float nvfp4_q8_0(int n, const void* vx, const void* vy) {
-    return k32_cpu_has_avx2() ? k32_nvfp4_q8_0_avx2(n, vx, vy) : k32_nvfp4_q8_0_scalar(n, vx, vy);
+    return cpu_has_avx2() ? k32_nvfp4_q8_0_avx2(n, vx, vy) : k32_nvfp4_q8_0_scalar(n, vx, vy);
 }
 
 void quantize_q8_0(int n, const float* x, uint8_t* out) {

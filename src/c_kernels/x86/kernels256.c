@@ -33,44 +33,14 @@
 #include <stdint.h>
 #include <string.h>
 #include <math.h>
+#include "cpu_caps.h"
 
 /* ------------------------------------------------------------------ */
 /* shared helpers                                                      */
 /* ------------------------------------------------------------------ */
 
-/* CPUID wrapper for x86-64 */
-static inline void k256_cpuid(int eax, int ecx, int* regs) {
-    __asm__ __volatile__ (
-        "cpuid"
-        : "=a"(regs[0]), "=b"(regs[1]), "=c"(regs[2]), "=d"(regs[3])
-        : "a"(eax), "c"(ecx)
-    );
-}
-
-/* XGETBV wrapper */
-static inline unsigned long long k256_xgetbv(int index) {
-    unsigned int eax, edx;
-    __asm__ __volatile__ (
-        "xgetbv"
-        : "=a"(eax), "=d"(edx)
-        : "c"(index)
-    );
-    return ((unsigned long long)edx << 32) | eax;
-}
-
-static int k256_cpu_has_avx2(void) {
-    int regs[4];
-    // Check AVX2: CPUID leaf 7, subleaf 0, EBX bit 5
-    k256_cpuid(7, 0, regs);
-    int has_avx2 = (regs[1] >> 5) & 1;
-    // Also need to check OS support via XCR0
-    if (has_avx2) {
-        unsigned long long xcr0 = k256_xgetbv(0);
-        // Check XMM (bit 1) and YMM (bit 2) state
-        has_avx2 = ((xcr0 >> 1) & 1) && ((xcr0 >> 2) & 1);
-    }
-    return has_avx2;
-}
+/* Runtime dispatch uses cpu_has_avx2() from cpu_caps.c (probed once at load
+ * time). Do NOT re-implement cpuid/xgetbv in this file. */
 
 /* IEEE 754 binary16 -> float, exact (mirrors util.f16At in kern256.zig). */
 static float k256_f16_to_f32(uint16_t h)
@@ -443,35 +413,35 @@ void quantize_q8_K(int n, const float * x, uint8_t * out)
 
 float q2_k_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_q2_k_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_q2_k_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
 
 float q3_k_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_q3_k_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_q3_k_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
 
 float q4_k_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_q4_k_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_q4_k_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
 
 float q5_k_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_q5_k_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_q5_k_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
 
 float q6_k_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_q6_k_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_q6_k_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
@@ -567,14 +537,14 @@ static float k256_tq1_0_q8_k_avx2(int n, const uint8_t * vx, const uint8_t * vy)
 
 float tq2_0_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_tq2_0_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_tq2_0_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
 
 float tq1_0_q8_k(int n, const void * vx, const void * vy)
 {
-    return k256_cpu_has_avx2()
+    return cpu_has_avx2()
         ? k256_tq1_0_q8_k_avx2(n, (const uint8_t *)vx, (const uint8_t *)vy)
         : k256_tq1_0_q8_k_scalar(n, (const uint8_t *)vx, (const uint8_t *)vy);
 }
