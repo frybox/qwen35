@@ -106,6 +106,11 @@
 - 量化格式覆盖很广，`make run0.8b` 会跑全部 22 个 GGUF 变体；回归时按需单独跑
   （如 `make run0.8biq3xxs`、`make run27biq3xxs`、`make run0.8biq2xxs-llamacpp`）。
 - 模型位于 `/mnt/Qwen3.5-0.8B-GGUF/` 等目录；`-ud` 变体用 `make run0.8bud`。
+- **llama-cli 必须加 `--single-turn`**（脚本/非交互调用时）。不带它 llama-cli 进入交互 REPL
+  模式，非交互上下文里读不到输入就静默退出：stdout 0 行、退出码 0、无任何日志——
+  看起来像"没跑"。性能对比命令模板：
+  `llama-cli -m <gguf> -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn`
+  （单线程保可比，`-dev none` 禁 GPU）。
 
 ## 7. 代码风格与提交
 
