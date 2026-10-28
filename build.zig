@@ -6,12 +6,68 @@ const std = @import("std");
 // for defining build steps and express dependencies between them, allowing the
 // build runner to parallelize the build automatically (and the cache system to
 // know when a step doesn't need to be re-run).
+/// The x86-64 feature set each SIMD kernel translation unit is compiled with.
+///
+/// These are deliberately attached to *separate build targets* (one per C file)
+/// rather than to per-file `-mavx2` style flags. Per-file flags are overridden
+/// by the `-mcpu <model>` flag that Zig appends for the compilation as a whole,
+/// so `zig build -Dcpu=x86_64` used to silently strip the AVX-512/AVX2 flags
+/// from the kernels, turning `#ifdef __AVX512VNNI__` style blocks into empty
+/// stubs while `cpu_caps.c` still reported the feature as present at runtime.
+/// Giving every kernel unit its own resolved target makes the ISA a property of
+/// the unit, immune to whatever `-Dcpu` the user passes for the Zig code.
+const KernelIsa = enum {
+    /// AVX-512 F/BW/DQ/VL + VNNI (kernels512.c).
+    avx512,
+    /// AVX2 + FMA + F16C (kernels32.c, kernels256.c, iq_kernels.c).
+    avx2,
+    /// Plain x86-64 baseline (cpu_caps.c: pure CPUID, must run on anything).
+    baseline,
+
+    fn features(self: KernelIsa) std.Target.Cpu.Feature.Set {
+        const x86 = std.Target.x86;
+        return switch (self) {
+            .avx512 => x86.featureSet(&.{
+                .avx512f,
+                .avx512bw,
+                .avx512dq,
+                .avx512vl,
+                .avx512vnni,
+            }),
+            .avx2 => x86.featureSet(&.{ .avx2, .fma, .f16c }),
+            .baseline => .empty,
+        };
+    }
+};
+
+/// Builds the target query for one kernel translation unit: x86-64 baseline CPU
+/// model plus that unit's ISA features, for this host's OS/ABI.
+fn kernelTarget(b: *std.Build, isa: KernelIsa) std.Build.ResolvedTarget {
+    const host = b.graph.host.result;
+    return b.resolveTargetQuery(.{
+        .cpu_arch = .x86_64,
+        .os_tag = host.os.tag,
+        .abi = host.abi,
+        .cpu_model = .baseline,
+        .cpu_features_add = isa.features(),
+    });
+}
+
 pub fn build(b: *std.Build) void {
-    // Standard target options allow the person running `zig build` to choose
-    // what target to build for. Here we do not override the defaults, which
-    // means any target is allowed, and the default is native. Other options
-    // for restricting supported target set are available.
-    const target = b.standardTargetOptions(.{});
+    // Default to the x86-64 *baseline* CPU model instead of `native`.
+    //
+    // native makes the compiler emit every instruction the build host happens
+    // to support, so a binary built on an AVX-512 machine crashes with
+    // "Illegal instruction" on an AVX2-only machine. SIMD is instead chosen at
+    // *run time* by src/kernels/x86/cpu_caps.c, so the Zig half of the program
+    // must stay baseline. `-Dcpu=native` (or `-Dtarget=...`) still opts into a
+    // host-tuned build for maximum single-machine speed.
+    const target = b.standardTargetOptions(.{
+        .default_target = .{
+            .cpu_arch = .x86_64,
+            .cpu_model = .baseline,
+        },
+    });
     // Standard optimization options allow the person running `zig build` to select
     // between Debug, ReleaseSafe, ReleaseFast, and ReleaseSmall. Here we do not
     // set a preferred release mode, allowing the user to decide how to optimize.
@@ -44,68 +100,63 @@ pub fn build(b: *std.Build) void {
     // ---------------------------------------------------------------------------
     // C kernels for SIMD-optimized IQ quantization (ported from llama.cpp)
     // ---------------------------------------------------------------------------
-    const c_kernels = b.addLibrary(.{
-        .name = "iq_kernels",
-        .linkage = .static,
-        .root_module = b.createModule(.{
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    c_kernels.root_module.addCSourceFile(.{
-        .file = b.path("src/kernels/x86/cpu_caps.c"),
-        .flags = &.{
-            "-std=c11",
-            "-O3",
-        },
-    });
-    c_kernels.root_module.addCSourceFile(.{
-        .file = b.path("src/kernels/x86/iq_kernels.c"),
-        .flags = &.{
-            "-std=c11",
-            "-O3",
-            "-mavx2",
-            "-mfma",
-            "-mf16c",
-        },
-    });
-    c_kernels.root_module.addCSourceFile(.{
-        .file = b.path("src/kernels/x86/kernels32.c"),
-        .flags = &.{
-            "-std=c11",
-            "-O3",
-            "-mavx2",
-            "-mfma",
-            "-mf16c",
-        },
-    });
-    c_kernels.root_module.addCSourceFile(.{
-        .file = b.path("src/kernels/x86/kernels256.c"),
-        .flags = &.{
-            "-std=c11",
-            "-O3",
-            "-mavx2",
-            "-mfma",
-            "-mf16c",
-        },
-    });
-    // AVX-512 VNNI kernels are a SEPARATE compile unit so the AVX2 units above
-    // keep their own codegen (adding -mavx512vnni to them would change the
-    // AVX2 kernels' output). Dispatch is runtime (cpu_has_avx512_vnni()).
-    c_kernels.root_module.addCSourceFile(.{
-        .file = b.path("src/kernels/x86/kernels512.c"),
-        .flags = &.{
-            "-std=c11",
-            "-O3",
-            "-mavx512f",
-            "-mavx512bw",
-            "-mavx512dq",
-            "-mavx512vl",
-            "-mavx512vnni",
-        },
-    });
-    c_kernels.root_module.link_libc = true;
-    b.installArtifact(c_kernels);
+    // One static library PER kernel translation unit, each with its OWN
+    // resolved target carrying that unit's ISA features (see KernelIsa above).
+    // Zig appends a single `-mcpu <model>` for the whole compilation of a
+    // module, and that flag wins over per-file `-mavx2` / `-mavx512*` flags --
+    // which is exactly how the AVX-512 kernels used to degrade into empty
+    // stubs under `-Dcpu=x86_64`. Splitting the units makes the ISA a property
+    // of the target instead of a flag that can be overridden.
+    const kernel_units = [_]struct {
+        name: []const u8,
+        file: []const u8,
+        isa: KernelIsa,
+    }{
+        // CPUID probes: baseline, so the dispatcher itself can never fault on
+        // an old CPU before it has decided what is available.
+        .{ .name = "qwen35_cpu_caps", .file = "src/kernels/x86/cpu_caps.c", .isa = .baseline },
+        .{ .name = "qwen35_kernels_avx2", .file = "src/kernels/x86/kernels32.c", .isa = .avx2 },
+        .{ .name = "qwen35_kernels256_avx2", .file = "src/kernels/x86/kernels256.c", .isa = .avx2 },
+        .{ .name = "qwen35_iq_kernels_avx2", .file = "src/kernels/x86/iq_kernels.c", .isa = .avx2 },
+        // AVX-512 VNNI kernels are a SEPARATE compile unit so the AVX2 units
+        // above keep their own codegen (adding -mavx512vnni to them would
+        // change the AVX2 kernels' output). Dispatch is runtime
+        // (cpu_has_avx512_vnni()).
+        .{ .name = "qwen35_kernels_avx512", .file = "src/kernels/x86/kernels512.c", .isa = .avx512 },
+        // Table cross-check: reads the tables through the extern declarations
+        // and counts mismatches against upstream anchors. Baseline ISA on
+        // purpose -- it must link even when no SIMD tier is available.
+        .{ .name = "qwen35_iq_table_check", .file = "src/kernels/x86/iq_table_check.c", .isa = .baseline },
+    };
+
+    var kernel_libs: [kernel_units.len]*std.Build.Step.Compile = undefined;
+    for (kernel_units, 0..) |unit, i| {
+        const lib = b.addLibrary(.{
+            .name = unit.name,
+            .linkage = .static,
+            .root_module = b.createModule(.{
+                // The ISA comes from this unit's own target; the user's
+                // `-Dcpu` only affects the Zig code and the final link.
+                .target = kernelTarget(b, unit.isa),
+                .optimize = optimize,
+                .link_libc = true,
+            }),
+        });
+        lib.root_module.addCSourceFile(.{
+            .file = b.path(unit.file),
+            .flags = &.{ "-std=c11", "-O3" },
+        });
+        b.installArtifact(lib);
+        kernel_libs[i] = lib;
+    }
+
+    // Links every kernel unit into `step`, in one place, so the executable and
+    // both test binaries can never disagree about which kernels they include.
+    const linkKernels = struct {
+        fn f(step: *std.Build.Step.Compile, libs: []const *std.Build.Step.Compile) void {
+            for (libs) |lib| step.root_module.linkLibrary(lib);
+        }
+    }.f;
 
     // Here we define an executable. An executable needs to have a root module
     // which needs to expose a `main` function. While we could add a main function
@@ -149,8 +200,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link C kernels library
-    exe.root_module.linkLibrary(c_kernels);
+    // Link all C kernel units (each built for its own ISA).
+    linkKernels(exe, &kernel_libs);
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
@@ -209,7 +260,7 @@ pub fn build(b: *std.Build) void {
     // test binary must link the C kernels library (undefined symbol:
     // cpu_has_avx2 / q4_0_q8_0 otherwise). The helper files are imported by
     // path from files already in `mod`, so no separate module is needed.
-    mod_tests.root_module.linkLibrary(c_kernels);
+    linkKernels(mod_tests, &kernel_libs);
 
     // A run step that will run the test executable.
     const run_mod_tests = b.addRunArtifact(mod_tests);

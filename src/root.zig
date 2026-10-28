@@ -10,6 +10,12 @@ pub const engine = @import("engine.zig");
 pub const quant_dequant = @import("quant_dequant.zig");
 pub const pool = @import("pool.zig");
 
+// The IQ lookup tables are defined here once and consumed by the C kernels via
+// `extern const` (src/kernels/x86/iq_tables.h).  Importing them from the root
+// module guarantees the symbols are emitted into the final binary regardless of
+// which Zig code path reaches them.
+pub const iq_tables = @import("iq_tables.zig");
+
 test {
     std.testing.refAllDecls(@This());
 }
@@ -32,5 +38,9 @@ test {
 
 test {
     _ = @import("simd_tests_iq_c.zig");
+}
+
+test {
+    _ = @import("iq_table_tests.zig");
 }
 
