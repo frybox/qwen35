@@ -1,6 +1,6 @@
 /**
  * @file cpu_caps.c
- * @brief x86 CPU feature probes — single source of truth for src/c_kernels/x86.
+ * @brief x86 CPU feature probes — single source of truth for src/kernels/x86.
  *
  * Features are probed ONCE in a constructor at load time. The probes below are
  * pure reads of cached ints, safe to call from a kernel dispatcher on every
@@ -12,6 +12,43 @@
 
 #include "cpu_caps.h"
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+/* DEBUG ONLY: QWEN35_FORCE_SCALAR=<comma-separated probe names> forces those
+ * probes to 0, so a kernel dispatcher takes its scalar (oracle) path.  Used to
+ * A/B "is the garbage coming from the SIMD kernel or from the engine?".
+ * Names: avx2 avx512f avx512bw avx512vl avx512dq vnni vbmi fma f16c ssse3
+ */
+static int force_mask_avx2        = 0;
+static int force_mask_avx512f     = 0;
+static int force_mask_avx512bw    = 0;
+static int force_mask_avx512vl    = 0;
+static int force_mask_avx512dq    = 0;
+static int force_mask_vnni        = 0;
+static int force_mask_vbmi        = 0;
+static int force_mask_fma         = 0;
+static int force_mask_f16c        = 0;
+static int force_mask_ssse3       = 0;
+
+static void cpu_caps_apply_env(void) {
+    const char* e = getenv("QWEN35_FORCE_SCALAR");
+    if (!e || !*e) return;
+    if (strstr(e, "avx2"))     force_mask_avx2    = 1;
+    if (strstr(e, "avx512f"))  force_mask_avx512f = 1;
+    if (strstr(e, "avx512bw")) force_mask_avx512bw = 1;
+    if (strstr(e, "avx512vl")) force_mask_avx512vl = 1;
+    if (strstr(e, "avx512dq")) force_mask_avx512dq = 1;
+    if (strstr(e, "avx512"))   force_mask_avx512f = force_mask_avx512bw = force_mask_avx512vl = force_mask_avx512dq = 1;
+    if (strstr(e, "vnni"))     force_mask_vnni    = 1;
+    if (strstr(e, "vbmi"))     force_mask_vbmi    = 1;
+    if (strstr(e, "fma"))      force_mask_fma     = 1;
+    if (strstr(e, "f16c"))     force_mask_f16c    = 1;
+    if (strstr(e, "ssse3"))    force_mask_ssse3   = 1;
+    if (strstr(e, "all"))      force_mask_avx2 = force_mask_avx512f = force_mask_avx512bw =
+                              force_mask_avx512vl = force_mask_avx512dq = force_mask_vnni =
+                              force_mask_vbmi = force_mask_fma = force_mask_f16c = force_mask_ssse3 = 1;
+}
 
 /* CPUID wrapper for x86-64 (inline asm, no GCC built-ins) */
 static inline void cpuid(int eax, int ecx, int* regs) {
@@ -60,6 +97,8 @@ __attribute__((constructor)) static void cpu_caps_init(void) {
     /* XMM(1)+YMM(2) for AVX/AVX2; opmask(5)+ZMM_hi256(6)+Hi16_ZMM(7) for AVX-512. */
     const int ymm_ok = ((xcr0 >> 1) & 1) && ((xcr0 >> 2) & 1);
     const int zmm_ok = ((xcr0 >> 5) & 1) && ((xcr0 >> 6) & 1) && ((xcr0 >> 7) & 1);
+
+    cpu_caps_apply_env();
 
     avx2_cached        = osxsave && ymm_ok && ((ebx >> 5)  & 1);
     avx512f_cached     = osxsave && zmm_ok && ((ebx >> 16) & 1);

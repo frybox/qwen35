@@ -1,12 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
 
-// TEMP(debug): dump token ids when Q35_DUMP_IDS is set non-empty.
-var dbg_dump_ids = false;
-fn dbgIds(token: u32) void {
-    if (dbg_dump_ids) std.debug.print("ID {d}\n", .{token});
-}
-
 const qwen35 = @import("qwen35");
 const gguf = qwen35.gguf;
 
@@ -18,7 +12,6 @@ const StreamCtx = struct {
     arena: std.mem.Allocator,
 
     fn onToken(ctx: ?*anyopaque, token: u32) void {
-        dbgIds(token);
         const self: *StreamCtx = @ptrCast(@alignCast(ctx orelse return));
         if (qwen35.pool.stat_on) {
             const s = qwen35.pool.snapshot();
@@ -43,14 +36,18 @@ const StreamCtx = struct {
 };
 
 pub fn main(init: std.process.Init) !void {
-    if (init.environ_map.get("Q35_DUMP_IDS")) |ids| {
-        if (ids.len != 0) dbg_dump_ids = true;
-    }
     if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
     if (init.environ_map.get("QWEN35_NO_BATCH") != null) qwen35.engine.no_batch = true;
     if (init.environ_map.get("QWEN35_PROF") != null) qwen35.engine.prof = true;
     if (init.environ_map.get("QWEN35_PROF_POST") != null) qwen35.pool.prof_post_only = true;
     if (init.environ_map.get("QWEN35_STAT") != null) qwen35.pool.stat_on = true;
+    if (init.environ_map.get("QWEN35_FORCE_F32") != null) qwen35.engine.dbg_force_f32 = true;
+    if (init.environ_map.get("QWEN35_F32_TYPES")) |l| {
+        qwen35.engine.dbg_force_f32 = true;
+        qwen35.engine.dbg_f32_types = l;
+    }
+    if (init.environ_map.get("QWEN35_FORCE_ROWDOT") != null) qwen35.engine.dbg_force_rowdot = true;
+    if (init.environ_map.get("QWEN35_KERNEL_CHECK") != null) qwen35.engine.dbg_kernel_check = true;
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
 

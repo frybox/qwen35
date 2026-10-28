@@ -1,4 +1,4 @@
-//! Test-only scalar oracle for the C kernels (src/c_kernels/x86/*).
+//! Test-only scalar oracle for the C kernels (src/kernels/x86/*).
 //!
 //! The `_ref` bodies below are the pure-scalar twins extracted from the old
 //! src/simd/kern32.zig / kern256.zig / kerniq*.zig (commit f0e36ea^), stripped
@@ -363,6 +363,9 @@ pub const dot32 = struct {
         }
         return sumf;
     }
+    // q5_0 block layout (ggml-common.h block_q5_0 / ggml-quants.c
+    // dequantize_row_q5_0): f16 d @0, uint8 qh[4] @2, uint8 qs[16] @6.
+    // qh is 4 bytes (not a u32 @2 with qs already at 6) and qs follows it.
     pub fn q5_0_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
         const nb = n / 32;
         var sumf: f32 = 0;
@@ -377,7 +380,7 @@ pub const dot32 = struct {
             for (0..16) |j| {
                 const xh0: u8 = @intCast(((qh & (@as(u32, 1) << @intCast(j))) >> @intCast(j)) << 4);
                 const xh1: u8 = @intCast(((qh & (@as(u32, 1) << @intCast(j + 16))) >> @intCast(j + 12)));
-                const b = x[6 + j];
+                const b = x[6 + j];  // qs[16] @6: low nibble -> elem j, high nibble -> elem j+16
                 const x0: i8 = @bitCast(@as(u8, b & 0x0F) | xh0);
                 const x1: i8 = @bitCast(@as(u8, b >> 4) | xh1);
                 sumi += (@as(i32, x0) - 16) * qi8(y, 2 + j);
@@ -439,6 +442,10 @@ pub const dot32 = struct {
         }
         return sumf;
     }
+    // q2_0 block layout (ggml-common.h block_q2_0, QK2_0 = 64):
+    // f16 d @0, uint8 qs[16] @2 (18 bytes/block -- QK2_0/4 = 16 qs bytes, NOT 8).
+    // Element j -> byte j/4, bits (j%4)*2; value = code - 1
+    // (00=-1, 01=0, 10=+1, 11=+2), see ggml dequantize_row_q2_0.
     pub fn q2_0_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
         const nb = n / 64;
         var sumf: f32 = 0;
@@ -451,12 +458,10 @@ pub const dot32 = struct {
                 const y = vy + (ib * 2 + k) * q8_bytes;
                 const d1 = util.f16At(y, 0);
                 var blk: i32 = 0;
-                for (0..8) |b| {
-                    const byte = x[2 + k * 8 + b];
-                    for (0..4) |j| {
-                        const q = @as(i32, (byte >> @intCast(j * 2)) & 3) - 1;
-                        blk += q * qi8(y, 2 + b * 4 + j);
-                    }
+                for (0..32) |j| {
+                    const byte = x[2 + k * 8 + j / 4];
+                    const q = @as(i32, (byte >> @intCast((j % 4) * 2)) & 3) - 1;
+                    blk += q * qi8(y, 2 + j);
                 }
                 sumi += d1 * @as(f32, @floatFromInt(blk));
             }

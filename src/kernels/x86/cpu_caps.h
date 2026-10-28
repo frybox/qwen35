@@ -2,7 +2,7 @@
  * @file cpu_caps.h
  * @brief Single source of truth for x86 CPU feature detection.
  *
- * Every C kernel file in src/c_kernels/x86/ MUST use these probes instead of
+ * Every C kernel file in src/kernels/x86/ MUST use these probes instead of
  * writing its own cpuid/xgetbv code. The features are probed exactly once, at
  * library load time (via a constructor), so a kernel dispatcher can read a
  * cached int on every call — cpuid/xgetbv costs ~1600 ns on this VM (VM-exit)

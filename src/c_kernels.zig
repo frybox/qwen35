@@ -6,7 +6,7 @@
 
 const std = @import("std");
 
-// C function declarations (probes come from src/c_kernels/x86/cpu_caps.c,
+// C function declarations (probes come from src/kernels/x86/cpu_caps.c,
 // the single source of truth for x86 feature detection — do not cpuid in Zig)
 extern fn cpu_has_avx2() c_int;
 extern fn cpu_has_avx512f() c_int;
@@ -49,6 +49,11 @@ extern fn q2_0_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
 extern fn mxfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
 extern fn nvfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
 extern fn quantize_q8_0(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
+
+// f16 / bf16 weight rows x Q8_0 activation (--threads-independent 32-block dots,
+// exact fp16 scaling: one f16 scale per row block, one per activation block)
+extern fn f16_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
+extern fn bf16_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
 extern fn quantize_q8_K(n: c_int, x: ?*const anyopaque, out: ?*anyopaque) void;
 
 /// Probes, forwarded to the C single source of truth (cpu_caps.c). These are
@@ -209,6 +214,18 @@ pub fn dotMxfp4Q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32
 /// Compute dot product of NVFP4 quantized vector with Q8_0 quantized vector.
 pub fn dotNvfp4Q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
     return nvfp4_q8_0(@intCast(n), vx, vy);
+}
+
+/// Compute dot product of an F16 weight row with a Q8_0 quantized vector.
+/// vx = f16 weights (2 B/elem), vy = Q8_0 activation (34 B / 32 elems).
+pub fn dotF16Q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    return f16_q8_0(@intCast(n), vx, vy);
+}
+
+/// Compute dot product of a BF16 weight row with a Q8_0 quantized vector.
+/// vx = bf16 weights (2 B/elem), vy = Q8_0 activation (34 B / 32 elems).
+pub fn dotBf16Q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+    return bf16_q8_0(@intCast(n), vx, vy);
 }
 
 /// Quantize float array to Q8_0 format.

@@ -1,4 +1,4 @@
-//! Test-only forwarding module: exposes the C kernels (src/c_kernels/x86/*)
+//! Test-only forwarding module: exposes the C kernels (src/kernels/x86/*)
 //! under the same shape the SIMD test files expect from a tier module
 //! (`dot32`, `dot256`, `dotiq`, `dotiq2`, `dotiq3`, `act`).
 //!

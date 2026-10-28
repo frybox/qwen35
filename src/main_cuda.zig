@@ -930,19 +930,12 @@ fn gpuInit(arena: std.mem.Allocator, e: *engine.Engine) !*Gpu {
 // generation (mirror engine.zig generate; same token order / EOS handling)
 // ---------------------------------------------------------------------------
 
-// TEMP(debug): dump token ids when Q35_DUMP_IDS is set non-empty.
-var dbg_dump_ids = false;
-fn dbgIds(token: u32) void {
-    if (dbg_dump_ids) std.debug.print("ID {d}\n", .{token});
-}
-
 const StreamCtx = struct {
     out: *Io.Writer,
     tok: *const tokenizer.Tokenizer,
     arena: std.mem.Allocator,
 
     fn onToken(ctx: ?*anyopaque, token: u32) void {
-        dbgIds(token);
         const self: *StreamCtx = @ptrCast(@alignCast(ctx orelse return));
         const piece = self.tok.decode(self.arena, &.{token}) catch null;
         var s: []const u8 = "";
@@ -1040,9 +1033,6 @@ fn generate(
 // ---------------------------------------------------------------------------
 
 pub fn main(init: std.process.Init) !void {
-    if (init.environ_map.get("Q35_DUMP_IDS")) |ids| {
-        if (ids.len != 0) dbg_dump_ids = true;
-    }
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
     var stdout_buffer: [32768]u8 = undefined;

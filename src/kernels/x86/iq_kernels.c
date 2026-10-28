@@ -109,13 +109,13 @@ static const uint64_t iq2xxs_grid[256] = {
     0x2b08081908192b08ULL, 0x2b08081919080808ULL, 0x2b08082b08190819ULL, 0x2b08190808080819ULL,
     0x2b08190808081908ULL, 0x2b08190808190808ULL, 0x2b08190808191919ULL, 0x2b08190819080808ULL,
     0x2b081908192b0808ULL, 0x2b08191908080808ULL, 0x2b0819191908192bULL, 0x2b0819192b191908ULL,
-    0x2b08192b08190808ULL, 0x2b08192b19081919ULL, 0x2b082b080808082bULL, 0x2b082b081919082bULL,
-    0x2b082b1919191908ULL, 0x2b082b1919192b08ULL, 0x2b082b192b080808ULL, 0x2b082b2b08190819ULL,
-    0x2b19080808080808ULL, 0x2b19080808082b08ULL, 0x2b190808082b0808ULL, 0x2b190808082b1919ULL,
-    0x2b19080819082b08ULL, 0x2b190808192b0819ULL, 0x2b190808192b1919ULL, 0x2b19081908081908ULL,
-    0x2b19081919190808ULL, 0x2b1908192b080808ULL, 0x2b1908192b192b19ULL, 0x2b19082b082b0808ULL,
-    0x2b19190808080819ULL, 0x2b19190808081908ULL, 0x2b19190808190808ULL, 0x2b191908082b0819ULL,
-    0x2b19190819191919ULL, 0x2b19191908192b08ULL, 0x2b19191919191908ULL, 0x2b191919192b0819ULL,
+    0x2b08192b08082b19ULL, 0x2b08192b19080808ULL, 0x2b08192b192b0808ULL, 0x2b082b080808082bULL,
+    0x2b082b1908081908ULL, 0x2b082b2b08190819ULL, 0x2b19080808081908ULL, 0x2b19080808190808ULL,
+    0x2b190808082b1908ULL, 0x2b19080819080808ULL, 0x2b1908082b2b0819ULL, 0x2b1908190819192bULL,
+    0x2b1908192b080808ULL, 0x2b19082b19081919ULL, 0x2b19190808080808ULL, 0x2b191908082b082bULL,
+    0x2b19190819081908ULL, 0x2b19191919190819ULL, 0x2b192b082b080819ULL, 0x2b192b19082b0808ULL,
+    0x2b2b08080808082bULL, 0x2b2b080819190808ULL, 0x2b2b08082b081919ULL, 0x2b2b081908082b19ULL,
+    0x2b2b082b08080808ULL, 0x2b2b190808192b08ULL, 0x2b2b2b0819190808ULL, 0x2b2b2b1908081908ULL,
 };
 
 // Signs lookup table for IQ2_XXS/IQ2_XS (scalar version, matches Zig ksigns_iq2xs)
@@ -1180,232 +1180,479 @@ float iq4_xs_q8_k(int n, const void* vx, const void* vy) {
 }
 
 /* ============================================================================
- * IQ1_S implementation - AVX2
+ * IQ1_S implementation
+ *
+ * This file used to carry a hand-written port that did NOT match ggml:
+ *   - the delta term was missing entirely (ggml adds IQ1S_DELTA * sum(ls*delta*sum(q8)),
+ *     where delta = +-1 is selected by qh[ib] bit 0x8000),
+ *   - the per-32-element 6-bit scale ls = 2*((qh[ib] >> 12) & 7) + 1 was never
+ *     read; a bare 0.125f constant stood in for it (and for IQ1S_DELTA),
+ *   - the 9-bit grid index was assembled from a single qh[] element with the
+ *     wrong bit fields instead of (qh[ib] >> 3*l) & 7,
+ *   - and the scalar fallback was a stub returning sum(d*y->d*0.125f).
+ * Both paths below are ports of ggml_vec_dot_iq1_s_q8_K (AVX2 / AVX) and
+ * ggml_vec_dot_iq1_s_q8_K_generic (scalar). Semantics per element:
+ *   value = fp16(x->d) * ls_ib * (iq1s_grid[idx][j] + delta_ib * IQ1S_DELTA)
+ * so the dot product is (grid.q8 term) + IQ1S_DELTA * (delta/scale term).
  * ============================================================================ */
+
+// IQ1_S delta: the grid read must be offset by +-0.125 (ggml IQ1S_DELTA).
+#define IQ1S_DELTA 0.125f
 
 #if defined(__AVX2__)
 __attribute__((target("avx2")))
 static float iq1_s_q8_k_avx2_impl(int n, const block_iq1_s* x, const block_q8_K* y) {
     const int nb = n / QK_K;
-    
-    __m256 accumf = _mm256_setzero_ps();
-    
+
+    __m256 accum = _mm256_setzero_ps();
+    float accum1 = 0;
     for (int i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(x[i].d) * y[i].d;
-        const uint8_t* qs = x[i].qs;
+
+        const int8_t*   q8 = y[i].qs;
+        const uint8_t*  qs = x[i].qs;
         const uint16_t* qh = x[i].qh;
-        const int8_t* q8 = y[i].qs;
-        
+
         __m256i sumi = _mm256_setzero_si256();
-        
-        for (int ib = 0; ib < QK_K/32; ++ib) {
-            // Load 32 bytes of q8
-            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            
-            // Get grid indices: low 8 bits from qs, high 3 bits from qh
-            uint32_t idx[4];
-            idx[0] = qs[0] | ((qh[0] & 0x07) << 8);
-            idx[1] = qs[1] | ((qh[0] & 0x38) << 5);
-            idx[2] = qs[2] | ((qh[0] & 0xC0) << 2) | ((qh[1] & 0x01) << 10);
-            idx[3] = qs[3] | ((qh[1] & 0x0E) << 7);
-            qs += 4;
-            qh += 1;
-            
-            // Load grid values from iq1s_grid
-            const __m256i q1_1 = _mm256_set_epi64x(
-                iq1s_grid[idx[3]], iq1s_grid[idx[2]],
-                iq1s_grid[idx[1]], iq1s_grid[idx[0]]);
-            
-            // Compute dot product
-            const __m256i dot = _mm256_maddubs_epi16(q1_1, q8_1);
-            sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(1)));
+        int sumi1 = 0;
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            // 9-bit grid indices: low 8 bits from qs, high 3 bits from qh nibbles.
+            const __m256i q1b_1 = _mm256_set_epi64x(
+                    (int64_t)iq1s_grid[qs[3] | (((uint16_t)qh[ib+0] >> 1) & 0x700)],
+                    (int64_t)iq1s_grid[qs[2] | (((uint16_t)qh[ib+0] << 2) & 0x700)],
+                    (int64_t)iq1s_grid[qs[1] | (((uint16_t)qh[ib+0] << 5) & 0x700)],
+                    (int64_t)iq1s_grid[qs[0] | (((uint16_t)qh[ib+0] << 8) & 0x700)]);
+            const __m256i q1b_2 = _mm256_set_epi64x(
+                    (int64_t)iq1s_grid[qs[7] | (((uint16_t)qh[ib+1] >> 1) & 0x700)],
+                    (int64_t)iq1s_grid[qs[6] | (((uint16_t)qh[ib+1] << 2) & 0x700)],
+                    (int64_t)iq1s_grid[qs[5] | (((uint16_t)qh[ib+1] << 5) & 0x700)],
+                    (int64_t)iq1s_grid[qs[4] | (((uint16_t)qh[ib+1] << 8) & 0x700)]);
+
+            const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+
+            const __m256i dot1 = mul_add_epi8(q1b_1, q8b_1);
+            const __m256i dot2 = mul_add_epi8(q1b_2, q8b_2);
+
+            // ls = 2*(3-bit field in bits 12..14) + 1, one per 32 elements.
+            const int16_t ls1 = 2*((qh[ib+0] >> 12) & 7) + 1;
+            const int16_t ls2 = 2*((qh[ib+1] >> 12) & 7) + 1;
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_set1_epi16(ls1));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_set1_epi16(ls2));
+
+            sumi = _mm256_add_epi32(sumi, _mm256_add_epi32(p1, p2));
+            // Delta term: sign from qh bit 15, magnitude is the block sum of q8.
+            sumi1 += (y[i].bsums[2*ib+0] + y[i].bsums[2*ib+1]) * (qh[ib+0] & 0x8000 ? -1 : 1) * ls1
+                   + (y[i].bsums[2*ib+2] + y[i].bsums[2*ib+3]) * (qh[ib+1] & 0x8000 ? -1 : 1) * ls2;
+
+            qs += 8;
         }
-        
-        accumf = _mm256_fmadd_ps(
-            _mm256_set1_ps(d * 0.125f),
-            _mm256_cvtepi32_ps(sumi),
-            accumf);
+
+        const float d = y[i].d * fp16_to_fp32(x[i].d);
+        accum  = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(sumi), accum);
+        accum1 += d * sumi1;
     }
-    
-    return hsum_float_8_avx(accumf);
+
+    return hsum_float_8_avx(accum) + IQ1S_DELTA * accum1;
+}
+#elif defined(__AVX__)
+/* AVX (no AVX2) tier: port of the __AVX__ branch of ggml_vec_dot_iq1_s_q8_K. */
+static float iq1_s_q8_k_avx_impl(int n, const block_iq1_s* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    __m256 accum = _mm256_setzero_ps();
+    float accum1 = 0;
+    for (int i = 0; i < nb; ++i) {
+
+        const int8_t*   q8 = y[i].qs;
+        const uint8_t*  qs = x[i].qs;
+        const uint16_t* qh = x[i].qh;
+
+        __m128i sumi1_0 = _mm_setzero_si128();
+        __m128i sumi1_1 = _mm_setzero_si128();
+        int sumi1 = 0;
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const __m128i q1b_1_0 = _mm_set_epi64x(
+                    (int64_t)iq1s_grid[qs[1] | (((uint16_t)qh[ib+0] << 5) & 0x700)],
+                    (int64_t)iq1s_grid[qs[0] | (((uint16_t)qh[ib+0] << 8) & 0x700)]);
+            const __m128i q1b_1_1 = _mm_set_epi64x(
+                    (int64_t)iq1s_grid[qs[3] | (((uint16_t)qh[ib+0] >> 1) & 0x700)],
+                    (int64_t)iq1s_grid[qs[2] | (((uint16_t)qh[ib+0] << 2) & 0x700)]);
+            const __m128i q1b_2_0 = _mm_set_epi64x(
+                    (int64_t)iq1s_grid[qs[5] | (((uint16_t)qh[ib+1] << 5) & 0x700)],
+                    (int64_t)iq1s_grid[qs[4] | (((uint16_t)qh[ib+1] << 8) & 0x700)]);
+            const __m128i q1b_2_1 = _mm_set_epi64x(
+                    (int64_t)iq1s_grid[qs[7] | (((uint16_t)qh[ib+1] >> 1) & 0x700)],
+                    (int64_t)iq1s_grid[qs[6] | (((uint16_t)qh[ib+1] << 2) & 0x700)]);
+            qs += 8;
+
+            const __m128i q8b_1_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8b_1_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8b_2_0 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+            const __m128i q8b_2_1 = _mm_loadu_si128((const __m128i*)q8); q8 += 16;
+
+            const __m128i dot1_0 = mul_add_epi8_sse(q1b_1_0, q8b_1_0);
+            const __m128i dot1_1 = mul_add_epi8_sse(q1b_1_1, q8b_1_1);
+            const __m128i dot2_0 = mul_add_epi8_sse(q1b_2_0, q8b_2_0);
+            const __m128i dot2_1 = mul_add_epi8_sse(q1b_2_1, q8b_2_1);
+
+            const int16_t ls1 = 2*((qh[ib+0] >> 12) & 7) + 1;
+            const int16_t ls2 = 2*((qh[ib+1] >> 12) & 7) + 1;
+            const __m128i p1_0 = _mm_madd_epi16(dot1_0, _mm_set1_epi16(ls1));
+            const __m128i p1_1 = _mm_madd_epi16(dot1_1, _mm_set1_epi16(ls1));
+            const __m128i p2_0 = _mm_madd_epi16(dot2_0, _mm_set1_epi16(ls2));
+            const __m128i p2_1 = _mm_madd_epi16(dot2_1, _mm_set1_epi16(ls2));
+
+            sumi1_0 = _mm_add_epi32(sumi1_0, _mm_add_epi32(p1_0, p2_0));
+            sumi1_1 = _mm_add_epi32(sumi1_1, _mm_add_epi32(p1_1, p2_1));
+            sumi1 += (y[i].bsums[2*ib+0] + y[i].bsums[2*ib+1]) * (qh[ib+0] & 0x8000 ? -1 : 1) * ls1
+                   + (y[i].bsums[2*ib+2] + y[i].bsums[2*ib+3]) * (qh[ib+1] & 0x8000 ? -1 : 1) * ls2;
+        }
+
+        const float d = y[i].d * fp16_to_fp32(x[i].d);
+        accum = _mm256_add_ps(
+                _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(MM256_SET_M128I(sumi1_1, sumi1_0))),
+                accum);
+        accum1 += d * sumi1;
+    }
+
+    return hsum_float_8_avx(accum) + IQ1S_DELTA * accum1;
 }
 #endif
+
+/* Scalar path: port of ggml_vec_dot_iq1_s_q8_K_generic.
+ * Semantically complete (project rule: a fallback must not be a stub). */
+static float iq1_s_q8_k_scalar_impl(int n, const block_iq1_s* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    float sumf = 0;
+    for (int i = 0; i < nb; i++) {
+
+        const int8_t*   q8 = y[i].qs;
+        const uint8_t*  qs = x[i].qs;
+        const uint16_t* qh = x[i].qh;
+
+        int sumi = 0, sumi1 = 0;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            const int ls = 2*((qh[ib] >> 12) & 7) + 1;
+            const int delta = qh[ib] & 0x8000 ? -1 : 1;
+            int lsum = 0;
+            for (int l = 0; l < 4; ++l) {
+                const int8_t* grid = (const int8_t*)(iq1s_grid + (qs[l] | (((qh[ib] >> 3*l) & 7) << 8)));
+                for (int j = 0; j < 8; ++j) {
+                    lsum += q8[j] * grid[j];
+                }
+                q8 += 8;
+            }
+            sumi  += ls * lsum;
+            sumi1 += ls * delta * (y[i].bsums[2*ib+0] + y[i].bsums[2*ib+1]);
+            qs += 4;
+        }
+
+        sumf += fp16_to_fp32(x[i].d) * y[i].d * (float)(sumi + IQ1S_DELTA * sumi1);
+    }
+    return sumf;
+}
 
 /* IQ1_S dispatch function */
 float iq1_s_q8_k(int n, const void* vx, const void* vy) {
     const block_iq1_s* x = (const block_iq1_s*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
         return iq1_s_q8_k_avx2_impl(n, x, y);
     }
-#endif
-    // Scalar fallback
-    const int nb = n / QK_K;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d * 0.125f;
+#elif defined(__AVX__)
+    if (cpu_has_avx2()) {
+        return iq1_s_q8_k_avx_impl(n, x, y);
     }
-    return sum;
+#endif
+    return iq1_s_q8_k_scalar_impl(n, x, y);
 }
 
 /* ============================================================================
- * IQ1_M implementation - AVX2
+ * IQ1_M implementation
+ *
+ * This file used to carry a hand-written port that did NOT match ggml:
+ *   - the delta term was missing entirely (ggml adds IQ1M_DELTA * sum(sum(q8)*delta)
+ *     where delta is +-1 selected by qh bits 0x08 / 0x80),
+ *   - the per-32-element 3-bit scales were collapsed into a single multiplier
+ *     read with the wrong bit fields (ggml uses 6*(ib%2)+{0,3}),
+ *   - the fp16 super-scale packed in scales[0..7] (iq1m_scale_t) was never
+ *     unpacked; a bare 0.125f constant stood in for fp16(scale)*y->d,
+ *   - grid indices were built with the IQ1_S 9-bit layout instead of the IQ1_M
+ *     one, qs[l] | (((uint16_t)qh[l/2] << (8 - 4*(l%2))) & 0x700),
+ *   - and the scalar fallback was a stub returning sum(y->d * 0.125f).
+ * Both paths below are ports of ggml_vec_dot_iq1_m_q8_K (AVX2) and
+ * ggml_vec_dot_iq1_m_q8_K_generic (scalar).
  * ============================================================================ */
+
+// IQ1_M delta: the grid read must be offset by +-0.125 (ggml IQ1M_DELTA).
+#define IQ1M_DELTA 0.125f
+
+static inline float iq1_m_scale_f16(const block_iq1_m* blk) {
+    // iq1m_scale_t: fp16 super-scale packed across the 8 scale bytes.
+    const uint16_t* sc = (const uint16_t*)blk->scales;
+    const uint16_t scale_u16 = (uint16_t)((sc[0] >> 12) | ((sc[1] >> 8) & 0x00f0) |
+                                          ((sc[2] >> 4) & 0x0f00) | (sc[3] & 0xf000));
+    return fp16_to_fp32(scale_u16);
+}
 
 #if defined(__AVX2__)
 __attribute__((target("avx2")))
 static float iq1_m_q8_k_avx2_impl(int n, const block_iq1_m* x, const block_q8_K* y) {
     const int nb = n / QK_K;
-    
-    __m256 accumf = _mm256_setzero_ps();
-    
+
+    const __m256i mask = _mm256_set1_epi16(0x7);
+    const __m256i mone = _mm256_set1_epi16(1);
+    const __m256i mone8 = _mm256_set1_epi8(1);
+    const __m256i mtwo8 = _mm256_set1_epi8(2);
+    // VPSHUFB cannot cross 128-bit lanes so odd shifts go to upper half.
+    const __m256i scales_shift = _mm256_set_epi64x(9, 3, 6, 0);
+
+    __m256 accum1 = _mm256_setzero_ps();
+    __m256 accum2 = _mm256_setzero_ps();
     for (int i = 0; i < nb; ++i) {
         const int8_t* q8 = y[i].qs;
         const uint8_t* qs = x[i].qs;
         const uint8_t* qh = x[i].qh;
-        const uint8_t* scales = x[i].scales;
-        
-        __m256i sumi = _mm256_setzero_si256();
-        
-        for (int ib = 0; ib < QK_K/32; ++ib) {
-            // Load 32 bytes of q8
-            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            
-            // Get grid indices
-            uint32_t idx[4];
-            idx[0] = qs[0] | ((qh[0] & 0x07) << 8);
-            idx[1] = qs[1] | ((qh[0] & 0x38) << 5);
-            idx[2] = qs[2] | ((qh[0] & 0xC0) << 2) | ((qh[1] & 0x01) << 10);
-            idx[3] = qs[3] | ((qh[1] & 0x0E) << 7);
-            qs += 4;
-            qh += 1;
-            
-            // Load grid values from iq1s_grid
-            const __m256i q1_1 = _mm256_set_epi64x(
-                iq1s_grid[idx[3]], iq1s_grid[idx[2]],
-                iq1s_grid[idx[1]], iq1s_grid[idx[0]]);
-            
-            // Get scale for this block (3-bit scale)
-            const uint8_t scale_byte = scales[ib / 2];
-            const int16_t ls = (ib % 2 == 0) ? (scale_byte & 0x07) : ((scale_byte >> 4) & 0x07);
-            
-            // Compute dot product with scale
-            const __m256i dot = _mm256_maddubs_epi16(q1_1, q8_1);
-            sumi = _mm256_add_epi32(sumi, _mm256_madd_epi16(dot, _mm256_set1_epi16(2 * ls + 1)));
+        const uint16_t* sc = (const uint16_t*)x[i].scales;
+
+        // Extract 3-bit scales (16 values, one per 16 elements).
+        __m256i scales = _mm256_set1_epi64x((int64_t)(*(const uint64_t*)sc));
+        scales = _mm256_srlv_epi64(scales, scales_shift);
+        scales = _mm256_add_epi16(_mm256_slli_epi16(_mm256_and_si256(scales, mask), 1), mone);
+
+        // Indices to repeat each scale 8 times.
+        __m256i scales_idx1 = _mm256_set1_epi16(0x0100);
+        __m256i scales_idx2 = _mm256_add_epi8(scales_idx1, _mm256_set1_epi8(8));
+
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const __m256i q1b_1 = _mm256_set_epi64x(
+                    (int64_t)iq1s_grid[qs[3] | (((uint16_t)qh[1] << 4) & 0x700)],
+                    (int64_t)iq1s_grid[qs[2] | (((uint16_t)qh[1] << 8) & 0x700)],
+                    (int64_t)iq1s_grid[qs[1] | (((uint16_t)qh[0] << 4) & 0x700)],
+                    (int64_t)iq1s_grid[qs[0] | (((uint16_t)qh[0] << 8) & 0x700)]);
+            const __m256i q1b_2 = _mm256_set_epi64x(
+                    (int64_t)iq1s_grid[qs[7] | (((uint16_t)qh[3] << 4) & 0x700)],
+                    (int64_t)iq1s_grid[qs[6] | (((uint16_t)qh[3] << 8) & 0x700)],
+                    (int64_t)iq1s_grid[qs[5] | (((uint16_t)qh[2] << 4) & 0x700)],
+                    (int64_t)iq1s_grid[qs[4] | (((uint16_t)qh[2] << 8) & 0x700)]);
+
+            const __m256i delta1 = _mm256_set_epi64x(
+                    qh[1] & 0x80 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL,
+                    qh[1] & 0x08 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL,
+                    qh[0] & 0x80 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL,
+                    qh[0] & 0x08 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL);
+            const __m256i delta2 = _mm256_set_epi64x(
+                    qh[3] & 0x80 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL,
+                    qh[3] & 0x08 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL,
+                    qh[2] & 0x80 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL,
+                    qh[2] & 0x08 ? (int64_t)0xffffffffffffffffULL : (int64_t)0x0101010101010101ULL);
+
+            const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+
+            const __m256i dot1 = mul_add_epi8(q1b_1, q8b_1);
+            const __m256i dot2 = mul_add_epi8(q1b_2, q8b_2);
+            const __m256i dot3 = _mm256_maddubs_epi16(mone8, _mm256_sign_epi8(q8b_1, delta1));
+            const __m256i dot4 = _mm256_maddubs_epi16(mone8, _mm256_sign_epi8(q8b_2, delta2));
+
+            const __m256i scale1 = _mm256_shuffle_epi8(scales, scales_idx1);
+            const __m256i scale2 = _mm256_shuffle_epi8(scales, scales_idx2);
+
+            scales_idx1 = _mm256_add_epi8(scales_idx1, mtwo8);
+            scales_idx2 = _mm256_add_epi8(scales_idx2, mtwo8);
+
+            const __m256i p1 = _mm256_madd_epi16(dot1, scale1);
+            const __m256i p2 = _mm256_madd_epi16(dot2, scale2);
+            const __m256i p3 = _mm256_madd_epi16(dot3, scale1);
+            const __m256i p4 = _mm256_madd_epi16(dot4, scale2);
+
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_add_epi32(p1, p2));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_add_epi32(p3, p4));
+
+            qs += 8; qh += 4;
         }
-        
-        accumf = _mm256_fmadd_ps(
-            _mm256_set1_ps(0.125f),
-            _mm256_cvtepi32_ps(sumi),
-            accumf);
+
+        const __m256 d = _mm256_set1_ps(y[i].d * iq1_m_scale_f16(&x[i]));
+
+        accum1 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(sumi1), accum1);
+        accum2 = _mm256_fmadd_ps(d, _mm256_cvtepi32_ps(sumi2), accum2);
     }
-    
-    return hsum_float_8_avx(accumf);
+
+    return hsum_float_8_avx(accum1) + IQ1M_DELTA * hsum_float_8_avx(accum2);
 }
 #endif
+
+/* Scalar path: port of ggml_vec_dot_iq1_m_q8_K_generic.
+ * Semantically complete (project rule: a fallback must not be a stub). */
+static float iq1_m_q8_k_scalar_impl(int n, const block_iq1_m* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    int sum1[2], sum2[2], delta[4];
+
+    float sumf = 0;
+    for (int i = 0; i < nb; ++i) {
+        const int8_t* q8 = y[i].qs;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint16_t* sc = (const uint16_t*)x[i].scales;
+
+        int sumi1 = 0, sumi2 = 0;
+        for (int ib = 0; ib < QK_K/32; ++ib) {
+            delta[0] = qh[0] & 0x08 ? -1 : 1;
+            delta[1] = qh[0] & 0x80 ? -1 : 1;
+            delta[2] = qh[1] & 0x08 ? -1 : 1;
+            delta[3] = qh[1] & 0x80 ? -1 : 1;
+            sum1[0] = sum1[1] = sum2[0] = sum2[1] = 0;
+            for (int l = 0; l < 4; ++l) {
+                const int8_t* grid = (const int8_t*)(iq1s_grid + (qs[l] | (((uint16_t)qh[l/2] << (8 - 4*(l%2))) & 0x700)));
+                int lsum1 = 0, lsum2 = 0;
+                for (int j = 0; j < 8; ++j) {
+                    lsum1 += q8[j] * grid[j];
+                    lsum2 += q8[j];
+                }
+                q8 += 8;
+                sum1[l/2] += lsum1;
+                sum2[l/2] += lsum2*delta[l];
+            }
+
+            const int ls1 = 2*((sc[ib/2] >> (6*(ib%2)+0)) & 0x7) + 1;
+            const int ls2 = 2*((sc[ib/2] >> (6*(ib%2)+3)) & 0x7) + 1;
+
+            sumi1 += sum1[0] * ls1 + sum1[1] * ls2;
+            sumi2 += sum2[0] * ls1 + sum2[1] * ls2;
+            qs += 4;
+            qh += 2;
+        }
+
+        sumf += iq1_m_scale_f16(&x[i]) * y[i].d * (float)(sumi1 + IQ1M_DELTA * sumi2);
+    }
+    return sumf;
+}
 
 /* IQ1_M dispatch function */
 float iq1_m_q8_k(int n, const void* vx, const void* vy) {
     const block_iq1_m* x = (const block_iq1_m*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
         return iq1_m_q8_k_avx2_impl(n, x, y);
     }
 #endif
-    // Scalar fallback
-    const int nb = n / QK_K;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        sum += y[i].d * 0.125f;
-    }
-    return sum;
+    return iq1_m_q8_k_scalar_impl(n, x, y);
 }
 
 /* ============================================================================
- * IQ2_S implementation - AVX2
+ * IQ2_S implementation
+ *
+ * This file used to carry a hand-written port that did NOT match ggml:
+ *   - it ignored IQ2_S's separate sign bits entirely (ggml flips q8 with the
+ *     `signs` array before the madd),
+ *   - it built grid indices with `qh_val >> (j*2)` on a uint8_t, which is UB
+ *     once j*2 >= 8, so the top 2 index bits were silently dropped,
+ *   - it read one scales byte per *two* 32-blocks instead of one per block,
+ *   - it dropped the 0.125 output factor,
+ *   - and its scalar fallback was a stub returning sum(d * y->d), violating
+ *     the project rule that a fallback must be semantically complete.
+ * Both paths below are ports of ggml_vec_dot_iq2_s_q8_K (AVX2) and
+ * ggml_vec_dot_iq2_s_q8_K_generic (scalar).
  * ============================================================================ */
 
 #if defined(__AVX2__)
+/* ggml's get_scale_shuffle_k4 (replicated locally; the one in this file's
+ * helpers is the 16-byte get_scale_shuffle variant). */
+static inline __m256i k_scale_shuffle_k4(int i) {
+    static const uint8_t k_shuffle[256] = {
+         0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1,
+         2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3, 2, 3,
+         4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5, 4, 5,
+         6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7, 6, 7,
+         8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9, 8, 9,
+        10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,10,11,
+        12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,12,13,
+        14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15,14,15
+    };
+    return _mm256_loadu_si256((const __m256i*)k_shuffle + i);
+}
+
 __attribute__((target("avx2")))
 static float iq2_s_q8_k_avx2_impl(int n, const block_iq2_s* x, const block_q8_K* y) {
     const int nb = n / QK_K;
-    
+
+    static const uint8_t k_mask1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03
+    };
+    static const uint8_t k_mask2[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    const __m128i m1 = _mm_set1_epi8(1);
+
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
+
+    uint64_t aux64;
+
     __m256 accumf = _mm256_setzero_ps();
-    
     for (int i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d) * y[i].d;
-        const uint8_t* qs = x[i].qs;
-        const uint8_t* qh = x[i].qh;
-        const uint8_t* scales = x[i].scales;
-        const int8_t* q8 = y[i].qs;
-        
+        const uint8_t * qs = x[i].qs;
+        const uint8_t * qh = x[i].qh;
+        const uint16_t * signs = (const uint16_t *)(x[i].qs + QK_K/8);
+        const int8_t  * q8 = y[i].qs;
+
+        memcpy(&aux64, x[i].scales, 8);
+        const __m128i scales8 = _mm_add_epi8(_mm_slli_epi16(_mm_and_si128(_mm_set_epi64x(aux64 >> 4, aux64), m4), 1), m1);
+        const __m256i scales16 = _mm256_cvtepi8_epi16(scales8); // 0 2 4 6 8 10 12 14 1 3 5 7 9 11 13 15
+
         __m256i sumi1 = _mm256_setzero_si256();
         __m256i sumi2 = _mm256_setzero_si256();
-        
         for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
             const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
             const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-            
-            // Load 16 bytes of qs and process with qh
-            const __m128i qs_lo = _mm_loadu_si128((const __m128i*)qs); qs += 16;
-            
-            // Get high bits from qh
-            const uint8_t qh_val = qh[ib32 / 4];
-            
-            // Build indices for iq2s_grid
-            uint32_t idx[16];
-            // Extract bytes from qs_lo using shuffle
-            const uint8_t* qs_bytes = (const uint8_t*)&qs_lo;
-            for (int j = 0; j < 16; ++j) {
-                idx[j] = (qs_bytes[j] | (((qh_val >> (j * 2)) & 0x03) << 8));
-            }
-            
-            // Load grid values
-            const __m256i q2_1 = _mm256_set_epi64x(
-                iq2s_grid[idx[3]], iq2s_grid[idx[2]],
-                iq2s_grid[idx[1]], iq2s_grid[idx[0]]);
-            const __m256i q2_2 = _mm256_set_epi64x(
-                iq2s_grid[idx[7]], iq2s_grid[idx[6]],
-                iq2s_grid[idx[5]], iq2s_grid[idx[4]]);
-            const __m256i q2_3 = _mm256_set_epi64x(
-                iq2s_grid[idx[11]], iq2s_grid[idx[10]],
-                iq2s_grid[idx[9]], iq2s_grid[idx[8]]);
-            const __m256i q2_4 = _mm256_set_epi64x(
-                iq2s_grid[idx[15]], iq2s_grid[idx[14]],
-                iq2s_grid[idx[13]], iq2s_grid[idx[12]]);
-            
-            // Get scales
-            const uint8_t scale_byte = scales[ib32 / 2];
-            const uint16_t ls1 = scale_byte & 0x0F;
-            const uint16_t ls2 = scale_byte >> 4;
-            
-            // Compute dot products - extract __m128i and convert to __m256i
-            const __m128i q8_1_lo = _mm256_extracti128_si256(q8_1, 0);
-            const __m128i q8_1_hi = _mm256_extracti128_si256(q8_1, 1);
-            const __m128i q8_2_lo = _mm256_extracti128_si256(q8_2, 0);
-            const __m128i q8_2_hi = _mm256_extracti128_si256(q8_2, 1);
-            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, MM256_SET_M128I(_mm_setzero_si128(), q8_1_lo));
-            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, MM256_SET_M128I(_mm_setzero_si128(), q8_1_hi));
-            const __m256i dot3 = _mm256_maddubs_epi16(q2_3, MM256_SET_M128I(_mm_setzero_si128(), q8_2_lo));
-            const __m256i dot4 = _mm256_maddubs_epi16(q2_4, MM256_SET_M128I(_mm_setzero_si128(), q8_2_hi));
-            
-            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, _mm256_set1_epi16(2*ls1+1)));
-            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot2, _mm256_set1_epi16(2*ls1+1)));
-            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot3, _mm256_set1_epi16(2*ls2+1)));
-            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot4, _mm256_set1_epi16(2*ls2+1)));
+            const __m256i q2_1 = _mm256_set_epi64x(iq2s_grid[qs[3] | ((qh[ib32+0] << 2) & 0x300)],
+                                                   iq2s_grid[qs[2] | ((qh[ib32+0] << 4) & 0x300)],
+                                                   iq2s_grid[qs[1] | ((qh[ib32+0] << 6) & 0x300)],
+                                                   iq2s_grid[qs[0] | ((qh[ib32+0] << 8) & 0x300)]);
+            const __m256i q2_2 = _mm256_set_epi64x(iq2s_grid[qs[7] | ((qh[ib32+1] << 2) & 0x300)],
+                                                   iq2s_grid[qs[6] | ((qh[ib32+1] << 4) & 0x300)],
+                                                   iq2s_grid[qs[5] | ((qh[ib32+1] << 6) & 0x300)],
+                                                   iq2s_grid[qs[4] | ((qh[ib32+1] << 8) & 0x300)]);
+            qs += 8;
+
+            __m256i aux256 = _mm256_set1_epi32((int)((uint32_t)signs[0] | ((uint32_t)signs[1] << 16)));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+
+            aux256 = _mm256_set1_epi32((int)((uint32_t)signs[2] | ((uint32_t)signs[3] << 16)));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256, mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+
+            signs += 4;
+
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1); // blocks 2*ib32+0, 2*ib32+1
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2); // blocks 2*ib32+2, 2*ib32+3
+
+            const __m256i p1 = _mm256_madd_epi16(dot1, _mm256_shuffle_epi8(scales16, k_scale_shuffle_k4(ib32+0)));
+            const __m256i p2 = _mm256_madd_epi16(dot2, _mm256_shuffle_epi8(scales16, k_scale_shuffle_k4(ib32+1)));
+            sumi1 = _mm256_add_epi32(sumi1, p1);
+            sumi2 = _mm256_add_epi32(sumi2, p2);
         }
-        
-        accumf = _mm256_fmadd_ps(
-            _mm256_set1_ps(d),
-            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
-            accumf);
+
+        accumf = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)), accumf);
     }
-    
-    return hsum_float_8_avx(accumf);
+
+    return 0.125f * hsum_float_8_avx(accumf);
 }
 #endif
 
@@ -1413,19 +1660,50 @@ static float iq2_s_q8_k_avx2_impl(int n, const block_iq2_s* x, const block_q8_K*
 float iq2_s_q8_k(int n, const void* vx, const void* vy) {
     const block_iq2_s* x = (const block_iq2_s*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
         return iq2_s_q8_k_avx2_impl(n, x, y);
     }
 #endif
-    // Scalar fallback
+    /* Scalar fallback: port of ggml_vec_dot_iq2_s_q8_K_generic.  Note IQ2_S
+     * keeps its sign bits inside the qs array (qs + QK_K/8), not in a separate
+     * member, and one scales byte per 32-element block. */
     const int nb = n / QK_K;
-    float sum = 0.0f;
+    float sumf = 0.0f;
     for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d;
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const int8_t  * q8 = y[i].qs;
+        const uint8_t * qs = x[i].qs;
+        const uint8_t * qh = x[i].qh;
+        const uint8_t * signs = qs + QK_K/8;
+
+        int bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const int ls1 = 1 + 2*(x[i].scales[ib32] & 0xf);
+            const int ls2 = 1 + 2*(x[i].scales[ib32] >>  4);
+            int sumi1 = 0, sumi2 = 0;
+            for (int l = 0; l < 2; ++l) {
+                const uint8_t * grid = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib32] << (8-2*l)) & 0x300)));
+                for (int j = 0; j < 8; ++j) {
+                    sumi1 += q8[j] * (int)grid[j] * ((signs[l] & kmask_iq2xs[j]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            for (int l = 2; l < 4; ++l) {
+                const uint8_t * grid = (const uint8_t *)(iq2s_grid + (qs[l] | ((qh[ib32] << (8-2*l)) & 0x300)));
+                for (int j = 0; j < 8; ++j) {
+                    sumi2 += q8[j] * (int)grid[j] * ((signs[l] & kmask_iq2xs[j]) ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += ls1 * sumi1 + ls2 * sumi2;
+            qs += 4;
+            signs += 4;
+        }
+        sumf += d * bsum;
     }
-    return sum;
+    return 0.125f * sumf;
 }
 
 /* ============================================================================

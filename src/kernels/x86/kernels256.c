@@ -48,13 +48,21 @@ static float k256_f16_to_f32(uint16_t h)
     const uint32_t s = ((uint32_t)h & 0x8000u) << 16;
     const uint32_t e = (uint32_t)(h >> 10) & 0x1Fu;
     const uint32_t m = (uint32_t)h & 0x3FFu;
-    if (e == 0) {
-        if (m == 0) return 0.0f;
-        /* subnormal: m * 2^-24 (exact in f32). */
-        return (float)((double)m * 0x1.0p-24);
-    }
     uint32_t bits;
-    if (e == 0x1Fu) {
+    if (e == 0) {
+        if (m == 0) return s ? -0.0f : 0.0f;
+        /* subnormal: value = m * 2^-24.  Normalize the mantissa into
+         * [512,1024) exactly like k32_f16_to_f32/k512_f16_to_f32 do, and keep
+         * the sign bit.  (Was: (float)((double)m * 0x1.0p-24), which silently
+         * dropped `s` -- every negative f16-subnormal block scale (|d| < 2^-14,
+         * frequent for Q6_K ssm_out / Q4_K dmin) came back POSITIVE, so whole
+         * 256-element blocks contributed with a flipped sign -> gibberish
+         * output.  Verified against blk.0.ssm_out.weight row 0 blocks 1,2,5,7.) */
+        uint32_t mm = m;
+        uint32_t lz = 0;
+        while (mm < 0x200u) { mm <<= 1; lz++; }
+        bits = s | ((112u - lz) << 23) | ((mm & 0x1FFu) << 14);
+    } else if (e == 0x1Fu) {
         bits = s | 0x7F800000u | (m << 13); /* inf / nan */
     } else {
         bits = s | ((e + 112u) << 23) | (m << 13); /* normal */
@@ -395,9 +403,15 @@ void quantize_q8_K(int n, const float * x, uint8_t * out)
         int16_t gsum[16] = { 0 };
         for (int k = 0; k < 256; k++) {
             float r = roundf(x[i + k] * inv);
-            if (r < -128.0f) r = -128.0f;
+            // Clamp to [-127, 127], not [-128, 127]: IQ kernels negate q8 via
+            // _mm256_sign_epi8, and negating -128 overflows back to -128 (the
+            // sign flips wrongly) -- x86 psubb cannot represent +128.  Using
+            // -127 as the lower bound is what llama.cpp does (iscale = -127.f /
+            // max).  With scale = amax/127 this only matters for a rounding
+            // edge case, but that edge case silently corrupts a whole block.
+            if (r < -127.0f) r = -127.0f;
             if (r > 127.0f) r = 127.0f;
-            if (!(r >= -128.0f)) r = 127.0f; /* NaN/inf guard (Zig intFromFloat saturates) */
+            if (!(r >= -127.0f)) r = 127.0f; /* NaN/inf guard (Zig intFromFloat saturates) */
             const int8_t q = (int8_t)(int32_t)r;
             o[4 + k] = (uint8_t)q;
             gsum[k / 16] = (int16_t)(gsum[k / 16] + (int32_t)q);

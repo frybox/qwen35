@@ -39,7 +39,7 @@ static inline float k512_f16_to_f32(uint16_t h) {
         uint32_t m = mant;
         uint32_t lz = 0;
         while (m < 0x200u) { m <<= 1; lz++; }
-        out = sign | ((112u - lz) << 23) | ((m & 0x1FFu) << 11);
+        out = sign | ((112u - lz) << 23) | ((m & 0x1FFu) << 14);
     } else if (exp == 31) {
         out = sign | 0x7F800000u | ((mant << 14) & 0x7FFFFFu);
     } else {

@@ -206,6 +206,20 @@ pub const Task = union(enum) {
         rows: usize,
         dot: ?simd_api.Dot32 = null,
     },
+    /// f16 / bf16 rows dotted directly against a Q8_0 activation (no f32
+    /// materialization): `rb32` bytes of packed 2-byte weights per 32-element
+    /// block, `row_blocks` Q8_0 blocks per row, one `dot(32, wblk, qblock)`
+    /// per block summed in ascending order (same accumulation as the
+    /// quant32 path, so results match the scalar rowDot fallback).
+    q8_0_d32: struct {
+        out: [*]f32,
+        data: []const u8,
+        q8: [*]const u8,
+        rb32: usize,
+        row_blocks: usize,
+        rows: usize,
+        dot: simd_api.Dot32,
+    },
     /// f32 rows.
     f32: struct {
         out: [*]f32,
@@ -275,6 +289,17 @@ pub const Task = union(enum) {
         rows: usize,
         k: usize,
     },
+    q8_0_d32b: struct {
+        out: [*]f32,
+        data: []const u8,
+        q8: [*]const u8,
+        q8_len: usize,
+        rb32: usize,
+        row_blocks: usize,
+        rows: usize,
+        k: usize,
+        dot: simd_api.Dot32,
+    },
 };
 
 pub const Slot = struct {
@@ -311,12 +336,14 @@ fn rowsOf(t: Task) usize {
         .quant32 => |q| q.rows,
         .quant_scalar => |q| q.rows,
         .q8_0 => |q| q.rows,
+        .q8_0_d32 => |q| q.rows,
         .f32 => |q| q.rows,
         .quant256b => |q| q.rows * q.k,
         .quant32b => |q| q.rows * q.k,
         .quant_scalarb => |q| q.rows * q.k,
         .q8_0b => |q| q.rows * q.k,
         .f32b => |q| q.rows * q.k,
+        .q8_0_d32b => |q| q.rows * q.k,
     };
 }
 
@@ -324,8 +351,8 @@ fn rowsOf(t: Task) usize {
 /// as the serial path, applied to `rows * k`).
 fn minParallelRows(t: Task) usize {
     return switch (t) {
-        .quant256, .quant32, .quant_scalar, .q8_0, .f32 => 256,
-        .quant256b, .quant32b, .quant_scalarb, .q8_0b, .f32b => 256,
+        .quant256, .quant32, .quant_scalar, .q8_0, .q8_0_d32, .f32 => 256,
+        .quant256b, .quant32b, .quant_scalarb, .q8_0b, .q8_0_d32b, .f32b => 256,
     };
 }
 
@@ -395,6 +422,18 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
                         dot += @as(i32, @as(i8, @bitCast(wb[2 + j]))) * @as(i32, @as(i8, @bitCast(q8sl[b * 34 + 2 + j])));
                     }
                     acc += wscale * @as(f32, @floatFromInt(dot)) * xscale;
+                }
+                q.out[r] = acc;
+            }
+        },
+        .q8_0_d32 => |q| {
+            var r = lo;
+            while (r < hi) : (r += 1) {
+                const wrow = q.data[r * q.row_blocks * q.rb32 ..][0 .. q.row_blocks * q.rb32];
+                if (stat_on) _ = stat32.fetchAdd(@intCast(q.row_blocks * q.rb32), .monotonic);
+                var acc: f32 = 0;
+                for (0..q.row_blocks) |b| {
+                    acc += q.dot(32, wrow[b * q.rb32 ..].ptr, q.q8 + b * 34);
                 }
                 q.out[r] = acc;
             }
@@ -482,6 +521,21 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
                 const xs = q.x[tok * q.x_len ..];
                 var acc: f32 = 0;
                 for (rowv, xs) |mv, vv| acc += mv * vv;
+                q.out[tok * q.rows + rr] = acc;
+            }
+        },
+        .q8_0_d32b => |q| {
+            var r = lo;
+            while (r < hi) : (r += 1) {
+                const tok = r / q.rows;
+                const rr = r % q.rows;
+                const wrow = q.data[rr * q.row_blocks * q.rb32 ..][0 .. q.row_blocks * q.rb32];
+                if (stat_on) _ = stat32.fetchAdd(@intCast(q.row_blocks * q.rb32), .monotonic);
+                const q8sl: [*]const u8 = q.q8 + tok * q.q8_len;
+                var acc: f32 = 0;
+                for (0..q.row_blocks) |b| {
+                    acc += q.dot(32, wrow[b * q.rb32 ..].ptr, q8sl + b * 34);
+                }
                 q.out[tok * q.rows + rr] = acc;
             }
         },

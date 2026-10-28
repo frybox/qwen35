@@ -260,3 +260,135 @@ test "simd kern32: row kernels == sum of block kernels (3 tiers)" {
     std.debug.print("  kern32 row-vs-block worst = {} ({s})\n", .{ worst, worst_case });
     try std.testing.expect(worst < 1e-3);
 }
+
+// ---------------------------------------------------------------------------
+// Horizontal-reduction coverage.
+//
+// History: an alignr-based butterfly reduction dropped the upper 128-bit lane
+// and double-counted the lower one.  The whole suite missed it because every
+// existing synthetic vector had *identical* values in all lanes (e.g. all-ones
+// activations, scale ratio 1.0), so losing or duplicating a lane still summed
+// to the right total.  The only way to pin this down is to make every lane's
+// contribution **distinct** and non-uniform, so any lane mix-up changes the sum.
+//
+// q8_0_q8_0 is used because it is a pure integer dot (i8 x i8), so the exact
+// expected value can be computed in integer arithmetic -- no tolerance needed,
+// and the reduction is the last step before float conversion, which is exactly
+// what we want to stress.
+test "simd kern32: horizontal reduction covers all 8 lanes (non-uniform lanes)" {
+    const alloc = std.testing.allocator;
+
+    // 8 blocks, each with a distinct power-of-two-ish scale and completely
+    // different integer patterns, so every lane of the i32 accumulator and the
+    // final float accumulator ends up with a unique magnitude.
+    const nb = 8;
+    const rb = 34;
+    const w = try alloc.alloc(u8, nb * rb);
+    defer alloc.free(w);
+    const y = try alloc.alloc(u8, nb * rb);
+    defer alloc.free(y);
+
+    for (0..nb) |ib| {
+        // f16 scale: exact small powers of two representable without rounding.
+        const dw: f16 = @floatFromInt(ib + 1);
+        const dv: f16 = @floatFromInt(2 * (ib + 1));
+        const wb: u16 = @bitCast(dw);
+        const yb: u16 = @bitCast(dv);
+        w[ib * rb + 0] = @truncate(wb);
+        w[ib * rb + 1] = @truncate(wb >> 8);
+        y[ib * rb + 0] = @truncate(yb);
+        y[ib * rb + 1] = @truncate(yb >> 8);
+        for (0..32) |j| {
+            // Distinct, non-symmetric values per (block, lane); sign varies so
+            // that a duplicated lane cannot cancel out to the same total.
+            const a: i32 = @as(i32, @intCast((ib * 7 + j * 5) % 251)) - 125;
+            const b: i32 = @as(i32, @intCast((ib * 3 + j * 11) % 241)) - 120;
+            w[ib * rb + 2 + j] = @bitCast(@as(i8, @intCast(@max(@min(a, 127), -128))));
+            y[ib * rb + 2 + j] = @bitCast(@as(i8, @intCast(@max(@min(b, 127), -128))));
+        }
+    }
+
+    // Exact integer-domain expectation.
+    var expect: f64 = 0;
+    for (0..nb) |ib| {
+        const wb: u16 = @as(u16, w[ib * rb]) | (@as(u16, w[ib * rb + 1]) << 8);
+        const yb: u16 = @as(u16, y[ib * rb]) | (@as(u16, y[ib * rb + 1]) << 8);
+        const dx: f32 = @floatCast(@as(f16, @bitCast(wb)));
+        const dy: f32 = @floatCast(@as(f16, @bitCast(yb)));
+        var sumi: i32 = 0;
+        for (0..32) |j| {
+            const xv: i8 = @bitCast(w[ib * rb + 2 + j]);
+            const yv: i8 = @bitCast(y[ib * rb + 2 + j]);
+            sumi += @as(i32, xv) * @as(i32, yv);
+        }
+        expect += @as(f64, dx) * @as(f64, dy) * @as(f64, @floatFromInt(sumi));
+    }
+
+    // Check EVERY available tier, not just the one this CPU happens to pick:
+    // the dispatcher may route to AVX-512 VNNI / AVX2 / scalar depending on the
+    // host, so a reduction bug in an un-exercised tier would stay invisible.
+    const tiers = .{
+        .{ .name = "simd_c", .f = &simd_c.dot32.q8_0_q8_0 },
+        .{ .name = "ref", .f = &simd_ref.dot32.q8_0_q8_0_ref },
+    };
+    inline for (tiers) |t| {
+        const got = t.f(nb * 32, w.ptr, y.ptr);
+        const rel = @abs(@as(f64, got) - expect) / @max(@abs(expect), 1.0);
+        std.debug.print("  reduce-all-lanes[{s}] got={e} expect={e} rel={e}\n", .{ t.name, got, expect, rel });
+        try std.testing.expect(rel < 1e-6);
+    }
+
+    // A lane-dropping reduction would be off by a large factor; assert the
+    // magnitude of the total is meaningful so the test cannot pass on zeros.
+    try std.testing.expect(@abs(expect) > 1.0);
+}
+
+// Same guard, but the *weights* are uniform and only the activation varies.
+// This is the second half of the old blind spot: identical weights made a
+// lane mix-up numerically invisible even with a non-uniform activation.
+test "simd kern32: horizontal reduction, uniform weights / varying activation" {
+    const alloc = std.testing.allocator;
+    const nb = 8;
+    const rb = 34;
+    const w = try alloc.alloc(u8, nb * rb);
+    defer alloc.free(w);
+    const y = try alloc.alloc(u8, nb * rb);
+    defer alloc.free(y);
+
+    for (0..nb) |ib| {
+        const dw: u16 = @bitCast(@as(f16, 1.0));
+        const dv: u16 = @bitCast(@as(f16, 1.0));
+        w[ib * rb + 0] = @truncate(dw);
+        w[ib * rb + 1] = @truncate(dw >> 8);
+        y[ib * rb + 0] = @truncate(dv);
+        y[ib * rb + 1] = @truncate(dv >> 8);
+        for (0..32) |j| {
+            // weights: all 1 (uniform)
+            w[ib * rb + 2 + j] = @bitCast(@as(i8, 1));
+            // activations: strongly varying, both signs
+            const b: i32 = @as(i32, @intCast((ib * 13 + j * 17) % 201)) - 100;
+            y[ib * rb + 2 + j] = @bitCast(@as(i8, @intCast(@max(@min(b, 127), -128))));
+        }
+    }
+
+    var expect: f64 = 0;
+    for (0..nb) |ib| {
+        var sumi: i32 = 0;
+        for (0..32) |j| {
+            const yv: i8 = @bitCast(y[ib * rb + 2 + j]);
+            sumi += @as(i32, yv);
+        }
+        expect += @as(f64, @floatFromInt(sumi));
+    }
+
+    const tiers = .{
+        .{ .name = "simd_c", .f = &simd_c.dot32.q8_0_q8_0 },
+        .{ .name = "ref", .f = &simd_ref.dot32.q8_0_q8_0_ref },
+    };
+    inline for (tiers) |t| {
+        const got = t.f(nb * 32, w.ptr, y.ptr);
+        const rel = @abs(@as(f64, got) - expect) / @max(@abs(expect), 1.0);
+        std.debug.print("  reduce-uniform-w[{s}] got={e} expect={e} rel={e}\n", .{ t.name, got, expect, rel });
+        try std.testing.expect(rel < 1e-6);
+    }
+}

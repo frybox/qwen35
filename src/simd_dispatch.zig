@@ -1,6 +1,6 @@
 //! Runtime ISA dispatch for the ported quantization kernels.
 //!
-//! This version uses only C kernels (src/c_kernels/x86/), no Zig SIMD.
+//! This version uses only C kernels (src/kernels/x86/), no Zig SIMD.
 
 const std = @import("std");
 const api = @import("simd_api.zig");
@@ -18,7 +18,7 @@ pub var force_tier: ?Tier = null;
 // CPU feature probing
 // ---------------------------------------------------------------------------
 //
-// All probing is delegated to src/c_kernels/x86/cpu_caps.c (probed once at
+// All probing is delegated to src/kernels/x86/cpu_caps.c (probed once at
 // load time). No cpuid/xgetbv is done in Zig: a single source of truth keeps
 // the C dispatchers and the tier selection agreeing on the same bits.
 
@@ -65,6 +65,8 @@ pub const Dot32Table = struct {
     iq4_nl_q8_0: api.Dot32,
     mxfp4_q8_0: api.Dot32,
     nvfp4_q8_0: api.Dot32,
+    f16_q8_0: api.Dot32,
+    bf16_q8_0: api.Dot32,
 };
 
 fn makeDot32() Dot32Table {
@@ -79,6 +81,8 @@ fn makeDot32() Dot32Table {
         .iq4_nl_q8_0 = c_kernels.dotIq4NlQ8_0,
         .mxfp4_q8_0 = c_kernels.dotMxfp4Q8_0,
         .nvfp4_q8_0 = c_kernels.dotNvfp4Q8_0,
+        .f16_q8_0 = c_kernels.dotF16Q8_0,
+        .bf16_q8_0 = c_kernels.dotBf16Q8_0,
     };
 }
 
@@ -99,6 +103,8 @@ pub const Dot32RowTable = struct {
     iq4_nl_q8_0: api.Dot32,
     mxfp4_q8_0: api.Dot32,
     nvfp4_q8_0: api.Dot32,
+    f16_q8_0: api.Dot32,
+    bf16_q8_0: api.Dot32,
 };
 
 fn makeDot32Row() Dot32RowTable {
@@ -113,6 +119,8 @@ fn makeDot32Row() Dot32RowTable {
         .iq4_nl_q8_0 = c_kernels.dotIq4NlQ8_0,
         .mxfp4_q8_0 = c_kernels.dotMxfp4Q8_0,
         .nvfp4_q8_0 = c_kernels.dotNvfp4Q8_0,
+        .f16_q8_0 = c_kernels.dotF16Q8_0,
+        .bf16_q8_0 = c_kernels.dotBf16Q8_0,
     };
 }
 

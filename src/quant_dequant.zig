@@ -16,6 +16,7 @@
 const std = @import("std");
 const ggml_tables = @import("ggml_tables.zig");
 const ggml_tables_extra = @import("ggml_tables_extra.zig");
+const simd_ref = @import("simd_ref.zig");
 
 const QK_K: usize = 256;
 const QK4_NL: usize = 32;
@@ -1196,4 +1197,143 @@ test "quant_dequant: all match C ground-truth (96 rows x 256)" {
     if (e > worst) worst = e;
     std.debug.print("  worst overall = {}\n", .{worst});
     try std.testing.expect(worst < 1e-3);
+}
+
+// ---------------------------------------------------------------------------
+// f16 -> f32 exhaustive sweep.
+//
+// History: an f16 subnormal bug shipped and passed the whole suite, because no
+// test ever exercised the exponent==0 path.  Those 1024 patterns are only
+// 15% of the space, so we simply enumerate ALL 65536 codes here.
+//
+// The oracle is written from the IEEE-754 half specification in *pure integer
+// bit arithmetic*, deliberately NOT using Zig's @floatCast(f16->f32): using the
+// builtin would validate it against itself and could not catch a bug in the
+// path being tested (which is itself @floatCast-based).  Every f16 value is
+// exactly representable in f32, so the comparison is exact -- any deviation is
+// a real bug, never rounding.
+fn f16ToF32ByBits(h: u16) f32 {
+    const sign: u32 = @as(u32, h >> 15) << 31;
+    const exp: u32 = @as(u32, (h >> 10) & 0x1F);
+    const man: u32 = h & 0x3FF;
+
+    const bits: u32 = if (exp == 0) blk: {
+        if (man == 0) break :blk sign; // +/- zero
+        // Subnormal: value = man * 2^-24.  Normalise: shift the mantissa left
+        // until bit 10 is set, decreasing the f32 exponent accordingly.
+        var m = man;
+        var e: i32 = -14; // f16 subnormal bias step
+        while ((m & 0x400) == 0) : (m <<= 1) e -= 1;
+        m &= 0x3FF;
+        const f32exp: u32 = @intCast(e + 127);
+        break :blk sign | (f32exp << 23) | (m << 13);
+    } else if (exp == 0x1F) blk: {
+        // Inf / NaN.  Preserve NaN-ness; the payload is not semantically
+        // meaningful for our kernels, so we only require NaN->NaN.
+        break :blk sign | 0x7F80_0000 | (if (man != 0) @as(u32, 0x0040_0000) else 0);
+    } else blk: {
+        const f32exp: u32 = exp + 127 - 15;
+        break :blk sign | (f32exp << 23) | (man << 13);
+    };
+    return @bitCast(bits);
+}
+
+test "quant_dequant: f16 -> f32 exhaustive over all 65536 codes" {
+    // Path A: the row accessor used by every rowDot kernel.
+    var mismatches: usize = 0;
+    var worst_rel: f32 = 0;
+    var first_bad: u16 = 0;
+    var have_bad = false;
+
+    var h: u32 = 0;
+    while (h < 0x10000) : (h += 1) {
+        const code: u16 = @intCast(h);
+        const row = [_]u8{ @truncate(code), @as(u8, @truncate(code >> 8)) };
+        const got = f16_to_f32(&row, 0);
+        const want = f16ToF32ByBits(code);
+
+        const both_nan = std.math.isNan(got) and std.math.isNan(want);
+        if (both_nan) continue;
+
+        const same = @as(u64, @bitCast(@as(f64, got))) == @as(u64, @bitCast(@as(f64, want)));
+        if (!same) {
+            mismatches += 1;
+            if (!have_bad) {
+                have_bad = true;
+                first_bad = code;
+            }
+            const denom = @max(@abs(want), 1e-30);
+            const rel = @abs(got - want) / denom;
+            if (rel > worst_rel) worst_rel = rel;
+        }
+    }
+    if (mismatches != 0) {
+        std.debug.print("  f16 sweep: {d} mismatches, first code 0x{X:0>4}, worst rel {e}\n", .{ mismatches, first_bad, worst_rel });
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches);
+
+    // Path B: simd_ref's pointer-based accessor must agree with path A.
+    var h2: u32 = 0;
+    var mismatches_b: usize = 0;
+    while (h2 < 0x10000) : (h2 += 1) {
+        const code: u16 = @intCast(h2);
+        const bytes = [_]u8{ @truncate(code), @as(u8, @truncate(code >> 8)) };
+        const got = simd_ref.util.f16At(&bytes, 0);
+        const want = f16ToF32ByBits(code);
+        if (std.math.isNan(got) and std.math.isNan(want)) continue;
+        if (@as(u64, @bitCast(@as(f64, got))) != @as(u64, @bitCast(@as(f64, want)))) mismatches_b += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 0), mismatches_b);
+}
+
+// ---------------------------------------------------------------------------
+// f16 / bf16 rows (unquantized 2-byte weights, 256 elements per "row block").
+// These are the scalar per-element references the f16_q8_0 / bf16_q8_0 C
+// kernels are A/B'd against (QWEN35_KERNEL_CHECK=1), and what the old
+// f32-materialization path effectively computed.  Same accumulation shape as
+// the kernels: one f32 accumulator per 32-element chunk, added row-major.
+// ---------------------------------------------------------------------------
+
+fn f16BitsToF32(h: u16) f32 {
+    return @floatCast(@as(f16, @bitCast(h)));
+}
+
+fn bf16BitsToF32(h: u16) f32 {
+    return @as(f32, @bitCast(@as(u32, h) << 16));
+}
+
+/// Dot of one f16 row (512 B = 256 x 2 B) with an f32 activation.
+pub fn rowDotF16(row: []const u8, x: []const f32) f32 {
+    // Same layout rule as bf16 below: 32 x f16 per block, no block metadata.
+    // Cover the WHOLE row (nblk from x.len), not a hardcoded 8 blocks.
+    std.debug.assert(x.len % 32 == 0);
+    std.debug.assert(row.len >= x.len * 2);
+    var sum: f32 = 0;
+    const nblk = x.len / 32;
+    const w: [*]const u16 = @ptrCast(@alignCast(row.ptr));
+    for (0..nblk) |blk| {
+        var acc: f32 = 0;
+        for (0..32) |k| acc += f16BitsToF32(w[blk * 32 + k]) * x[blk * 32 + k];
+        sum += acc;
+    }
+    return sum;
+}
+
+/// Dot of one bf16 row (512 B = 256 x 2 B) with an f32 activation.
+pub fn rowDotBF16(row: []const u8, x: []const f32) f32 {
+    // One 32-element block = 32 x bf16 = 64 bytes; no per-block scale (bf16 IS
+    // the value).  The row length is implied by `x`, so cover ALL of x -- the
+    // old version stopped after 8 blocks (256 elements), silently truncating
+    // every row wider than 256 and producing garbage for real models.
+    std.debug.assert(x.len % 32 == 0);
+    std.debug.assert(row.len >= x.len * 2);
+    var sum: f32 = 0;
+    const nblk = x.len / 32;
+    const w: [*]const u16 = @ptrCast(@alignCast(row.ptr));
+    for (0..nblk) |blk| {
+        var acc: f32 = 0;
+        for (0..32) |k| acc += bf16BitsToF32(w[blk * 32 + k]) * x[blk * 32 + k];
+        sum += acc;
+    }
+    return sum;
 }

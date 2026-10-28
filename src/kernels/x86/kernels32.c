@@ -53,7 +53,7 @@ static inline float k32_f16_to_f32(uint16_t h) {
         uint32_t lz = 0;
         while (m < 0x200u) { m <<= 1; lz++; }
         /* value = (1 + (m-512)/512) * 2^(-15-lz) */
-        out = sign | ((112u - lz) << 23) | ((m & 0x1FFu) << 11);
+        out = sign | ((112u - lz) << 23) | ((m & 0x1FFu) << 14);
     } else if (exp == 31) {
         /* inf / nan */
         out = sign | 0x7F800000u | ((mant << 14) & 0x7FFFFFu);
@@ -97,6 +97,17 @@ static inline uint16_t k32_f32_to_f16bits(float x) {
 }
 
 /* ------------------------------------------------------------------ */
+/* safe little-endian 32-bit load (block payloads are only 2-byte       */
+/* aligned, so a raw uint32_t dereference is UB / a sanitizer crash)    */
+/* ------------------------------------------------------------------ */
+
+static inline uint32_t k32_ld32(const uint8_t* p) {
+    uint32_t v;
+    memcpy(&v, p, 4);
+    return v;
+}
+
+/* ------------------------------------------------------------------ */
 /* iq4_nl value table — from src/simd/kerniq.zig L32 (keep in sync)   */
 /* ------------------------------------------------------------------ */
 
@@ -109,12 +120,17 @@ static const int32_t k32_iq4nl_tab[16] = { -127, -104, -83, -65, -49, -35, -22, 
 /* ------------------------------------------------------------------ */
 
 /* exact sum of the 8 i32 lanes of v -> int (|total| << 2^31 here).
- * after the 3 alignr stages lane 0 holds the full 8-lane sum. */
+ *
+ * NOTE: this must collapse BOTH 128-bit lanes.  _mm256_alignr_epi8 shifts
+ * within a 128-bit lane only (it never crosses the lane boundary), so an
+ * alignr-based butterfly loses the upper lane entirely and double-counts the
+ * lower one.  Fold the lanes together first, then reduce inside one xmm.
+ */
 static inline int k32_sum8i32(const __m256i v) {
-    __m256i t = _mm256_add_epi32(v, _mm256_alignr_epi8(v, v, 4));
-    t = _mm256_add_epi32(t, _mm256_alignr_epi8(t, t, 8));
-    t = _mm256_add_epi32(t, _mm256_alignr_epi8(t, t, 16));
-    return (int)_mm256_extract_epi32(t, 0);
+    __m128i t = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1));
+    t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0x4E));   /* +[2,3,0,1] */
+    t = _mm_add_epi32(t, _mm_shuffle_epi32(t, 0xB1));   /* +[1,0,3,2] */
+    return (int)_mm_cvtsi128_si32(t);
 }
 
 /*
@@ -430,13 +446,19 @@ static inline __m256i k32_bytes_from_q5_0(const uint8_t* qs, const uint8_t* qh) 
     const __m256i bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
     const __m256i low4 = _mm256_and_si256(bytes, _mm256_set1_epi8(0x0F));
     
-    // qh has 32 bits, one per element (bit 4)
-    const uint32_t qh32 = *(const uint32_t*)qh;
+    // qh has 32 bits, one per element (bit 4).  qh is only 2-byte aligned
+    // (block offset 2 inside a 22-byte block), so a raw uint32_t load is a
+    // misaligned access (UB, and SIGSEGV under -fsanitize=alignment).
+    const uint32_t qh32 = k32_ld32(qh);
     const __m256i shuf_mask = _mm256_set_epi64x(
         0x0303030303030303, 0x0202020202020202,
         0x0101010101010101, 0x0000000000000000);
     __m256i qh_bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(qh32), shuf_mask);
-    const __m256i bit_mask = _mm256_set1_epi64x(0x7FBFDFF7FBFDFF7F);
+    /* low-bit-clear mask: per byte bit0 of each replicated source byte is kept,
+     * all other bits are set.  Must be 0x7fbfdfeff7fbfdfe, exactly as
+     * ggml-cpu/arch/x86/quants.c:bytes_from_bits_32 (a transposed copy here
+     * silently corrupted the q5 high bits). */
+    const __m256i bit_mask = _mm256_set1_epi64x(0x7FBFDFEFF7FBFDFE);
     qh_bytes = _mm256_or_si256(qh_bytes, bit_mask);
     const __m256i qh_bits = _mm256_cmpeq_epi8(qh_bytes, _mm256_set1_epi64x(-1));
     const __m256i high1 = _mm256_and_si256(_mm256_set1_epi8(0x10), qh_bits);
@@ -463,7 +485,7 @@ static float k32_q5_0_q8_0_avx2(int n, const void* vx, const void* vy) {
         const __m256i y32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
         
         const int sumi = k32_dot32_i8_i8(x32, y32);
-        acc = _mm256_fmadd_ps(d, _mm256_set1_ps((float)sumi), acc);
+        acc = _mm256_fmadd_ps(d, _mm256_setr_ps((float)sumi, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), acc);
     }
     return k32_hsum_float_8(acc);
 }
@@ -490,7 +512,7 @@ static float k32_q5_0_q8_0_scalar(int n, const void* vx, const void* vy) {
         const float dx = k32_f16_to_f32((uint16_t)(xb[0] | ((uint32_t)xb[1] << 8)));
         const float dy = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
         int sumi = 0;
-        const uint32_t qh = *(const uint32_t*)(xb + 2);
+        const uint32_t qh = k32_ld32(xb + 2);
         for (int j = 0; j < 32; j++) {
             const uint8_t q4 = (xb[6 + j/2] >> (4 * (j & 1))) & 0x0F;
             const uint8_t q5 = q4 | (((qh >> j) & 1) << 4);
@@ -535,8 +557,8 @@ static float k32_q5_1_q8_0_avx2(int n, const void* vx, const void* vy) {
         const int sumi = k32_dot32_i8_i8(x32, y32);
         const int sumy = k32_dot32_i8_i8(y32, ones);
         
-        acc = _mm256_fmadd_ps(d, _mm256_set1_ps((float)sumi), acc);
-        sumy_acc = _mm256_fmadd_ps(m, _mm256_set1_ps((float)sumy), sumy_acc);
+        acc = _mm256_fmadd_ps(d, _mm256_setr_ps((float)sumi, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), acc);
+        sumy_acc = _mm256_fmadd_ps(m, _mm256_setr_ps((float)sumy, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), sumy_acc);
     }
     return k32_hsum_float_8(_mm256_add_ps(acc, sumy_acc));
 }
@@ -565,7 +587,7 @@ static float k32_q5_1_q8_0_scalar(int n, const void* vx, const void* vy) {
         const float dy = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
         int sumi = 0;
         int sumy = 0;
-        const uint32_t qh = *(const uint32_t*)(xb + 4);
+        const uint32_t qh = k32_ld32(xb + 4);
         for (int j = 0; j < 32; j++) {
             const uint8_t q4 = (xb[8 + j/2] >> (4 * (j & 1))) & 0x0F;
             const uint8_t q5 = q4 | (((qh >> j) & 1) << 4);
@@ -597,7 +619,9 @@ static inline __m256i k32_bytes_from_bits_32(const uint8_t* x) {
         0x0303030303030303, 0x0202020202020202,
         0x0101010101010101, 0x0000000000000000);
     __m256i bytes = _mm256_shuffle_epi8(_mm256_set1_epi32(x32), shuf_mask);
-    const __m256i bit_mask = _mm256_set1_epi64x(0x7FBFDFF7FBFDFF7F);
+    /* bit_mask must be 0x7fbfdfeff7fbfdfe (see ggml bytes_from_bits_32); the
+     * transposed 0x7FBFDFF7FBFDFF7F dropped bit0 of byte 6/7 in every lane. */
+    const __m256i bit_mask = _mm256_set1_epi64x(0x7FBFDFEFF7FBFDFE);
     bytes = _mm256_or_si256(bytes, bit_mask);
     return _mm256_cmpeq_epi8(bytes, _mm256_set1_epi64x(-1));
 }
@@ -605,31 +629,37 @@ static inline __m256i k32_bytes_from_bits_32(const uint8_t* x) {
 static float k32_q1_0_q8_0_avx2(int n, const void* vx, const void* vy) {
     const uint8_t* x = (const uint8_t*)vx;
     const uint8_t* y = (const uint8_t*)vy;
-    const int nb = n / 32;
+    /* QK1_0 = 128: block_q1_0 = f16 d + uint8 qs[16] = 18 bytes, covering 128
+     * elements = 4 x 32-element Q8_0 chunks.  The previous code treated it as
+     * n/32 blocks of 6 bytes, so it only ever read the first 32 elements of
+     * each row (and mis-strided past the first block).  Matches ggml
+     * ggml_vec_dot_q1_0_q8_0 (arch/x86/quants.c). */
+    const int nb = n / 128;
     __m256 acc = _mm256_setzero_ps();
     const __m256i ones = _mm256_set1_epi16(1);
-    
+    const __m256i zero = _mm256_setzero_si256();
+
     for (int ib = 0; ib < nb; ib++) {
-        const uint8_t* xb = x + ib * 6;
-        const uint8_t* yb = y + ib * 34;
+        const uint8_t* xb = x + ib * 18;
+        const uint8_t* yb = y + ib * 4 * 34;
         const float dx = k32_f16_to_f32((uint16_t)(xb[0] | ((uint32_t)xb[1] << 8)));
-        const float dy = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
-        const __m256 d = _mm256_set1_ps(dx * dy);
-        
-        const __m256i x_bits = k32_bytes_from_bits_32(xb + 2);
-        // Convert 0xFF/0x00 to +1/-1: (bit * 2) - 1
-        const __m256i x_vals = _mm256_sub_epi8(_mm256_slli_epi16(x_bits, 1), _mm256_set1_epi8(0xFF));
-        const __m256i y32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
-        
-        // x_vals is in {-1, +1}, y32 is int8
-        // Use sign manipulation: abs(x) * sign(x) * y = sign(x) * y when abs(x)=1
-        const __m256i ax = _mm256_sign_epi8(x_vals, x_vals);
-        const __m256i sy = _mm256_sign_epi8(y32, x_vals);
-        const __m256i dot = _mm256_maddubs_epi16(ax, sy);
-        const __m256i summed = _mm256_madd_epi16(dot, ones);
-        const int sumi = k32_sum8i32(summed);
-        
-        acc = _mm256_fmadd_ps(d, _mm256_set1_ps((float)sumi), acc);
+
+        __m256 acc_block = _mm256_setzero_ps();
+        for (int k = 0; k < 4; k++) {
+            const uint8_t* xq = xb + 2 + k * 4;
+            const uint8_t* yq = yb + k * 34;
+            const float dy = k32_f16_to_f32((uint16_t)(yq[0] | ((uint32_t)yq[1] << 8)));
+            const __m256i x_bits = k32_bytes_from_bits_32(xq);
+            /* x_bits is 0xFF (bit set -> +1) / 0x00 (bit clear -> -1); xor/sub
+             * by the 0x00 mask is the ggml_q1_0 formulation (the old
+             * _mm256_slli_epi16(x_bits, 1) shifted WORDS, not bytes). */
+            const __m256i smask = _mm256_cmpeq_epi8(x_bits, zero);
+            const __m256i y32 = _mm256_loadu_si256((const __m256i*)(yq + 2));
+            const __m256i sy = _mm256_sub_epi8(_mm256_xor_si256(y32, smask), smask);
+            const __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(_mm256_set1_epi8(1), sy), ones);
+            acc_block = _mm256_fmadd_ps(_mm256_set1_ps(dy), _mm256_cvtepi32_ps(s32), acc_block);
+        }
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(dx), acc_block, acc);
     }
     return k32_hsum_float_8(acc);
 }
@@ -656,7 +686,7 @@ static float k32_q1_0_q8_0_scalar(int n, const void* vx, const void* vy) {
         const float dx = k32_f16_to_f32((uint16_t)(xb[0] | ((uint32_t)xb[1] << 8)));
         const float dy = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
         int sumi = 0;
-        const uint32_t qs = *(const uint32_t*)(xb + 2);
+        const uint32_t qs = k32_ld32(xb + 2);
         for (int j = 0; j < 32; j++) {
             const int q1 = ((qs >> j) & 1) ? 1 : -1;
             sumi += q1 * (int)(int8_t)yb[2 + j];
@@ -678,13 +708,29 @@ float q1_0_q8_0(int n, const void* vx, const void* vy) {
 
 #if defined(__AVX2__)
 
-// Unpack 32 2-bit values from 8 bytes
-// Each byte has 4 x 2-bit values: (b >> (2*i)) & 3
+// Unpack 32 2-bit values from 8 bytes.
+// Element j (0..31) -> qs[j/4], code = (qs[j/4] >> ((j%4)*2)) & 3, exactly the
+// indexing of ggml dequantize_row_q2_0 (values are 00=-1, 01=0, 10=+1, 11=+2).
+// The previous version did cvtepu8_epi32 + slli_epi32(v,12)/slli_epi32(v,6),
+// which pushes each byte's fields into the NEIGHBOURING 32-bit word: lanes
+// 16..31 then read bytes 4..7 at the wrong field offset, so every second half
+// of a block was garbage (q2_0 came out 8x off).
 static inline __m256i k32_q2_0_unpack_32(const uint8_t* qs) {
-    __m256i v = _mm256_cvtepu8_epi32(_mm_loadl_epi64((const __m128i*)qs));
-    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 12));
-    v = _mm256_or_si256(v, _mm256_slli_epi32(v, 6));
-    return _mm256_and_si256(v, _mm256_set1_epi32(0x03030303));
+    const __m128i src = _mm_loadl_epi64((const __m128i*)qs);   // 8 bytes
+    const __m128i lo_reps = _mm_setr_epi8(0,0,0,0, 1,1,1,1, 2,2,2,2, 3,3,3,3);
+    const __m128i hi_reps = _mm_setr_epi8(4,4,4,4, 5,5,5,5, 6,6,6,6, 7,7,7,7);
+    const __m256i v = _mm256_set_m128i(_mm_shuffle_epi8(src, hi_reps), _mm_shuffle_epi8(src, lo_reps));
+    // per-lane shift 0,2,4,6 repeated per group of 4 lanes
+    const __m256i sel = _mm256_setr_epi8(
+        0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6,
+        0,2,4,6, 0,2,4,6, 0,2,4,6, 0,2,4,6);
+    const __m256i s2 = _mm256_srli_epi16(v, 2);
+    const __m256i s4 = _mm256_srli_epi16(v, 4);
+    const __m256i s6 = _mm256_srli_epi16(v, 6);
+    __m256i r = _mm256_blendv_epi8(v,  s2, _mm256_cmpeq_epi8(sel, _mm256_set1_epi8(2)));
+    r = _mm256_blendv_epi8(r, s4, _mm256_cmpeq_epi8(sel, _mm256_set1_epi8(4)));
+    r = _mm256_blendv_epi8(r, s6, _mm256_cmpeq_epi8(sel, _mm256_set1_epi8(6)));
+    return _mm256_and_si256(r, _mm256_set1_epi8(3));
 }
 
 static float k32_q2_0_q8_0_avx2(int n, const void* vx, const void* vy) {
@@ -692,10 +738,9 @@ static float k32_q2_0_q8_0_avx2(int n, const void* vx, const void* vy) {
     const uint8_t* y = (const uint8_t*)vy;
     const int nb = n / 64;  // QK2_0 = 64
     __m256 acc0 = _mm256_setzero_ps();
-    __m256 acc1 = _mm256_setzero_ps();
     
     for (int ib = 0; ib < nb; ib++) {
-        const uint8_t* xb = x + ib * 10;
+        const uint8_t* xb = x + ib * 18;  // block_q2_0 = f16 d + uint8 qs[16]
         const uint8_t* yb = y + ib * 68;  // 2 Q8_0 blocks (2*34=68)
         const float dx = k32_f16_to_f32((uint16_t)(xb[0] | ((uint32_t)xb[1] << 8)));
         const float dy0 = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
@@ -710,16 +755,20 @@ static float k32_q2_0_q8_0_avx2(int n, const void* vx, const void* vy) {
         // x in [0,3], convert to [-1, 2] by subtracting 1
         const __m256i x0_off = _mm256_sub_epi8(x32_0, _mm256_set1_epi8(1));
         const int sumi0 = k32_dot32_i8_i8(x0_off, y32_0);
-        acc0 = _mm256_fmadd_ps(d0, _mm256_set1_ps((float)sumi0), acc0);
         
-        // Second 32 elements
-        const __m256i x32_1 = k32_q2_0_unpack_32(xb + 2 + 4);  // next 4 bytes
+        // Second 32 elements: element j -> qs[j/4], so elems 32..63 use qs[8..15]
+        const __m256i x32_1 = k32_q2_0_unpack_32(xb + 2 + 8);
         const __m256i y32_1 = _mm256_loadu_si256((const __m256i*)(yb + 34 + 2));
         const __m256i x1_off = _mm256_sub_epi8(x32_1, _mm256_set1_epi8(1));
         const int sumi1 = k32_dot32_i8_i8(x1_off, y32_1);
-        acc1 = _mm256_fmadd_ps(d1, _mm256_set1_ps((float)sumi1), acc1);
+        // Fold both halves into ONE scalar before the FMA.  Broadcasting each
+        // half into its own __m256 acc and hsumming (acc0+acc1) counts every
+        // scalar 8 times, i.e. 8x the true dot product (the old q2_0 bug).
+        acc0 = _mm256_fmadd_ps(d0, _mm256_setr_ps((float)sumi0, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), acc0);
+        acc0 = _mm256_fmadd_ps(d1, _mm256_setr_ps((float)sumi1, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), acc0);
     }
-    return k32_hsum_float_8(_mm256_add_ps(acc0, acc1));
+    // Only lane 0 of acc0 carries data (see above); use lane 0, not an 8-lane sum.
+    return _mm256_cvtss_f32(acc0);
 }
 
 #else
@@ -768,11 +817,44 @@ float q2_0_q8_0(int n, const void* vx, const void* vy) {
 /* block_mxfp4: uint8 e (E8M0) @0, 16 bytes qs @1 (17 bytes)       */
 /* ------------------------------------------------------------------ */
 
-// MXFP4 lookup table for 4-bit values
-static const float k32_mxfp4_values[16] = {
-    0.0f, 0.0625f, 0.125f, 0.1875f, 0.25f, 0.3125f, 0.375f, 0.4375f,
-    0.5f, 0.625f, 0.75f, 0.875f, 1.0f, 1.25f, 1.5f, 1.75f
+// MXFP4 integer value table, identical to ggml's kvalues_mxfp4.
+// NOTE: these are the *4-bit code* magnitudes (0..12), NOT floats -- the
+// E8M0 block scale supplies the power-of-two factor. Keeping them integral
+// matches the scalar reference exactly and avoids float->int truncation.
+static const int8_t k32_mxfp4_values[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12
 };
+
+// E8M0 (biassed power-of-two exponent) -> f32.  Uses ggml's bit-construction
+// form; the former `1 << ((e & 0x7F) - 127)` had a *negative* shift for every
+// e < 127, which is undefined behaviour (UBSan misaligned/shift ABRT).
+static inline float k32_e8m0_to_f32(uint8_t e) {
+    if (e == 0) return 0.0f;
+    uint32_t bits = (uint32_t)(e - 1) << 23;
+    float r;
+    memcpy(&r, &bits, sizeof(float));
+    return r;
+}
+
+/* UE4M3 (nvfp4 per-group scale): 1 sign bit (always 0 here), 4 exp, 3 mantissa,
+ * bias 7, plus the 0.5 factor ggml's kvalues_nvfp4/grid applies.  Matches
+ * src/simd_ref.zig:ue4m3ToHalf and ggml-impl.h:e4m3_to_fp32. */
+static inline float k32_ue4m3_to_f32(uint8_t x) {
+    if (x == 0 || x == 0x7F) return 0.0f;
+    const uint32_t exp = (uint32_t)(x >> 3) & 0x0Fu;
+    const uint32_t man = (uint32_t)x & 0x7u;
+    float raw;
+    if (exp == 0) {
+        raw = (float)man * (1.0f / 512.0f);              /* 2^-9 */
+    } else {
+        const uint32_t bits = ((exp - 7u) + 127u) << 23;
+        float p;
+        memcpy(&p, &bits, sizeof(float));
+        raw = (1.0f + (float)man * 0.125f) * p;
+    }
+    return raw * 0.5f;
+}
 
 #if defined(__AVX2__)
 
@@ -788,26 +870,25 @@ static float k32_mxfp4_q8_0_avx2(int n, const void* vx, const void* vy) {
         const uint8_t* xb = x + ib * 17;
         const uint8_t* yb = y + ib * 34;
         const float de = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
-        // E8M0 to float conversion (simplified)
-        const uint8_t e8m0 = xb[0];
-        const float scale = de * (e8m0 ? (1 << ((e8m0 & 0x7F) - 127)) : 0.0f);
+        const float scale = de * k32_e8m0_to_f32(xb[0]);
         const __m256 d = _mm256_set1_ps(scale);
         
         // Load 16 nibbles, expand to 32 bytes using lookup
         const __m128i q4bits = _mm_loadu_si128((const __m128i*)(xb + 1));
         const __m256i q4b_lo = _mm256_and_si256(_mm256_cvtepu8_epi16(q4bits), m4b);
         const __m256i q4b_hi = _mm256_and_si256(_mm256_srli_epi16(_mm256_cvtepu8_epi16(q4bits), 4), m4b);
-        
-        // This is a simplified version - full implementation needs shuffle with lookup table
-        // For now, use scalar fallback logic in AVX2 path
+        (void)q4b_lo; (void)q4b_hi; (void)m4b; (void)mone;
+
+        // Integer accumulation, exactly like the scalar reference: kvalues are
+        // integers, so no float->int truncation (the old code truncated each
+        // product, losing accuracy vs. the reference).
         int sumi = 0;
         for (int j = 0; j < 16; j++) {
             const uint8_t b = xb[1 + j];
-            const float v0 = k32_mxfp4_values[b & 0x0F];
-            const float v1 = k32_mxfp4_values[b >> 4];
-            sumi += (int)(v0 * (float)(int8_t)yb[2 + j] + v1 * (float)(int8_t)yb[2 + 16 + j]);
+            sumi += (int)k32_mxfp4_values[b & 0x0F] * (int)(int8_t)yb[2 + j];
+            sumi += (int)k32_mxfp4_values[b >> 4]   * (int)(int8_t)yb[2 + 16 + j];
         }
-        acc = _mm256_fmadd_ps(d, _mm256_set1_ps((float)sumi), acc);
+        acc = _mm256_fmadd_ps(d, _mm256_setr_ps((float)sumi, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), acc);
     }
     return k32_hsum_float_8(acc);
 }
@@ -832,15 +913,14 @@ static float k32_mxfp4_q8_0_scalar(int n, const void* vx, const void* vy) {
         const uint8_t* xb = x + ib * 17;
         const uint8_t* yb = y + ib * 34;
         const float dy = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
-        const uint8_t e8m0 = xb[0];
-        const float scale = dy * (e8m0 ? (1 << ((e8m0 & 0x7F) - 127)) : 0.0f);
-        float sumi = 0.0f;
+        const float scale = dy * k32_e8m0_to_f32(xb[0]);
+        int sumi = 0;
         for (int j = 0; j < 16; j++) {
             const uint8_t b = xb[1 + j];
-            sumi += k32_mxfp4_values[b & 0x0F] * (float)(int8_t)yb[2 + j];
-            sumi += k32_mxfp4_values[b >> 4] * (float)(int8_t)yb[2 + 16 + j];
+            sumi += (int)k32_mxfp4_values[b & 0x0F] * (int)(int8_t)yb[2 + j];
+            sumi += (int)k32_mxfp4_values[b >> 4]   * (int)(int8_t)yb[2 + 16 + j];
         }
-        sumf += scale * sumi;
+        sumf += scale * (float)sumi;
     }
     return sumf;
 }
@@ -856,9 +936,13 @@ float mxfp4_q8_0(int n, const void* vx, const void* vy) {
 /* ------------------------------------------------------------------ */
 
 // NVFP4 lookup table for 4-bit E2M1 values
+/* FP4 E2M1 codes, INTEGER domain, matching src/simd_ref.zig:kvalues_fp4
+ * (the 0.5 factor is already folded into the ue4m3 group scale).  The old
+ * table was halved, i.e. the 0.5 was applied twice, which is why nvfp4 came
+ * out exactly 2x low. */
 static const float k32_nvfp4_values[16] = {
-    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
-    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
+    -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
 };
 
 #if defined(__AVX2__)
@@ -873,11 +957,10 @@ static float k32_nvfp4_q8_0_avx2(int n, const void* vx, const void* vy) {
         const uint8_t* xb = x + ib * 36;
         const uint8_t* yb = y + ib * 68;  // 2 Q8_0 blocks
         
-        // UE4M3 scales (simplified - need proper conversion)
-        const float s0 = (xb[0] & 0x0F) * 0.5f;  // placeholder
-        const float s1 = (xb[1] & 0x0F) * 0.5f;
-        const float s2 = (xb[2] & 0x0F) * 0.5f;
-        const float s3 = (xb[3] & 0x0F) * 0.5f;
+        const float s0 = k32_ue4m3_to_f32(xb[0]);
+        const float s1 = k32_ue4m3_to_f32(xb[1]);
+        const float s2 = k32_ue4m3_to_f32(xb[2]);
+        const float s3 = k32_ue4m3_to_f32(xb[3]);
         
         const float dy0 = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
         const float dy1 = k32_f16_to_f32((uint16_t)(yb[34] | ((uint32_t)yb[35] << 8)));
@@ -886,15 +969,20 @@ static float k32_nvfp4_q8_0_avx2(int n, const void* vx, const void* vy) {
         float sumi = 0.0f;
         for (int sg = 0; sg < 4; sg++) {
             const float scale = ((float[]){s0, s1, s2, s3})[sg] * ((sg < 2) ? dy0 : dy1);
-            for (int j = 0; j < 16; j++) {
-                const uint8_t b = xb[4 + sg * 8 + j/2];
-                const int idx = (j & 1) ? (b >> 4) : (b & 0x0F);
-                const int yoff = (sg < 2) ? 0 : 34;
-                const int yj = (sg & 1) * 16 + j;
-                sumi += scale * k32_nvfp4_values[idx] * (float)(int8_t)yb[yoff + 2 + yj];
+            /* ggml/simd_ref layout: byte j holds element j in its LOW nibble
+             * and element 8+j in its HIGH nibble -- the two halves are NOT
+             * interleaved.  The old j/2 + (j&1) walk paired low nibbles with
+             * y[j] and high nibbles with y[j+1], i.e. a different (wrong)
+             * element order. */
+            const int yoff = (sg < 2) ? 0 : 34;
+            const int ybase = yoff + 2 + (sg & 1) * 16;
+            for (int j = 0; j < 8; j++) {
+                const uint8_t b = xb[4 + sg * 8 + j];
+                sumi += scale * k32_nvfp4_values[b & 0x0F] * (float)(int8_t)yb[ybase + j];
+                sumi += scale * k32_nvfp4_values[b >> 4]   * (float)(int8_t)yb[ybase + 8 + j];
             }
         }
-        acc = _mm256_add_ps(acc, _mm256_set1_ps(sumi));
+        acc = _mm256_add_ps(acc, _mm256_setr_ps(sumi, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f));
     }
     return k32_hsum_float_8(acc);
 }
@@ -919,11 +1007,10 @@ static float k32_nvfp4_q8_0_scalar(int n, const void* vx, const void* vy) {
         const uint8_t* xb = x + ib * 36;
         const uint8_t* yb = y + ib * 68;
         
-        // UE4M3 scales (simplified)
-        const float s0 = (xb[0] & 0x0F) * 0.5f;
-        const float s1 = (xb[1] & 0x0F) * 0.5f;
-        const float s2 = (xb[2] & 0x0F) * 0.5f;
-        const float s3 = (xb[3] & 0x0F) * 0.5f;
+        const float s0 = k32_ue4m3_to_f32(xb[0]);
+        const float s1 = k32_ue4m3_to_f32(xb[1]);
+        const float s2 = k32_ue4m3_to_f32(xb[2]);
+        const float s3 = k32_ue4m3_to_f32(xb[3]);
         
         const float dy0 = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
         const float dy1 = k32_f16_to_f32((uint16_t)(yb[34] | ((uint32_t)yb[35] << 8)));
@@ -969,4 +1056,138 @@ void quantize_q8_0(int n, const float* x, uint8_t* out) {
             yb[2 + k] = (uint8_t)(int8_t)q;
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* f16 / bf16 weights x Q8_0 activation                                */
+/*                                                                     */
+/* Same Q8_0 activation framing as the 4-bit kernels above: quantize    */
+/* the activation ONCE to Q8_0, then per 32-element block:              */
+/*     sum_k w[k] * d_a * q[k]  =  d_a * sum_k w[k]*q[k]                */
+/* with w[k] widened exactly (f16 -> f32, bf16 -> f32 is a pure shift).  */
+/* The accumulation order matches the scalar rowDot fallback             */
+/* (quant.rowDotF16 / rowDotBF16): per 32-element float-accumulator      */
+/* chunk, then added into the row sum. That keeps this kernel            */
+/* bit-identical to the scalar path it replaces.                         */
+/*                                                                     */
+/* Public API:                                                          */
+/*   float f16_q8_0(int n, const void* vx, const void* vy);              */
+/*   float bf16_q8_0(int n, const void* vx, const void* vy);             */
+/* ------------------------------------------------------------------ */
+
+static inline float k32_f16_to_f32(uint16_t h);
+
+/* bf16 -> f32 is exact: bf16 is the truncated high half of an f32, so the
+ * conversion is a pure 16-bit left shift.  (Fills in a definition that the
+ * in-flight bf16_q8_0 work referenced but never provided; without it the
+ * whole kernels32.c translation unit fails to compile.) */
+static inline float k32_bf16_to_f32(uint16_t h) {
+    const uint32_t bits = (uint32_t)h << 16;
+    return *(const float *)&bits;
+}
+
+static float k32_f16_q8_0_scalar(int n, const void* vx, const void* vy) {
+    const uint8_t* x = (const uint8_t*)vx; /* f16, 2 B/elem */
+    const uint8_t* y = (const uint8_t*)vy; /* Q8_0, 34 B / 32 elems */
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        const uint16_t* xb = (const uint16_t*)(x + ib * 64);
+        const uint8_t* yb = y + ib * 34;
+        const float d = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
+        float acc = 0.0f;
+        for (int k = 0; k < 32; k++) {
+            acc += k32_f16_to_f32(xb[k]) * (float)(int)(int8_t)yb[2 + k];
+        }
+        sumf += d * acc;
+    }
+    return sumf;
+}
+
+static float k32_bf16_q8_0_scalar(int n, const void* vx, const void* vy) {
+    const uint8_t* x = (const uint8_t*)vx; /* bf16: high 16 bits of f32 */
+    const uint8_t* y = (const uint8_t*)vy;
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        const uint16_t* xb = (const uint16_t*)(x + ib * 64);
+        const uint8_t* yb = y + ib * 34;
+        const float d = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
+        float acc = 0.0f;
+        for (int k = 0; k < 32; k++) {
+            const float w = k32_bf16_to_f32(xb[k]);
+            acc += w * (float)(int)(int8_t)yb[2 + k];
+        }
+        sumf += d * acc;
+    }
+    return sumf;
+}
+
+#if defined(__AVX2__)
+/* 32 f16 halves -> 32 f32, exactly (vcvtph2ps, F16C). */
+static float k32_f16_q8_0_avx2(int n, const void* vx, const void* vy) {
+    const uint8_t* x = (const uint8_t*)vx;
+    const uint8_t* y = (const uint8_t*)vy;
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        const uint8_t* xb = x + ib * 64;
+        const uint8_t* yb = y + ib * 34;
+        const float d = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
+        const __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(xb + 0)));
+        const __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(xb + 16)));
+        const __m256i q32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
+        const __m256 q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(q32)));
+        const __m256 q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_extracti128_si256(q32, 1)));
+        __m256 acc = _mm256_mul_ps(w0, q0);
+        acc = _mm256_fmadd_ps(w1, q1, acc);
+        sumf += d * k32_hsum_float_8(acc);
+    }
+    return sumf;
+}
+
+/* 32 bf16 -> 32 f32 by shifting each 16-bit lane into the f32 exponent
+ * field (vpmovzxwd + vpslld). No rounding: bf16 is exactly the truncated
+ * high half of an f32. */
+static inline __m256 k32_bf16x8_to_f32x8(__m128i v) {
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(v), 16));
+}
+
+static float k32_bf16_q8_0_avx2(int n, const void* vx, const void* vy) {
+    const uint8_t* x = (const uint8_t*)vx;
+    const uint8_t* y = (const uint8_t*)vy;
+    const int nb = n / 32;
+    float sumf = 0.0f;
+    for (int ib = 0; ib < nb; ib++) {
+        const uint8_t* xb = x + ib * 64;
+        const uint8_t* yb = y + ib * 34;
+        const float d = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
+        const __m256 w0 = k32_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(xb + 0)));
+        const __m256 w1 = k32_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(xb + 16)));
+        const __m256i q32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
+        const __m256 q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(q32)));
+        const __m256 q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_extracti128_si256(q32, 1)));
+        __m256 acc = _mm256_mul_ps(w0, q0);
+        acc = _mm256_fmadd_ps(w1, q1, acc);
+        sumf += d * k32_hsum_float_8(acc);
+    }
+    return sumf;
+}
+#else
+static float k32_f16_q8_0_avx2(int n, const void* vx, const void* vy) {
+    return k32_f16_q8_0_scalar(n, vx, vy);
+}
+static float k32_bf16_q8_0_avx2(int n, const void* vx, const void* vy) {
+    return k32_bf16_q8_0_scalar(n, vx, vy);
+}
+#endif
+
+float f16_q8_0(int n, const void* vx, const void* vy) {
+    return cpu_has_avx2() ? k32_f16_q8_0_avx2(n, vx, vy)
+                          : k32_f16_q8_0_scalar(n, vx, vy);
+}
+
+float bf16_q8_0(int n, const void* vx, const void* vy) {
+    return cpu_has_avx2() ? k32_bf16_q8_0_avx2(n, vx, vy)
+                          : k32_bf16_q8_0_scalar(n, vx, vy);
 }
