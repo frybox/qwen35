@@ -81,11 +81,11 @@ pub fn rmsNorm(out: []f32, x: []const f32, w: []const f32, eps: f32) void {
     const xp: [*]const f32 = x.ptr;
     const wp: [*]const f32 = w.ptr;
     const op: [*]f32 = out.ptr;
-    for (0 .. out.len / GV) |b| {
+    for (0..out.len / GV) |b| {
         const o = b * GV;
         vstoreF32(GV, op + o, vloadF32(GV, xp + o) * sv * vloadF32(GV, wp + o));
     }
-    for (out.len - out.len % GV .. out.len) |i| out[i] = x[i] * scale * w[i];
+    for (out.len - out.len % GV..out.len) |i| out[i] = x[i] * scale * w[i];
 }
 
 pub fn sigmoid(x: f32) f32 {
@@ -96,7 +96,7 @@ pub fn sigmoid(x: f32) f32 {
 fn sigmoidVec(x: []f32) void {
     const one: @Vector(GV, f32) = @splat(1.0);
     const p: [*]f32 = x.ptr;
-    for (0 .. x.len / GV) |b| {
+    for (0..x.len / GV) |b| {
         const o = b * GV;
         vstoreF32(GV, p + o, one / (one + @exp(-vloadF32(GV, p + o))));
     }
@@ -107,7 +107,7 @@ fn mulSiluVec(out: []f32, gate: []const f32) void {
     const one: @Vector(GV, f32) = @splat(1.0);
     const op: [*]f32 = out.ptr;
     const gp: [*]const f32 = gate.ptr;
-    for (0 .. out.len / GV) |b| {
+    for (0..out.len / GV) |b| {
         const o = b * GV;
         const g = vloadF32(GV, gp + o);
         vstoreF32(GV, op + o, vloadF32(GV, op + o) * (g / (one + @exp(-g))));
@@ -170,22 +170,22 @@ const GV = 16; // f32 lanes per vector used by the GDN kernels
 fn scaleVec(x: []f32, s: f32) void {
     const sv: @Vector(GV, f32) = @splat(s);
     const p: [*]f32 = x.ptr;
-    for (0 .. x.len / GV) |b| {
+    for (0..x.len / GV) |b| {
         const o = b * GV;
         vstoreF32(GV, p + o, vloadF32(GV, p + o) * sv);
     }
-    for (x.len - x.len % GV .. x.len) |i| x[i] *= s;
+    for (x.len - x.len % GV..x.len) |i| x[i] *= s;
 }
 
 /// (1) S *= gamma.
 fn gdnDecay(sh: []f32, gamma: f32) void {
     const g: @Vector(GV, f32) = @splat(gamma);
     const p: [*]f32 = sh.ptr;
-    for (0 .. sh.len / GV) |b| {
+    for (0..sh.len / GV) |b| {
         const o = b * GV;
         vstoreF32(GV, p + o, vloadF32(GV, p + o) * g);
     }
-    for (sh.len - sh.len % GV .. sh.len) |i| sh[i] *= gamma;
+    for (sh.len - sh.len % GV..sh.len) |i| sh[i] *= gamma;
 }
 
 /// (2) km[j] = sum_i sh[i*vd + j] * k[i].  km must be vd long; vd % GV == 0.
@@ -195,10 +195,10 @@ fn gdnKvMem(sh: []const f32, k: []const f32, km: []f32, vd: usize) void {
     @memset(km, 0);
     const p: [*]const f32 = sh.ptr;
     const q: [*]f32 = km.ptr;
-    for (0 .. k.len) |i| {
+    for (0..k.len) |i| {
         const ki: @Vector(GV, f32) = @splat(k[i]);
         const row = p + i * vd;
-        for (0 .. vd / GV) |b| {
+        for (0..vd / GV) |b| {
             const o = b * GV;
             vstoreF32(GV, q + o, vloadF32(GV, q + o) + vloadF32(GV, row + o) * ki);
         }
@@ -211,15 +211,15 @@ fn gdnOuter(sh: []f32, k: []const f32, v: []const f32, km: []const f32, delta: [
     const vp: [*]const f32 = v.ptr;
     const kp: [*]const f32 = km.ptr;
     const dp: [*]f32 = delta.ptr;
-    for (0 .. vd / GV) |b| {
+    for (0..vd / GV) |b| {
         const o = b * GV;
         vstoreF32(GV, dp + o, (vloadF32(GV, vp + o) - vloadF32(GV, kp + o)) * b16);
     }
     const p: [*]f32 = sh.ptr;
-    for (0 .. k.len) |i| {
+    for (0..k.len) |i| {
         const ki: @Vector(GV, f32) = @splat(k[i]);
         const row = p + i * vd;
-        for (0 .. vd / GV) |b| {
+        for (0..vd / GV) |b| {
             const o = b * GV;
             vstoreF32(GV, row + o, vloadF32(GV, row + o) + ki * vloadF32(GV, dp + o));
         }
@@ -233,10 +233,10 @@ fn gdnStateOut(sh: []const f32, q: []const f32, out: []f32, vd: usize) void {
     @memset(out, 0);
     const p: [*]const f32 = sh.ptr;
     const o: [*]f32 = out.ptr;
-    for (0 .. q.len) |i| {
+    for (0..q.len) |i| {
         const qi: @Vector(GV, f32) = @splat(q[i]);
         const row = p + i * vd;
-        for (0 .. vd / GV) |b| {
+        for (0..vd / GV) |b| {
             const ob = b * GV;
             vstoreF32(GV, o + ob, vloadF32(GV, o + ob) + vloadF32(GV, row + ob) * qi);
         }
@@ -250,8 +250,7 @@ fn gdnStateOut(sh: []const f32, q: []const f32, out: []f32, vd: usize) void {
 /// are accumulated in vector registers rather than load/store'd per row.
 /// Fast path requires vd == 128 (all Qwen3.5 variants); otherwise it falls back
 /// to the four separate kernels.
-inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32,
-    km: []f32, delta: []f32, out: []f32, gamma: f32, beta: f32, vd: usize) void {
+inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32, km: []f32, delta: []f32, out: []f32, gamma: f32, beta: f32, vd: usize) void {
     std.debug.assert(k.len == q.len and km.len == vd and out.len == vd and delta.len == vd);
     if (vd != 128) {
         gdnDecay(sh, gamma);
@@ -270,7 +269,7 @@ inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32,
     // registers.  The decayed rows are NOT stored: pass 2 recomputes them.
     var acc: [W]@Vector(32, f32) = undefined;
     for (0..W) |b| acc[b] = @splat(@as(f32, 0.0));
-    for (0 .. k.len) |i| {
+    for (0..k.len) |i| {
         const row = sp + i * vd;
         const ki: @Vector(32, f32) = @splat(k[i]);
         for (0..W) |b| acc[b] += vloadF32(32, row + b * 32) * ki;
@@ -296,7 +295,7 @@ inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32,
     for (0..W) |b| dvec[b] = vloadF32(32, dp + b * 32);
     var oacc: [W]@Vector(32, f32) = undefined;
     for (0..W) |b| oacc[b] = @splat(@as(f32, 0.0));
-    for (0 .. k.len) |i| {
+    for (0..k.len) |i| {
         const row = sp + i * vd;
         const ki: @Vector(32, f32) = @splat(k[i]);
         const qi: @Vector(32, f32) = @splat(q[i]);
@@ -314,12 +313,12 @@ inline fn gdnFused(sh: []f32, k: []const f32, v: []const f32, q: []const f32,
 fn siluVec(x: []f32) void {
     const p: [*]f32 = x.ptr;
     const one: @Vector(GV, f32) = @splat(1.0);
-    for (0 .. x.len / GV) |b| {
+    for (0..x.len / GV) |b| {
         const o = b * GV;
         const xv = vloadF32(GV, p + o);
         vstoreF32(GV, p + o, xv / (one + @exp(-xv)));
     }
-    for (x.len - x.len % GV .. x.len) |i| x[i] = silu(x[i]);
+    for (x.len - x.len % GV..x.len) |i| x[i] = silu(x[i]);
 }
 
 /// out[i] *= sigmoid(g[i]) for the whole slice.
@@ -327,12 +326,12 @@ fn mulSigmoidVec(out: []f32, gate: []const f32) void {
     const one: @Vector(GV, f32) = @splat(1.0);
     const op: [*]f32 = out.ptr;
     const gp: [*]const f32 = gate.ptr;
-    for (0 .. out.len / GV) |b| {
+    for (0..out.len / GV) |b| {
         const o = b * GV;
         const g = vloadF32(GV, gp + o);
         vstoreF32(GV, op + o, vloadF32(GV, op + o) * (one / (one + @exp(-g))));
     }
-    for (out.len - out.len % GV .. out.len) |i| out[i] *= sigmoid(gate[i]);
+    for (out.len - out.len % GV..out.len) |i| out[i] *= sigmoid(gate[i]);
 }
 
 /// Activation context for the f64 reference: `x` is the serial input
@@ -406,7 +405,11 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
 pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: usize, pool: ?*pool_mod.Pool) void {
     std.debug.assert(mat.len == rows * cols and out.len == rows and x.len == cols);
     pool_mod.parallel(pool, .{ .f32 = .{
-        .out = out.ptr, .mat = mat, .x = x, .cols = cols, .rows = rows,
+        .out = out.ptr,
+        .mat = mat,
+        .x = x,
+        .cols = cols,
+        .rows = rows,
     } });
 }
 
@@ -430,9 +433,7 @@ fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8, q8k: []u8,
 
 /// Batched twin of `linMatvec`: `out` is [k, rows] and `xK` is [k, cols]
 /// row-major, with per-token Q8/Q8_K slots in q8K/q8kK.
-fn linMatvecBatchK(out: []f32, w: Engine.LinearW, xK: []const f32, k: usize,
-    q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void
-{
+fn linMatvecBatchK(out: []f32, w: Engine.LinearW, xK: []const f32, k: usize, q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void {
     Engine.matvecBatchK(out, w, xK, k, q8K, q8kK, pool);
 }
 
@@ -507,8 +508,10 @@ pub fn quantizeQ8_0(data: []const f32, out: []u8) !void {
     if (out.len != data.len / q8_0_block_elems * q8_0_block_bytes) return error.SizeMismatch;
     var idata: usize = 0;
     var iout: usize = 0;
-    while (idata < data.len):
-          ({ idata += q8_0_block_elems; iout += q8_0_block_bytes; }) {
+    while (idata < data.len) : ({
+        idata += q8_0_block_elems;
+        iout += q8_0_block_bytes;
+    }) {
         var max: f32 = 0;
         for (data[idata..][0..q8_0_block_elems]) |d| {
             const v = @abs(d);
@@ -518,7 +521,7 @@ pub fn quantizeQ8_0(data: []const f32, out: []u8) !void {
         const scale: f16 = @floatCast(scale32);
         std.mem.writeInt(u16, out[iout..][0..2], @bitCast(scale), .little);
         for (0..q8_0_block_elems) |i| {
-            out[iout+2+i] = @bitCast(@as(i8, @intFromFloat(@round(data[idata+i]/scale32))));
+            out[iout + 2 + i] = @bitCast(@as(i8, @intFromFloat(@round(data[idata + i] / scale32))));
         }
     }
 }
@@ -578,8 +581,11 @@ pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8, pool: ?*pool_m
     simd.actQ8_0(x.len, x.ptr, q8.ptr);
 
     pool_mod.parallel(pool, .{ .q8_0 = .{
-        .out = out.ptr, .data = w.data, .q8 = q8.ptr,
-        .row_blocks = w.row_blocks, .rows = w.rows(),
+        .out = out.ptr,
+        .data = w.data,
+        .q8 = q8.ptr,
+        .row_blocks = w.row_blocks,
+        .rows = w.rows(),
     } });
 }
 
@@ -860,9 +866,7 @@ fn kchkSummary() void {
 
 /// Same A/B as `kernelCheck` for 32-element-block kernels (Q8_0 activation,
 /// `bpr` 32-element blocks per row of `rb` bytes each).
-fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8,
-    dot: simd_api.Dot32, rb: usize, bpr: usize, rows: usize) void
-{
+fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8, dot: simd_api.Dot32, rb: usize, bpr: usize, rows: usize) void {
     if (!dbg_kernel_check) return;
     const rd: *const fn (row: []const u8, x: []const f32) f32 = rowDotFor(ttype) orelse return;
     const slot = kchkTypeSlot(ttype);
@@ -910,7 +914,7 @@ fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: 
         var xfirst: u32 = 0;
         for (0..32) |k| xfirst += @bitCast(x[k]);
         std.debug.print("  DIAGBLK c={e:.6} ref={e:.6} actd0={e:.6} actq0={d}\n", .{
-            c_acc, c_blockwise,
+            c_acc,                                                                                c_blockwise,
             @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, act[0]) | (@as(u16, act[1]) << 8))))), act[2],
         });
         std.debug.print("  DIAG x0={e:.3} x1={e:.3} act0={d} act2={d} c_again={e:.3} b0={e:.3} xsum={e:.3} nin={d} nblocks={d} rbsum={d} f32bits={d}\n", .{
@@ -948,9 +952,7 @@ fn rowDotFor(ttype: gguf.TensorType) ?*const fn (row: []const u8, x: []const f32
 
 /// A/B a few rows of a .quant matvec: C integer-domain kernel vs the Zig
 /// per-element rowDot on the same activation.  Prints per-row divergence.
-fn kernelCheck(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8,
-    dot: simd_api.Dot256, rb: usize, is256: bool, bpr: usize, rows: usize) void
-{
+fn kernelCheck(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8, dot: simd_api.Dot256, rb: usize, is256: bool, bpr: usize, rows: usize) void {
     if (!dbg_kernel_check) return;
     const rd: *const fn (row: []const u8, x: []const f32) f32 = rowDotFor(ttype) orelse return;
     const slot = kchkTypeSlot(ttype);
@@ -981,13 +983,14 @@ fn kernelCheck(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []
         var zig_acc: f32 = 0;
         var q_acc: f32 = 0;
         for (0..bpr) |b| {
-            const blk = data[(r * bpr + b) * rb ..][0 .. rb];
+            const blk = data[(r * bpr + b) * rb ..][0..rb];
             zig_acc += rd(blk, x[b * 256 .. b * 256 + 256]);
             q_acc += rd(blk, xq[b * 256 .. b * 256 + 256]);
         }
         const c_acc = if (is256)
             dot(bpr * 256, data[r * bpr * rb ..].ptr, act.ptr)
-        else blkLoop32(dot, data[r * bpr * rb ..].ptr, act.ptr, rb, bpr);
+        else
+            blkLoop32(dot, data[r * bpr * rb ..].ptr, act.ptr, rb, bpr);
         const relq = if (q_acc != 0) @abs(c_acc - q_acc) / @abs(q_acc) else @abs(c_acc - q_acc);
         const relx = if (zig_acc != 0) @abs(q_acc - zig_acc) / @abs(zig_acc) else @abs(q_acc - zig_acc);
         std.debug.print("KCHK {s} row {d} bpr {d} c={e:.6} q={e:.6} x={e:.6} kern_err={e:.6} quant_err={e:.6}\n", .{
@@ -1003,14 +1006,16 @@ fn kernelCheck(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []
         // per-block breakdown: C kernel on block b vs Zig rowDot on the same
         // block paired with the dequantized activation block b.
         for (0..bpr) |b| {
-            const blk = data[(r * bpr + b) * rb ..][0 .. rb];
+            const blk = data[(r * bpr + b) * rb ..][0..rb];
             const cb = if (is256)
                 dot(256, blk.ptr, (act.ptr + b * 292))
-            else blkLoop32(dot, blk.ptr, act.ptr + b * 292, rb, 1);
+            else
+                blkLoop32(dot, blk.ptr, act.ptr + b * 292, rb, 1);
             const qb = rd(blk, xq[b * 256 .. b * 256 + 256]);
             const rb_ref = if (is256 and ttype == .q6_k)
-                q6kIntRef(blk, act[b * 292 ..][0 .. 292])
-            else cb;
+                q6kIntRef(blk, act[b * 292 ..][0..292])
+            else
+                cb;
             const dbits: u16 = @as(u16, blk[rb - 2]) | (@as(u16, blk[rb - 1]) << 8);
             const d_b = @as(f32, @floatCast(@as(f16, @bitCast(dbits))));
             const dy_b = @as(f32, @bitCast(@as(u32, act[b * 292]) | (@as(u32, act[b * 292 + 1]) << 8) |
@@ -1053,9 +1058,7 @@ fn q6kIntRef(blk: []const u8, actb: []const u8) f32 {
 }
 
 /// 32-block dot loop over one row, matching the engine's quant32 framing.
-fn blkLoop32(dot: *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32,
-    wrow: [*]const u8, q8: [*]const u8, rb32: usize, bpr: usize) f32
-{
+fn blkLoop32(dot: *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32, wrow: [*]const u8, q8: [*]const u8, rb32: usize, bpr: usize) f32 {
     var acc: f32 = 0;
     for (0..8 * bpr) |k| acc += dot(32, (wrow + k * rb32), (q8 + k * 34));
     return acc;
@@ -1064,10 +1067,9 @@ pub var prof_io: Io = undefined;
 
 pub fn profReport() void {
     const tot: f64 = prof_emb + prof_gdn + prof_full + prof_mlp + prof_lm;
-    std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6});
+    std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{ prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6 });
     pool_mod.profReport();
 }
-
 
 pub const ProfEntry = struct { key: [64]u8 = undefined, klen: usize = 0, ns: f64 = 0, calls: usize = 0 };
 pub var prof_entries: [64]ProfEntry = std.mem.zeroes([64]ProfEntry);
@@ -1102,7 +1104,9 @@ pub fn profReportMatvec() void {
         for (i + 1..prof_n) |j| {
             if (prof_entries[idx[j]].ns > prof_entries[idx[best]].ns) best = j;
         }
-        const t = idx[i]; idx[i] = idx[best]; idx[best] = t;
+        const t = idx[i];
+        idx[i] = idx[best];
+        idx[best] = t;
     }
     for (0..prof_n) |i| {
         const e = &prof_entries[idx[i]];
@@ -1114,13 +1118,11 @@ fn profNs(io: Io, t0: Io.Clock.Timestamp) f64 {
     return @as(f64, @floatFromInt(t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds));
 }
 
-
 pub var prof_gdn: f64 = 0;
 pub var prof_full: f64 = 0;
 pub var prof_mlp: f64 = 0;
 pub var prof_lm: f64 = 0;
 pub var prof_emb: f64 = 0;
-
 
 pub const Engine = struct {
     alloc: std.mem.Allocator,
@@ -1172,7 +1174,7 @@ pub const Engine = struct {
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
     /// through cache).  0 => the batched path is unavailable.
-    k_tokens: usize = 0,
+    nbatch: usize = 0,
     /// K-slot scratch for the batched prefill path.  `xK[t*hidden..]` is the
     /// residual stream of token t of the current chunk; `x1K[t*hidden..]` the
     /// RMS-normed input; `qkvK/gateK/abK/qK/kK/vK` the batched projection
@@ -1297,7 +1299,9 @@ pub const Engine = struct {
     fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, pool: ?*pool_mod.Pool) void {
         if (dbg_kernel_check) {
             var nz: usize = 0;
-            for (x) |v| { if (@abs(v) > 1e-30) nz += 1; }
+            for (x) |v| {
+                if (@abs(v) > 1e-30) nz += 1;
+            }
             std.debug.print("  DIAGNZ xlen={d} nonzero={d} ptr={d}\n", .{ x.len, nz, @intFromPtr(x.ptr) });
         }
         if (dbg_kernel_check) std.debug.print("  DIAGENT ttype={s} rows={d} bpr={d} xlen={d} x0={e:.3}\n", .{
@@ -1345,8 +1349,13 @@ pub const Engine = struct {
             const rb256 = quantRowBytes(w.ttype);
             kernelCheck(w.data, w.ttype, x, q8k, dot, rb256, true, bpr, rows);
             pool_mod.parallel(pool, .{ .quant256 = .{
-                .out = out.ptr, .data = w.data, .q8k = q8k.ptr,
-                .row_bytes = rb256, .bpr = bpr, .rows = rows, .dot = dot,
+                .out = out.ptr,
+                .data = w.data,
+                .q8k = q8k.ptr,
+                .row_bytes = rb256,
+                .bpr = bpr,
+                .rows = rows,
+                .dot = dot,
             } });
             return;
         }
@@ -1371,8 +1380,13 @@ pub const Engine = struct {
                 else => unreachable,
             };
             pool_mod.parallel(pool, .{ .quant32 = .{
-                .out = out.ptr, .data = w.data, .q8 = q8.ptr,
-                .rb32 = rb32, .bpr = bpr, .rows = rows, .dot = dotr,
+                .out = out.ptr,
+                .data = w.data,
+                .q8 = q8.ptr,
+                .rb32 = rb32,
+                .bpr = bpr,
+                .rows = rows,
+                .dot = dotr,
             } });
             return;
         }
@@ -1392,11 +1406,17 @@ pub const Engine = struct {
                 x.len, x[0], x[1], q8[0], q8[2], q8.len,
             });
             if (dbg_kernel_check) kernelCheck32(w.data, w.ttype, x, q8, dot, 8 * 2, bpr, rows);
-            pool_mod.parallel(pool, .{ .q8_0_d32 = .{
-                .out = out.ptr, .data = w.data, .q8 = q8.ptr,
-                .rb32 = 8 * 2, // 8 blocks of 32 elements, 2 bytes per weight
-                .row_blocks = bpr * 8, .rows = rows, .dot = dot,
-            } });
+            pool_mod.parallel(pool, .{
+                .q8_0_d32 = .{
+                    .out = out.ptr,
+                    .data = w.data,
+                    .q8 = q8.ptr,
+                    .rb32 = 8 * 2, // 8 blocks of 32 elements, 2 bytes per weight
+                    .row_blocks = bpr * 8,
+                    .rows = rows,
+                    .dot = dot,
+                },
+            });
             return;
         }
 
@@ -1424,9 +1444,13 @@ pub const Engine = struct {
             else => unreachable, // only supported types load as .quant
         };
         pool_mod.parallel(pool, .{ .quant_scalar = .{
-            .out = out.ptr, .data = w.data, .x = x,
-            .row_bytes = quantRowBytes(w.ttype), .bpr = bpr,
-            .rows = rows, .dot = rowDot,
+            .out = out.ptr,
+            .data = w.data,
+            .x = x,
+            .row_bytes = quantRowBytes(w.ttype),
+            .bpr = bpr,
+            .rows = rows,
+            .dot = rowDot,
         } });
     }
 
@@ -1436,9 +1460,7 @@ pub const Engine = struct {
     /// virtual rows (`t = r/rows`, `rr = r%rows`).  The per-row dot call is
     /// identical to the serial matvec, so out[t*rows+rr] is bit-identical to
     /// `linMatvec(out[t*rows .. t*rows+rows], w, xK[t*cols..])` run per token.
-    fn matvecBatchK(out: []f32, w: LinearW, xK: []const f32, k: usize,
-        q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void
-    {
+    fn matvecBatchK(out: []f32, w: LinearW, xK: []const f32, k: usize, q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void {
         const rows = out.len / k;
         std.debug.assert(out.len % k == 0);
         switch (w) {
@@ -1451,8 +1473,13 @@ pub const Engine = struct {
                 while (t < k) : (t += 1)
                     simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen ..].ptr);
                 pool_mod.parallel(pool, .{ .q8_0b = .{
-                    .out = out.ptr, .data = row.data, .q8 = q8K.ptr, .q8_len = blen,
-                    .row_blocks = row.row_blocks, .rows = rows, .k = k,
+                    .out = out.ptr,
+                    .data = row.data,
+                    .q8 = q8K.ptr,
+                    .q8_len = blen,
+                    .row_blocks = row.row_blocks,
+                    .rows = rows,
+                    .k = k,
                 } });
             },
             .quant => |qrow| {
@@ -1482,9 +1509,15 @@ pub const Engine = struct {
                     while (t < k) : (t += 1)
                         simd.actQ8_K(cols, xK[t * cols ..].ptr, q8kK[t * klen ..].ptr);
                     pool_mod.parallel(pool, .{ .quant256b = .{
-                        .out = out.ptr, .data = qrow.data, .q8k = q8kK.ptr, .q8k_len = klen,
-                        .row_bytes = quantRowBytes(qrow.ttype), .bpr = qrow.blocks_per_row,
-                        .rows = rows, .k = k, .dot = dot,
+                        .out = out.ptr,
+                        .data = qrow.data,
+                        .q8k = q8kK.ptr,
+                        .q8k_len = klen,
+                        .row_bytes = quantRowBytes(qrow.ttype),
+                        .bpr = qrow.blocks_per_row,
+                        .rows = rows,
+                        .k = k,
+                        .dot = dot,
                     } });
                     return;
                 }
@@ -1507,8 +1540,14 @@ pub const Engine = struct {
                         else => unreachable,
                     };
                     pool_mod.parallel(pool, .{ .quant32b = .{
-                        .out = out.ptr, .data = qrow.data, .q8 = q8K.ptr, .q8_len = blen32,
-                        .rb32 = rb32, .bpr = qrow.blocks_per_row, .rows = rows, .k = k,
+                        .out = out.ptr,
+                        .data = qrow.data,
+                        .q8 = q8K.ptr,
+                        .q8_len = blen32,
+                        .rb32 = rb32,
+                        .bpr = qrow.blocks_per_row,
+                        .rows = rows,
+                        .k = k,
                         .dot = dotr,
                     } });
                     return;
@@ -1527,9 +1566,15 @@ pub const Engine = struct {
                     while (t < k) : (t += 1)
                         simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen32 ..].ptr);
                     pool_mod.parallel(pool, .{ .q8_0_d32b = .{
-                        .out = out.ptr, .data = qrow.data, .q8 = q8K.ptr, .q8_len = blen32,
-                        .rb32 = 8 * 2, .row_blocks = qrow.blocks_per_row * 8,
-                        .rows = rows, .k = k, .dot = dot,
+                        .out = out.ptr,
+                        .data = qrow.data,
+                        .q8 = q8K.ptr,
+                        .q8_len = blen32,
+                        .rb32 = 8 * 2,
+                        .row_blocks = qrow.blocks_per_row * 8,
+                        .rows = rows,
+                        .k = k,
+                        .dot = dot,
                     } });
                     return;
                 }
@@ -1555,22 +1600,32 @@ pub const Engine = struct {
                     else => unreachable,
                 };
                 pool_mod.parallel(pool, .{ .quant_scalarb = .{
-                    .out = out.ptr, .data = qrow.data, .x = xK.ptr, .x_len = cols,
-                    .row_bytes = quantRowBytes(qrow.ttype), .bpr = qrow.blocks_per_row,
-                    .rows = rows, .k = k, .dot = rowDot,
+                    .out = out.ptr,
+                    .data = qrow.data,
+                    .x = xK.ptr,
+                    .x_len = cols,
+                    .row_bytes = quantRowBytes(qrow.ttype),
+                    .bpr = qrow.blocks_per_row,
+                    .rows = rows,
+                    .k = k,
+                    .dot = rowDot,
                 } });
             },
             .f32 => |m| {
                 const cols = m.len / rows;
                 std.debug.assert(xK.len >= k * cols);
                 pool_mod.parallel(pool, .{ .f32b = .{
-                    .out = out.ptr, .mat = m, .x = xK.ptr, .x_len = cols,
-                    .cols = cols, .rows = rows, .k = k,
+                    .out = out.ptr,
+                    .mat = m,
+                    .x = xK.ptr,
+                    .x_len = cols,
+                    .cols = cols,
+                    .rows = rows,
+                    .k = k,
                 } });
             },
         }
     }
-
 
     /// [rows, cols] so cols = len / rows.
     fn matvecCols(w: LinearW, out_len: usize) usize {
@@ -1950,7 +2005,7 @@ pub const Engine = struct {
         const K: usize = 16;
         const q_dimK: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
         const kv_dimK: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
-        e.k_tokens = if (no_batch) 0 else K;
+        e.nbatch = if (no_batch) 0 else K;
         e.xK = try alloc.alloc(f32, K * cfg.hidden);
         e.x1K = try alloc.alloc(f32, K * cfg.hidden);
         e.qkvK = try alloc.alloc(f32, K * @max(gdn_conv_dim, 2 * q_dimK));
@@ -1989,14 +2044,14 @@ pub const Engine = struct {
     fn freeLayerTyped(alloc: std.mem.Allocator, lw: *LayerWeights) void {
         // linear weights (q8 views point into the mmap, f32 copies are ours)
         inline for (.{
-            &lw.attn_qkv, &lw.attn_gate, &lw.ssm_alpha, &lw.ssm_beta, &lw.ssm_out,
+            &lw.attn_qkv, &lw.attn_gate, &lw.ssm_alpha, &lw.ssm_beta,    &lw.ssm_out,
             &lw.attn_q,   &lw.attn_k,    &lw.attn_v,    &lw.attn_output,
         }) |p| {
             if (p.*) |w| freeLinear(alloc, w);
         }
         // plain f32 scratch tensors
         inline for (.{
-            &lw.ssm_conv1d, &lw.ssm_dt_bias, &lw.ssm_a, &lw.ssm_norm,
+            &lw.ssm_conv1d,  &lw.ssm_dt_bias, &lw.ssm_a, &lw.ssm_norm,
             &lw.attn_q_norm, &lw.attn_k_norm,
         }) |p| {
             if (p.*) |w| alloc.free(w);
@@ -2070,7 +2125,11 @@ pub const Engine = struct {
         const hidden: usize = c.hidden;
         const io = self.io;
         if (prof) {
-            prof_gdn = 0; prof_full = 0; prof_mlp = 0; prof_lm = 0; prof_emb = 0;
+            prof_gdn = 0;
+            prof_full = 0;
+            prof_mlp = 0;
+            prof_lm = 0;
+            prof_emb = 0;
         }
         const te = Io.Clock.Timestamp.now(io, .awake);
         // embedding lookup: dequantize the token row straight into x
@@ -2134,7 +2193,7 @@ pub const Engine = struct {
 
     pub fn profReport() void {
         const tot: f64 = prof_gdn + prof_full + prof_mlp + prof_lm;
-        std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6});
+        std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{ prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6 });
     }
 
     /// Forward + sample one token.  Greedy (argmax) when the sampler's
@@ -2174,7 +2233,7 @@ pub const Engine = struct {
     /// KV cache and GDN state end up bit-identical to the serial prefill.
     pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) []f32 {
         const k = tokens.len;
-        std.debug.assert(k > 0 and k <= self.k_tokens);
+        std.debug.assert(k > 0 and k <= self.nbatch);
         if (k == 1) return self.forwardLogits(tokens[0], pos0);
 
         const c = self.cfg;
@@ -2382,7 +2441,7 @@ pub const Engine = struct {
         const h: [*]f32 = st.conv.ptr;
         const w: [*]const f32 = wconv.ptr;
         const out: [*]f32 = qkv.ptr;
-        for (0 .. qkv.len) |i| {
+        for (0..qkv.len) |i| {
             const hp = h + i * 3;
             const cur = out[i];
             // 4 taps per channel in one @Vector multiply; the sum keeps the
@@ -2668,7 +2727,7 @@ pub const Engine = struct {
         const io = self.io;
         const t_start = Io.Clock.Timestamp.now(io, .awake);
         var last_logits: []f32 = &.{};
-        if (self.k_tokens == 0) {
+        if (self.nbatch == 0) {
             for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
         } else {
             // K-token batched prefill: every layer's weights are read once per
@@ -2678,7 +2737,7 @@ pub const Engine = struct {
             // last prompt token are bit-identical to the serial prefill.
             var i: usize = 0;
             while (i < prompt.len) {
-                const n = @min(self.k_tokens, prompt.len - i);
+                const n = @min(self.nbatch, prompt.len - i);
                 last_logits = self.forwardChunk(prompt[i .. i + n], @intCast(i));
                 i += n;
             }
@@ -3014,7 +3073,7 @@ test "maxQ8Cols: widest matvec INPUT is n_ff, not conv_dim / 2*q_dim" {
         .n_heads = 24,
         .head_dim = 256,
         .n_ff = 17408,
-        .gdn_n_heads = 48,   // ssm.inner_size 6144 / state_size 128
+        .gdn_n_heads = 48, // ssm.inner_size 6144 / state_size 128
         .gdn_head_dim = 128,
         .gdn_num_k_heads = 16, // ssm.group_count
     };
