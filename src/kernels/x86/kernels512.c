@@ -82,11 +82,25 @@ float k512_q8_0_q8_0_vnni(int n, const void* vx, const void* vy) {
 }
 
 #else
-/* Compiled without __AVX512VNNI__: thin wrapper (never called; dispatch
- * guards on cpu_has_avx512_vnni()). Falls back to the AVX2 path's scalar by
- * returning 0; kernels32.c will not route here when VNNI is absent. */
+/* This file is supposed to be compiled with AVX-512 VNNI enabled. Reaching
+ * this branch means the build is misconfigured (that happened for real: a
+ * stray `-mcpu x86_64` overrode the -mavx512* flags, this unit became a stub
+ * returning 0.0f, and since cpu_caps.c still reported VNNI the dispatcher
+ * called it -> every dot product silently became 0 -> garbage tokens).
+ *
+ * Do NOT return a plausible-looking number here: a silent 0 disguises "this
+ * code was never really compiled" as "the math is wrong", which is far harder
+ * to diagnose. Fail loudly instead. Dispatch guards on cpu_has_avx512_vnni(),
+ * so on a non-AVX-512 machine this function is never reached. */
+#include <stdio.h>
+#include <stdlib.h>
+
 float k512_q8_0_q8_0_vnni(int n, const void* vx, const void* vy) {
     (void)n; (void)vx; (void)vy;
-    return 0.0f;
+    fputs("qwen35: FATAL: the AVX-512 VNNI kernels were compiled without "
+          "-mavx512vnni (build misconfiguration), but the CPU reports VNNI "
+          "support and dispatch selected them. Refusing to return a bogus "
+          "result.\n", stderr);
+    abort();
 }
 #endif
