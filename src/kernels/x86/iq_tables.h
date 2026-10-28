@@ -1,10 +1,11 @@
 /*
- * Generated lookup tables for IQ kernels
- * Extracted from llama.cpp/ggml/src/ggml-common.h
+ * IQ-series lookup tables: iq1s_grid, iq2s_grid, iq3s_grid, kmask_iq2xs.
+ * Copied verbatim from llama.cpp ggml/src/ggml-common.h — do not edit by hand;
+ * re-extract from upstream if the tables ever change.
  */
 
-#ifndef GENERATED_TABLES_H
-#define GENERATED_TABLES_H
+#ifndef IQ_TABLES_H
+#define IQ_TABLES_H
 
 #include <stdint.h>
 
@@ -867,4 +868,4 @@ static const uint8_t kmask_iq2xs[8] = {
 }
 #endif
 
-#endif // GENERATED_TABLES_H
+#endif // IQ_TABLES_H

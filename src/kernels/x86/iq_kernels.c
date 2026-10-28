@@ -6,7 +6,7 @@
  */
 
 #include "iq_kernels.h"
-#include "generated_tables.h"
+#include "iq_tables.h"
 #include "cpu_caps.h"
 #include <string.h>
 #include <stdint.h>
@@ -130,7 +130,7 @@ static const uint8_t ksigns_iq2xs[128] = {
     240, 113, 114, 243, 116, 245, 246, 119, 120, 249, 250, 123, 252, 125, 126, 255,
 };
 
-// kmask_iq2xs is now defined in generated_tables.h
+// kmask_iq2xs is now defined in iq_tables.h
 
 // Signs lookup table for IQ2_XXS/IQ2_XS (SIMD version)
 #if defined(__AVX__) || defined(__AVX2__)
@@ -303,9 +303,51 @@ static const uint64_t iq2xs_grid[512] = {
 };
 
 // kvalues_iq4nl: 4-bit quantization values for IQ4 types
+// Must stay identical to k32_iq4nl_tab in kernels32.c and to kvalues_iq4nl in
+// src/quant_dequant.zig. The _Static_assert block below fails the build if the
+// data is edited without editing the expectation.
 static const int8_t kvalues_iq4nl[16] = {
     -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
 };
+
+/* Expected values restated as enum constants: an enum constant is an integer
+ * constant expression, an array element is not, so this is what
+ * _Static_assert can compare against. The duplication is the CHECK, not the
+ * data. */
+enum {
+    IQ4NL_E0 = -127, IQ4NL_E1 = -104, IQ4NL_E2 = -83,
+    IQ4NL_E3 = -65,  IQ4NL_E4 = -49,  IQ4NL_E5 = -35,
+    IQ4NL_E6 = -22,  IQ4NL_E7 = -10,  IQ4NL_E8 = 1,
+    IQ4NL_E9 = 13,   IQ4NL_E10 = 25,  IQ4NL_E11 = 38,
+    IQ4NL_E12 = 53,  IQ4NL_E13 = 69,  IQ4NL_E14 = 89,
+    IQ4NL_E15 = 113,
+};
+
+#define IQ4NL_CHECK(i)                                                     \
+    _Static_assert(kvalues_iq4nl[i] == IQ4NL_E##i,                         \
+                   "kvalues_iq4nl[" #i "] does not match IQ4_NL table")
+
+IQ4NL_CHECK(0);
+IQ4NL_CHECK(1);
+IQ4NL_CHECK(2);
+IQ4NL_CHECK(3);
+IQ4NL_CHECK(4);
+IQ4NL_CHECK(5);
+IQ4NL_CHECK(6);
+IQ4NL_CHECK(7);
+IQ4NL_CHECK(8);
+IQ4NL_CHECK(9);
+IQ4NL_CHECK(10);
+IQ4NL_CHECK(11);
+IQ4NL_CHECK(12);
+IQ4NL_CHECK(13);
+IQ4NL_CHECK(14);
+IQ4NL_CHECK(15);
+
+#undef IQ4NL_CHECK
+
+_Static_assert(sizeof(kvalues_iq4nl) / sizeof(kvalues_iq4nl[0]) == 16,
+               "kvalues_iq4nl must have exactly 16 elements");
 
 /* ============================================================================
  * Block structures (from llama.cpp)

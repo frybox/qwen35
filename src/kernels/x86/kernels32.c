@@ -110,8 +110,57 @@ static inline uint32_t k32_ld32(const uint8_t* p) {
 /* ------------------------------------------------------------------ */
 /* iq4_nl value table — from src/simd/kerniq.zig L32 (keep in sync)   */
 /* ------------------------------------------------------------------ */
+/* This table must stay identical to kvalues_iq4nl in iq_kernels.c and  */
+/* to kvalues_iq4nl in src/quant_dequant.zig.  int32_t (not int8_t) is  */
+/* deliberate: it lets the AVX2 hot path use the values without a       */
+/* widening conversion.  The _Static_assert block below fails the build */
+/* if the data is edited without editing the expectation.               */
 
 static const int32_t k32_iq4nl_tab[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
+
+/* Expected values, restated once as enum constants: in C an enum constant
+ * *is* an integer constant expression, which is what _Static_assert needs
+ * (an array element such as k32_iq4nl_tab[i] is not one).  The duplication
+ * here is the CHECK, not the data: editing k32_iq4nl_tab above without
+ * editing these keeps the mismatch and breaks the build. */
+enum {
+    K32_IQ4NL_E0 = -127, K32_IQ4NL_E1 = -104, K32_IQ4NL_E2 = -83,
+    K32_IQ4NL_E3 = -65,  K32_IQ4NL_E4 = -49,  K32_IQ4NL_E5 = -35,
+    K32_IQ4NL_E6 = -22,  K32_IQ4NL_E7 = -10,  K32_IQ4NL_E8 = 1,
+    K32_IQ4NL_E9 = 13,   K32_IQ4NL_E10 = 25,  K32_IQ4NL_E11 = 38,
+    K32_IQ4NL_E12 = 53,  K32_IQ4NL_E13 = 69,  K32_IQ4NL_E14 = 89,
+    K32_IQ4NL_E15 = 113,
+};
+
+/* k32_iq4nl_tab[i] == expect[i]; expect[i] also has to fit in int8_t, since
+ * the callers cast the int32_t entries to int8_t. */
+#define K32_IQ4NL_CHECK(i)                                                 \
+    _Static_assert(k32_iq4nl_tab[i] == K32_IQ4NL_E##i,                     \
+                   "k32_iq4nl_tab[" #i "] does not match IQ4_NL table");   \
+    _Static_assert(K32_IQ4NL_E##i >= -128 && K32_IQ4NL_E##i <= 127,        \
+                   "IQ4_NL value[" #i "] does not fit in int8_t")
+
+K32_IQ4NL_CHECK(0);
+K32_IQ4NL_CHECK(1);
+K32_IQ4NL_CHECK(2);
+K32_IQ4NL_CHECK(3);
+K32_IQ4NL_CHECK(4);
+K32_IQ4NL_CHECK(5);
+K32_IQ4NL_CHECK(6);
+K32_IQ4NL_CHECK(7);
+K32_IQ4NL_CHECK(8);
+K32_IQ4NL_CHECK(9);
+K32_IQ4NL_CHECK(10);
+K32_IQ4NL_CHECK(11);
+K32_IQ4NL_CHECK(12);
+K32_IQ4NL_CHECK(13);
+K32_IQ4NL_CHECK(14);
+K32_IQ4NL_CHECK(15);
+
+#undef K32_IQ4NL_CHECK
+
+_Static_assert(sizeof(k32_iq4nl_tab) / sizeof(k32_iq4nl_tab[0]) == 16,
+               "k32_iq4nl_tab must have exactly 16 elements");
 
 #if defined(__AVX2__)
 

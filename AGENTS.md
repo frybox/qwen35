@@ -7,9 +7,9 @@
 
 - **x86 SIMD kernel**（SSE / AVX / AVX2 / AVX512 等）：使用 **C** 开发，放在 `src/kernels/x86/`。
   现状：`iq_kernels.c`（IQ 量化点积）、`kernels256.c`、`kernels32.c`、`kernels512.c`、
-  `cpu_caps.c`（特性探测，单一来源）、`generated_tables.h`、
+  `cpu_caps.c`（特性探测，单一来源）、`iq_tables.h`、
   `src/ggml_tables.zig` / `src/ggml_tables_extra.zig`（Zig 侧表）。
-  其中 `generated_tables.h` 文件头写明是从 `llama.cpp/ggml/src/ggml-common.h` **手工提取**的，
+  其中 `iq_tables.h` 文件头写明是从 `llama.cpp/ggml/src/ggml-common.h` **手工提取**的，
   并无生成脚本——改它必须对照 ggml 原文，不要凭记忆。
   （注意：`scripts/gen_simd_tables.py` 生成的是 `src/simd/tables.zig`，而 `src/simd/` 已随
   "去 Zig SIMD" 改造被删除，该脚本目前**过期失效**，不要执行它。）
