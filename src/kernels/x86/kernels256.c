@@ -31,6 +31,7 @@
  * per-kernel comments.
  */
 #include <stdint.h>
+#include "iq_tables.h"
 #include <string.h>
 #include <math.h>
 #include "cpu_caps.h"
@@ -499,7 +500,6 @@ static float k256_tq2_0_q8_k_avx2(int n, const uint8_t * vx, const uint8_t * vy)
 /* Base-5 packing: value = (((qs[j] * pow3[l]) & 0xFF) * 3 >> 8) - 1   */
 /* ------------------------------------------------------------------ */
 
-static const uint8_t k256_pow3[6] = { 1, 3, 9, 27, 81, 243 };
 
 static float k256_tq1_0_q8_k_scalar(int n, const uint8_t * vx, const uint8_t * vy)
 {
@@ -513,7 +513,7 @@ static float k256_tq1_0_q8_k_scalar(int n, const uint8_t * vx, const uint8_t * v
         /* Bytes 0..31: 32 bytes -> 5 groups of 32 elements */
         for (int m = 0; m < 32; m++) {
             for (int l = 0; l < 5; l++) {
-                uint8_t q = x[m] * k256_pow3[l];
+                uint8_t q = x[m] * iq_pow3[l];
                 uint16_t xi = ((uint16_t)q * 3) >> 8;
                 sum += (int32_t)(int8_t)q8[l * 32 + m] * ((int32_t)xi - 1);
             }
@@ -521,7 +521,7 @@ static float k256_tq1_0_q8_k_scalar(int n, const uint8_t * vx, const uint8_t * v
         /* Bytes 32..47: 16 bytes -> 5 groups of 16 elements */
         for (int m = 0; m < 16; m++) {
             for (int l = 0; l < 5; l++) {
-                uint8_t q = x[32 + m] * k256_pow3[l];
+                uint8_t q = x[32 + m] * iq_pow3[l];
                 uint16_t xi = ((uint16_t)q * 3) >> 8;
                 sum += (int32_t)(int8_t)q8[160 + l * 16 + m] * ((int32_t)xi - 1);
             }
@@ -529,7 +529,7 @@ static float k256_tq1_0_q8_k_scalar(int n, const uint8_t * vx, const uint8_t * v
         /* Bytes 48..51: 4 bytes -> 4 groups of 4 elements */
         for (int j = 0; j < 4; j++) {
             for (int l = 0; l < 4; l++) {
-                uint8_t q = x[48 + j] * k256_pow3[l];
+                uint8_t q = x[48 + j] * iq_pow3[l];
                 uint16_t xi = ((uint16_t)q * 3) >> 8;
                 sum += (int32_t)(int8_t)q8[240 + l * 4 + j] * ((int32_t)xi - 1);
             }

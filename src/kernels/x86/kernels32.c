@@ -28,6 +28,7 @@
  * are bit-identical.
  */
 #include <stdint.h>
+#include "iq_tables.h"
 #include <string.h>
 #include <immintrin.h>
 #include "cpu_caps.h"
@@ -107,60 +108,15 @@ static inline uint32_t k32_ld32(const uint8_t* p) {
     return v;
 }
 
-/* ------------------------------------------------------------------ */
-/* iq4_nl value table — from src/simd/kerniq.zig L32 (keep in sync)   */
-/* ------------------------------------------------------------------ */
-/* This table must stay identical to kvalues_iq4nl in iq_kernels.c and  */
-/* to kvalues_iq4nl in src/quant_dequant.zig.  int32_t (not int8_t) is  */
-/* deliberate: it lets the AVX2 hot path use the values without a       */
-/* widening conversion.  The _Static_assert block below fails the build */
-/* if the data is edited without editing the expectation.               */
-
-static const int32_t k32_iq4nl_tab[16] = { -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
-
-/* Expected values, restated once as enum constants: in C an enum constant
- * *is* an integer constant expression, which is what _Static_assert needs
- * (an array element such as k32_iq4nl_tab[i] is not one).  The duplication
- * here is the CHECK, not the data: editing k32_iq4nl_tab above without
- * editing these keeps the mismatch and breaks the build. */
-enum {
-    K32_IQ4NL_E0 = -127, K32_IQ4NL_E1 = -104, K32_IQ4NL_E2 = -83,
-    K32_IQ4NL_E3 = -65,  K32_IQ4NL_E4 = -49,  K32_IQ4NL_E5 = -35,
-    K32_IQ4NL_E6 = -22,  K32_IQ4NL_E7 = -10,  K32_IQ4NL_E8 = 1,
-    K32_IQ4NL_E9 = 13,   K32_IQ4NL_E10 = 25,  K32_IQ4NL_E11 = 38,
-    K32_IQ4NL_E12 = 53,  K32_IQ4NL_E13 = 69,  K32_IQ4NL_E14 = 89,
-    K32_IQ4NL_E15 = 113,
-};
-
-/* k32_iq4nl_tab[i] == expect[i]; expect[i] also has to fit in int8_t, since
- * the callers cast the int32_t entries to int8_t. */
-#define K32_IQ4NL_CHECK(i)                                                 \
-    _Static_assert(k32_iq4nl_tab[i] == K32_IQ4NL_E##i,                     \
-                   "k32_iq4nl_tab[" #i "] does not match IQ4_NL table");   \
-    _Static_assert(K32_IQ4NL_E##i >= -128 && K32_IQ4NL_E##i <= 127,        \
-                   "IQ4_NL value[" #i "] does not fit in int8_t")
-
-K32_IQ4NL_CHECK(0);
-K32_IQ4NL_CHECK(1);
-K32_IQ4NL_CHECK(2);
-K32_IQ4NL_CHECK(3);
-K32_IQ4NL_CHECK(4);
-K32_IQ4NL_CHECK(5);
-K32_IQ4NL_CHECK(6);
-K32_IQ4NL_CHECK(7);
-K32_IQ4NL_CHECK(8);
-K32_IQ4NL_CHECK(9);
-K32_IQ4NL_CHECK(10);
-K32_IQ4NL_CHECK(11);
-K32_IQ4NL_CHECK(12);
-K32_IQ4NL_CHECK(13);
-K32_IQ4NL_CHECK(14);
-K32_IQ4NL_CHECK(15);
-
-#undef K32_IQ4NL_CHECK
-
-_Static_assert(sizeof(k32_iq4nl_tab) / sizeof(k32_iq4nl_tab[0]) == 16,
-               "k32_iq4nl_tab must have exactly 16 elements");
+/*
+ * iq4_nl / mxfp4 / nvfp4 value tables are declared extern in iq_tables.h and
+ * defined once in src/iq_tables.zig (k32_iq4nl_tab is the int32 mirror of
+ * kvalues_iq4nl, generated at comptime; kvalues_fp4 is the int8 mxfp4 table,
+ * which upstream aliases as kvalues_mxfp4 at ggml-common.h:1129; k32_nvfp4_values
+ * is its f32 view).  The local copies and their _Static_assert guards are gone:
+ * the guard moved to iq_table_check.c, which compares the tables the kernels
+ * actually see against the upstream anchors.
+ */
 
 #if defined(__AVX2__)
 
@@ -401,6 +357,12 @@ float iq4_nl_q8_0(int n, const void* vx, const void* vy) {
 /* q8_0 x q8_0 — both sides are Q8_0 quantized                        */
 /* block_q8_0: f16 d @0, 32 x int8 qs @2 (34 bytes)                 */
 /* ------------------------------------------------------------------ */
+
+/* Defined below, outside the __AVX2__ block.  Declared up here because the
+ * non-AVX2 build's k32_q8_0_q8_0_avx2() stub below calls it, and a build
+ * without -mavx2 must still compile (that is the whole point of building
+ * for a baseline CPU).  Implicit declaration is an error in C99 and later. */
+static float k32_q8_0_q8_0_scalar(int n, const void* vx, const void* vy);
 
 #if defined(__AVX2__)
 
@@ -866,15 +828,6 @@ float q2_0_q8_0(int n, const void* vx, const void* vy) {
 /* block_mxfp4: uint8 e (E8M0) @0, 16 bytes qs @1 (17 bytes)       */
 /* ------------------------------------------------------------------ */
 
-// MXFP4 integer value table, identical to ggml's kvalues_mxfp4.
-// NOTE: these are the *4-bit code* magnitudes (0..12), NOT floats -- the
-// E8M0 block scale supplies the power-of-two factor. Keeping them integral
-// matches the scalar reference exactly and avoids float->int truncation.
-static const int8_t k32_mxfp4_values[16] = {
-    0, 1, 2, 3, 4, 6, 8, 12,
-    0, -1, -2, -3, -4, -6, -8, -12
-};
-
 // E8M0 (biassed power-of-two exponent) -> f32.  Uses ggml's bit-construction
 // form; the former `1 << ((e & 0x7F) - 127)` had a *negative* shift for every
 // e < 127, which is undefined behaviour (UBSan misaligned/shift ABRT).
@@ -934,8 +887,8 @@ static float k32_mxfp4_q8_0_avx2(int n, const void* vx, const void* vy) {
         int sumi = 0;
         for (int j = 0; j < 16; j++) {
             const uint8_t b = xb[1 + j];
-            sumi += (int)k32_mxfp4_values[b & 0x0F] * (int)(int8_t)yb[2 + j];
-            sumi += (int)k32_mxfp4_values[b >> 4]   * (int)(int8_t)yb[2 + 16 + j];
+            sumi += (int)kvalues_fp4[b & 0x0F] * (int)(int8_t)yb[2 + j];
+            sumi += (int)kvalues_fp4[b >> 4]   * (int)(int8_t)yb[2 + 16 + j];
         }
         acc = _mm256_fmadd_ps(d, _mm256_setr_ps((float)sumi, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f), acc);
     }
@@ -966,8 +919,8 @@ static float k32_mxfp4_q8_0_scalar(int n, const void* vx, const void* vy) {
         int sumi = 0;
         for (int j = 0; j < 16; j++) {
             const uint8_t b = xb[1 + j];
-            sumi += (int)k32_mxfp4_values[b & 0x0F] * (int)(int8_t)yb[2 + j];
-            sumi += (int)k32_mxfp4_values[b >> 4]   * (int)(int8_t)yb[2 + 16 + j];
+            sumi += (int)kvalues_fp4[b & 0x0F] * (int)(int8_t)yb[2 + j];
+            sumi += (int)kvalues_fp4[b >> 4]   * (int)(int8_t)yb[2 + 16 + j];
         }
         sumf += scale * (float)sumi;
     }
@@ -984,15 +937,10 @@ float mxfp4_q8_0(int n, const void* vx, const void* vy) {
 /* Note: QK_NVFP4 = 64, so each block has 64 elements                 */
 /* ------------------------------------------------------------------ */
 
-// NVFP4 lookup table for 4-bit E2M1 values
-/* FP4 E2M1 codes, INTEGER domain, matching src/simd_ref.zig:kvalues_fp4
- * (the 0.5 factor is already folded into the ue4m3 group scale).  The old
- * table was halved, i.e. the 0.5 was applied twice, which is why nvfp4 came
- * out exactly 2x low. */
-static const float k32_nvfp4_values[16] = {
-    0.0f, 1.0f, 2.0f, 3.0f, 4.0f, 6.0f, 8.0f, 12.0f,
-    -0.0f, -1.0f, -2.0f, -3.0f, -4.0f, -6.0f, -8.0f, -12.0f
-};
+/* k32_nvfp4_values comes from iq_tables.h (defined in src/iq_tables.zig as the
+ * f32 view of kvalues_fp4).  The old local copy was halved, which is why nvfp4
+ * came out exactly 2x low; the upstream table is the integer E2M1 code domain
+ * with the 0.5 folded into the ue4m3 group scale. */
 
 #if defined(__AVX2__)
 

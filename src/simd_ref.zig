@@ -6,13 +6,12 @@
 //! SIMD row kernels (which no longer exist); they are rewritten here to forward
 //! to the real scalar `X_ref`.
 const std = @import("std");
-const tables = @import("ggml_tables.zig");
-const tables_x = @import("ggml_tables_extra.zig");
+const tables = @import("iq_tables.zig");
 
-const iq2xxs_grid = tables_x.iq2xxs_grid;
-const iq2xs_grid = tables_x.iq2xs_grid;
-const iq2s_grid = tables_x.iq2s_grid;
-const iq1s_grid = tables_x.iq1s_grid;
+const iq2xxs_grid = tables.iq2xxs_grid;
+const iq2xs_grid = tables.iq2xs_grid;
+const iq2s_grid = tables.iq2s_grid;
+const iq1s_grid = tables.iq1s_grid;
 const iq3s_grid = tables.iq3s_grid;
 const iq3xxs_grid = tables.iq3xxs_grid;
 const kmask_iq2xs = tables.kmask_iq2xs;
@@ -22,9 +21,9 @@ const q8_bytes = 34;
 const q8k_bytes = 292;
 const qk_k = 256;
 const iq1s_delta = 0.125;
-const pow3 = [6]u8{ 1, 3, 9, 27, 81, 243 };
+const pow3 = tables.iq_pow3;
 const kvalues_iq4nl = [16]i8{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
-const kvalues_fp4 = [16]i8{ 0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12 };
+const kvalues_fp4 = tables.kvalues_fp4;
 
 pub const util = struct {
     pub fn f16At(p: [*]const u8, off: usize) f32 {

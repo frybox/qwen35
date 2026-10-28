@@ -11,6 +11,7 @@
 #include <string.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>   // getenv(): QWEN35_IQ_FORCE_SCALAR debug hook
 
 #if defined(__AVX__) || defined(__AVX2__)
 #include <immintrin.h>
@@ -51,94 +52,17 @@ static inline __m128i get_scale_shuffle(int i) {
 
 // kmask_iq2xs is now defined in iq_tables.h
 
-// keven_signs_q2xs: SIMD sign-flip table for IQ2_XXS/IQ2_XS.
-// This table is derived from ksigns_iq2xs (expanded to one +1/-1 lane per
-// sign bit) and has no counterpart in upstream ggml-common.h -- it is a
-// local implementation detail of this repository, NOT upstream data. Do not
-// expect it to track llama.cpp, and do not move it into iq_tables.h.
-#if defined(__AVX__) || defined(__AVX2__)
-static const int8_t keven_signs_q2xs[1024] = {
-     1,  1,  1,  1,  1,  1,  1,  1, -1,  1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1,  1,
-     1,  1, -1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1,  1,  1, -1, -1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1, -1,
-     1,  1,  1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1,  1,  1, -1,  1, -1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1, -1,
-     1,  1, -1, -1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1,  1, -1,  1, -1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1,  1,
-     1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1, -1,
-     1,  1, -1,  1, -1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1,  1,
-     1,  1,  1, -1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1,  1,
-     1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1,  1,  1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1, -1,
-     1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1,  1,  1, -1,  1,  1,  1, -1,  1,  1,  1, -1,  1,  1, -1, -1,  1,  1,  1, -1,  1, -1,
-     1,  1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1,  1,
-     1,  1,  1, -1,  1, -1,  1,  1, -1,  1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1,  1,
-     1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1,  1,  1,  1, -1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1, -1,
-     1,  1,  1,  1, -1, -1,  1,  1, -1,  1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1,  1,
-     1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1,  1,  1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1, -1,
-     1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1,  1,  1,  1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1, -1,
-     1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1,  1,
-     1,  1,  1,  1,  1,  1, -1, -1, -1,  1,  1,  1,  1,  1, -1,  1,  1, -1,  1,  1,  1,  1, -1,  1, -1, -1,  1,  1,  1,  1, -1, -1,
-     1,  1, -1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1, -1, -1,  1, -1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1,  1,
-     1,  1,  1, -1,  1,  1, -1,  1, -1,  1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1,  1,
-     1,  1, -1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1,  1,  1, -1, -1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1, -1,
-     1,  1,  1,  1, -1,  1, -1,  1, -1,  1,  1,  1, -1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1,  1,
-     1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1,  1,  1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1, -1,
-     1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1,  1, -1,  1,  1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1, -1,
-     1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1,  1, -1, -1,  1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1,  1,
-     1,  1,  1,  1,  1, -1, -1,  1, -1,  1,  1,  1,  1, -1, -1, -1,  1, -1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1, -1,  1,
-     1,  1, -1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1,  1, -1, -1,  1, -1, -1, -1,  1,  1, -1, -1, -1,
-     1,  1,  1, -1,  1, -1, -1, -1, -1,  1,  1, -1,  1, -1, -1,  1,  1, -1,  1, -1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1, -1,
-     1,  1, -1, -1,  1, -1, -1,  1, -1,  1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1,  1,
-     1,  1,  1,  1, -1, -1, -1, -1, -1,  1,  1,  1, -1, -1, -1,  1,  1, -1,  1,  1, -1, -1, -1,  1, -1, -1,  1,  1, -1, -1, -1, -1,
-     1,  1, -1,  1, -1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1, -1,  1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1,  1,
-     1,  1,  1, -1, -1, -1, -1,  1, -1,  1,  1, -1, -1, -1, -1, -1,  1, -1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1,  1,
-     1,  1, -1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1,  1,  1, -1, -1, -1, -1, -1, -1,  1, -1, -1, -1, -1, -1, -1, -1, -1,
-};
-#endif
-
-// kvalues_iq4nl: 4-bit quantization values for IQ4 types
-// Must stay identical to k32_iq4nl_tab in kernels32.c and to kvalues_iq4nl in
-// src/quant_dequant.zig. The _Static_assert block below fails the build if the
-// data is edited without editing the expectation.
-static const int8_t kvalues_iq4nl[16] = {
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-};
-
-/* Expected values restated as enum constants: an enum constant is an integer
- * constant expression, an array element is not, so this is what
- * _Static_assert can compare against. The duplication is the CHECK, not the
- * data. */
-enum {
-    IQ4NL_E0 = -127, IQ4NL_E1 = -104, IQ4NL_E2 = -83,
-    IQ4NL_E3 = -65,  IQ4NL_E4 = -49,  IQ4NL_E5 = -35,
-    IQ4NL_E6 = -22,  IQ4NL_E7 = -10,  IQ4NL_E8 = 1,
-    IQ4NL_E9 = 13,   IQ4NL_E10 = 25,  IQ4NL_E11 = 38,
-    IQ4NL_E12 = 53,  IQ4NL_E13 = 69,  IQ4NL_E14 = 89,
-    IQ4NL_E15 = 113,
-};
-
-#define IQ4NL_CHECK(i)                                                     \
-    _Static_assert(kvalues_iq4nl[i] == IQ4NL_E##i,                         \
-                   "kvalues_iq4nl[" #i "] does not match IQ4_NL table")
-
-IQ4NL_CHECK(0);
-IQ4NL_CHECK(1);
-IQ4NL_CHECK(2);
-IQ4NL_CHECK(3);
-IQ4NL_CHECK(4);
-IQ4NL_CHECK(5);
-IQ4NL_CHECK(6);
-IQ4NL_CHECK(7);
-IQ4NL_CHECK(8);
-IQ4NL_CHECK(9);
-IQ4NL_CHECK(10);
-IQ4NL_CHECK(11);
-IQ4NL_CHECK(12);
-IQ4NL_CHECK(13);
-IQ4NL_CHECK(14);
-IQ4NL_CHECK(15);
-
-#undef IQ4NL_CHECK
-
-_Static_assert(sizeof(kvalues_iq4nl) / sizeof(kvalues_iq4nl[0]) == 16,
-               "kvalues_iq4nl must have exactly 16 elements");
+/*
+ * All IQ lookup tables (iq1s_grid, iq2xxs_grid, iq2xs_grid, iq2s_grid,
+ * iq3xxs_grid, iq3s_grid, ksigns_iq2xs, kmask_iq2xs, kvalues_iq4nl,
+ * keven_signs_q2xs, ksigns64) are declared extern in iq_tables.h and defined
+ * once in src/iq_tables.zig.  There is deliberately no table data in this
+ * file: the previous local copies are what let the Zig oracle and the C kernel
+ * disagree on the sign table (see the kerniq runtime-quantization failures).
+ *
+ * keven_signs_q2xs is generated at Zig comptime from ksigns_iq2xs, so it can
+ * no longer drift from the table the scalar reference uses.
+ */
 
 /* ============================================================================
  * Block structures (from llama.cpp)
@@ -666,243 +590,433 @@ static float iq3_xxs_q8_k_avx_impl(int n, const block_iq3_xxs* x, const block_q8
 }
 #endif
 
+// Scalar oracle for IQ3_XXS -- semantically complete (project rule: a fallback
+// must never be a stub). Ported expression-by-expression from
+// llama.cpp/ggml/src/ggml-cpu/quants.c:1050
+// ggml_vec_dot_iq3_xxs_q8_K_generic.
+//
+// Why this is a top-level static function instead of an `#if !defined(__AVX2__)`
+// `#else` branch: this TU is compiled with -mcpu baseline+avx2+f16c+fma, so an
+// `#else` branch is dead code that the compiler never even parses. That is
+// exactly how this function degenerated into "sum of d*d_y" unnoticed. Kept as
+// a normal function it is compiled (and validated against AVX2) on every build.
+//
+// Sign table trap: the scalar reference expands `ksigns_iq2xs[128]` bit masks
+// together with `kmask_iq2xs[j]` (bit j -> element j, ascending order).
+// `keven_signs_q2xs[1024]` is the SIMD-only int8 +-1 expansion and must NOT be
+// used here (ggml's *_generic uses ksigns_iq2xs). Tables come from iq_tables.h.
+//
+// Note `ls` has no -32 bias here (unlike IQ4_XS): it is 2*(aux32>>28)+1, always
+// odd and positive. Also the 0.25f factor matches ggml.
+static float iq3_xxs_q8_k_scalar_impl(int n, const block_iq3_xxs* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    float sumf = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint8_t* q3  = x[i].qs;
+        const uint8_t* gas = x[i].qs + QK_K/4;
+        const int8_t*  q8  = y[i].qs;
+        int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            uint32_t aux32;
+            memcpy(&aux32, gas, sizeof(uint32_t)); gas += sizeof(uint32_t);
+            const uint32_t ls = 2*(aux32 >> 28) + 1;
+            int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid1 = (const uint8_t*)(iq3xxs_grid + q3[2*l+0]);
+                const uint8_t* grid2 = (const uint8_t*)(iq3xxs_grid + q3[2*l+1]);
+                const uint8_t  signs = ksigns_iq2xs[(aux32 >> 7*l) & 127];
+                for (int j = 0; j < 4; ++j) {
+                    sumi += grid1[j] * q8[j+0] * (signs & kmask_iq2xs[j+0] ? -1 : 1);
+                    sumi += grid2[j] * q8[j+4] * (signs & kmask_iq2xs[j+4] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            q3 += 8;
+            bsum += sumi * (int32_t)ls;
+        }
+        sumf += d * bsum;
+    }
+    return 0.25f * sumf;
+}
+
 /* IQ3_XXS dispatch function */
 float iq3_xxs_q8_k(int n, const void* vx, const void* vy) {
     const block_iq3_xxs* x = (const block_iq3_xxs*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
+    // QWEN35_IQ_FORCE_SCALAR (any value, getenv()!=NULL): force the scalar
+    // oracle. Purpose: validate the scalar path on AVX2 hosts and A/B the two
+    // paths. Named distinctly from the other debug switches so it never
+    // collides with them.
+    if (getenv("QWEN35_IQ_FORCE_SCALAR") != NULL) {
+        return iq3_xxs_q8_k_scalar_impl(n, x, y);
+    }
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
         return iq3_xxs_q8_k_avx2_impl(n, x, y);
     }
 #endif
 #if defined(__AVX__)
+    // Machine lacks AVX2 but this unit was built with AVX: use the AVX kernel.
     return iq3_xxs_q8_k_avx_impl(n, x, y);
 #else
-    // Scalar fallback
-    float sum = 0.0f;
-    const int nb = n / QK_K;
-    for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d;
-    }
-    return sum;
+    // No AVX (baseline compile unit): scalar oracle, not "sum of scales".
+    return iq3_xxs_q8_k_scalar_impl(n, x, y);
 #endif
 }
 
+/* ============================================================================
+ * IQ2_XS implementation
+ *
+ * Split into avx2 / scalar entry points so that BOTH are compiled and
+ * exercised on every build. The scalar path below used to live in an
+ * `#else` branch that is never compiled (this TU is built with AVX2), which
+ * is exactly why it silently degenerated into "sum of scales" for years.
+ * ============================================================================ */
+
+// Port of ggml_vec_dot_iq2_xs_q8_K_generic:
+// llama.cpp/ggml/src/ggml-cpu/quants.c:948
+// Grid/sign tables: iq2xs_grid / ksigns_iq2xs (iq_tables.h, copied from
+// ggml-common.h).
+// Dispatch under AVX2: this .so/lib is compiled with AVX2 so this is the
+// hot path; kept as a direct copy of the former inlined dispatch body
+// (behaviour unchanged) and moved out only so the scalar twin is compiled
+// unconditionally.
+#if defined(__AVX2__)
+__attribute__((target("avx2")))
+static float iq2_xs_q8_k_avx2_impl(int n, const block_iq2_xs* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+    
+    // Helper tables for sign processing
+    static const uint8_t k_bit_helper[32] = {
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+        0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
+    };
+    
+    static const char block_sign_shuffle_mask_1[32] = {
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
+        0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
+    };
+    static const char block_sign_shuffle_mask_2[32] = {
+        0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
+        0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
+    };
+    static const uint8_t bit_selector_mask_bytes[32] = {
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+    };
+    
+    const __m256i bit_helper = _mm256_loadu_si256((const __m256i*)k_bit_helper);
+    const __m256i bit_selector_mask = _mm256_loadu_si256((const __m256i*)bit_selector_mask_bytes);
+    const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_1);
+    const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_2);
+    const __m256i mone = _mm256_set1_epi8(1);
+    const __m256i m511 = _mm256_set1_epi16(511);
+    const __m128i m4 = _mm_set1_epi8(0xf);
+    const __m128i m1 = _mm_set1_epi8(1);
+    
+    uint64_t aux64;
+    __m256i aux_gindex;
+    const uint16_t* gindex = (const uint16_t*)&aux_gindex;
+    
+    __m256 accumf = _mm256_setzero_ps();
+    
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint16_t* q2 = x[i].qs;
+        const int8_t* q8 = y[i].qs;
+        
+        // Process scales
+        memcpy(&aux64, x[i].scales, 8);
+        __m128i stmp = _mm_set1_epi64x(aux64);
+        stmp = _mm_unpacklo_epi8(_mm_and_si128(stmp, m4), _mm_and_si128(_mm_srli_epi16(stmp, 4), m4));
+        const __m128i scales = _mm_add_epi8(_mm_slli_epi16(stmp, 1), m1);
+        
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+        
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 4) {
+            const __m256i q2_data = _mm256_loadu_si256((const __m256i*)q2); q2 += 16;
+            aux_gindex = _mm256_and_si256(q2_data, m511);
+            
+            // Process sign bits
+            const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
+            const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
+            const __m256i partial_sign_bits_for_counting = _mm256_xor_si256(partial_sign_bits, partial_sign_bits_upper);
+            const __m256i odd_bits = _mm256_shuffle_epi8(bit_helper, partial_sign_bits_for_counting);
+            const __m256i full_sign_bits = _mm256_or_si256(partial_sign_bits, odd_bits);
+            
+            // Load 4 blocks of 32 q8 values each
+            const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8_4 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            
+            // Build quantized values from grid
+            const __m256i q2_1 = _mm256_set_epi64x(
+                iq2xs_grid[gindex[3]], iq2xs_grid[gindex[2]], iq2xs_grid[gindex[1]], iq2xs_grid[gindex[0]]);
+            const __m256i q2_2 = _mm256_set_epi64x(
+                iq2xs_grid[gindex[7]], iq2xs_grid[gindex[6]], iq2xs_grid[gindex[5]], iq2xs_grid[gindex[4]]);
+            const __m256i q2_3 = _mm256_set_epi64x(
+                iq2xs_grid[gindex[11]], iq2xs_grid[gindex[10]], iq2xs_grid[gindex[9]], iq2xs_grid[gindex[8]]);
+            const __m256i q2_4 = _mm256_set_epi64x(
+                iq2xs_grid[gindex[15]], iq2xs_grid[gindex[14]], iq2xs_grid[gindex[13]], iq2xs_grid[gindex[12]]);
+            
+            // Shuffle signs
+            const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
+            const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
+            const __m256i full_signs_1 = MM256_SET_M128I(full_signs_l, full_signs_l);
+            const __m256i full_signs_2 = MM256_SET_M128I(full_signs_h, full_signs_h);
+            
+            __m256i signs;
+            signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_1);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_1 = _mm256_sign_epi8(q8_1, _mm256_or_si256(signs, mone));
+            
+            signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_2);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_2 = _mm256_sign_epi8(q8_2, _mm256_or_si256(signs, mone));
+            
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_1);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_3 = _mm256_sign_epi8(q8_3, _mm256_or_si256(signs, mone));
+            
+            signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_2);
+            signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
+            const __m256i q8s_4 = _mm256_sign_epi8(q8_4, _mm256_or_si256(signs, mone));
+            
+            // Dot products
+            const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
+            const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
+            const __m256i dot3 = _mm256_maddubs_epi16(q2_3, q8s_3);
+            const __m256i dot4 = _mm256_maddubs_epi16(q2_4, q8s_4);
+            
+            // Apply scales
+            const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+0)));
+            const __m256i sc2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+1)));
+            const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+2)));
+            const __m256i sc4 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+3)));
+            
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, sc1));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, sc2));
+            sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot3, sc3));
+            sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot4, sc4));
+        }
+        
+        accumf = _mm256_fmadd_ps(
+            _mm256_set1_ps(d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+            accumf);
+    }
+    
+    return 0.125f * hsum_float_8_avx(accumf);
+}
+#endif
+
+// Scalar oracle for IQ2_XS -- semantically complete (project rule: a fallback
+// must never be a stub). Ported expression-by-expression from
+// llama.cpp/ggml/src/ggml-cpu/quants.c:948
+// ggml_vec_dot_iq2_xs_q8_K_generic.
+//
+// Sign table trap: the *scalar* reference expands `ksigns_iq2xs[128]` bit
+// masks (bit j -> iq2xs index in *ascending* order) and honours the
+// `0.125f` output scaling; `keven_signs_q2xs[1024]` is the SIMD-only int8
+// +-1 expansion and must NOT be used here (ggml uses ksigns_iq2xs).
+static float iq2_xs_q8_k_scalar_impl(int n, const block_iq2_xs* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    float sumf = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint16_t* q2 = x[i].qs;
+        const uint8_t*  sc = x[i].scales;
+        const int8_t*   q8 = y[i].qs;
+        int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ++ib32) {
+            const uint16_t ls1 = 2*(sc[ib32] & 0xf) + 1;
+            const uint16_t ls2 = 2*(sc[ib32] >>  4) + 1;
+            int32_t sumi = 0;
+            for (int l = 0; l < 2; ++l) {
+                const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[l] & 511));
+                const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    sumi += grid[j] * q8[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * ls1;
+            sumi = 0;
+            for (int l = 2; l < 4; ++l) {
+                const uint8_t* grid = (const uint8_t*)(iq2xs_grid + (q2[l] & 511));
+                const uint8_t signs = ksigns_iq2xs[q2[l] >> 9];
+                for (int j = 0; j < 8; ++j) {
+                    sumi += grid[j] * q8[j] * (signs & kmask_iq2xs[j] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            bsum += sumi * ls2;
+            q2 += 4;
+        }
+        sumf += d * bsum;
+    }
+    return 0.125f * sumf;
+}
+
+/* IQ2_XS dispatch function */
 float iq2_xs_q8_k(int n, const void* vx, const void* vy) {
     const block_iq2_xs* x = (const block_iq2_xs*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
+    // QWEN35_IQ_FORCE_SCALAR (any value, getenv()!=NULL): force the scalar
+    // oracle for IQ2_XS/IQ3_S. Purpose: validate the scalar path on AVX2
+    // hosts and A/B the two paths (see test/numcheck). Named distinctly from
+    // the other debug switches so it never collides with them.
+    if (getenv("QWEN35_IQ_FORCE_SCALAR") != NULL) {
+        return iq2_xs_q8_k_scalar_impl(n, x, y);
+    }
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
-        const int nb = n / QK_K;
-        
-        // Helper tables for sign processing
-        static const uint8_t k_bit_helper[32] = {
-            0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
-            0x00, 0x80, 0x80, 0x00, 0x80, 0x00, 0x00, 0x80, 0x80, 0x00, 0x00, 0x80, 0x00, 0x80, 0x80, 0x00,
-        };
-        
-        static const char block_sign_shuffle_mask_1[32] = {
-            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02,
-            0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06, 0x06,
-        };
-        static const char block_sign_shuffle_mask_2[32] = {
-            0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x08, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a, 0x0a,
-            0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0c, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e, 0x0e,
-        };
-        static const uint8_t bit_selector_mask_bytes[32] = {
-            0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
-            0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
-        };
-        
-        const __m256i bit_helper = _mm256_loadu_si256((const __m256i*)k_bit_helper);
-        const __m256i bit_selector_mask = _mm256_loadu_si256((const __m256i*)bit_selector_mask_bytes);
-        const __m256i block_sign_shuffle_1 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_1);
-        const __m256i block_sign_shuffle_2 = _mm256_loadu_si256((const __m256i*)block_sign_shuffle_mask_2);
-        const __m256i mone = _mm256_set1_epi8(1);
-        const __m256i m511 = _mm256_set1_epi16(511);
-        const __m128i m4 = _mm_set1_epi8(0xf);
-        const __m128i m1 = _mm_set1_epi8(1);
-        
-        uint64_t aux64;
-        __m256i aux_gindex;
-        const uint16_t* gindex = (const uint16_t*)&aux_gindex;
-        
-        __m256 accumf = _mm256_setzero_ps();
-        
-        for (int i = 0; i < nb; ++i) {
-            const float d = fp16_to_fp32(x[i].d) * y[i].d;
-            const uint16_t* q2 = x[i].qs;
-            const int8_t* q8 = y[i].qs;
-            
-            // Process scales
-            memcpy(&aux64, x[i].scales, 8);
-            __m128i stmp = _mm_set1_epi64x(aux64);
-            stmp = _mm_unpacklo_epi8(_mm_and_si128(stmp, m4), _mm_and_si128(_mm_srli_epi16(stmp, 4), m4));
-            const __m128i scales = _mm_add_epi8(_mm_slli_epi16(stmp, 1), m1);
-            
-            __m256i sumi1 = _mm256_setzero_si256();
-            __m256i sumi2 = _mm256_setzero_si256();
-            
-            for (int ib32 = 0; ib32 < QK_K/32; ib32 += 4) {
-                const __m256i q2_data = _mm256_loadu_si256((const __m256i*)q2); q2 += 16;
-                aux_gindex = _mm256_and_si256(q2_data, m511);
-                
-                // Process sign bits
-                const __m256i partial_sign_bits = _mm256_srli_epi16(q2_data, 9);
-                const __m256i partial_sign_bits_upper = _mm256_srli_epi16(q2_data, 13);
-                const __m256i partial_sign_bits_for_counting = _mm256_xor_si256(partial_sign_bits, partial_sign_bits_upper);
-                const __m256i odd_bits = _mm256_shuffle_epi8(bit_helper, partial_sign_bits_for_counting);
-                const __m256i full_sign_bits = _mm256_or_si256(partial_sign_bits, odd_bits);
-                
-                // Load 4 blocks of 32 q8 values each
-                const __m256i q8_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-                const __m256i q8_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-                const __m256i q8_3 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-                const __m256i q8_4 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-                
-                // Build quantized values from grid
-                const __m256i q2_1 = _mm256_set_epi64x(
-                    iq2xs_grid[gindex[3]], iq2xs_grid[gindex[2]], iq2xs_grid[gindex[1]], iq2xs_grid[gindex[0]]);
-                const __m256i q2_2 = _mm256_set_epi64x(
-                    iq2xs_grid[gindex[7]], iq2xs_grid[gindex[6]], iq2xs_grid[gindex[5]], iq2xs_grid[gindex[4]]);
-                const __m256i q2_3 = _mm256_set_epi64x(
-                    iq2xs_grid[gindex[11]], iq2xs_grid[gindex[10]], iq2xs_grid[gindex[9]], iq2xs_grid[gindex[8]]);
-                const __m256i q2_4 = _mm256_set_epi64x(
-                    iq2xs_grid[gindex[15]], iq2xs_grid[gindex[14]], iq2xs_grid[gindex[13]], iq2xs_grid[gindex[12]]);
-                
-                // Shuffle signs
-                const __m128i full_signs_l = _mm256_castsi256_si128(full_sign_bits);
-                const __m128i full_signs_h = _mm256_extractf128_si256(full_sign_bits, 1);
-                const __m256i full_signs_1 = MM256_SET_M128I(full_signs_l, full_signs_l);
-                const __m256i full_signs_2 = MM256_SET_M128I(full_signs_h, full_signs_h);
-                
-                __m256i signs;
-                signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_1);
-                signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
-                const __m256i q8s_1 = _mm256_sign_epi8(q8_1, _mm256_or_si256(signs, mone));
-                
-                signs = _mm256_shuffle_epi8(full_signs_1, block_sign_shuffle_2);
-                signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
-                const __m256i q8s_2 = _mm256_sign_epi8(q8_2, _mm256_or_si256(signs, mone));
-                
-                signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_1);
-                signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
-                const __m256i q8s_3 = _mm256_sign_epi8(q8_3, _mm256_or_si256(signs, mone));
-                
-                signs = _mm256_shuffle_epi8(full_signs_2, block_sign_shuffle_2);
-                signs = _mm256_cmpeq_epi8(_mm256_and_si256(signs, bit_selector_mask), bit_selector_mask);
-                const __m256i q8s_4 = _mm256_sign_epi8(q8_4, _mm256_or_si256(signs, mone));
-                
-                // Dot products
-                const __m256i dot1 = _mm256_maddubs_epi16(q2_1, q8s_1);
-                const __m256i dot2 = _mm256_maddubs_epi16(q2_2, q8s_2);
-                const __m256i dot3 = _mm256_maddubs_epi16(q2_3, q8s_3);
-                const __m256i dot4 = _mm256_maddubs_epi16(q2_4, q8s_4);
-                
-                // Apply scales
-                const __m256i sc1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+0)));
-                const __m256i sc2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+1)));
-                const __m256i sc3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+2)));
-                const __m256i sc4 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(ib32+3)));
-                
-                sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot1, sc1));
-                sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot2, sc2));
-                sumi1 = _mm256_add_epi32(sumi1, _mm256_madd_epi16(dot3, sc3));
-                sumi2 = _mm256_add_epi32(sumi2, _mm256_madd_epi16(dot4, sc4));
-            }
-            
-            accumf = _mm256_fmadd_ps(
-                _mm256_set1_ps(d),
-                _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
-                accumf);
-        }
-        
-        return 0.125f * hsum_float_8_avx(accumf);
+        return iq2_xs_q8_k_avx2_impl(n, x, y);
     }
 #endif
-#if defined(__AVX__)
-    // AVX fallback
-    const int nb = n / QK_K;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d;
-    }
-    return sum;
-#else
-    // Scalar fallback
-    const int nb = n / QK_K;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d;
-    }
-    return sum;
-#endif
+    // No AVX2 (old CPU, or a baseline/AVX-only compile unit): scalar oracle.
+    return iq2_xs_q8_k_scalar_impl(n, x, y);
 }
 
+/* IQ4_XS implementation - AVX2 extract
+ *
+ * The AVX2 loop used to be inlined in the dispatch under `if (cpu_has_avx2())`.
+ * Pulled out into a named function so that the dispatch has the same shape as
+ * the other IQ kernels (avx2_impl / scalar_impl), and so the scalar path can be
+ * validated against the exact same AVX2 body on an AVX2 host. Body unchanged. */
+#if defined(__AVX2__)
+__attribute__((target("avx2")))
+static float iq4_xs_q8_k_avx2_impl(int n, const block_iq4_xs* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
+    const __m128i m4b = _mm_set1_epi8(0x0f);
+
+    __m256 accum = _mm256_setzero_ps();
+
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const uint8_t* qs = x[ibl].qs;
+        const int8_t* q8 = y[ibl].qs;
+        uint16_t sh = x[ibl].scales_h;
+
+        __m256i sumi1 = _mm256_setzero_si256();
+        __m256i sumi2 = _mm256_setzero_si256();
+
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)qs); qs += 16;
+            const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)qs); qs += 16;
+
+            const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+            const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
+
+            const __m256i q4b_1 = MM256_SET_M128I(
+                _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+            const __m256i q4b_2 = MM256_SET_M128I(
+                _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+
+            const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
+            const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
+
+            // Calculate scales
+            const uint8_t ls1 = (x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30);
+            const uint8_t ls2 = (x[ibl].scales_l[ib/2] >> 4) | ((sh << 2) & 0x30);
+            sh >>= 4;
+
+            const __m256i p_1 = _mm256_madd_epi16(p16_1, _mm256_set1_epi16((int16_t)(ls1 - 32)));
+            const __m256i p_2 = _mm256_madd_epi16(p16_2, _mm256_set1_epi16((int16_t)(ls2 - 32)));
+
+            sumi1 = _mm256_add_epi32(p_1, sumi1);
+            sumi2 = _mm256_add_epi32(p_2, sumi2);
+        }
+
+        accum = _mm256_fmadd_ps(
+            _mm256_set1_ps(fp16_to_fp32(x[ibl].d) * y[ibl].d),
+            _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
+            accum);
+    }
+
+    return hsum_float_8_avx(accum);
+}
+#endif
+
+// Scalar oracle for IQ4_XS -- semantically complete (project rule: a fallback
+// must never be a stub). Ported expression-by-expression from
+// llama.cpp/ggml/src/ggml-cpu/quants.c:1283
+// ggml_vec_dot_iq4_xs_q8_K_generic.
+//
+// Top-level static for the same reason as iq3_xxs_q8_k_scalar_impl: this TU is
+// compiled with AVX2, so an `#else` branch would never be compiled and the old
+// "sum of d*d_y" stub went unnoticed for years.
+//
+// No sign table here: IQ4_XS is a plain 4-bit lookup into kvalues_iq4nl[16]
+// (low nibble -> first 16 weights, high nibble -> next 16), unlike the IQ2/IQ3
+// grid formats. `ls` HAS the -32 bias (unlike IQ3_XXS), and there is NO 0.25f
+// output factor -- sumf is already the final result.
+static float iq4_xs_q8_k_scalar_impl(int n, const block_iq4_xs* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    float sumf = 0;
+    for (int ibl = 0; ibl < nb; ++ibl) {
+        const float d4d8 = fp16_to_fp32(x[ibl].d) * y[ibl].d;
+        uint16_t h = x[ibl].scales_h;
+        const uint8_t* qs = x[ibl].qs;
+        const int8_t*  q8 = y[ibl].qs;
+        for (int ib = 0; ib < QK_K/32; ib += 2) {
+            const uint8_t ls1 = (x[ibl].scales_l[ib/2] & 0xf) | ((h << 4) & 0x30);
+            const uint8_t ls2 = (x[ibl].scales_l[ib/2] >>  4) | ((h << 2) & 0x30);
+            h >>= 4;
+            const float d1 = d4d8*(ls1 - 32);
+            const float d2 = d4d8*(ls2 - 32);
+            int sumi1 = 0, sumi2 = 0;
+            for (int j = 0; j < 16; ++j) {
+                sumi1 += q8[j+ 0] * kvalues_iq4nl[qs[j] & 0xf];
+                sumi2 += q8[j+16] * kvalues_iq4nl[qs[j] >>  4];
+            }
+            sumf += d1 * (sumi1 + sumi2);
+            qs += 16;
+            q8 += 32;
+            sumi1 = sumi2 = 0;
+            for (int j = 0; j < 16; ++j) {
+                sumi1 += q8[j+ 0] * kvalues_iq4nl[qs[j] & 0xf];
+                sumi2 += q8[j+16] * kvalues_iq4nl[qs[j] >>  4];
+            }
+            sumf += d2 * (sumi1 + sumi2);
+            qs += 16;
+            q8 += 32;
+        }
+    }
+    return sumf;
+}
+
+/* IQ4_XS dispatch function */
 float iq4_xs_q8_k(int n, const void* vx, const void* vy) {
     const block_iq4_xs* x = (const block_iq4_xs*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
+    // QWEN35_IQ_FORCE_SCALAR: same hook as iq3_xxs_q8_k (see there).
+    if (getenv("QWEN35_IQ_FORCE_SCALAR") != NULL) {
+        return iq4_xs_q8_k_scalar_impl(n, x, y);
+    }
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
-        const int nb = n / QK_K;
-        
-        const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
-        const __m128i m4b = _mm_set1_epi8(0x0f);
-        
-        __m256 accum = _mm256_setzero_ps();
-        
-        for (int ibl = 0; ibl < nb; ++ibl) {
-            const uint8_t* qs = x[ibl].qs;
-            const int8_t* q8 = y[ibl].qs;
-            uint16_t sh = x[ibl].scales_h;
-            
-            __m256i sumi1 = _mm256_setzero_si256();
-            __m256i sumi2 = _mm256_setzero_si256();
-            
-            for (int ib = 0; ib < QK_K/32; ib += 2) {
-                const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)qs); qs += 16;
-                const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)qs); qs += 16;
-                
-                const __m256i q8b_1 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-                const __m256i q8b_2 = _mm256_loadu_si256((const __m256i*)q8); q8 += 32;
-                
-                // Unpack 4-bit values and lookup in kvalues_iq4nl
-                const __m256i q4b_1 = MM256_SET_M128I(
-                    _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
-                    _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
-                const __m256i q4b_2 = MM256_SET_M128I(
-                    _mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
-                    _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
-                
-                const __m256i p16_1 = mul_add_epi8(q4b_1, q8b_1);
-                const __m256i p16_2 = mul_add_epi8(q4b_2, q8b_2);
-                
-                // Calculate scales
-                const uint8_t ls1 = (x[ibl].scales_l[ib/2] & 0xf) | ((sh << 4) & 0x30);
-                const uint8_t ls2 = (x[ibl].scales_l[ib/2] >> 4) | ((sh << 2) & 0x30);
-                sh >>= 4;
-                
-                const __m256i p_1 = _mm256_madd_epi16(p16_1, _mm256_set1_epi16((int16_t)(ls1 - 32)));
-                const __m256i p_2 = _mm256_madd_epi16(p16_2, _mm256_set1_epi16((int16_t)(ls2 - 32)));
-                
-                sumi1 = _mm256_add_epi32(p_1, sumi1);
-                sumi2 = _mm256_add_epi32(p_2, sumi2);
-            }
-            
-            accum = _mm256_fmadd_ps(
-                _mm256_set1_ps(fp16_to_fp32(x[ibl].d) * y[ibl].d),
-                _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1, sumi2)),
-                accum);
-        }
-        
-        return hsum_float_8_avx(accum);
+        return iq4_xs_q8_k_avx2_impl(n, x, y);
     }
 #endif
 #if defined(__AVX__)
-    // AVX fallback
+    // AVX fallback (machine lacks AVX2 but this unit was built with AVX).
+    {
     const int nb = n / QK_K;
     
     const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
@@ -965,14 +1079,10 @@ float iq4_xs_q8_k(int n, const void* vx, const void* vy) {
     }
     
     return hsum_float_8_avx(accum);
-#else
-    // Scalar fallback
-    const int nb = n / QK_K;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d;
     }
-    return sum;
+#else
+    // No AVX (baseline compile unit): scalar oracle, not "sum of scales".
+    return iq4_xs_q8_k_scalar_impl(n, x, y);
 #endif
 }
 
@@ -1601,21 +1711,81 @@ static float iq3_s_q8_k_avx2_impl(int n, const block_iq3_s* x, const block_q8_K*
 }
 #endif
 
+// Scalar oracle for IQ3_S -- semantically complete (project rule: a fallback
+// must never be a stub). It replaces the previous fallback that only summed
+// fp16_to_fp32(x[i].d) * y[i].d and so returned garbage on any machine
+// without AVX2 (or inside a baseline/AVX-only compile unit).
+//
+// Ported expression-by-expression from
+// llama.cpp/ggml/src/ggml-cpu/quants.c:1094
+// ggml_vec_dot_iq3_s_q8_K_generic:
+//   grid  = iq3s_grid[qs[2l] | ((qh[ib32] << (8-2l)) & 256)]  (iq_tables.h)
+//   signs = kmask_iq2xs[j] bit j of x[i].signs[l]  (mask table, NOT
+//           keven_signs_q2xs -- that one is the int8 expansion used by SIMD)
+//   scales= 2*(nibble)+1, ls1 = low nibble, ls2 = high nibble
+//   output= *s = sumf (the generic version applies no extra 0.125 factor).
+static float iq3_s_q8_k_scalar_impl(int n, const block_iq3_s* x, const block_q8_K* y) {
+    const int nb = n / QK_K;
+
+    float sumf = 0.f;
+    for (int i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * y[i].d;
+        const uint8_t* qs = x[i].qs;
+        const uint8_t* qh = x[i].qh;
+        const uint8_t* signs = x[i].signs;
+        const int8_t*  q8 = y[i].qs;
+        int32_t bsum = 0;
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const uint32_t ls1 = 2*(x[i].scales[ib32/2] & 0xf) + 1;
+            const uint32_t ls2 = 2*(x[i].scales[ib32/2] >>  4) + 1;
+            int32_t sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid1 = (const uint8_t*)(iq3s_grid + (qs[2*l+0] | ((qh[ib32+0] << (8-2*l)) & 256)));
+                const uint8_t* grid2 = (const uint8_t*)(iq3s_grid + (qs[2*l+1] | ((qh[ib32+0] << (7-2*l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += grid1[j] * q8[j+0] * (signs[l] & kmask_iq2xs[j+0] ? -1 : 1);
+                    sumi += grid2[j] * q8[j+4] * (signs[l] & kmask_iq2xs[j+4] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qs += 8;
+            signs += 4;
+            bsum += sumi * ls1;
+            sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const uint8_t* grid1 = (const uint8_t*)(iq3s_grid + (qs[2*l+0] | ((qh[ib32+1] << (8-2*l)) & 256)));
+                const uint8_t* grid2 = (const uint8_t*)(iq3s_grid + (qs[2*l+1] | ((qh[ib32+1] << (7-2*l)) & 256)));
+                for (int j = 0; j < 4; ++j) {
+                    sumi += grid1[j] * q8[j+0] * (signs[l] & kmask_iq2xs[j+0] ? -1 : 1);
+                    sumi += grid2[j] * q8[j+4] * (signs[l] & kmask_iq2xs[j+4] ? -1 : 1);
+                }
+                q8 += 8;
+            }
+            qs += 8;
+            signs += 4;
+            bsum += sumi * ls2;
+        }
+        sumf += d * bsum;
+    }
+    return sumf;
+}
+
 /* IQ3_S dispatch function */
 float iq3_s_q8_k(int n, const void* vx, const void* vy) {
     const block_iq3_s* x = (const block_iq3_s*)vx;
     const block_q8_K* y = (const block_q8_K*)vy;
-    
+
+    // QWEN35_IQ_FORCE_SCALAR: same hook as iq2_xs_q8_k (see there).
+    if (getenv("QWEN35_IQ_FORCE_SCALAR") != NULL) {
+        return iq3_s_q8_k_scalar_impl(n, x, y);
+    }
+
 #if defined(__AVX2__)
     if (cpu_has_avx2()) {
         return iq3_s_q8_k_avx2_impl(n, x, y);
     }
 #endif
-    // Scalar fallback
-    const int nb = n / QK_K;
-    float sum = 0.0f;
-    for (int i = 0; i < nb; ++i) {
-        sum += fp16_to_fp32(x[i].d) * y[i].d;
-    }
-    return sum;
+    // No AVX2 (old CPU or baseline/AVX-only compile unit): scalar oracle.
+    return iq3_s_q8_k_scalar_impl(n, x, y);
 }
+

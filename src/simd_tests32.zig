@@ -392,3 +392,86 @@ test "simd kern32: horizontal reduction, uniform weights / varying activation" {
         try std.testing.expect(rel < 1e-6);
     }
 }
+
+// IQ4_NL table cross-check: kvalues_iq4nl is written out three times --
+// k32_iq4nl_tab in kernels32.c, kvalues_iq4nl in iq_kernels.c (both covered by
+// C11 _Static_assert against a restated enum) and kvalues_iq4nl in
+// src/quant_dequant.zig, which C cannot see. Those C checks only pin an array
+// to its own restated expectation, never to the other side, and the Zig copy
+// has no check at all.
+//
+// These two tests close the gap from the Zig side: sweep every 4-bit code
+// through the block layout (low nibble -> elements 0..15, high nibble ->
+// elements 16..31, see ggml dequantize_row_iq4_nl) so that each table entry
+// shows up in the dot product, and compare quant_dequant's table with the one
+// the C kernel actually multiplies by. An edit on either side alone fails.
+// Guard on the IQ4_NL value table, which exists three times: k32_iq4nl_tab
+// (kernels32.c), kvalues_iq4nl (iq_kernels.c) and kvalues_iq4nl in
+// src/quant_dequant.zig. The two C copies are pinned by _Static_assert against
+// a restated enum, and Zig cannot see them; the Zig copy had no check at all.
+// So an edit to one side alone (wrong value, swapped entry, transposed table)
+// would silently produce garbage dot products -- this is the same failure class
+// as the ksigns_iq2xs / keven_signs_q2xs mixup.
+//
+// The test drives the real C kernel entry point (c_kernels.dotIq4NlQ8_0) and
+// the Zig scalar oracle (simd_ref), and compares both against a value computed
+// here from quant_dequant.kvalues_iq4nl using the ggml block layout
+// (block_iq4_nl: f16 d @0, 16 packed code bytes; element j -> byte j low
+// nibble, element 16+j -> byte j high nibble). Each of the 16 codes is placed
+// in every nibble slot in turn, so a table entry cannot hide behind a value it
+// shares with another entry or with the all-zero default.
+test "simd kern32: IQ4_NL table matches C kernel (Zig side guard)" {
+    const nb = 8; // 8 x 32 = 256 elements: exercises the multi-block loop
+    const c = @import("c_kernels.zig").dotIq4NlQ8_0;
+    const r = simd_ref.dot32.iq4_nl_q8_0_ref;
+
+    var y: [nb * q8_bytes]u8 = @splat(0);
+    var x: [nb * 18]u8 = @splat(0);
+    for (0..nb) |blk| {
+        std.mem.writeInt(u16, x[blk * 18 ..][0..2], 0x3C00, .little); // f16 1.0
+        std.mem.writeInt(u16, y[blk * q8_bytes ..][0..2], 0x3C00, .little); // f16 1.0
+        for (0..32) |j| y[blk * q8_bytes + 2 + j] = 1; // q8 activations = 1
+    }
+    const n = nb * 32;
+
+    for (0..16) |k| {
+        for (0..2) |half| {
+            // Code k in nibble slot k (low half = elements 0..15, high half =
+            // elements 16..31), code 0 everywhere else.
+            for (0..nb) |blk| {
+                for (0..16) |j| {
+                    const code: u8 = if (j == k) @intCast(k) else 0;
+                    x[blk * 18 + 2 + j] = if (half == 0) code else code << 4;
+                }
+            }
+            // d = 1 and 32 activations of 1, so each block contributes the sum
+            // of its 32 decoded int8 values = kvalues_iq4nl[k] + 31 * [0].
+            const got_c = c(n, &x, &y);
+            const got_r = r(n, &x, &y);
+            const vk: f32 = @floatFromInt(quant.kvalues_iq4nl[k]);
+            const v0: f32 = @floatFromInt(quant.kvalues_iq4nl[0]);
+            const want = @as(f32, @floatFromInt(nb)) * (vk + 31.0 * v0);
+            std.debug.print("  iq4nl tab[{d}] half={d} C={e} ref={e} zig={e} want={e}\n",
+                .{ k, half, got_c, got_r, vk, want });
+            try std.testing.expectEqual(want, got_c);
+            try std.testing.expectEqual(want, got_r);
+        }
+    }
+
+    // Every code in every nibble slot at once: catches a table that is right
+    // per-entry but applied to the wrong elements.
+    var sum: f32 = 0;
+    for (0..16) |k| sum += @as(f32, @floatFromInt(quant.kvalues_iq4nl[k]));
+    for (0..nb) |blk| {
+        for (0..16) |j| {
+            const code: u8 = @intCast(j);
+            x[blk * 18 + 2 + j] = code | (code << 4);
+        }
+    }
+    const all_c = c(n, &x, &y);
+    const all_r = r(n, &x, &y);
+    const all_want = @as(f32, @floatFromInt(nb)) * 2.0 * sum;
+    std.debug.print("  iq4nl all-codes C={e} ref={e} want={e}\n", .{ all_c, all_r, all_want });
+    try std.testing.expectEqual(all_want, all_c);
+    try std.testing.expectEqual(all_want, all_r);
+}

@@ -14,15 +14,14 @@
 //   IQ3_S  : d(2) qs[64] qh[8] signs[32] scales[4]        = 110
 
 const std = @import("std");
-const ggml_tables = @import("ggml_tables.zig");
-const ggml_tables_extra = @import("ggml_tables_extra.zig");
+const ggml_tables = @import("iq_tables.zig");
 const simd_ref = @import("simd_ref.zig");
 
 const QK_K: usize = 256;
 const QK4_NL: usize = 32;
 
-const kvalues_iq4nl: [16]i8 = .{ -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113 };
-const kmask_iq2xs: [8]u8 = .{ 1, 2, 4, 8, 16, 32, 64, 128 };
+pub const kvalues_iq4nl = ggml_tables.kvalues_iq4nl;
+const kmask_iq2xs = ggml_tables.kmask_iq2xs;
 const iq1s_delta: f32 = 0.125;
 
 // f16 field at row[off..off+2] (little-endian) -> f32, exact.
@@ -752,7 +751,7 @@ pub fn dequantIQ2XXS(row: []const u8, out: []f32) void {
         const aux1: u32 = @bitCast([4]u8{ a[4], a[5], a[6], a[7] });
         const db = d * (0.5 + @as(f32, @floatFromInt(aux1 >> 28))) * 0.25;
         for (0..4) |l| {
-            const grid: [8]u8 = @bitCast(ggml_tables_extra.iq2xxs_grid[a[l]]);
+            const grid: [8]u8 = @bitCast(ggml_tables.iq2xxs_grid[a[l]]);
             const signs: u8 = ggml_tables.ksigns_iq2xs[(aux1 >> @as(u5, @intCast(7 * l))) & 127];
             for (0..8) |j| {
                 out[y + j] = db * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0);
@@ -772,7 +771,7 @@ pub fn rowDotIQ2XXS(row: []const u8, x: []const f32) f32 {
         const aux1: u32 = @bitCast([4]u8{ a[4], a[5], a[6], a[7] });
         const db = d * (0.5 + @as(f32, @floatFromInt(aux1 >> 28))) * 0.25;
         for (0..4) |l| {
-            const grid: [8]u8 = @bitCast(ggml_tables_extra.iq2xxs_grid[a[l]]);
+            const grid: [8]u8 = @bitCast(ggml_tables.iq2xxs_grid[a[l]]);
             const signs: u8 = ggml_tables.ksigns_iq2xs[(aux1 >> @as(u5, @intCast(7 * l))) & 127];
             for (0..8) |j| {
                 acc += db * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (signs & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + j];
@@ -796,7 +795,7 @@ pub fn dequantIQ2XS(row: []const u8, out: []f32) void {
         const db1 = d * (0.5 + @as(f32, @floatFromInt(sc >> 4))) * 0.25;
         for (0..4) |l| {
             const q16: u16 = @bitCast([2]u8{ qs16[(4 * ib32 + l) * 2], qs16[(4 * ib32 + l) * 2 + 1] });
-            const grid: [8]u8 = @bitCast(ggml_tables_extra.iq2xs_grid[q16 & 511]);
+            const grid: [8]u8 = @bitCast(ggml_tables.iq2xs_grid[q16 & 511]);
             const signs: u8 = ggml_tables.ksigns_iq2xs[q16 >> 9];
             const db: f32 = if (l / 2 == 0) db0 else db1;
             for (0..8) |j| {
@@ -819,7 +818,7 @@ pub fn rowDotIQ2XS(row: []const u8, x: []const f32) f32 {
         const db1 = d * (0.5 + @as(f32, @floatFromInt(sc >> 4))) * 0.25;
         for (0..4) |l| {
             const q16: u16 = @bitCast([2]u8{ qs16[(4 * ib32 + l) * 2], qs16[(4 * ib32 + l) * 2 + 1] });
-            const grid: [8]u8 = @bitCast(ggml_tables_extra.iq2xs_grid[q16 & 511]);
+            const grid: [8]u8 = @bitCast(ggml_tables.iq2xs_grid[q16 & 511]);
             const signs: u8 = ggml_tables.ksigns_iq2xs[q16 >> 9];
             const db: f32 = if (l / 2 == 0) db0 else db1;
             for (0..8) |j| {
@@ -847,7 +846,7 @@ pub fn dequantIQ2S(row: []const u8, out: []f32) void {
             const qsv = row[2 + 4 * ib32 + l];
             const shifted: u16 = (qh_val << @as(u4, @intCast(8 - 2 * l))) & 0x300;
             const idx: u16 = qsv | shifted;
-            const grid: [8]u8 = @bitCast(ggml_tables_extra.iq2s_grid[idx]);
+            const grid: [8]u8 = @bitCast(ggml_tables.iq2s_grid[idx]);
             const sign_byte = row[34 + 4 * ib32 + l];
             for (0..8) |j| {
                 out[y + j] = dl * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (sign_byte & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0);
@@ -871,7 +870,7 @@ pub fn rowDotIQ2S(row: []const u8, x: []const f32) f32 {
             const qsv = row[2 + 4 * ib32 + l];
             const shifted: u16 = (qh_val << @as(u4, @intCast(8 - 2 * l))) & 0x300;
             const idx: u16 = qsv | shifted;
-            const grid: [8]u8 = @bitCast(ggml_tables_extra.iq2s_grid[idx]);
+            const grid: [8]u8 = @bitCast(ggml_tables.iq2s_grid[idx]);
             const sign_byte = row[34 + 4 * ib32 + l];
             for (0..8) |j| {
                 acc += dl * @as(f32, @floatFromInt(grid[j])) * @as(f32, if (sign_byte & ggml_tables.kmask_iq2xs[j] != 0) -1.0 else 1.0) * x[y + j];
@@ -957,7 +956,7 @@ pub fn dequantIQ1S(row: []const u8, out: []f32) void {
         const delta: f32 = if (qh16 & 0x8000 != 0) -iq1s_delta else iq1s_delta;
         for (0..4) |l| {
             const idx: u16 = qs[4 * ib + l] | @as(u16, ((qh16 >> @as(u4, @intCast(3 * l))) & 7) << 8);
-            const grid: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx]);
+            const grid: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx]);
             for (0..8) |j| {
                 out[y + j] = dl * (@as(f32, @floatFromInt(grid[j])) + delta);
             }
@@ -978,7 +977,7 @@ pub fn rowDotIQ1S(row: []const u8, x: []const f32) f32 {
         const delta: f32 = if (qh16 & 0x8000 != 0) -iq1s_delta else iq1s_delta;
         for (0..4) |l| {
             const idx: u16 = qs[4 * ib + l] | @as(u16, ((qh16 >> @as(u4, @intCast(3 * l))) & 7) << 8);
-            const grid: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx]);
+            const grid: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx]);
             for (0..8) |j| {
                 acc += dl * (@as(f32, @floatFromInt(grid[j])) + delta) * x[y + j];
             }
@@ -1016,10 +1015,10 @@ pub fn dequantIQ1M(row: []const u8, out: []f32) void {
         const d1: f32 = if (qh0 & 0x80 != 0) -iq1s_delta else iq1s_delta;
         const d2: f32 = if (qh1 & 0x08 != 0) -iq1s_delta else iq1s_delta;
         const d3: f32 = if (qh1 & 0x80 != 0) -iq1s_delta else iq1s_delta;
-        const g0: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx0]);
-        const g1: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx1]);
-        const g2: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx2]);
-        const g3: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx3]);
+        const g0: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx0]);
+        const g1: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx1]);
+        const g2: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx2]);
+        const g3: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx3]);
         for (0..8) |j| {
             out[y + j] = dl1 * (@as(f32, @floatFromInt(g0[j])) + d0);
             out[y + 8 + j] = dl1 * (@as(f32, @floatFromInt(g1[j])) + d1);
@@ -1057,10 +1056,10 @@ pub fn rowDotIQ1M(row: []const u8, x: []const f32) f32 {
         const d1: f32 = if (qh0 & 0x80 != 0) -iq1s_delta else iq1s_delta;
         const d2: f32 = if (qh1 & 0x08 != 0) -iq1s_delta else iq1s_delta;
         const d3: f32 = if (qh1 & 0x80 != 0) -iq1s_delta else iq1s_delta;
-        const g0: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx0]);
-        const g1: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx1]);
-        const g2: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx2]);
-        const g3: [8]i8 = @bitCast(ggml_tables_extra.iq1s_grid[idx3]);
+        const g0: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx0]);
+        const g1: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx1]);
+        const g2: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx2]);
+        const g3: [8]i8 = @bitCast(ggml_tables.iq1s_grid[idx3]);
         for (0..8) |j| {
             acc += dl1 * (@as(f32, @floatFromInt(g0[j])) + d0) * x[y + j];
             acc += dl1 * (@as(f32, @floatFromInt(g1[j])) + d1) * x[y + 8 + j];
