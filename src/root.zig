@@ -5,6 +5,8 @@
 const std = @import("std");
 
 pub const gguf = @import("gguf.zig");
+pub const backend = @import("backend.zig");
+pub const backend_cpu = @import("backend_cpu.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const engine = @import("engine.zig");
 pub const quant_dequant = @import("quant_dequant.zig");
@@ -22,5 +24,9 @@ test {
 
 test {
     _ = @import("iq_table_tests.zig");
+}
+
+test {
+    _ = @import("backend_cpu.zig");
 }
 
