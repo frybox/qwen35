@@ -490,6 +490,20 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
         },
         .q8_0b => |q| {
             const blen = q.row_blocks * 34;
+            // Same kernel as the non-batched `.q8_0` case: one call per row into
+            // the C SIMD dot (q8_0_q8_0 walks all n/32 blocks internally).  The
+            // previous version expanded the blocks in a scalar per-element loop
+            // `for (0..32) |j| i8*i8`, which made batched prefill several times
+            // slower than decode instead of faster -- it was the reason a larger
+            // K barely helped (measured: 16->64 only +3.7% before this fix).
+            //
+            // NOTE: not bit-identical to the old scalar loop -- the AVX2 kernel
+            // accumulates in 8-wide float lanes with FMA (kernels32.c:421), so
+            // the summation order differs and only the rounding changes.  Row
+            // ORDER is unchanged (rows are independent), so the result is still
+            // deterministic run to run.
+            const rowdot = q8RowDot() orelse unreachable;
+            const n = q.row_blocks * 32;
             var r = lo;
             while (r < hi) : (r += 1) {
                 const tok = r / q.rows;
@@ -497,18 +511,7 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
                 const q8sl: []const u8 = q.q8[tok * q.q8_len ..][0..blen];
                 const wrow = q.data[rr * blen ..][0..blen];
                 if (stat_on) _ = statq8.fetchAdd(@intCast(blen), .monotonic);
-                var acc: f32 = 0;
-                for (0..q.row_blocks) |b| {
-                    const wb = wrow[b * 34 ..][0..34];
-                    const wscale: f32 = @as(f32, @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, wb[0..2], .little)))));
-                    const xscale: f32 = @as(f32, @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, q8sl[b * 34 ..][0..2], .little)))));
-                    var dot: i32 = 0;
-                    for (0..32) |j| {
-                        dot += @as(i32, @as(i8, @bitCast(wb[2 + j]))) * @as(i32, @as(i8, @bitCast(q8sl[b * 34 + 2 + j])));
-                    }
-                    acc += wscale * @as(f32, @floatFromInt(dot)) * xscale;
-                }
-                q.out[tok * q.rows + rr] = acc;
+                q.out[tok * q.rows + rr] = rowdot(n, wrow.ptr, q8sl.ptr);
             }
         },
         .f32b => |q| {
