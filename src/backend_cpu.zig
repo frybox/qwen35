@@ -253,10 +253,18 @@ fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, poo
 }
 
 /// Zig scalar reference path (`quant.rowDotXXX` over f32 activations),
-/// shared by the serial matvec, the K-token batch and
-/// QWEN35_FORCE_ROWDOT.  `act_b32` only decides which activation block
-/// width the caller's scratch arrays were sized for; it is unused here
-/// because this path never quantizes the activation.
+/// shared by the serial matvec and the K-token batch (the entry point for
+/// types with no C row dot, and for IQ types).  `act_b32` only decides which
+/// activation block width the caller's scratch arrays were sized for; it is
+/// unused here because this path never quantizes the activation.
+///
+/// WARNING: this path is only correct for 256-element-block types.  It hands
+/// the pool `.row_bytes = blockBytes()` (ONE block) while the pool's
+/// `quant_scalar` loop reads `xs[b*256 .. b*256+256]` -- i.e. it assumes one
+/// 256-element row-block per `bpr` step.  For q4_0/iq4_nl (block=32,
+/// row-block=256) the row stride and the activation window are therefore
+/// wrong.  Not reachable for those types today (they have C row dots), but do
+/// not use this as a Q4_0/IQ4_NL oracle.
 fn matvecQuantScalar(out: []f32, w: QuantRow, x: []const f32, cols: usize, rows: usize, bpr: usize, pool: ?*pool_mod.Pool) void {
     const rowDot = rowDotFor(w.ttype) orelse unreachable; // only supported types load as .quant
     pool_mod.parallel(pool, .{ .quant_scalar = .{

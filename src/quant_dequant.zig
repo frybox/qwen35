@@ -1294,7 +1294,7 @@ test "quant_dequant: f16 -> f32 exhaustive over all 65536 codes" {
 // ---------------------------------------------------------------------------
 // f16 / bf16 rows (unquantized 2-byte weights, 256 elements per "row block").
 // These are the scalar per-element references the f16_q8_0 / bf16_q8_0 C
-// kernels are A/B'd against (QWEN35_KERNEL_CHECK=1), and what the old
+// kernels are A/B'd against, and what the old
 // f32-materialization path effectively computed.  Same accumulation shape as
 // the kernels: one f32 accumulator per 32-element chunk, added row-major.
 // ---------------------------------------------------------------------------

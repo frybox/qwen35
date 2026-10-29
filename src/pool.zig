@@ -209,8 +209,8 @@ pub const Task = union(enum) {
         dot256: simd_api.Dot256,
     },
     /// Zig scalar per-block reference (`quant.rowDotXXX` against the f32
-    /// activation): the oracle the SIMD kernels are checked against, used for
-    /// IQ types that have no C dot and by QWEN35_FORCE_ROWDOT.
+    /// activation): the oracle the SIMD kernels are checked against, and the
+    /// fallback for IQ types that have no C dot.
     quant_scalar: struct {
         out: [*]f32,
         data: []const u8,

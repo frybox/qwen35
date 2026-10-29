@@ -16,6 +16,28 @@
 - **CUDA kernel**：使用 **CUDA C/C++**，放在 `src/kernels/cuda/`（尚未建立，新建时遵循同一约定）。
 - Zig 侧只负责模型加载、内存布局、调度、`extern` 声明与分发（`src/c_kernels.zig`、
   `src/simd_dispatch.zig`、`src/simd_api.zig`）。quant / dequant / matvec 等数值核心都应在 C kernel 中完成。
+
+### 1.1 模块分层（2026-10 重构后，必须遵守）
+
+```
+gguf.zig          叶子：Tensor/TensorType + QuantRow（纯字节布局）+ blockElems/blockBytes
+   ↑
+backend.zig       LinearW + Exec 接口/VTable + selectBackend()
+   ↑
+backend_cpu.zig   CPU 实现：matvec 全族 / loadLinear / dequant / scratch / pool / tier / prof
+   ↑
+engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
+```
+
+- `engine.zig` 的 import 只有 `std`、`gguf`、`backend`、`backend_cpu`、`sampler`。
+  **不要再往 engine 里塞 kernel/quant/线程池的 import**；一切硬件能力经 `backend.Exec` 调用。
+- 换后端（CUDA 等）= 新增一个实现 `backend.Exec` 的模块，`engine.zig` 一行不改。
+- `QuantRow.blocks_per_row` 的**单位是 row-block**：`q8_0` 是 32 元素，**其余类型一律 256 元素**
+  （含 `q4_0`/`q4_1`/`q5_0`/`q5_1`/`iq4_nl`/`mxfp4`——GGUF 把它们按 8×32 帧成 256 元素的 row-block）。
+  所以 `cols() = blocks_per_row * rowBlockElems()`，`rowBlockElems(q4_0) == 256`，不是 32。
+  **踩过的坑**：把 `rowBlockElems` 改成"所有 32 元素块类型都返回 32"会让 `cols()` 小 8 倍，
+  且 `matvecQuant` 的自洽断言仍然通过，只在 Q4_0/IQ4_NL 上静默输出乱码。
+  `rowBlockElems` 只按 `t == .q8_0` 分支，不要按 `blockElems(t) == 32` 分支。
 - C kernel 按指令集分层提供实现（AVX2 / AVX / scalar fallback）并运行时分发；
   **scalar fallback 必须是语义完整的正确实现，禁止占位或简化版本**
   （已知违规：`iq_kernels.c` 中 `iq3_xxs_q8_k` 的 `#else` 分支只累加 scale，未算点积）。
@@ -42,25 +64,19 @@
 
 ## 4. 正确性与测试
 
-- **当前 `make test` 基线是红的，不是绿色**（2026-10 实测：60 个用例中 54 pass / 4 fail / 2 crash）。
-  规则改为：**改动前先记录基线，改动后不得新增失败**；已有失败要当 bug 修，
-  不要用 `skip` / 放宽阈值 / 删除用例的方式"变绿"。
-  已知失败清单（`zig build test --cache-dir /tmp/qwen35-cache`）：
-  - `simd_tests_iq_a/b/c.test.simd kerniq*: SIMD (3 tiers) + _ref vs engine rowDot (synthetic)` — 3 个失败。
-    输出里可见运行时对拍偏差：`iq2_xxs_q8_k = 0.0218`、`iq3_xxs_q8_k = 0.00173`、
-    `iq4_xs_q8_k = 0.00397`、`iq2_xs_q8_k = 0.00066`；
-    **这些正是 C kernel(用 `keven_signs_q2xs`) 与 Zig rowDot(用 `ksigns_iq2xs`) 符号表不一致的表现**，
-    与 §1 的表格问题、以及模型乱码同源——修符号表后这批用例应转绿，是修复的验收信号。
-  - `simd_tests32.test.simd kern32: SIMD (3 tiers) vs scalar ref` 与
-    `... row kernels == sum of block kernels (3 tiers)` — 2 个 **crash**：
-    `panic: load of misaligned address ... for type 'const uint32_t'`（疑为测试/kernel 构造或读取数据未对齐）。
-  - `simd_tests32.test.simd kern32: real testdata rows vs engine rowDot` — 1 个失败。
-- 测试入口：`src/root.zig` 里的 `test { _ = @import("simd_tests_*.zig"); }` 列表
-  + `refAllDecls`；`make test` 实际跑两个 test artifact（`mod_tests` 与 `exe_tests`，见 `build.zig`），
-  且 `mod_tests` 会 `linkLibrary(c_kernels)`，因此**C kernel 也在对拍范围内**。
-- 对拍测试文件：`src/simd_tests32.zig`、`src/simd_tests256.zig`、
-  `src/simd_tests_iq_a.zig` / `_iq_b.zig` / `_iq_c.zig`；C kernel 的 Zig 侧调用封装在 `src/simd_c.zig`。
-  **新增 kernel 必须在这里补一个"Zig 标量参照 vs C SIMD 结果"的用例**，并在 `src/root.zig` 挂上 import。
+- **当前 `zig build test` 是绿的：17/17 steps succeeded, `test success`**（2026-10 重构后实测）。
+  在此之前旧的 simd 对拍用例（60 用例 / 54 pass / 4 fail / 2 crash）已随 `33e2bb8`
+  连同 `simd_tests*.zig`、`bench.zig` 一起**删除**。
+- **必须知道的代价**：删掉那 5 个 `simd_tests*.zig` 后，**C kernel 不再有 Zig 侧对拍覆盖**。
+  §1 提到的 IQ 符号表风险（`ksigns_iq2xs` vs `keven_signs_q2xs` 混用）现在**没有任何自动化测试能发现**，
+  只能靠端到端探针（见 §6）肉眼看输出是否通顺。
+  规则：**改动前先跑一遍 `zig build test` 与 §6 的探针记录基线，改动后不得新增失败或让探针退化**。
+  不要用 `skip` / 放宽阈值 / 删用例的方式"变绿"。
+- 现有测试入口：`src/root.zig` 的 import 列表 + `refAllDecls`；`make test` 跑两个 test artifact
+  （`mod_tests` 与 `exe_tests`，见 `build.zig`），`mod_tests` 会 `linkLibrary(c_kernels)`。
+- `src/backend_cpu.zig` 内有少量内联测试（如 Q8_0 matvec 用例），新增后端能力时在此补对拍。
+  **新增 kernel 仍应补一个"Zig 标量参照 vs C SIMD 结果"的用例**——对被删掉的这批，
+  想要恢复保护就得重建（可用 `git show 33e2bb8^:src/simd_tests32.zig` 取回原文）。
 - 端到端验收：`tests/run_acceptance.sh [file.gguf]`（注意其默认 ZIG 仍指向 0.16.0，
   与本项目 0.17.0 不一致，跑之前显式 `ZIG=<0.17.0 路径>`）。
 - 量化格式的**权威源码**在本机可直接查：
@@ -81,25 +97,32 @@
 |------|------|
 | `QWEN35_SIMD_TIER` | 强制 ISA tier，取值 `baseline`/`avx2`/`avx512`/`avx512vnni`/`avx512vbmi`（其它值静默忽略），定位某档 kernel 出错 |
 | `QWEN35_FORCE_SCALAR` | **值为逗号分隔的 probe 名**（`avx2 avx512f avx512bw avx512vl avx512dq vnni vbmi fma f16c ssse3`），关掉这些特性探测，让对应 dispatcher 走标量 oracle 路径。用于 A/B "垃圾来自 SIMD kernel 还是引擎" |
-| `QWEN35_FORCE_F32` | 全部量化权重走 Zig dequant + f32 matvec，绕开所有 C kernel（A/B 两半流水线） |
-| `QWEN35_F32_TYPES` | 只把列出的类型转 f32（空列表 = FORCE_F32 原语义，q8_0 保持原生） |
-| `QWEN35_FORCE_ROWDOT` | 强制 Zig 量化域 rowDot |
-| `QWEN35_KERNEL_CHECK` | kernel 结果与 Zig 参照逐块比对 |
+| `QWEN35_FORCE_F32` | ~~全部量化权重走 Zig dequant + f32 matvec~~ **已于 `0cdfb23` 删除**，设了也无效 |
+| `QWEN35_F32_TYPES` | ~~只把列出的类型转 f32~~ **已于 `0cdfb23` 删除** |
+| `QWEN35_FORCE_ROWDOT` | ~~强制 Zig 量化域 rowDot~~ **已于 `0cdfb23` 删除** |
+| `QWEN35_KERNEL_CHECK` | ~~kernel 结果与 Zig 参照逐块比对~~ **已于 `0cdfb23` 删除** |
 | `QWEN35_DUMP_OUT` / `QWEN35_DUMP_IDS` | 导出中间输出 / token id |
 | `QWEN35_NO_BATCH` | 关闭 K-token 批量 prefill chunk |
-| `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析 |
+| `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析（`PROF-M` 行由 `backend_cpu` 输出） |
 
 调试方法论：
-1. **先定位是"哪一层"错**，不要猜。用 tier / scalar / force_f32 三个开关做二分，
-   把"C kernel 侧"与"Zig 侧"彻底隔离开。
-2. **输出乱码 / 空输出时优先怀疑最早的环节**：token embedding（`engine.zig` 的 `embedRow`）
-   和 lm_head，而不是中间层。embedding 错则全链路输入皆错。
-3. **注意 Zig 数值路径的残留调用点**：`dequantToRows` / `dequantRowFnFor`（`engine.zig`）
-   除 `QWEN35_FORCE_F32` 调试路径外，仍在 `embedRow`、`dumpOut` 等主链路被调用。
-   按 §1，这些是应迁移到 C kernel 的历史遗留；改它们时以 C kernel 行为为准。
+1. **先定位是"哪一层"错**，不要猜。重构后只剩 `QWEN35_SIMD_TIER` 与 `QWEN35_FORCE_SCALAR`
+   两条 A/B 路径（4 个更强的开关已删）。如果 tier/scalar 全档一致地错，
+   说明**不是 ISA 问题**，而是几何/布局/索引问题——去查 `QuantRow` 的
+   `blocks_per_row` / `rowBlockElems` / `cols()` 三者是否自洽（见 §1.1 的坑）。
+2. **输出乱码 / 空输出时优先怀疑最早的环节**：token embedding 和 lm_head，而非中间层。
+   embedding 错则全链路输入皆错。`vDequantRow` 对 `q8_0` 有**专用旁路**，不能删：
+   `dequantRowFnFor` 只覆盖 256 元素块的 K/IQ 类型，Q8_0 塞进去当 `cols % 256 != 0` 时会丢尾巴。
+3. **`matvecQuantScalar` 只对 256 元素块类型正确**：它传 `.row_bytes = blockBytes()`（单块字节）
+   而 pool 用 `xs[b*256 .. b*256+256]` 一次吃一个 256 元素 row-block，
+   对 `q4_0`/`iq4_nl` 这类"块 32、row-block 256"的类型会算错行跨与激活窗口。
+   已知未修；A/B 时不要拿它当 Q4_0 的 oracle。
 4. 改动前后固定复跑同一句探针：
    `zig-out/bin/qwen35 run <gguf> "天空为什么是蓝色的？" -n 48 --threads 1`
    （单线程是为了结果可比，勿随手加线程数）。
+5. **跨量化格式必须逐个验**，不能只验 Q8_0 就收工：Q8_0 通过**不代表**其它类型通过
+   （2026-10 实测：Q8_0 与基线逐字节一致，同时 Q4_0/IQ4_NL 输出乱码）。
+   至少覆盖 Q8_0 / BF16 / Q4_0 / IQ4_NL / Q4_K_M / Q6_K。
 
 ## 6. 运行探针（模型与 target）
 
