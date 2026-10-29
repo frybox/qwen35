@@ -113,6 +113,35 @@ __attribute__((constructor)) static void cpu_caps_init(void) {
     ssse3_cached = (one[2] >> 9)  & 1;
     fma_cached   = ymm_ok && ((one[2] >> 12) & 1);
     f16c_cached  = ymm_ok && ((one[2] >> 29) & 1);
+
+    /* Apply QWEN35_FORCE_SCALAR LAST, after every bit has been probed.
+     * This ran here-but-never-actually-happened before: cpu_caps_apply_env()
+     * only *parsed* the env var into the force_mask_* globals and nothing ever
+     * read them back, so the documented debug switch was a silent no-op and
+     * every "force scalar" A/B compared a kernel against itself. Clearing a
+     * cached flag here (rather than at probe time) also keeps the mask from
+     * disabling a feature before its dependency chain is resolved. */
+    if (force_mask_avx2)        avx2_cached        = 0;
+    if (force_mask_avx512f)     avx512f_cached     = 0;
+    if (force_mask_avx512bw)    avx512bw_cached    = 0;
+    if (force_mask_avx512vl)    avx512vl_cached    = 0;
+    if (force_mask_avx512dq)    avx512dq_cached    = 0;
+    if (force_mask_vnni)        avx512_vnni_cached = 0;
+    if (force_mask_vbmi)        avx512_vbmi_cached = 0;
+    if (force_mask_fma)         fma_cached         = 0;
+    if (force_mask_f16c)        f16c_cached        = 0;
+    if (force_mask_ssse3)       ssse3_cached       = 0;
+
+    /* AVX-512 features are only reachable when the 512-bit state is on; keep
+     * the dependency invariant the probe built (avx512*_cached implies
+     * avx512f_cached) so a mask on avx512f cannot leave VNNI claiming support. */
+    if (!avx512f_cached) {
+        avx512bw_cached = 0;
+        avx512vl_cached = 0;
+        avx512dq_cached = 0;
+        avx512_vnni_cached = 0;
+        avx512_vbmi_cached = 0;
+    }
 }
 
 int cpu_has_avx2(void)        { return avx2_cached < 0 ? (cpu_caps_init(), avx2_cached)        : avx2_cached; }
