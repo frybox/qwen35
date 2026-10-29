@@ -10,7 +10,7 @@
 //!   gguf.QuantRow   packed tensor + its layout geometry (no maths, no hardware)
 //!   backend.zig     this file: the `Exec` interface + `LinearW` + dispatch
 //!   backend_cpu.zig CPU implementation (C kernels under src/kernels/x86)
-//!   backend_cuda.zig GPU implementation (future; src/kernels/cuda)
+//!   backend_cuda.zig CUDA implementation (currently a CPU trampoline; see file)
 //!
 //! Adding a backend means implementing `Exec` and registering it in
 //! `selectBackend`; the engine does not change.
@@ -150,12 +150,17 @@ pub const Exec = struct {
     }
 };
 
-/// Which backend a model run uses.  CPU is the only one wired up today; the
-/// CUDA backend will be selected here once `src/kernels/cuda` exists.
-pub const Kind = enum { cpu };
+/// Which backend a model run uses.
+///
+/// `.cuda` is wired up but currently a *trampoline*: `backend_cuda.CudaBackend`
+/// embeds a CPU backend and hands out its `Exec`, so `--backend cuda` exercises
+/// the selection path end-to-end with byte-identical numbers while the device
+/// implementation does not exist yet.  See the header of `backend_cuda.zig`.
+pub const Kind = enum { cpu, cuda };
 
 pub fn selectBackend(kind: Kind) type {
     return switch (kind) {
         .cpu => @import("backend_cpu.zig").CpuBackend,
+        .cuda => @import("backend_cuda.zig").CudaBackend,
     };
 }

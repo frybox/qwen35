@@ -730,7 +730,12 @@ pub const CpuBackend = struct {
         profReportMatvec();
     }
 
-    const vtable = backend.Exec.VTable{
+    /// `pub` so a backend that composes (rather than replaces) the CPU
+    /// implementation -- see `backend_cuda.zig`'s trampoline stage -- can hand
+    /// out the CPU vtable unchanged.  Every target is a free function that
+    /// recovers `*CpuBackend` from `ctx`, so the vtable works for any `ctx`
+    /// that really points at a `CpuBackend`.
+    pub const vtable = backend.Exec.VTable{
         .loadLinear = vLoadLinear,
         .freeLinear = vFreeLinear,
         .allocScratch = vAllocScratch,

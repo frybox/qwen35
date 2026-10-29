@@ -7,6 +7,7 @@ const std = @import("std");
 pub const gguf = @import("gguf.zig");
 pub const backend = @import("backend.zig");
 pub const backend_cpu = @import("backend_cpu.zig");
+pub const backend_cuda = @import("backend_cuda.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const engine = @import("engine.zig");
 pub const quant_dequant = @import("quant_dequant.zig");
@@ -28,5 +29,9 @@ test {
 
 test {
     _ = @import("backend_cpu.zig");
+    // Referenced so the trampoline is type-checked by `zig build test` even
+    // before anything selects `.cuda`; the CUDA backend has no test of its own
+    // (it is a pure forwarding layer) so this is its only compile-time guard.
+    _ = @import("backend_cuda.zig");
 }
 

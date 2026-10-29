@@ -707,6 +707,34 @@ pub const Engine = struct {
 
     pub const max_seq: u32 = 4096;
 
+    /// One decl per `backend.Kind`, holding the concrete backend type
+    /// `selectBackend` picks for it.
+    ///
+    /// `load` cannot call `selectBackend(kind)` directly: it returns a `type`,
+    /// so its argument must be comptime-known, while the CLI kind is a runtime
+    /// value ("types are not available at runtime").  Naming the map as a
+    /// *namespace of decls* keeps it comptime-known at the call site, so
+    /// `@field(BackendTypes, @tagName(k))` works for a runtime `k`.
+    /// (Fields would not do: a struct field cannot hold a type as its value.)
+    const BackendTypes = struct {
+        pub const cpu = backend.selectBackend(.cpu);
+        pub const cuda = backend.selectBackend(.cuda);
+    };
+
+    /// Map a runtime backend kind to its concrete backend struct type.
+    ///
+    /// `kind` is `comptime` on purpose: callers that have a runtime kind must
+    /// instantiate once per tag (see the `switch` in `load`), because a `type`
+    /// cannot be produced at runtime.  The `inline else` prong captures the tag
+    /// at comptime, which is what lets `@field` name one instantiation per
+    /// `Kind`.  No `else`: a new `Kind` fails to compile here instead of
+    /// silently running CPU code.
+    fn backendImplFor(comptime kind: backend.Kind) type {
+        return switch (kind) {
+            inline else => |k| @field(BackendTypes, @tagName(k)),
+        };
+    }
+
     /// Debug switch: force a SIMD tier (baseline|avx2|avx512) before load.
     /// Force a SIMD tier (QWEN35_SIMD_TIER).  Static because it is applied
     /// before the backend exists (the tier only changes which C kernels the
@@ -740,10 +768,23 @@ pub const Engine = struct {
         // Create the hardware backend now that the file is parsed: the CPU
         // backend keeps `&g` to resolve tensor names into mmap views.  Its
         // allocation lives in the same arena as the engine.
-        const BackendImpl = backend.selectBackend(backend_kind);
-        const backend_ptr = try alloc.create(BackendImpl);
-        backend_ptr.* = BackendImpl.init(alloc, &g);
-        const exec = backend_ptr.exec();
+        //
+        // `switch` because the concrete type depends on the *runtime* kind:
+        // `selectBackend` returns a `type`, which cannot be produced at
+        // runtime, so each prong instantiates its own backend.  `inline else`
+        // means a new `Kind` is handled automatically, and a missing entry in
+        // `BackendTypes` is then a compile error rather than a silent fallback.
+        //
+        // The struct itself is not kept: `exec` is all the engine needs, and
+        // its `ptr` keeps the box alive (same arena as the engine).
+        const exec = switch (backend_kind) {
+            inline else => |k| blk: {
+                const BackendImpl = backendImplFor(k);
+                const p = try alloc.create(BackendImpl);
+                p.* = BackendImpl.init(alloc, &g);
+                break :blk p.exec();
+            },
+        };
 
         var cfg = Config{};
         // block_count includes the trailing MTP/nextn prediction layer(s)

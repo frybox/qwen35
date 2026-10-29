@@ -111,7 +111,10 @@ fn runInference(
             "usage: {s} run <file.gguf> <prompt> [-n N] [-t TEMPERATURE] [-k K] [-s SEED]\n" ++
                 "  -t  temperature; 0 (default) = greedy argmax\n" ++
                 "  -k  top-k cutoff (0 = off, default)\n" ++
-                "  -s  PRNG seed for sampling (default 12345)\n",
+                "  -s  PRNG seed for sampling (default 12345)\n" ++
+                "  --threads N  intra-op worker count (0 = default)\n" ++
+                "  --backend cpu|cuda  execution backend (default cpu; cuda is a\n" ++
+                "      CPU-backed trampoline today, numerically identical to cpu)\n",
             .{args[0]},
         );
         try err_out.flush();
@@ -125,9 +128,19 @@ fn runInference(
     var top_k: usize = 0;
     var seed: u64 = 12345;
     var n_threads: usize = 0; // 0 = default (min(16, cpus))
+    var backend_kind: qwen35.backend.Kind = .cpu;
     var i: usize = 4;
     while (i + 1 < args.len + 1 and i < args.len) : (i += 1) {
-        if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
+        if (std.mem.eql(u8, args[i], "--backend") and i + 1 < args.len) {
+            // Keep the accepted set in sync with `backend.Kind`; naming the
+            // valid values in the error is what makes a typo recoverable.
+            backend_kind = std.meta.stringToEnum(qwen35.backend.Kind, args[i + 1]) orelse {
+                try err_out.print("error: --backend expects 'cpu' or 'cuda', got '{s}'\n", .{args[i + 1]});
+                try err_out.flush();
+                return error.InvalidArgument;
+            };
+            i += 1;
+        } else if (std.mem.eql(u8, args[i], "--threads") and i + 1 < args.len) {
             n_threads = std.fmt.parseInt(usize, args[i + 1], 10) catch {
                 try err_out.print("error: --threads expects a number, got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
@@ -169,7 +182,7 @@ fn runInference(
         }
     }
 
-    var e = engine.Engine.load(arena, path, io, n_threads, .cpu) catch |e2| {
+    var e = engine.Engine.load(arena, path, io, n_threads, backend_kind) catch |e2| {
         try err_out.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(e2) });
         try err_out.flush();
         return e2;
