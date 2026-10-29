@@ -111,8 +111,10 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    说明**不是 ISA 问题**，而是几何/布局/索引问题——去查 `QuantRow` 的
    `blocks_per_row` / `rowBlockElems` / `cols()` 三者是否自洽（见 §1.1 的坑）。
 2. **输出乱码 / 空输出时优先怀疑最早的环节**：token embedding 和 lm_head，而非中间层。
-   embedding 错则全链路输入皆错。`vDequantRow` 对 `q8_0` 有**专用旁路**，不能删：
-   `dequantRowFnFor` 只覆盖 256 元素块的 K/IQ 类型，Q8_0 塞进去当 `cols % 256 != 0` 时会丢尾巴。
+   embedding 错则全链路输入皆错。`vDequantRow`（现为 `dequantRowInto`）对 `q8_0` 有**专用旁路**，
+   不能删：`dequantRowFnFor` 只覆盖 256 元素块的 K/IQ 类型，Q8_0 塞进去当 `cols % 256 != 0` 时会丢尾巴。
+   注意 `dequantRowFn` **每次只写 256 个 float**，宽行必须按 `blocks_per_row` 分块调用——
+   用 `rowBlocks()`（本类型自己的块数，q4_0 是 8 倍）当循环上界会越界。
 3. **`matvecQuantScalar` 只对 256 元素块类型正确**：它传 `.row_bytes = blockBytes()`（单块字节）
    而 pool 用 `xs[b*256 .. b*256+256]` 一次吃一个 256 元素 row-block，
    对 `q4_0`/`iq4_nl` 这类"块 32、row-block 256"的类型会算错行跨与激活窗口。
@@ -120,9 +122,14 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 4. 改动前后固定复跑同一句探针：
    `zig-out/bin/qwen35 run <gguf> "天空为什么是蓝色的？" -n 48 --threads 1`
    （单线程是为了结果可比，勿随手加线程数）。
-5. **跨量化格式必须逐个验**，不能只验 Q8_0 就收工：Q8_0 通过**不代表**其它类型通过
-   （2026-10 实测：Q8_0 与基线逐字节一致，同时 Q4_0/IQ4_NL 输出乱码）。
+5. **跨量化格式必须逐个验**，不能只验 Q8_0 就收工：Q8_0 通过**不代表**其它类型通过。
    至少覆盖 Q8_0 / BF16 / Q4_0 / IQ4_NL / Q4_K_M / Q6_K。
+   这不是理论风险：2026-10 的 `5f654f3` 修的就是两个只在 Q8_0 之外才发作的 bug——
+   `matvecQuant` 断言 `bpr == cols/32`（Q4_0 等实际是 cols/256），以及
+   `vDequantRow` 把整行交给只写 256 个 float 的 `dequantRowFn`（1024 宽的行有 3/4 未写）。
+   **Q8_0 恰好是 32 块与 row-block 单位重合的唯一类型**，所以它单测通过而其它全坏。
+   定位手段是给 `dequantRowInto` 写 Q4_0 对拍测试，而不是读代码猜；
+   新增类型时照此办：先在测试里造块字节，与 `quant.rowDotXxx` 参照对齐。
 
 ## 6. 运行探针（模型与 target）
 
