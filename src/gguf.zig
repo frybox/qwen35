@@ -257,6 +257,102 @@ pub const Tensor = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Block geometry + zero-copy row view
+//
+// A GGUF tensor is a sequence of fixed-size blocks whose (element count, byte
+// size) pair is fixed per type by ggml's `ggml_blck_size` / `ggml_type_size`
+// (see `TensorType.blockLayout`).  Everything below is pure layout arithmetic:
+// no quantization maths, no hardware, no debug switches.  `QuantRow` is the
+// shared "packed tensor + its geometry" view that both the engine and the
+// backends pass around; it is a slice of the mmap, never a copy.
+// ---------------------------------------------------------------------------
+
+/// Elements in one block of `t`.
+pub fn blockElems(t: TensorType) usize {
+    return @intCast((t.blockLayout() orelse unreachableBlockLayout(t)).elems);
+}
+
+/// Packed bytes of one block of `t`.
+pub fn blockBytes(t: TensorType) usize {
+    return @intCast((t.blockLayout() orelse unreachableBlockLayout(t)).bytes);
+}
+
+fn unreachableBlockLayout(t: TensorType) noreturn {
+    std.debug.panic("no blockLayout for ttype {s}: its block geometry is unknown", .{@tagName(t)});
+}
+
+/// Elements in one GGUF row-block: the unit `QuantRow.blocks_per_row` counts
+/// for every type except Q8_0 (whose rows are plain 32-element blocks).
+/// All framed types pack 8 x 32 = 256 elements per row-block; spelled as an
+/// expression over the layout table rather than a bare 256 so the 32-element
+/// block size keeps a single source.
+pub fn rowBlockElems(t: TensorType) usize {
+    return if (t == .q8_0) blockElems(.q8_0) else 8 * blockElems(.q4_0);
+}
+
+const gguf = @This();
+
+/// A quantized 2-D weight kept in its native packed layout: a zero-copy view
+/// into the GGUF mapping plus the geometry needed to index its rows.
+///
+/// `data` covers the whole tensor; `blocks_per_row` counts row-blocks (see
+/// `rowBlockElems`), which is the framing every GGUF row actually uses.
+pub const QuantRow = struct {
+    data: []const u8,
+    ttype: TensorType,
+    rows: usize,
+    blocks_per_row: usize,
+
+    /// Build the view for a tensor, validating that the packing is integral.
+    pub fn init(t: Tensor, data: []const u8) QuantRow {
+        const rbe = gguf.rowBlockElems(t.ttype);
+        const ncols: usize = @intCast(t.dims[0]);
+        return .{
+            .data = data,
+            .ttype = t.ttype,
+            .rows = @intCast(t.nElems() / ncols),
+            .blocks_per_row = ncols / rbe,
+        };
+    }
+
+    /// Elements per block of this type.
+    pub fn blockElems(self: QuantRow) usize {
+        return gguf.blockElems(self.ttype);
+    }
+
+    /// Packed bytes per block of this type.
+    pub fn blockBytes(self: QuantRow) usize {
+        return gguf.blockBytes(self.ttype);
+    }
+
+    /// Elements per row-block (256 framed / 32 for Q8_0).
+    pub fn rowBlockElems(self: QuantRow) usize {
+        return gguf.rowBlockElems(self.ttype);
+    }
+
+    /// Columns of this weight.
+    pub fn cols(self: QuantRow) usize {
+        return self.blocks_per_row * self.rowBlockElems();
+    }
+
+    /// This type's own blocks per row (Q8_0: cols/32, K/IQ: cols/256).
+    pub fn rowBlocks(self: QuantRow) usize {
+        return self.cols() / self.blockElems();
+    }
+
+    /// Packed bytes for one full row.
+    pub fn rowBytes(self: QuantRow) usize {
+        return self.rowBlocks() * self.blockBytes();
+    }
+
+    /// Packed bytes of row `r`.
+    pub fn row(self: QuantRow, r: usize) []const u8 {
+        const blen = self.rowBytes();
+        return self.data[r * blen ..][0..blen];
+    }
+};
+
 /// Cursor over a byte slice with bounds-checked little-endian reads.
 pub const ByteReader = struct {
     buf: []const u8,
