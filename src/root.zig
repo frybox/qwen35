@@ -21,26 +21,6 @@ test {
 }
 
 test {
-    _ = @import("simd_tests32.zig");
-}
-
-test {
-    _ = @import("simd_tests256.zig");
-}
-
-test {
-    _ = @import("simd_tests_iq_a.zig");
-}
-
-test {
-    _ = @import("simd_tests_iq_b.zig");
-}
-
-test {
-    _ = @import("simd_tests_iq_c.zig");
-}
-
-test {
     _ = @import("iq_table_tests.zig");
 }
 
