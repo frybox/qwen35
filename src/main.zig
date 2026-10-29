@@ -41,7 +41,10 @@ var dump_ids = false;
 pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
     if (init.environ_map.get("QWEN35_NO_BATCH") != null) qwen35.engine.no_batch = true;
-    if (init.environ_map.get("QWEN35_PROF") != null) qwen35.engine.prof = true;
+    if (init.environ_map.get("QWEN35_PROF") != null) {
+        qwen35.engine.prof = true;
+        qwen35.backend_cpu.prof = true;
+    }
     if (init.environ_map.get("QWEN35_PROF_POST") != null) qwen35.pool.prof_post_only = true;
     if (init.environ_map.get("QWEN35_STAT") != null) qwen35.pool.stat_on = true;
     dump_ids = init.environ_map.get("QWEN35_DUMP_IDS") != null;
@@ -166,7 +169,7 @@ fn runInference(
         }
     }
 
-    var e = engine.Engine.load(arena, path, io, n_threads) catch |e2| {
+    var e = engine.Engine.load(arena, path, io, n_threads, .cpu) catch |e2| {
         try err_out.print("error: failed to load '{s}': {s}\n", .{ path, @errorName(e2) });
         try err_out.flush();
         return e2;
@@ -206,7 +209,7 @@ fn runInference(
         for (res.tokens) |id| try out.print(" {d}", .{id});
         try out.print("\n", .{});
     }
-    if (qwen35.engine.prof) { qwen35.engine.profReport(); qwen35.engine.profReportMatvec(); }
+    if (qwen35.engine.prof) { qwen35.engine.profReport(); qwen35.backend_cpu.profReportMatvec(); }
     try out.flush();
 }
 
