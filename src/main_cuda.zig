@@ -251,12 +251,15 @@ fn uploadF32(arena: std.mem.Allocator, gpu: *Gpu, arr: []const f32) !?*anyopaque
 
 fn uploadLinear(arena: std.mem.Allocator, gpu: *Gpu, lw: engine.Engine.LinearW, rows: usize, cols: usize) !LinearGpu {
     switch (lw) {
-        .q8 => |row| {
+        // Q8_0 and the K/IQ types both arrive as `QuantRow` now: the packed
+        // bytes are uploaded verbatim and the GPU side distinguishes Q8_0 by
+        // `ttype` (it is the only 32-element-block type in this path).
+        .quant => |row| {
             const n: usize = row.data.len;
             const d = q35_malloc(n) orelse return error.GpuAlloc;
             gpu.gpu_ptrs.append(arena, d) catch return error.GpuAlloc;
             _ = q35_h2d(d, hsrcC(row.data.ptr), n);
-            return .{ .ptr = d, .rows = rows, .cols = cols, .is_q8 = true };
+            return .{ .ptr = d, .rows = rows, .cols = cols, .is_q8 = row.ttype == .q8_0 };
         },
         .f32 => |arr| {
             const n: usize = arr.len;
@@ -843,13 +846,13 @@ fn gpuInit(arena: std.mem.Allocator, e: *engine.Engine) !*Gpu {
 
     // token embedding + output norm
     switch (e.token_embd) {
-        .q8 => |row| {
+        .quant => |row| {
             const n: usize = row.data.len;
             const d = q35_malloc(n) orelse return error.GpuAlloc;
             g.gpu_ptrs.append(arena, d) catch return error.GpuAlloc;
             _ = q35_h2d(d, hsrcC(row.data.ptr), n);
             g.token_embd = d;
-            g.emb_is_q8 = true;
+            g.emb_is_q8 = row.ttype == .q8_0;
         },
         .f32 => |arr| {
             const n: usize = arr.len;

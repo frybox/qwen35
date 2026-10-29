@@ -363,27 +363,29 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
         if (xoff + cols > dx.x.len) return -3; // activation slice OOB
         var acc: f64 = 0;
         switch (w) {
-            .q8 => |row| {
-                const blen = row.row_blocks * q8_0_block_bytes;
-                if (rr * blen + blen > row.data.len) return -4;
-                const wrow = row.data[rr * blen ..][0..blen];
-                for (0..row.row_blocks) |b| {
-                    const wb = wrow[b * q8_0_block_bytes ..][0..q8_0_block_bytes];
-                    const d: f64 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, wb[0..2], .little))));
-                    for (0..q8_0_block_elems) |j| {
-                        const wv: f64 = d * @as(f64, @as(i8, @bitCast(wb[2 + j])));
-                        acc += wv * @as(f64, dx.x[xoff + b * q8_0_block_elems + j]);
-                    }
-                }
-            },
             .quant => |q| {
-                const rb = Engine.quantRowBytes(q.ttype);
-                const deq = dequantRowFnFor(q.ttype) orelse return -2;
-                for (0..q.blocks_per_row) |b| {
-                    const i = rr * q.blocks_per_row + b;
-                    if (i * rb + rb > q.data.len) return -4;
-                    deq(q.data[i * rb ..][0..rb], rowbuf[0..256]);
-                    for (0..256) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * 256 + j]);
+                if (q.ttype == .q8_0) {
+                    // Q8_0: 32-element blocks, f16 block scale + i8 quants.
+                    const blen = q.rowBytes();
+                    if (rr * blen + blen > q.data.len) return -4;
+                    const wrow = q.data[rr * blen ..][0..blen];
+                    for (0..q.row_blocks()) |b| {
+                        const wb = wrow[b * q8_0_block_bytes ..][0..q8_0_block_bytes];
+                        const d: f64 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, wb[0..2], .little))));
+                        for (0..q8_0_block_elems) |j| {
+                            const wv: f64 = d * @as(f64, @as(i8, @bitCast(wb[2 + j])));
+                            acc += wv * @as(f64, dx.x[xoff + b * q8_0_block_elems + j]);
+                        }
+                    }
+                } else {
+                    const rb = Engine.quantRowBytes(q.ttype);
+                    const deq = dequantRowFnFor(q.ttype) orelse return -2;
+                    for (0..q.blocks_per_row) |b| {
+                        const i = rr * q.blocks_per_row + b;
+                        if (i * rb + rb > q.data.len) return -4;
+                        deq(q.data[i * rb ..][0..rb], rowbuf[0..256]);
+                        for (0..256) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * 256 + j]);
+                    }
                 }
             },
             .f32 => |m| {
@@ -419,11 +421,15 @@ pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: u
 /// `q8` is the engine's Q8 activation scratch (ceil(cols/32) blocks).
 fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8, q8k: []u8, pool: ?*pool_mod.Pool) void {
     switch (w) {
-        .q8 => |row| {
-            matvecQ8_0(out, row, x, q8, pool);
-        },
         .quant => |qrow| {
-            Engine.matvecQuant(out, qrow, x, q8k, q8, pool);
+            // Q8_0 keeps its own numeric entry point: it uses all of `q8`
+            // (cols/32 blocks) and the row-granular C dot, while the generic
+            // path quantizes to q8k and streams 256-element blocks.
+            if (qrow.ttype == .q8_0) {
+                matvecQ8_0(out, qrow, x, q8, pool);
+            } else {
+                Engine.matvecQuant(out, qrow, x, q8k, q8, pool);
+            }
         },
         .f32 => |m| {
             matvec(out, m, x, out.len, x.len, pool);
@@ -532,43 +538,30 @@ pub fn quantizeQ8_0(data: []const f32, out: []u8) !void {
 // block scale. x is f32, quantized on the fly into a scratch buffer.
 // ---------------------------------------------------------------------------
 
-/// Per-row Q8_0 weight view into the mmapped GGUF data section.
-pub const Q8Row = struct {
-    /// raw block bytes, `rows * row_blocks * q8_0_block_bytes`
-    data: []const u8,
-    /// quantized blocks per row (cols / 32)
-    row_blocks: usize,
-
-    pub fn rowBytes(self: Q8Row) usize {
-        return self.row_blocks * q8_0_block_bytes;
-    }
-
-    pub fn rows(self: Q8Row) usize {
-        return self.data.len / self.rowBytes();
-    }
-
-    pub fn row(self: Q8Row, r: usize) []const u8 {
-        return self.data[r * self.rowBytes() ..][0..self.rowBytes()];
-    }
-};
-
 /// out[r] = sum_c W[r,c] * x[c], W row-major Q8_0 blocks. Scratch q8 must
 /// hold ceil(cols / 32) blocks (x quantized per block with round-to-nearest,
 /// matching quantizeQ8_0 semantics).
-pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8, pool: ?*pool_mod.Pool) void {
+///
+/// `w` is the unified `QuantRow` view with `ttype == .q8_0`; its
+/// `blocks_per_row` is the Q8_0 block count (cols / 32) and `row_blocks()`
+/// derives the byte stride from it + `q8_0_block_bytes`.  Numbers unchanged:
+/// the body is the pre-merge `Q8Row` implementation, which is why `.q8_0` in
+/// pool.zig still maps to the C `q8_0_q8_0` row dot.
+pub fn matvecQ8_0(out: []f32, w: Engine.QuantRow, x: []const f32, q8: []u8, pool: ?*pool_mod.Pool) void {
     var pidx: usize = undefined;
     var pt0: Io.Clock.Timestamp = undefined;
     if (prof) {
         var kbuf: [64]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "q8:{d}", .{w.rows()}) catch "q8?";
+        const key = std.fmt.bufPrint(&kbuf, "q8:{d}", .{w.rows}) catch "q8?";
         pidx = profStart(key[0..@min(key.len, 64)]);
         pt0 = Io.Clock.Timestamp.now(prof_io, .awake);
         defer profEnd(pidx, profNs(prof_io, pt0));
     }
-    std.debug.assert(w.rows() == out.len);
-    const cols = w.row_blocks * q8_0_block_elems;
+    std.debug.assert(w.rows == out.len);
+    const row_blocks = w.row_blocks();
+    const cols = row_blocks * q8_0_block_elems;
     std.debug.assert(x.len == cols);
-    std.debug.assert(q8.len >= w.row_blocks * q8_0_block_bytes);
+    std.debug.assert(q8.len >= row_blocks * q8_0_block_bytes);
 
     // Quantize the activation once (shared by all rows), then dot each row.
     //
@@ -584,8 +577,8 @@ pub fn matvecQ8_0(out: []f32, w: Q8Row, x: []const f32, q8: []u8, pool: ?*pool_m
         .out = out.ptr,
         .data = w.data,
         .q8 = q8.ptr,
-        .row_blocks = w.row_blocks,
-        .rows = w.rows(),
+        .row_blocks = row_blocks,
+        .rows = w.rows,
     } });
 }
 
@@ -758,8 +751,7 @@ fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine
         }
     }
     switch (t.ttype) {
-        .q8_0 => return .{ .q8 = try Engine.q8RowOf(g, t) },
-        .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
+        .q8_0, .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
             return .{ .quant = try Engine.quantRowOf(g, t) };
         },
         // REVERTED: f16/bf16 used to take the zero-copy packed quant path
@@ -1235,27 +1227,58 @@ pub const Engine = struct {
     mtp_n: usize = 3,
 
     /// A linear layer weight:
-    ///  - `.q8`    Q8_0 kept in native blocks (zero-copy mmap view);
-    ///  - `.quant` a K/IQ quant type kept in its native packed bytes
-    ///    (zero-copy mmap view); matvec reads the packed bytes directly and
-    ///    accumulates in f32 — no whole-row f32 materialization;
+    ///  - `.quant` a quantized type kept in its native packed bytes (zero-copy
+    ///    mmap view); matvec reads the packed bytes directly and accumulates
+    ///    in f32 — no whole-row f32 materialization.  Q8_0 lives here too:
+    ///    it is just a 32-element-block type (`blocks_per_row` = cols / 32,
+    ///    block bytes from `q8_0_block_bytes`), so it needs no own variant;
     ///  - `.f32`  small tensors already F32 in the GGUF, or dequantized copies.
     pub const LinearW = union(enum) {
-        q8: Q8Row,
         quant: QuantRow,
         f32: []f32,
     };
 
-    /// One 2D linear weight held in a K/IQ quantized GGUF type: a zero-copy
+    /// One 2D linear weight held in a quantized GGUF type: a zero-copy
     /// view over the mmapped file.  The GGUF stores a row-major [rows, cols]
-    /// matrix as a flat stream of `blocks_per_row` packed 256-element blocks
-    /// per output row (row r = output channel r).  `rows` * `blocks_per_row`
-    /// blocks of `quantRowBytes(ttype)` bytes each, row-major.
+    /// matrix as a flat stream of `blocks_per_row` packed blocks per output
+    /// row (row r = output channel r), `quantRowBytes(ttype)` bytes each.
+    ///
+    /// `blocks_per_row` always counts blocks in the type's OWN block size:
+    /// 256-element blocks for K/IQ types (cols / 256), 32-element blocks for
+    /// Q8_0 (cols / 32).  `blockElems()`/`row_blocks()`/`rowBytes()` are
+    /// derived from `ttype`, never stored — a second copy of the block size
+    /// could drift from the GGUF layout table.
     pub const QuantRow = struct {
         data: []const u8,
         ttype: gguf.TensorType,
         rows: usize,
-        blocks_per_row: usize, // cols / 256
+        blocks_per_row: usize,
+
+        /// Elements per block of this type (Q8_0 = 32, K/IQ = 256).
+        pub fn blockElems(self: QuantRow) usize {
+            return if (self.ttype == .q8_0) q8_0_block_elems else 256;
+        }
+
+        /// Packed bytes per block of this type.
+        pub fn blockBytes(self: QuantRow) usize {
+            return if (self.ttype == .q8_0) q8_0_block_bytes else quantRowBytes(self.ttype);
+        }
+
+        /// Blocks per row in `blockElems()` units (same as `blocks_per_row`).
+        pub fn row_blocks(self: QuantRow) usize {
+            return self.blocks_per_row;
+        }
+
+        /// Packed bytes for one full row.
+        pub fn rowBytes(self: QuantRow) usize {
+            return self.blocks_per_row * self.blockBytes();
+        }
+
+        /// Packed bytes for output row `r`.
+        pub fn row(self: QuantRow, r: usize) []const u8 {
+            const blen = self.rowBytes();
+            return self.data[r * blen ..][0..blen];
+        }
     };
 
     /// Packed bytes for one 256-element K/IQ block of a type (0 = unknown).
@@ -1318,6 +1341,9 @@ pub const Engine = struct {
         }
         const rows = w.rows;
         const bpr = w.blocks_per_row;
+        // Q8_0 has its own entry point (matvecQ8_0: 32-element blocks, row dot);
+        // reaching here with q8_0 would silently read it as 256-element blocks.
+        std.debug.assert(w.ttype != .q8_0);
         const cols = bpr * 256;
         std.debug.assert(out.len == rows and x.len >= cols);
         std.debug.assert(q8k.len >= q8kScratchBytes(cols));
@@ -1464,25 +1490,28 @@ pub const Engine = struct {
         const rows = out.len / k;
         std.debug.assert(out.len % k == 0);
         switch (w) {
-            .q8 => |row| {
-                const cols = row.row_blocks * q8_0_block_elems;
-                const blen = row.row_blocks * q8_0_block_bytes;
-                std.debug.assert(xK.len >= k * cols);
-                std.debug.assert(q8K.len >= k * blen);
-                var t: usize = 0;
-                while (t < k) : (t += 1)
-                    simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen ..].ptr);
-                pool_mod.parallel(pool, .{ .q8_0b = .{
-                    .out = out.ptr,
-                    .data = row.data,
-                    .q8 = q8K.ptr,
-                    .q8_len = blen,
-                    .row_blocks = row.row_blocks,
-                    .rows = rows,
-                    .k = k,
-                } });
-            },
             .quant => |qrow| {
+                if (qrow.ttype == .q8_0) {
+                    // Q8_0 batch: 32-element blocks, row-granular C dot.  Same
+                    // kernel (q8_0_q8_0) as the serial `.q8_0` task below.
+                    const cols = qrow.row_blocks() * q8_0_block_elems;
+                    const blen = qrow.rowBytes();
+                    std.debug.assert(xK.len >= k * cols);
+                    std.debug.assert(q8K.len >= k * blen);
+                    var t: usize = 0;
+                    while (t < k) : (t += 1)
+                        simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen ..].ptr);
+                    pool_mod.parallel(pool, .{ .q8_0b = .{
+                        .out = out.ptr,
+                        .data = qrow.data,
+                        .q8 = q8K.ptr,
+                        .q8_len = blen,
+                        .row_blocks = qrow.blocks_per_row,
+                        .rows = rows,
+                        .k = k,
+                    } });
+                    return;
+                }
                 const cols = qrow.blocks_per_row * 256;
                 const klen = q8kScratchBytes(cols);
                 const rb32 = quantRowBytes(qrow.ttype) / 8;
@@ -1630,38 +1659,26 @@ pub const Engine = struct {
     /// [rows, cols] so cols = len / rows.
     fn matvecCols(w: LinearW, out_len: usize) usize {
         return switch (w) {
-            .q8 => |row| row.row_blocks * q8_0_block_elems,
-            .quant => |q| q.blocks_per_row * 256,
+            .quant => |q| q.blocks_per_row * q.blockElems(),
             .f32 => |m| m.len / out_len,
         };
     }
 
-    fn q8RowOf(g: *gguf.File, t: *const gguf.Tensor) !Q8Row {
-        // GGUF dims are innermost-first: dims[0] = contiguous cols, dims[1] = rows
-        std.debug.assert(t.dims.len == 2);
-        std.debug.assert(t.dims[0] % q8_0_block_elems == 0);
-        const row_blocks: usize = @intCast(t.dims[0] / q8_0_block_elems);
-        std.debug.assert(t.nElems() / t.dims[0] * row_blocks * q8_0_block_bytes ==
-            (try g.tensorData(t)).len);
-        return .{
-            .data = try g.tensorData(t),
-            .row_blocks = row_blocks,
-        };
-    }
-
-    /// Zero-copy view of a K/IQ quantized 2D linear weight.  GGUF dims are
-    /// innermost-first: dims[0] = contiguous cols, dims[1] = rows.  Every
-    /// K/IQ row packs exactly 256 elements, so cols must be a multiple of 256
-    /// (true for all Qwen3 linear layers).
+    /// Zero-copy view of a quantized 2D linear weight (Q8_0 included).  GGUF
+    /// dims are innermost-first: dims[0] = contiguous cols, dims[1] = rows.
+    /// `blocks_per_row` is expressed in the type's own block size: 32 elements
+    /// for Q8_0, 256 for the K/IQ types (whose rows are all 256 elements, so
+    /// cols must be a multiple of 256 — true for all Qwen3 linear layers).
     fn quantRowOf(g: *gguf.File, t: *const gguf.Tensor) !QuantRow {
         std.debug.assert(t.dims.len == 2);
         const cols: usize = t.dims[0];
-        if (cols % 256 != 0) return error.NotMultipleOfRow;
-        const bpr: usize = cols / 256;
+        const block_elems: usize = if (t.ttype == .q8_0) q8_0_block_elems else 256;
+        const block_bytes: usize = if (t.ttype == .q8_0) q8_0_block_bytes else quantRowBytes(t.ttype);
+        if (block_bytes == 0) return error.UnsupportedTensorType;
+        if (cols % block_elems != 0) return error.NotMultipleOfRow;
+        const bpr: usize = cols / block_elems;
         const rows: usize = t.dims[1];
-        const rb = quantRowBytes(t.ttype);
-        if (rb == 0) return error.UnsupportedTensorType;
-        const expected: usize = rows * bpr * rb;
+        const expected: usize = rows * bpr * block_bytes;
         const data = try g.tensorData(t);
         if (data.len < expected) return error.SizeMismatch;
         return .{
@@ -2157,11 +2174,12 @@ pub const Engine = struct {
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
             switch (ow) {
-                .q8 => |row| {
-                    matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool);
-                },
                 .quant => |qrow| {
-                    Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    if (qrow.ttype == .q8_0) {
+                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
+                    } else {
+                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    }
                 },
                 .f32 => |m| {
                     matvec(self.logits, m, self.x1, c.vocab, hidden, self.pool);
@@ -2170,11 +2188,12 @@ pub const Engine = struct {
         } else {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
-                .q8 => |row| {
-                    matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool);
-                },
                 .quant => |qrow| {
-                    Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    if (qrow.ttype == .q8_0) {
+                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
+                    } else {
+                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    }
                 },
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
@@ -2208,13 +2227,16 @@ pub const Engine = struct {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len == hidden);
         switch (self.token_embd) {
-            .q8 => |row| dequantizeQ8_0(row.row(token), dst) catch unreachable,
             .f32 => |m| @memcpy(dst, m[token * hidden ..][0..hidden]),
             .quant => |qrow| {
-                const rb = quantRowBytes(qrow.ttype);
-                const rb_row = qrow.blocks_per_row * rb;
-                const off = token * rb_row;
-                dequantToRows(self.alloc, qrow.ttype, qrow.data[off .. off + rb_row], dst) catch unreachable;
+                if (qrow.ttype == .q8_0) {
+                    dequantizeQ8_0(qrow.row(token), dst) catch unreachable;
+                } else {
+                    const rb = quantRowBytes(qrow.ttype);
+                    const rb_row = qrow.blocks_per_row * rb;
+                    const off = token * rb_row;
+                    dequantToRows(self.alloc, qrow.ttype, qrow.data[off .. off + rb_row], dst) catch unreachable;
+                }
             },
         }
     }
@@ -2303,11 +2325,12 @@ pub const Engine = struct {
         rmsNorm(self.x1, self.xK[(k - 1) * hidden ..][0..hidden], self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .q8 => |row| {
-                    matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool);
-                },
                 .quant => |qrow| {
-                    Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    if (qrow.ttype == .q8_0) {
+                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
+                    } else {
+                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    }
                 },
                 .f32 => |m| {
                     matvec(self.logits, m, self.x1, c.vocab, hidden, self.pool);
@@ -2315,11 +2338,12 @@ pub const Engine = struct {
             }
         } else {
             switch (self.token_embd) {
-                .q8 => |row| {
-                    matvecQ8_0(self.logits, row, self.x1, self.q8_scratch, self.pool);
-                },
                 .quant => |qrow| {
-                    Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    if (qrow.ttype == .q8_0) {
+                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
+                    } else {
+                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
+                    }
                 },
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
@@ -2924,7 +2948,7 @@ test "matvecQ8_0 matches f32 matvec on dequantized weights" {
     }
     for (&x) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
 
-    const w: Q8Row = .{ .data = &wq, .row_blocks = cols / q8_0_block_elems };
+    const w: Engine.QuantRow = .{ .data = &wq, .ttype = .q8_0, .rows = rows, .blocks_per_row = cols / q8_0_block_elems };
     var out_q8: [rows]f32 = undefined;
     var q8scratch: [cols / q8_0_block_elems * q8_0_block_bytes]u8 = undefined;
     matvecQ8_0(&out_q8, w, &x, &q8scratch, null);
@@ -2953,7 +2977,7 @@ test "matvecQ8_0 zero x gives zero out" {
     var x: [cols]f32 = @splat(0);
     var out: [2]f32 = undefined;
     var scratch: [q8_0_block_bytes]u8 = undefined;
-    matvecQ8_0(&out, .{ .data = &wq, .row_blocks = 1 }, &x, &scratch, null);
+    matvecQ8_0(&out, .{ .data = &wq, .ttype = .q8_0, .rows = 2, .blocks_per_row = 1 }, &x, &scratch, null);
     try std.testing.expectEqual(@as(f32, 0), out[0]);
     try std.testing.expectEqual(@as(f32, 0), out[1]);
 }
@@ -3114,10 +3138,10 @@ test "checkQ8Scratch: rejects a scratch too small for the widest input" {
 }
 
 test "matvecCols: reads input width from Q8_0 / K-IQ / f32 weights" {
-    // Q8_0: row_blocks * 32
-    const q8 = Engine.LinearW{ .q8 = .{ .data = &.{}, .row_blocks = 544 } };
+    // Q8_0: blocks_per_row * 32 (native 32-element blocks)
+    const q8 = Engine.LinearW{ .quant = .{ .data = &.{}, .ttype = .q8_0, .rows = 5120, .blocks_per_row = 544 } };
     try std.testing.expectEqual(@as(usize, 17408), Engine.matvecCols(q8, 5120));
-    // K/IQ: blocks_per_row * 256
+    // K/IQ: blocks_per_row * 256 (native 256-element blocks)
     const q = Engine.LinearW{ .quant = .{ .data = &.{}, .ttype = .q4_k, .rows = 5120, .blocks_per_row = 68 } };
     try std.testing.expectEqual(@as(usize, 17408), Engine.matvecCols(q, 5120));
     // f32: flat [rows, cols] -> len / rows (small shape, 4 rows x 256 cols)
