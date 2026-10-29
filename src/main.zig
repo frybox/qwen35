@@ -35,6 +35,9 @@ const StreamCtx = struct {
     }
 };
 
+/// `QWEN35_DUMP_IDS`: print the raw generated token ids (A/B md5 probes).
+var dump_ids = false;
+
 pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
     if (init.environ_map.get("QWEN35_NO_BATCH") != null) qwen35.engine.no_batch = true;
@@ -48,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (init.environ_map.get("QWEN35_FORCE_ROWDOT") != null) qwen35.engine.dbg_force_rowdot = true;
     if (init.environ_map.get("QWEN35_KERNEL_CHECK") != null) qwen35.engine.dbg_kernel_check = true;
+    dump_ids = init.environ_map.get("QWEN35_DUMP_IDS") != null;
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;
 
@@ -201,6 +205,14 @@ fn runInference(
         if (res.decode_ms > 0) @as(f64, @floatFromInt(res.tokens.len)) / (res.decode_ms / 1000.0) else 0.0,
     });
     try out.print("{s}\n", .{if (res.hit_eos) "Stop reason: EOS" else "Stop reason: max tokens reached"});
+    // `QWEN35_DUMP_IDS`: print the raw generated token ids.  Used for A/B md5
+    // probes -- text output can hide a divergence that shows up in ids, and ids
+    // are what a refactor must keep byte-identical.
+    if (dump_ids) {
+        try out.print("IDS:", .{});
+        for (res.tokens) |id| try out.print(" {d}", .{id});
+        try out.print("\n", .{});
+    }
     if (qwen35.engine.prof) { qwen35.engine.profReport(); qwen35.engine.profReportMatvec(); }
     try out.flush();
 }
