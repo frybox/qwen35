@@ -18,6 +18,12 @@ const ggml_tables = @import("iq_tables.zig");
 const simd_ref = @import("simd_ref.zig");
 
 const QK_K: usize = 256;
+
+/// Q8_0 block geometry (ggml `block_q8_0`: f16 d + 32 x i8 = 34 bytes).
+/// Spelled out here rather than imported from gguf so this file stays a
+/// dependency-free reference implementation.
+const QK8_0: usize = 32;
+const block_q8_0_bytes: usize = 2 + QK8_0;
 const QK4_NL: usize = 32;
 
 pub const kvalues_iq4nl = ggml_tables.kvalues_iq4nl;
@@ -1335,4 +1341,44 @@ pub fn rowDotBF16(row: []const u8, x: []const f32) f32 {
         sum += acc;
     }
     return sum;
+}
+
+/// Dequantize Q8_0 into f32 (used for small tensors / tests).
+pub fn dequantizeQ8_0(data: []const u8, out: []f32) !void {
+    if (out.len % QK8_0 != 0) return error.NotMultipleOfBlock;
+    if (data.len != out.len / QK8_0 * block_q8_0_bytes) return error.SizeMismatch;
+    var blk: usize = 0;
+    var base: usize = 0;
+    while (blk < out.len) : ({
+        blk += QK8_0;
+        base += block_q8_0_bytes;
+    }) {
+        const d: f16 = @bitCast(std.mem.readInt(u16, data[base..][0..2], .little));
+        const df: f32 = @floatCast(d);
+        const qs = data[base + 2 ..][0..QK8_0];
+        for (qs, 0..) |q, j| out[blk + j] = df * @as(f32, @floatFromInt(@as(i8, @bitCast(q))));
+    }
+}
+
+pub fn quantizeQ8_0(data: []const f32, out: []u8) !void {
+    if (data.len % QK8_0 != 0) return error.NotMultipleOfBlock;
+    if (out.len != data.len / QK8_0 * block_q8_0_bytes) return error.SizeMismatch;
+    var idata: usize = 0;
+    var iout: usize = 0;
+    while (idata < data.len) : ({
+        idata += QK8_0;
+        iout += block_q8_0_bytes;
+    }) {
+        var max: f32 = 0;
+        for (data[idata..][0..QK8_0]) |d| {
+            const v = @abs(d);
+            if (v > max) max = v;
+        }
+        const scale32: f32 = max / 127.0;
+        const scale: f16 = @floatCast(scale32);
+        std.mem.writeInt(u16, out[iout..][0..2], @bitCast(scale), .little);
+        for (0..QK8_0) |i| {
+            out[iout + 2 + i] = @bitCast(@as(i8, @intFromFloat(@round(data[idata + i] / scale32))));
+        }
+    }
 }
