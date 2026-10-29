@@ -44,13 +44,6 @@ pub fn main(init: std.process.Init) !void {
     if (init.environ_map.get("QWEN35_PROF") != null) qwen35.engine.prof = true;
     if (init.environ_map.get("QWEN35_PROF_POST") != null) qwen35.pool.prof_post_only = true;
     if (init.environ_map.get("QWEN35_STAT") != null) qwen35.pool.stat_on = true;
-    if (init.environ_map.get("QWEN35_FORCE_F32") != null) qwen35.engine.dbg_force_f32 = true;
-    if (init.environ_map.get("QWEN35_F32_TYPES")) |l| {
-        qwen35.engine.dbg_force_f32 = true;
-        qwen35.engine.dbg_f32_types = l;
-    }
-    if (init.environ_map.get("QWEN35_FORCE_ROWDOT") != null) qwen35.engine.dbg_force_rowdot = true;
-    if (init.environ_map.get("QWEN35_KERNEL_CHECK") != null) qwen35.engine.dbg_kernel_check = true;
     dump_ids = init.environ_map.get("QWEN35_DUMP_IDS") != null;
     const arena: std.mem.Allocator = init.arena.allocator();
     const io = init.io;

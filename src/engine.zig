@@ -664,44 +664,10 @@ fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8
     return out;
 }
 
-/// Is this ttype allowed through the FORCE_F32 path by QWEN35_F32_TYPES?
-/// Empty list = every type (original FORCE_F32 behaviour).
-fn f32TypeAllowed(ttype: gguf.TensorType) bool {
-    if (dbg_f32_types.len == 0) return true;
-    const tn = @tagName(ttype);
-    var i: usize = 0;
-    while (i < dbg_f32_types.len) {
-        var j = i;
-        while (j < dbg_f32_types.len and dbg_f32_types[j] != ',') j += 1;
-        if (std.mem.eql(u8, std.mem.trim(u8, dbg_f32_types[i..j], " "), tn)) return true;
-        i = j + 1;
-    }
-    return false;
-}
-
 /// Load a 2D linear weight: Q8_0 and K/IQ quant types stay in their native
 /// packed format (zero-copy view into the mmap); F32/F16 load as f32.
 fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine.LinearW {
     const t = g.findTensor(name) orelse return error.MissingTensor;
-    // Debug switch: QWEN35_FORCE_F32=1 forces every quant weight through the pure
-    // Zig dequant + f32 matvec path (bypasses all C kernels and activation
-    // quantization) so the two halves of the pipeline can be A/B'd.
-    if (dbg_force_f32) {
-        // Empty list keeps the original FORCE_F32 semantics (q8_0 stays on the
-        // native q8 path); an explicit list can include q8_0 too.
-        const allowed = if (dbg_f32_types.len == 0) (t.ttype != .q8_0) else f32TypeAllowed(t.ttype);
-        if (allowed) {
-            const n: usize = @intCast(t.nElems());
-            const data = try g.tensorData(t);
-            const out = try alloc.alloc(f32, n);
-            if (t.ttype == .q8_0) {
-                try dequantizeQ8_0(data, out);
-            } else {
-                try dequantToRows(alloc, t.ttype, data, out);
-            }
-            return .{ .f32 = out };
-        }
-    }
     switch (t.ttype) {
         .q8_0, .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
             return .{ .quant = try Engine.quantRowOf(g, t) };
@@ -751,135 +717,9 @@ pub fn applyRope64(x: []f32, pos: u32, base: f32) void {
 
 pub var no_batch = false;
 pub var prof = false;
-/// Debug switch: when true, quant weights are dequantized to f32 at load time and
-/// the f32 matvec path is used (bypasses C kernels + activation quantization).
-pub var dbg_force_f32 = false;
-/// Debug switch: comma-separated list of tensor types (e.g. `q4_k,q5_k`).  When
-/// non-empty, QWEN35_F32_TYPES restricts QWEN35_FORCE_F32's dequant-to-f32
-/// path to only those ttypes; every other type keeps its native packed path.
-/// An empty list means "all types" (the original FORCE_F32 behaviour).
-pub var dbg_f32_types: []const u8 = "";
-/// Debug switch: when true, K/IQ quant matvec uses the pure Zig per-element
-/// rowDot path (bypasses the C dot kernels and the C activation quantizer).
-pub var dbg_force_rowdot = false;
-/// Debug switch: when true, the first `dbg_kernel_check_rows` rows of every
-/// quant matvec are computed BOTH by the C kernel (integer-domain, with the C
-/// activation quantizer) and by the Zig per-element rowDot on the same
-/// activation; the divergence is printed to stderr.
-pub var dbg_kernel_check = false;
-var dbg_kernel_check_budget: usize = 200;
-
-// Per-ttype coverage tracking.  A global row budget alone is useless in
-// practice: a model's first ~25 matvec tensors are almost always q5_k/q6_k,
-// so the budget was exhausted before any IQ / 32-block tensor was ever seen
-// (a "false green" -- e.g. the Q4_0 model's q4_0 kernel was never checked).
-// We therefore guarantee the FIRST tensor of every distinct ttype is checked,
-// independently of the global budget, and report the per-ttype worst error.
-const KchkStat = struct { rows: usize = 0, worst: f32 = 0, labels: usize = 0 };
-var dbg_kchk_seen = @as([64]bool, @splat(false));
-var dbg_kchk_stats = @as([64]KchkStat, @splat(.{}));
-
-fn kchkTypeSlot(ttype: gguf.TensorType) ?usize {
-    // Stable 0..63 slot for a TensorType: first-seen order via a small table.
-    const tags = std.enums.values(gguf.TensorType);
-    for (tags, 0..) |t, i| {
-        if (t == ttype) return if (i < 64) i else null;
-    }
-    return null;
-}
-
-/// Print the per-ttype kernel-check coverage.  This is what turns KCHK from a
-/// "false green" (only the first few q5_k/q6_k tensors ever checked) into a
-/// real signal: every ttype that actually appeared in the model is listed with
-/// how many rows were checked and the worst kernel-vs-Zig relative error.
-fn kchkSummary() void {
-    if (!dbg_kernel_check) return;
-    const tags = std.enums.values(gguf.TensorType);
-    var any = false;
-    for (tags, 0..) |t, i| {
-        if (i >= 64) break;
-        const st = dbg_kchk_stats[i];
-        if (st.rows == 0) continue;
-        any = true;
-        std.debug.print("KCHKSUM {s} rows={d} worst_kern_err={e:.6}\n", .{
-            @tagName(t), st.rows, st.worst,
-        });
-    }
-    if (any) std.debug.print("KCHKSUM done\n", .{});
-}
-
-/// Same A/B as `kernelCheck` for 32-element-block kernels (Q8_0 activation,
-/// `bpr` row-blocks per row, each row-block painted with
-/// `kernelCheck32BlocksPerRowBlock()` 32-element blocks of `rb` bytes each).
-fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8, dot: simd_api.Dot32, rb: usize, bpr: usize, rows: usize) void {
-    if (!dbg_kernel_check) return;
-    const rd: *const fn (row: []const u8, x: []const f32) f32 = rowDotFor(ttype) orelse return;
-    const slot = kchkTypeSlot(ttype);
-    const first_for_type = if (slot) |s| !dbg_kchk_seen[s] else false;
-    if (!first_for_type and dbg_kernel_check_budget == 0) return;
-    const take = if (first_for_type) @min(rows, 8) else @min(dbg_kernel_check_budget, @min(rows, 8));
-    if (!first_for_type) dbg_kernel_check_budget -= take;
-    if (slot) |s| dbg_kchk_seen[s] = true;
-    var xq: [8192]f32 = undefined;
-    const nblocks = bpr * kernelCheck32BlocksPerRowBlock();
-    if (nblocks * 32 > xq.len) return;
-    for (0..nblocks) |j| {
-        const p = act[j * 34 ..];
-        const sc = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, p[0]) | (@as(u16, p[1]) << 8)))));
-        for (0..32) |k| xq[j * 32 + k] = sc * @as(f32, @floatFromInt(@as(i8, @bitCast(p[2 + k]))));
-    }
-    var r: usize = 0;
-    while (r < take) : (r += 1) {
-        const wrow = data[r * nblocks * rb ..][0 .. nblocks * rb];
-        var c_acc: f32 = 0;
-        for (0..nblocks) |b| c_acc += dot(32, wrow[b * rb ..].ptr, act.ptr + b * 34);
-        // kernel vs the Zig rowDot over the SAME blocks (no activation quant):
-        var c_blockwise: f32 = 0;
-        for (0..nblocks) |b| {
-            const blk = data[r * nblocks * rb + b * rb ..][0..rb];
-            c_blockwise += rd(blk, x[b * 32 ..][0..32]);
-        }
-        var zig_acc: f32 = 0;
-        var q_acc: f32 = 0;
-        for (0..bpr) |b| {
-            const blk = data[(r * bpr + b) * (kernelCheck32BlocksPerRowBlock() * rb) ..][0 .. kernelCheck32BlocksPerRowBlock() * rb];
-            zig_acc += rd(blk, x[b * 256 .. b * 256 + 256]);
-            q_acc += rd(blk, xq[b * 256 .. b * 256 + 256]);
-        }
-        const relq = if (q_acc != 0) @abs(c_acc - q_acc) / @abs(q_acc) else @abs(c_acc - q_acc);
-        const relx = if (zig_acc != 0) @abs(q_acc - zig_acc) / @abs(zig_acc) else @abs(q_acc - zig_acc);
-        std.debug.print("KCHK32 {s} row {d} bpr {d} c={e:.6} q={e:.6} x={e:.6} kern_err={e:.6} quant_err={e:.6}\n", .{
-            @tagName(ttype), r, bpr, c_acc, q_acc, zig_acc, relq, relx,
-        });
-        // TEMP diag: raw inputs, independent C call, and first blocks
-        const c_again = dot(32, data[r * nblocks * rb ..].ptr, act.ptr);
-        const b0: f32 = dot(32, data[r * nblocks * rb ..].ptr, act.ptr);
-        var first_blk: f32 = 0;
-        for (0..32) |k| first_blk += x[bpr * 256 + k];
-        var xfirst: u32 = 0;
-        for (0..32) |k| xfirst += @bitCast(x[k]);
-        std.debug.print("  DIAGBLK c={e:.6} ref={e:.6} actd0={e:.6} actq0={d}\n", .{
-            c_acc,                                                                                c_blockwise,
-            @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, act[0]) | (@as(u16, act[1]) << 8))))), act[2],
-        });
-        std.debug.print("  DIAG x0={e:.3} x1={e:.3} act0={d} act2={d} c_again={e:.3} b0={e:.3} xsum={e:.3} nin={d} nblocks={d} rbsum={d} f32bits={d}\n", .{
-            x[0], x[1], act[0], act[2], c_again, b0, first_blk, x.len, nblocks, nblocks * rb, xfirst,
-        });
-        if (slot) |s| {
-            var st = &dbg_kchk_stats[s];
-            st.rows += 1;
-            if (relq > st.worst) st.worst = relq;
-        }
-    }
-}
-
-/// 32-element blocks per row-block in the 8x32-framed types (Q4_0, Q4_1,
-/// IQ4_NL: 256 elements stored as eight 32-element blocks), derived from the
-/// layout table instead of a literal 8.
-fn kernelCheck32BlocksPerRowBlock() usize {
-    return 256 / blockElemsOf(.q4_0);
-}
-
+/// Zig scalar rowDot per ttype.  Not a debug switch: this is the scalar
+/// fallback used when a type has no C dot kernel (see the `orelse` arms in
+/// matvecQuant / matvecBatchK), so it must stay reachable in release builds.
 fn rowDotFor(ttype: gguf.TensorType) ?*const fn (row: []const u8, x: []const f32) f32 {
     return switch (ttype) {
         .q4_k => &quant.rowDotQ4K,
@@ -902,120 +742,6 @@ fn rowDotFor(ttype: gguf.TensorType) ?*const fn (row: []const u8, x: []const f32
         .bf16 => &quant.rowDotBF16,
         else => null,
     };
-}
-
-/// A/B a few rows of a .quant matvec: C integer-domain kernel vs the Zig
-/// per-element rowDot on the same activation.  Prints per-row divergence.
-fn kernelCheck(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8, dot: simd_api.Dot256, rb: usize, is256: bool, bpr: usize, rows: usize) void {
-    if (!dbg_kernel_check) return;
-    const rd: *const fn (row: []const u8, x: []const f32) f32 = rowDotFor(ttype) orelse return;
-    const slot = kchkTypeSlot(ttype);
-    const first_for_type = if (slot) |s| !dbg_kchk_seen[s] else false;
-    // Every distinct ttype gets its first tensor checked unconditionally;
-    // later tensors of the same type consume the global row budget.
-    if (!first_for_type and dbg_kernel_check_budget == 0) return;
-    const take = if (first_for_type) @min(rows, 8) else @min(dbg_kernel_check_budget, @min(rows, 8));
-    if (!first_for_type) dbg_kernel_check_budget -= take;
-    if (slot) |s| dbg_kchk_seen[s] = true;
-    var xq: [8192]f32 = undefined;
-    if (bpr * 256 > xq.len) return;
-    for (0..bpr) |b| {
-        if (is256) {
-            var blk256: [256]f32 = undefined;
-            simd_ref.util.deqQ8K(act[b * 292 ..].ptr, &blk256);
-            @memcpy(xq[b * 256 .. b * 256 + 256], &blk256);
-        } else {
-            for (0..8) |j| {
-                const p = act[(b * 8 + j) * 34 ..];
-                const s = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, p[0]) | (@as(u16, p[1]) << 8)))));
-                for (0..32) |k| xq[b * 256 + j * 32 + k] = s * @as(f32, @floatFromInt(@as(i8, @bitCast(p[2 + k]))));
-            }
-        }
-    }
-    var r: usize = 0;
-    while (r < take) : (r += 1) {
-        var zig_acc: f32 = 0;
-        var q_acc: f32 = 0;
-        for (0..bpr) |b| {
-            const blk = data[(r * bpr + b) * rb ..][0..rb];
-            zig_acc += rd(blk, x[b * 256 .. b * 256 + 256]);
-            q_acc += rd(blk, xq[b * 256 .. b * 256 + 256]);
-        }
-        const c_acc = if (is256)
-            dot(bpr * 256, data[r * bpr * rb ..].ptr, act.ptr)
-        else
-            blkLoop32(dot, data[r * bpr * rb ..].ptr, act.ptr, rb, bpr);
-        const relq = if (q_acc != 0) @abs(c_acc - q_acc) / @abs(q_acc) else @abs(c_acc - q_acc);
-        const relx = if (zig_acc != 0) @abs(q_acc - zig_acc) / @abs(zig_acc) else @abs(q_acc - zig_acc);
-        std.debug.print("KCHK {s} row {d} bpr {d} c={e:.6} q={e:.6} x={e:.6} kern_err={e:.6} quant_err={e:.6}\n", .{
-            @tagName(ttype), r, bpr, c_acc, q_acc, zig_acc, relq, relx,
-        });
-        // Track per-ttype coverage + worst kernel-vs-Zig divergence so that a
-        // model's dominant type can never be silently skipped.
-        if (slot) |s| {
-            var st = &dbg_kchk_stats[s];
-            st.rows += 1;
-            if (relq > st.worst) st.worst = relq;
-        }
-        // per-block breakdown: C kernel on block b vs Zig rowDot on the same
-        // block paired with the dequantized activation block b.
-        for (0..bpr) |b| {
-            const blk = data[(r * bpr + b) * rb ..][0..rb];
-            const cb = if (is256)
-                dot(256, blk.ptr, (act.ptr + b * 292))
-            else
-                blkLoop32(dot, blk.ptr, act.ptr + b * 292, rb, 1);
-            const qb = rd(blk, xq[b * 256 .. b * 256 + 256]);
-            const rb_ref = if (is256 and ttype == .q6_k)
-                q6kIntRef(blk, act[b * 292 ..][0..292])
-            else
-                cb;
-            const dbits: u16 = @as(u16, blk[rb - 2]) | (@as(u16, blk[rb - 1]) << 8);
-            const d_b = @as(f32, @floatCast(@as(f16, @bitCast(dbits))));
-            const dy_b = @as(f32, @bitCast(@as(u32, act[b * 292]) | (@as(u32, act[b * 292 + 1]) << 8) |
-                (@as(u32, act[b * 292 + 2]) << 16) | (@as(u32, act[b * 292 + 3]) << 24)));
-            std.debug.print("  KBLK b={d} c={e:.6} q={e:.6} ref={e:.6} c/ref={e:.6} d={e:.6} dy={e:.6}\n", .{
-                b, cb, qb, rb_ref, if (rb_ref != 0) cb / rb_ref else 0.0, d_b, dy_b,
-            });
-        }
-    }
-}
-
-/// Independent integer reference for ONE Q6_K block, written from the llama.cpp
-/// generic formula (aux8 expansion + signed scales + integer isum). Third
-/// implementation to adjudicate "C kernel vs Zig rowDotQ6K" sign disagreements.
-fn q6kIntRef(blk: []const u8, actb: []const u8) f32 {
-    const q4 = blk[0..128];
-    const qh = blk[128..192];
-    var a8: [256]i32 = undefined;
-    for (0..2) |h| {
-        for (0..32) |l| {
-            const b0 = q4[h * 64 + l];
-            const b1 = q4[h * 64 + l + 32];
-            const hb = qh[h * 32 + l];
-            a8[h * 128 + l + 0] = @as(i32, @as(i8, @bitCast(b0 & 0x0F | (hb >> 0 & 3) << 4))) - 32;
-            a8[h * 128 + l + 32] = @as(i32, @as(i8, @bitCast(b1 & 0x0F | (hb >> 2 & 3) << 4))) - 32;
-            a8[h * 128 + l + 64] = @as(i32, @as(i8, @bitCast(b0 >> 4 | (hb >> 4 & 3) << 4))) - 32;
-            a8[h * 128 + l + 96] = @as(i32, @as(i8, @bitCast(b1 >> 4 | (hb >> 6 & 3) << 4))) - 32;
-        }
-    }
-    var isum: i32 = 0;
-    for (0..16) |g| {
-        const scg: i32 = @as(i32, @as(i8, @bitCast(blk[192 + g])));
-        var sub: i32 = 0;
-        for (0..16) |l| sub += a8[g * 16 + l] * @as(i32, @as(i8, @bitCast(actb[4 + g * 16 + l])));
-        isum += scg * sub;
-    }
-    const d = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, blk[208]) | (@as(u16, blk[209]) << 8)))));
-    const dy = @as(f32, @bitCast(@as(u32, actb[0]) | (@as(u32, actb[1]) << 8) | (@as(u32, actb[2]) << 16) | (@as(u32, actb[3]) << 24)));
-    return d * dy * @as(f32, @floatFromInt(isum));
-}
-
-/// 32-block dot loop over one row, matching the engine's quant32 framing.
-fn blkLoop32(dot: *const fn (n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32, wrow: [*]const u8, q8: [*]const u8, rb32: usize, bpr: usize) f32 {
-    var acc: f32 = 0;
-    for (0..8 * bpr) |k| acc += dot(32, (wrow + k * rb32), (q8 + k * 34));
-    return acc;
 }
 pub var prof_io: Io = undefined;
 
@@ -1270,16 +996,6 @@ pub const Engine = struct {
     /// over the whole row; no type gets a special case, which is why Q8_0 no
     /// longer has a dedicated matvec entry point of its own.
     fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, pool: ?*pool_mod.Pool) void {
-        if (dbg_kernel_check) {
-            var nz: usize = 0;
-            for (x) |v| {
-                if (@abs(v) > 1e-30) nz += 1;
-            }
-            std.debug.print("  DIAGNZ xlen={d} nonzero={d} ptr={d}\n", .{ x.len, nz, @intFromPtr(x.ptr) });
-        }
-        if (dbg_kernel_check) std.debug.print("  DIAGENT ttype={s} rows={d} bpr={d} xlen={d} x0={e:.3}\n", .{
-            @tagName(w.ttype), w.rows, w.blocks_per_row, x.len, x[0],
-        });
         var pidx: usize = undefined;
         var pt0: Io.Clock.Timestamp = undefined;
         if (prof) {
@@ -1310,7 +1026,7 @@ pub const Engine = struct {
             // Q8_0 activation (34 B / 32 elems) + one 32-block row kernel per
             // row.  Q8_0 weights land here too: their activation quantizer and
             // dot call are exactly the family's, they are not special.
-            const dot = (if (dbg_force_rowdot) null else switch (w.ttype) {
+            const dot = switch (w.ttype) {
                 .q8_0 => simd.d32row.q8_0_q8_0,
                 .q4_0 => simd.d32row.q4_0_q8_0,
                 .q4_1 => simd.d32row.q4_1_q8_0,
@@ -1324,7 +1040,7 @@ pub const Engine = struct {
                 .f16 => simd.d32row.f16_q8_0,
                 .bf16 => simd.d32row.bf16_q8_0,
                 else => null,
-            }) orelse {
+            } orelse {
                 // No C row dot for this 32-block type: Zig scalar rowDot
                 // oracle (IQ types).  The .b32 shape is a bit-identity no-op
                 // loop, so the assert would be wrong; return early below.
@@ -1332,10 +1048,6 @@ pub const Engine = struct {
                 return;
             };
             simd.actQ8_0(cols, x.ptr, q8.ptr);
-            // kernelCheck32 wants `rb` = bytes of ONE 32-element block and
-            // `bpr` = 32-element blocks per row-block (1 for the 32-block
-            // native types, 8 for the 8x32-framed q4_0/q4_1/iq4_nl).
-            if (dbg_kernel_check) kernelCheck32(w.data, w.ttype, x, q8, dot, blockElemBytes(w.ttype), bpr * blockElemsOf(.q4_0) / 32, rows);
             pool_mod.parallel(pool, .{ .quantN = .{
                 .act_block = .b32,
                 .out = out.ptr,
@@ -1356,7 +1068,7 @@ pub const Engine = struct {
 
         // 256-element blocks: Q8_K activation (292 B / 256 elems) + one C dot
         // over the whole row.
-        const dot = (if (dbg_force_rowdot) null else switch (w.ttype) {
+        const dot = switch (w.ttype) {
             .q2_k => simd.d256.q2_k_q8_k,
             .q3_k => simd.d256.q3_k_q8_k,
             .q4_k => simd.d256.q4_k_q8_k,
@@ -1373,13 +1085,12 @@ pub const Engine = struct {
             .iq1_m => simd.diq.iq1_m_q8_k,
             .iq4_xs => simd.diq.iq4_xs_q8_k,
             else => null,
-        }) orelse {
+        } orelse {
             matvecQuantScalar(out, w, x, cols, rows, bpr, pool);
             return;
         };
         simd.actQ8_K(cols, x.ptr, q8k.ptr);
         const rb256 = w.blockBytes(); // one 256-element block
-        kernelCheck(w.data, w.ttype, x, q8k, dot, rb256, true, bpr, rows);
         pool_mod.parallel(pool, .{ .quantN = .{
             .act_block = .b256,
             .out = out.ptr,
@@ -1435,7 +1146,7 @@ pub const Engine = struct {
                 std.debug.assert(xK.len >= k * cols);
                 const act_b32 = blockElemsOf(qrow.ttype) == 32;
                 if (act_b32) {
-                    const dot = (if (dbg_force_rowdot) null else switch (qrow.ttype) {
+                    const dot = switch (qrow.ttype) {
                         .q8_0 => simd.d32row.q8_0_q8_0,
                         .q4_0 => simd.d32row.q4_0_q8_0,
                         .q4_1 => simd.d32row.q4_1_q8_0,
@@ -1449,7 +1160,7 @@ pub const Engine = struct {
                         .f16 => simd.d32row.f16_q8_0,
                         .bf16 => simd.d32row.bf16_q8_0,
                         else => null,
-                    }) orelse {
+                    } orelse {
                         matvecBatchKScalar(out, qrow, xK, k, rows, cols, pool);
                         return;
                     };
@@ -1475,7 +1186,7 @@ pub const Engine = struct {
                     } });
                     return;
                 }
-                const dot = (if (dbg_force_rowdot) null else switch (qrow.ttype) {
+                const dot = switch (qrow.ttype) {
                     .q2_k => simd.d256.q2_k_q8_k,
                     .q3_k => simd.d256.q3_k_q8_k,
                     .q4_k => simd.d256.q4_k_q8_k,
@@ -1490,7 +1201,7 @@ pub const Engine = struct {
                     .iq1_m => simd.diq.iq1_m_q8_k,
                     .iq4_xs => simd.diq.iq4_xs_q8_k,
                     else => null,
-                }) orelse {
+                } orelse {
                     matvecBatchKScalar(out, qrow, xK, k, rows, cols, pool);
                     return;
                 };
@@ -2014,7 +1725,6 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
-        kchkSummary();
         if (self.pool) |p| pool_mod.deinit(p, self.alloc);
         self.pool = null;
         self.freeAll();
