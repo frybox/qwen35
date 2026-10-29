@@ -56,12 +56,6 @@ pub fn reset() void {
     statf32.store(0, .release);
 }
 
-/// The AVX-512 VNNI row kernel (vpdpbusd, two interleaved block chains).
-/// Always returns the C kernel for maximum performance.
-inline fn q8RowDot() ?simd_api.Dot32 {
-    return simd.d32row.q8_0_q8_0;
-}
-
 // ---------------------------------------------------------------------------
 // Prof hooks: three-segment timing of one parallel() call.  Active only when
 // `prof` and `prof_phase` are both set by the engine (QWEN35_PROF); when off,
@@ -164,141 +158,79 @@ pub fn profReport() void {
 }
 
 pub const Task = union(enum) {
-    /// K/IQ types with a 256-block SIMD dot: out[r] = dot(bpr*256, row, q8k)
-    quant256: struct {
+    /// One family for every quantized matvec whose activation block width is
+    /// 32 or 256 elements -- i.e. every type this engine can dot.  Which of the
+    /// two shapes is picked depends ONLY on the activation block width, which
+    /// is a property of the weight block format, never a per-type whitelist:
+    ///
+    ///   * 32-element blocks (Q4_0/Q4_1/IQ4_NL/Q5_0/Q5_1/Q1_0/Q2_0/MXFP4/
+    ///     NVFP4/Q8_0/F16/BF16) -> Q8_0 activation (34 B / 32 elems) and a
+    ///     32-block row kernel.  Q8_0 weights are just the member of this
+    ///     family whose kernel is q8_0_q8_0: nothing about the activation
+    ///     quantizer or the dot call is different for them, which is why they
+    ///     used to have their own variant and no longer do.
+    ///   * 256-element blocks (K/IQ types) -> Q8_K activation (292 B / 256
+    ///     elems) and a 256-block C dot.
+    ///
+    /// Both shapes call their kernel ONCE PER ROW over the whole row
+    /// (`n = cols`), never once per block: the C kernels walk all their own
+    /// blocks internally (kernels32.c: `nb = n / 32`), so a per-block caller
+    /// loop is pure call overhead -- see the removed `.quant32` variant.
+    ///
+    /// `k` is the number of tokens batched into one task (1 = single token).
+    /// The virtual row index `r` covers `rows * k` work units: token
+    /// `tok = r / rows`, row `rr = r % rows`, output slot `out[tok*rows + rr]`,
+    /// activation slot `base[tok * len ..]`.  The per-row inner call is the
+    /// exact same kernel with the exact same arguments as for k = 1, so every
+    /// out[tok*rows+rr] is bit-identical to the serial per-token matvec.
+    quantN: struct {
+        /// 32: Q8_0 activation in `act` (34 B/32 elems).
+        /// 256: Q8_K activation in `act` (292 B/256 elems).
+        act_block: enum { b32, b256 },
         out: [*]f32,
         data: []const u8,
-        q8k: [*]const u8,
-        row_bytes: usize,
+        act: [*]const u8,
+        /// Packed activation bytes per token (0 = size it from bpr, which only
+        /// works for the 32-block shape; the 256-block caller always sets it).
+        act_len: usize,
+        /// Bytes of one weight block (34 for Q8_0, 144 for Q4_K, ...).
+        blk_bytes: usize,
+        /// Elements of one weight block (32 or 256).
+        blk_elems: usize,
+        /// Weight blocks per row as the GGUF row frames them: cols/256 for
+        /// every framed type, cols/32 for Q8_0 (which has no 256 framing).
         bpr: usize,
+        /// Elements per row.  Spelled out instead of derived from `bpr`,
+        /// because `bpr`'s unit (32 or 256) is exactly the thing that varies.
+        cols: usize,
         rows: usize,
-        dot: simd_api.Dot256,
+        k: usize,
+        dot32: simd_api.Dot32,
+        dot256: simd_api.Dot256,
     },
-    /// 32-block types framed as 256-element rows: per row, 8*bpr block dots.
-    quant32: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8: [*]const u8,
-        rb32: usize,
-        bpr: usize,
-        rows: usize,
-        dot: simd_api.Dot32,
-    },
-    /// Remaining IQ types: scalar per-block rowDot against the f32 activation.
+    /// Zig scalar per-block reference (`quant.rowDotXXX` against the f32
+    /// activation): the oracle the SIMD kernels are checked against, used for
+    /// IQ types that have no C dot and by QWEN35_FORCE_ROWDOT.
     quant_scalar: struct {
         out: [*]f32,
         data: []const u8,
-        x: []const f32,
+        x: [*]const f32,
+        x_len: usize,
         row_bytes: usize,
         bpr: usize,
         rows: usize,
+        k: usize,
         dot: RowDotScalar,
     },
-    /// Q8_0 rows: per row, row_blocks i32 block dots.  `dot` is the row-level
-    /// kernel (AVX-512 VNNI vpdpbusd on tiers that have it); when it is null
-    /// (baseline tier, or a caller that did not set it) the scalar per-block
-    /// loop below is used instead.
-    q8_0: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8: [*]const u8,
-        row_blocks: usize,
-        rows: usize,
-        dot: ?simd_api.Dot32 = null,
-    },
-    /// f16 / bf16 rows dotted directly against a Q8_0 activation (no f32
-    /// materialization): `rb32` bytes of packed 2-byte weights per 32-element
-    /// block, `row_blocks` Q8_0 blocks per row, one `dot(32, wblk, qblock)`
-    /// per block summed in ascending order (same accumulation as the
-    /// quant32 path, so results match the scalar rowDot fallback).
-    q8_0_d32: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8: [*]const u8,
-        rb32: usize,
-        row_blocks: usize,
-        rows: usize,
-        dot: simd_api.Dot32,
-    },
-    /// f32 rows.
+    /// Unquantized f32 rows.
     f32: struct {
         out: [*]f32,
         mat: []const f32,
-        x: []const f32,
-        cols: usize,
-        rows: usize,
-    },
-
-    // ---- batched (K-token) variants -------------------------------------
-    //
-    // `rows` is the row count of ONE token's matvec, `k` the number of tokens
-    // batched into one task.  The virtual row index `r` covers `rows * k`
-    // work units: token `t = r / rows`, row `rr = r % rows`, output slot
-    // `out[t * rows + rr]`, activation slot `base[t * len ..]`.  The per-row
-    // inner summation is the exact same `dot` call as the serial path, so
-    // every out[t*rows+rr] is bit-identical to a serial per-token matvec.
-
-    quant256b: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8k: [*]const u8,
-        q8k_len: usize,
-        row_bytes: usize,
-        bpr: usize,
-        rows: usize,
-        k: usize,
-        dot: simd_api.Dot256,
-    },
-    quant32b: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8: [*]const u8,
-        q8_len: usize,
-        rb32: usize,
-        bpr: usize,
-        rows: usize,
-        k: usize,
-        dot: simd_api.Dot32,
-    },
-    quant_scalarb: struct {
-        out: [*]f32,
-        data: []const u8,
-        x: [*]const f32,
-        x_len: usize,
-        row_bytes: usize,
-        bpr: usize,
-        rows: usize,
-        k: usize,
-        dot: RowDotScalar,
-    },
-    q8_0b: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8: [*]const u8,
-        q8_len: usize,
-        row_blocks: usize,
-        rows: usize,
-        k: usize,
-    },
-    f32b: struct {
-        out: [*]f32,
-        mat: []const f32,
         x: [*]const f32,
         x_len: usize,
         cols: usize,
         rows: usize,
         k: usize,
-    },
-    q8_0_d32b: struct {
-        out: [*]f32,
-        data: []const u8,
-        q8: [*]const u8,
-        q8_len: usize,
-        rb32: usize,
-        row_blocks: usize,
-        rows: usize,
-        k: usize,
-        dot: simd_api.Dot32,
     },
 };
 
@@ -332,28 +264,17 @@ pub const Pool = struct {
 
 fn rowsOf(t: Task) usize {
     return switch (t) {
-        .quant256 => |q| q.rows,
-        .quant32 => |q| q.rows,
-        .quant_scalar => |q| q.rows,
-        .q8_0 => |q| q.rows,
-        .q8_0_d32 => |q| q.rows,
-        .f32 => |q| q.rows,
-        .quant256b => |q| q.rows * q.k,
-        .quant32b => |q| q.rows * q.k,
-        .quant_scalarb => |q| q.rows * q.k,
-        .q8_0b => |q| q.rows * q.k,
-        .f32b => |q| q.rows * q.k,
-        .q8_0_d32b => |q| q.rows * q.k,
+        .quantN => |q| q.rows * q.k,
+        .quant_scalar => |q| q.rows * q.k,
+        .f32 => |q| q.rows * q.k,
     };
 }
 
 /// Minimum virtual-row count worth splitting across the pool (same threshold
 /// as the serial path, applied to `rows * k`).
 fn minParallelRows(t: Task) usize {
-    return switch (t) {
-        .quant256, .quant32, .quant_scalar, .q8_0, .q8_0_d32, .f32 => 256,
-        .quant256b, .quant32b, .quant_scalarb, .q8_0b, .q8_0_d32b, .f32b => 256,
-    };
+    _ = t;
+    return 256;
 }
 
 /// Compute rows [lo, hi) of a published task.  Row loop order within the chunk
@@ -361,119 +282,43 @@ fn minParallelRows(t: Task) usize {
 /// to the serial path.
 fn runRows(t: Task, lo: usize, hi: usize) void {
     switch (t) {
-        .quant256 => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const wrow = q.data[r * q.bpr * q.row_bytes ..][0 .. q.bpr * q.row_bytes];
-                if (stat_on) _ = stat256.fetchAdd(@intCast(q.bpr * q.row_bytes), .monotonic);
-                q.out[r] = q.dot(q.bpr * 256, wrow.ptr, q.q8k);
-            }
-        },
-        .quant32 => |q| {
-            const q8sl: []const u8 = q.q8[0 .. q.bpr * 8 * 34];
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const wrow = q.data[r * q.bpr * q.rb32 * 8 ..][0 .. q.bpr * q.rb32 * 8];
-                if (stat_on) _ = stat32.fetchAdd(@intCast(q.bpr * q.rb32 * 8), .monotonic);
-                var acc: f32 = 0;
-                for (0..8 * q.bpr) |k| {
-                    acc += q.dot(32, wrow[k * q.rb32 ..].ptr, q8sl[k * 34 ..].ptr);
-                }
-                q.out[r] = acc;
-            }
-        },
-        .quant_scalar => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                var acc: f32 = 0;
-                for (0..q.bpr) |b| {
-                    const blk = q.data[(r * q.bpr + b) * q.row_bytes ..];
-                    if (stat_on) _ = statsc.fetchAdd(@intCast(q.row_bytes), .monotonic);
-                    acc += q.dot(blk[0..q.row_bytes], q.x[b * 256 .. b * 256 + 256]);
-                }
-                q.out[r] = acc;
-            }
-        },
-        .q8_0 => |q| {
-            const blen = q.row_blocks * 34;
-            const rowdot = q.dot orelse q8RowDot();
-            if (rowdot) |f| {
-                const n = q.row_blocks * 32;
+        .quantN => |q| switch (q.act_block) {
+            // 32-element block weights against a Q8_0 activation.  ONE kernel
+            // call per row over the whole row width (`n = cols`): the C kernel
+            // loops `nb = n/32` blocks internally (kernels32.c:377), so this is
+            // the same summation it would do, minus the per-block call.
+            .b32 => {
+                const n = q.cols;
+                // `bpr` is in 256-element row-blocks for the framed 32-block
+                // types (q4_0 = 8x18, q4_1 = 8x20, iq4_nl = 8x18) but in plain
+                // 32-element blocks for Q8_0, so derive the row bytes from
+                // cols, the one unambiguous width.
+                const rb = n * q.blk_bytes / q.blk_elems;
                 var r = lo;
                 while (r < hi) : (r += 1) {
-                    const wrow = q.data[r * blen ..][0..blen];
-                    if (stat_on) _ = statq8.fetchAdd(@intCast(blen), .monotonic);
-                    q.out[r] = f(n, wrow.ptr, q.q8);
+                    const tok = r / q.rows;
+                    const rr = r % q.rows;
+                    const wrow = q.data[rr * rb ..][0..rb];
+                    if (stat_on) _ = stat32.fetchAdd(@intCast(rb), .monotonic);
+                    q.out[tok * q.rows + rr] = q.dot32(n, wrow.ptr, q.act + tok * q.act_len);
                 }
-                return;
-            }
-            const q8sl: []const u8 = q.q8[0 .. q.row_blocks * 34];
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const wrow = q.data[r * blen ..][0..blen];
-                if (stat_on) _ = statq8.fetchAdd(@intCast(blen), .monotonic);
-                var acc: f32 = 0;
-                for (0..q.row_blocks) |b| {
-                    const wb = wrow[b * 34 ..][0..34];
-                    const wscale: f32 = @as(f32, @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, wb[0..2], .little)))));
-                    const xscale: f32 = @as(f32, @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, q8sl[b * 34 ..][0..2], .little)))));
-                    var dot: i32 = 0;
-                    for (0..32) |j| {
-                        dot += @as(i32, @as(i8, @bitCast(wb[2 + j]))) * @as(i32, @as(i8, @bitCast(q8sl[b * 34 + 2 + j])));
-                    }
-                    acc += wscale * @as(f32, @floatFromInt(dot)) * xscale;
+            },
+            // 256-element block weights against a Q8_K activation: one C dot
+            // over the whole row (`n = cols`, kernel loops bpr blocks itself).
+            .b256 => {
+                const n = q.cols;
+                const rb = q.bpr * q.blk_bytes;
+                var r = lo;
+                while (r < hi) : (r += 1) {
+                    const tok = r / q.rows;
+                    const rr = r % q.rows;
+                    const wrow = q.data[rr * rb ..][0..rb];
+                    if (stat_on) _ = stat256.fetchAdd(@intCast(rb), .monotonic);
+                    q.out[tok * q.rows + rr] = q.dot256(n, wrow.ptr, q.act + tok * q.act_len);
                 }
-                q.out[r] = acc;
-            }
+            },
         },
-        .q8_0_d32 => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const wrow = q.data[r * q.row_blocks * q.rb32 ..][0 .. q.row_blocks * q.rb32];
-                if (stat_on) _ = stat32.fetchAdd(@intCast(q.row_blocks * q.rb32), .monotonic);
-                var acc: f32 = 0;
-                for (0..q.row_blocks) |b| {
-                    acc += q.dot(32, wrow[b * q.rb32 ..].ptr, q.q8 + b * 34);
-                }
-                q.out[r] = acc;
-            }
-        },
-        .f32 => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const rowv = q.mat[r * q.cols ..][0..q.cols];
-                if (stat_on) _ = statf32.fetchAdd(@intCast(q.cols * 4), .monotonic);
-                var acc: f32 = 0;
-                for (rowv, q.x) |mv, vv| acc += mv * vv;
-                q.out[r] = acc;
-            }
-        },
-        .quant256b => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const tok = r / q.rows;
-                const rr = r % q.rows;
-                const wrow = q.data[rr * q.bpr * q.row_bytes ..][0 .. q.bpr * q.row_bytes];
-                if (stat_on) _ = stat256.fetchAdd(@intCast(q.bpr * q.row_bytes), .monotonic);
-                q.out[tok * q.rows + rr] = q.dot(q.bpr * 256, wrow.ptr, q.q8k[tok * q.q8k_len ..]);
-            }
-        },
-        .quant32b => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const tok = r / q.rows;
-                const rr = r % q.rows;
-                const q8sl: []const u8 = q.q8[tok * q.q8_len ..][0 .. q.bpr * 8 * 34];
-                const wrow = q.data[rr * q.bpr * q.rb32 * 8 ..][0 .. q.bpr * q.rb32 * 8];
-                if (stat_on) _ = stat32.fetchAdd(@intCast(q.bpr * q.rb32 * 8), .monotonic);
-                var acc: f32 = 0;
-                for (0..8 * q.bpr) |kk| {
-                    acc += q.dot(32, wrow[kk * q.rb32 ..].ptr, q8sl[kk * 34 ..].ptr);
-                }
-                q.out[tok * q.rows + rr] = acc;
-            }
-        },
-        .quant_scalarb => |q| {
+        .quant_scalar => |q| {
             var r = lo;
             while (r < hi) : (r += 1) {
                 const tok = r / q.rows;
@@ -488,33 +333,7 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
                 q.out[tok * q.rows + rr] = acc;
             }
         },
-        .q8_0b => |q| {
-            const blen = q.row_blocks * 34;
-            // Same kernel as the non-batched `.q8_0` case: one call per row into
-            // the C SIMD dot (q8_0_q8_0 walks all n/32 blocks internally).  The
-            // previous version expanded the blocks in a scalar per-element loop
-            // `for (0..32) |j| i8*i8`, which made batched prefill several times
-            // slower than decode instead of faster -- it was the reason a larger
-            // K barely helped (measured: 16->64 only +3.7% before this fix).
-            //
-            // NOTE: not bit-identical to the old scalar loop -- the AVX2 kernel
-            // accumulates in 8-wide float lanes with FMA (kernels32.c:421), so
-            // the summation order differs and only the rounding changes.  Row
-            // ORDER is unchanged (rows are independent), so the result is still
-            // deterministic run to run.
-            const rowdot = q8RowDot() orelse unreachable;
-            const n = q.row_blocks * 32;
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const tok = r / q.rows;
-                const rr = r % q.rows;
-                const q8sl: []const u8 = q.q8[tok * q.q8_len ..][0..blen];
-                const wrow = q.data[rr * blen ..][0..blen];
-                if (stat_on) _ = statq8.fetchAdd(@intCast(blen), .monotonic);
-                q.out[tok * q.rows + rr] = rowdot(n, wrow.ptr, q8sl.ptr);
-            }
-        },
-        .f32b => |q| {
+        .f32 => |q| {
             var r = lo;
             while (r < hi) : (r += 1) {
                 const tok = r / q.rows;
@@ -524,21 +343,6 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
                 const xs = q.x[tok * q.x_len ..];
                 var acc: f32 = 0;
                 for (rowv, xs) |mv, vv| acc += mv * vv;
-                q.out[tok * q.rows + rr] = acc;
-            }
-        },
-        .q8_0_d32b => |q| {
-            var r = lo;
-            while (r < hi) : (r += 1) {
-                const tok = r / q.rows;
-                const rr = r % q.rows;
-                const wrow = q.data[rr * q.row_blocks * q.rb32 ..][0 .. q.row_blocks * q.rb32];
-                if (stat_on) _ = stat32.fetchAdd(@intCast(q.row_blocks * q.rb32), .monotonic);
-                const q8sl: [*]const u8 = q.q8 + tok * q.q8_len;
-                var acc: f32 = 0;
-                for (0..q.row_blocks) |b| {
-                    acc += q.dot(32, wrow[b * q.rb32 ..].ptr, q8sl + b * 34);
-                }
                 q.out[tok * q.rows + rr] = acc;
             }
         },

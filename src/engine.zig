@@ -378,13 +378,14 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
                         }
                     }
                 } else {
-                    const rb = Engine.quantRowBytes(q.ttype);
+                    const bb = q.blockBytes(); // one block of this type
+                    const be = q.blockElems();
                     const deq = dequantRowFnFor(q.ttype) orelse return -2;
                     for (0..q.blocks_per_row) |b| {
                         const i = rr * q.blocks_per_row + b;
-                        if (i * rb + rb > q.data.len) return -4;
-                        deq(q.data[i * rb ..][0..rb], rowbuf[0..256]);
-                        for (0..256) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * 256 + j]);
+                        if (i * bb + bb > q.data.len) return -4;
+                        deq(q.data[i * bb ..][0..bb], rowbuf[0..be]);
+                        for (0..be) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * be + j]);
                     }
                 }
             },
@@ -409,28 +410,23 @@ pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: u
     pool_mod.parallel(pool, .{ .f32 = .{
         .out = out.ptr,
         .mat = mat,
-        .x = x,
+        .x = x.ptr,
+        .x_len = cols,
         .cols = cols,
         .rows = rows,
+        .k = 1,
     } });
 }
 
-/// Linear layer with native quantized weights: Q8_0 and K/IQ types stay in
-/// their packed format (zero-copy mmap) and are dotted in the quantized
-/// domain (no whole-row f32 materialization); f32 is the small/dequant path.
-/// `q8` is the engine's Q8 activation scratch (ceil(cols/32) blocks).
+/// Linear layer with native quantized weights: every quantized type stays in
+/// its packed format (zero-copy mmap) and is dotted in the quantized domain
+/// (no whole-row f32 materialization); f32 is the small/dequant path.
+/// `q8` is the Q8_0 activation scratch (34 B per 32 elems), `q8k` the Q8_K one
+/// (292 B per 256 elems); which of the two is used is decided inside
+/// `matvecQuant` from the weight's block width, not from its type.
 fn linMatvec(out: []f32, w: Engine.LinearW, x: []const f32, q8: []u8, q8k: []u8, pool: ?*pool_mod.Pool) void {
     switch (w) {
-        .quant => |qrow| {
-            // Q8_0 keeps its own numeric entry point: it uses all of `q8`
-            // (cols/32 blocks) and the row-granular C dot, while the generic
-            // path quantizes to q8k and streams 256-element blocks.
-            if (qrow.ttype == .q8_0) {
-                matvecQ8_0(out, qrow, x, q8, pool);
-            } else {
-                Engine.matvecQuant(out, qrow, x, q8k, q8, pool);
-            }
-        },
+        .quant => |qrow| Engine.matvecQuant(out, qrow, x, q8k, q8, pool),
         .f32 => |m| {
             matvec(out, m, x, out.len, x.len, pool);
         },
@@ -447,8 +443,39 @@ fn linMatvecBatchK(out: []f32, w: Engine.LinearW, xK: []const f32, k: usize, q8K
 // Q8_0 block format (ggml: 34 bytes per 32 elements: f16 scale + 32 x i8)
 // ---------------------------------------------------------------------------
 
-pub const q8_0_block_elems = 32;
-pub const q8_0_block_bytes = 34;
+/// Block geometry of a quantized ttype: ONE source, `gguf.TensorType
+/// .blockLayout()`, which mirrors ggml's `ggml_blck_size` / `ggml_type_size`
+/// pair (`ggml.c` type table; per-block sizes asserted in ggml-common.h e.g.
+/// `static_assert(sizeof(block_q8_0) == ...)`).  Every block-elems / block-bytes
+/// number in engine.zig is derived here -- there is deliberately no
+/// "row bytes" table any more: a row is `blocks_per_row * blockElemBytes()`.
+///
+/// Panics on a layout-less ttype: 0 was the old "unknown" sentinel and each
+/// caller turned it into its own error, but every caller is either guarded by
+/// `gguf.File` rejecting unknown types at load (`gguf.zig` `isKnown()`) or
+/// behind an exhaustive dispatch switch, so reaching here means a real bug.
+pub fn blockElemsOf(t: gguf.TensorType) usize {
+    return @intCast((t.blockLayout() orelse unreachable_block_layout(t)).elems);
+}
+
+/// Packed bytes of one block of `t` (`blockLayout().bytes`).
+pub fn blockElemBytes(t: gguf.TensorType) usize {
+    return @intCast((t.blockLayout() orelse unreachable_block_layout(t)).bytes);
+}
+
+fn unreachable_block_layout(t: gguf.TensorType) noreturn {
+    std.debug.panic("no blockLayout for ttype {s}: its block geometry is unknown", .{@tagName(t)});
+}
+
+pub const q8_0_block_elems = blockElemsOf(.q8_0);
+pub const q8_0_block_bytes = blockElemBytes(.q8_0);
+
+/// Elements in one GGUF row-block: the unit `QuantRow.blocks_per_row` counts
+/// for every type except Q8_0 (whose rows are plain 32-element blocks).
+/// All framed types pack 8 x 32 = 256 elements per row-block; it is spelled
+/// as an expression over the layout table rather than a bare 256 so that the
+/// 32-element block size still has a single source.
+pub const rowBlockElems = q8_0_block_elems * 8;
 
 /// Bytes `q8_scratch` must hold to quantize a matvec INPUT of `cols` elements
 /// (ceil(cols/32) blocks of 34 bytes).  Every Q8_0 matvec writes its quantized
@@ -461,7 +488,8 @@ pub fn q8ScratchBytes(cols: usize) usize {
 /// Bytes `q8k_scratch` must hold to Q8_K-quantize a matvec INPUT of `cols`
 /// elements (292 bytes per 256 elements: f32 scale + 256 x i8 + 16 x i16 bsums).
 pub fn q8kScratchBytes(cols: usize) usize {
-    return (cols + 255) / 256 * 292;
+    const be = blockElemsOf(.q8_k);
+    return (cols + be - 1) / be * blockElemBytes(.q8_k);
 }
 
 /// The widest Q8_0 matvec INPUT in a model of this shape, derived from the
@@ -538,50 +566,6 @@ pub fn quantizeQ8_0(data: []const f32, out: []u8) !void {
 // block scale. x is f32, quantized on the fly into a scratch buffer.
 // ---------------------------------------------------------------------------
 
-/// out[r] = sum_c W[r,c] * x[c], W row-major Q8_0 blocks. Scratch q8 must
-/// hold ceil(cols / 32) blocks (x quantized per block with round-to-nearest,
-/// matching quantizeQ8_0 semantics).
-///
-/// `w` is the unified `QuantRow` view with `ttype == .q8_0`; its
-/// `blocks_per_row` is the Q8_0 block count (cols / 32) and `row_blocks()`
-/// derives the byte stride from it + `q8_0_block_bytes`.  Numbers unchanged:
-/// the body is the pre-merge `Q8Row` implementation, which is why `.q8_0` in
-/// pool.zig still maps to the C `q8_0_q8_0` row dot.
-pub fn matvecQ8_0(out: []f32, w: Engine.QuantRow, x: []const f32, q8: []u8, pool: ?*pool_mod.Pool) void {
-    var pidx: usize = undefined;
-    var pt0: Io.Clock.Timestamp = undefined;
-    if (prof) {
-        var kbuf: [64]u8 = undefined;
-        const key = std.fmt.bufPrint(&kbuf, "q8:{d}", .{w.rows}) catch "q8?";
-        pidx = profStart(key[0..@min(key.len, 64)]);
-        pt0 = Io.Clock.Timestamp.now(prof_io, .awake);
-        defer profEnd(pidx, profNs(prof_io, pt0));
-    }
-    std.debug.assert(w.rows == out.len);
-    const row_blocks = w.row_blocks();
-    const cols = row_blocks * q8_0_block_elems;
-    std.debug.assert(x.len == cols);
-    std.debug.assert(q8.len >= row_blocks * q8_0_block_bytes);
-
-    // Quantize the activation once (shared by all rows), then dot each row.
-    //
-    // The dot stays a scalar i32 loop HERE ON PURPOSE: measured on this box,
-    // the SIMD kern32 kernels are memory-bandwidth-bound on a 4.5 GB mmap'd
-    // weight file and AVX-512-heavy code downclocks, so the vector row kernel
-    // measured ~2x SLOWER than this loop in-engine (0.74 vs 1.51 tok/s on
-    // 4B-Q8_0), even though it wins in a cache-resident microbenchmark.
-    // The K-quant 256-block path (matvecQuant) is where SIMD pays off.
-    simd.actQ8_0(x.len, x.ptr, q8.ptr);
-
-    pool_mod.parallel(pool, .{ .q8_0 = .{
-        .out = out.ptr,
-        .data = w.data,
-        .q8 = q8.ptr,
-        .row_blocks = row_blocks,
-        .rows = w.rows,
-    } });
-}
-
 // ---------------------------------------------------------------------------
 // Generic per-row dequant: a tensor of a K-quantized type is a sequence of
 // fixed-size rows (each `row_bytes` bytes == 256 elements); dequantize each
@@ -624,58 +608,26 @@ fn dequantRowBF16(row: []const u8, out: []f32) void {
     for (0..out.len) |i| out[i] = @as(f32, @bitCast(@as(u32, src[i]) << 16));
 }
 
+/// Dequantize a flat packed block stream into f32, one block per iteration.
+/// The unit walked here is the type's own block, taken from the layout table
+/// (`blockElemsOf`/`blockElemBytes`) -- the old per-type row-byte table
+/// (144 for Q4_0, 512 for f16, ...) was a second, divergent copy of exactly
+/// that geometry.
 fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const u8, out: []f32) !void {
-    const row_bytes: usize = switch (ttype) {
-        // 32-elem-block types stored as 8 sub-blocks per 256-elem row:
-        // Q4_0 = 8*18 = 144, Q4_1 = 8*20 = 160 bytes/row.
-        .q4_0 => 144,
-        .q4_1 => 160,
-        .q4_k => 144,
-        .q5_k => 176,
-        .q6_k => 210,
-        .q3_k => 110,
-        .iq4_xs => 136,
-        .iq4_nl => 144,
-        .iq3_s => 110,
-        .iq3_xxs => 98,
-        .iq2_s => 82,
-        .iq2_xxs => 66,
-        .iq2_xs => 74,
-        .iq1_s => 50,
-        .iq1_m => 56,
-        .q2_k => 84,
-        // unquantized 2-byte types: 8 x 32 elements x 2 B per 256-elem row
-        .f16, .bf16 => 512,
+    const deq: dequantRowFn = dequantRowFnFor(ttype) orelse switch (ttype) {
+        .f16 => &dequantRowF16,
+        .bf16 => &dequantRowBF16,
         else => return error.UnsupportedTensorType,
     };
     const row_elems = 256; // every K-quant type packs 256 elems per row
+    // byte size of one such row, from the block geometry (was a per-type
+    // table: 144 for Q4_0, 512 for f16, ...)
+    const row_bytes: usize = row_elems / blockElemsOf(ttype) * blockElemBytes(ttype);
     const nf: usize = out.len;
     if (nf % row_elems != 0) return error.NotMultipleOfRow;
     const nrows = nf / row_elems;
     const expected_bytes = nrows * row_bytes;
     if (data.len < expected_bytes) return error.SizeMismatch;
-
-    const deq: dequantRowFn = switch (ttype) {
-        .q4_0 => &quant.dequantQ4_0,
-        .q4_1 => &quant.dequantQ4_1,
-        .q4_k => &quant.dequantQ4K,
-        .q5_k => &quant.dequantQ5K,
-        .q6_k => &quant.dequantQ6K,
-        .q3_k => &quant.dequantQ3K,
-        .iq4_xs => &quant.dequantIQ4XS,
-        .iq4_nl => &quant.dequantIQ4NL,
-        .iq3_s => &quant.dequantIQ3S,
-        .iq3_xxs => &quant.dequantIQ3XXS,
-        .iq2_s => &quant.dequantIQ2S,
-        .iq2_xxs => &quant.dequantIQ2XXS,
-        .iq2_xs => &quant.dequantIQ2XS,
-        .iq1_s => &quant.dequantIQ1S,
-        .iq1_m => &quant.dequantIQ1M,
-        .q2_k => &quant.dequantQ2K,
-        .f16 => &dequantRowF16,
-        .bf16 => &dequantRowBF16,
-        else => return error.UnsupportedTensorType,
-    };
 
     const row = try alloc.alloc(f32, row_elems);
     defer alloc.free(row);
@@ -857,7 +809,8 @@ fn kchkSummary() void {
 }
 
 /// Same A/B as `kernelCheck` for 32-element-block kernels (Q8_0 activation,
-/// `bpr` 32-element blocks per row of `rb` bytes each).
+/// `bpr` row-blocks per row, each row-block painted with
+/// `kernelCheck32BlocksPerRowBlock()` 32-element blocks of `rb` bytes each).
 fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: []const u8, dot: simd_api.Dot32, rb: usize, bpr: usize, rows: usize) void {
     if (!dbg_kernel_check) return;
     const rd: *const fn (row: []const u8, x: []const f32) f32 = rowDotFor(ttype) orelse return;
@@ -868,8 +821,8 @@ fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: 
     if (!first_for_type) dbg_kernel_check_budget -= take;
     if (slot) |s| dbg_kchk_seen[s] = true;
     var xq: [8192]f32 = undefined;
-    const nblocks = bpr * 8;
-    if (bpr * 256 > xq.len) return;
+    const nblocks = bpr * kernelCheck32BlocksPerRowBlock();
+    if (nblocks * 32 > xq.len) return;
     for (0..nblocks) |j| {
         const p = act[j * 34 ..];
         const sc = @as(f32, @floatCast(@as(f16, @bitCast(@as(u16, p[0]) | (@as(u16, p[1]) << 8)))));
@@ -889,7 +842,7 @@ fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: 
         var zig_acc: f32 = 0;
         var q_acc: f32 = 0;
         for (0..bpr) |b| {
-            const blk = data[(r * bpr + b) * (8 * rb) ..][0 .. 8 * rb];
+            const blk = data[(r * bpr + b) * (kernelCheck32BlocksPerRowBlock() * rb) ..][0 .. kernelCheck32BlocksPerRowBlock() * rb];
             zig_acc += rd(blk, x[b * 256 .. b * 256 + 256]);
             q_acc += rd(blk, xq[b * 256 .. b * 256 + 256]);
         }
@@ -920,6 +873,13 @@ fn kernelCheck32(data: []const u8, ttype: gguf.TensorType, x: []const f32, act: 
     }
 }
 
+/// 32-element blocks per row-block in the 8x32-framed types (Q4_0, Q4_1,
+/// IQ4_NL: 256 elements stored as eight 32-element blocks), derived from the
+/// layout table instead of a literal 8.
+fn kernelCheck32BlocksPerRowBlock() usize {
+    return 256 / blockElemsOf(.q4_0);
+}
+
 fn rowDotFor(ttype: gguf.TensorType) ?*const fn (row: []const u8, x: []const f32) f32 {
     return switch (ttype) {
         .q4_k => &quant.rowDotQ4K,
@@ -934,6 +894,8 @@ fn rowDotFor(ttype: gguf.TensorType) ?*const fn (row: []const u8, x: []const f32
         .iq2_s => &quant.rowDotIQ2S,
         .iq2_xxs => &quant.rowDotIQ2XXS,
         .iq2_xs => &quant.rowDotIQ2XS,
+        .iq1_s => &quant.rowDotIQ1S,
+        .iq1_m => &quant.rowDotIQ1M,
         .q4_0 => &quant.rowDotQ4_0,
         .q4_1 => &quant.rowDotQ4_1,
         .f16 => &quant.rowDotF16,
@@ -1241,37 +1203,52 @@ pub const Engine = struct {
     /// One 2D linear weight held in a quantized GGUF type: a zero-copy
     /// view over the mmapped file.  The GGUF stores a row-major [rows, cols]
     /// matrix as a flat stream of `blocks_per_row` packed blocks per output
-    /// row (row r = output channel r), `quantRowBytes(ttype)` bytes each.
+    /// row (row r = output channel r), `rowBytes()` bytes each.
     ///
     /// `blocks_per_row` always counts blocks in the type's OWN block size:
     /// 256-element blocks for K/IQ types (cols / 256), 32-element blocks for
-    /// Q8_0 (cols / 32).  `blockElems()`/`row_blocks()`/`rowBytes()` are
-    /// derived from `ttype`, never stored — a second copy of the block size
-    /// could drift from the GGUF layout table.
+    /// Q8_0, Q4_0, Q4_1 and IQ4_NL (cols / 32).  There is no per-type
+    /// block-size test anywhere: `blockElems()`/`blockBytes()`/`row_blocks()`/
+    /// `rowBytes()` all come from `blockElemsOf`/`blockElemBytes`, i.e. from
+    /// the GGUF layout table — a second copy could drift from it.
     pub const QuantRow = struct {
         data: []const u8,
         ttype: gguf.TensorType,
         rows: usize,
         blocks_per_row: usize,
 
-        /// Elements per block of this type (Q8_0 = 32, K/IQ = 256).
+        /// Elements per block of this type, from the GGUF layout table.
         pub fn blockElems(self: QuantRow) usize {
-            return if (self.ttype == .q8_0) q8_0_block_elems else 256;
+            return blockElemsOf(self.ttype);
         }
 
-        /// Packed bytes per block of this type.
+        /// Packed bytes per block of this type, from the GGUF layout table.
         pub fn blockBytes(self: QuantRow) usize {
-            return if (self.ttype == .q8_0) q8_0_block_bytes else quantRowBytes(self.ttype);
+            return blockElemBytes(self.ttype);
         }
 
-        /// Blocks per row in `blockElems()` units (same as `blocks_per_row`).
+        /// Elements per row-block: 256 for every type (the GGUF row framing
+        /// shared by all K/IQ types and by the 8x32-framed ones), 32 for Q8_0,
+        /// whose rows are stored as plain 32-element blocks with no 256
+        /// framing and which is therefore the one type counted directly.
+        pub fn rowBlockElems(self: QuantRow) usize {
+            return if (self.ttype == .q8_0) blockElemsOf(.q8_0) else 256;
+        }
+
+        /// Columns of this weight, derived from the row-block count.
+        pub fn cols(self: QuantRow) usize {
+            return self.blocks_per_row * self.rowBlockElems();
+        }
+
+        /// This type's own blocks per row (Q8_0: cols/32, K/IQ: cols/256).
         pub fn row_blocks(self: QuantRow) usize {
-            return self.blocks_per_row;
+            return self.cols() / self.blockElems();
         }
 
-        /// Packed bytes for one full row.
+        /// Packed bytes for one full row = columns x bytes-per-element, i.e.
+        /// `row_blocks()` blocks of `blockBytes()` each.
         pub fn rowBytes(self: QuantRow) usize {
-            return self.blocks_per_row * self.blockBytes();
+            return self.row_blocks() * self.blockBytes();
         }
 
         /// Packed bytes for output row `r`.
@@ -1281,44 +1258,17 @@ pub const Engine = struct {
         }
     };
 
-    /// Packed bytes for one 256-element K/IQ block of a type (0 = unknown).
-    pub fn quantRowBytes(t: gguf.TensorType) usize {
-        // every supported type holds 256 elements per row; Q4_0 (8x18) and
-        // Q4_1 (8x20) are 32-elem-block types framed as one 256-elem row.
-        return switch (t) {
-            .q4_0 => 144,
-            .q4_1 => 160,
-            .q4_k => 144,
-            .q5_k => 176,
-            .q6_k => 210,
-            .q3_k => 110,
-            .iq4_xs => 136,
-            .iq4_nl => 144,
-            .iq3_s => 110,
-            .iq3_xxs => 98,
-            .iq2_s => 82,
-            .iq2_xxs => 66,
-            .q2_k => 84,
-            .iq2_xs => 74,
-            .iq1_s => 50,
-            .iq1_m => 56,
-            .f16, .bf16 => 512, // 256 x 2 B, no block metadata
-            else => 0,
-        };
-    }
-
-    /// Packed block `b` of row `r` (one 256-element block).
-    fn quantBlock(w: QuantRow, r: usize, b: usize) []const u8 {
-        const rb = quantRowBytes(w.ttype);
-        const i = r * w.blocks_per_row + b;
-        return w.data[i * rb .. (i + 1) * rb];
-    }
-
-    /// out[r] = sum_c W[r,c] * x[c] for a K/IQ quantized row-major weight,
-    /// reading the packed bytes directly and accumulating in f32 (no whole-row
-    /// f32 materialization).  W is [rows, cols]; each row is `blocks_per_row`
-    /// packed 256-element blocks.  Fallback for the 256-block-aligned case
-    /// uses per-block `quant.rowDotXXX`; partial tail handled in f32.
+    /// out[r] = sum_c W[r,c] * x[c] for a quantized row-major weight, reading
+    /// the packed bytes directly and accumulating in f32 (no whole-row f32
+    /// materialization).  W is [rows, cols].
+    ///
+    /// There is exactly ONE decision here: the weight's activation block
+    /// width.  GGUF framing gives every quantized row `blocks_per_row` blocks
+    /// of either 32 (Q8_0 -- the only type counted in 32s) or 256 elements
+    /// (everything else, including the 8x32-framed q4_0/q4_1/iq4_nl and the
+    /// 2-byte f16/bf16 rows).  Both shapes call their C kernel ONCE per row
+    /// over the whole row; no type gets a special case, which is why Q8_0 no
+    /// longer has a dedicated matvec entry point of its own.
     fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, pool: ?*pool_mod.Pool) void {
         if (dbg_kernel_check) {
             var nz: usize = 0;
@@ -1341,25 +1291,79 @@ pub const Engine = struct {
         }
         const rows = w.rows;
         const bpr = w.blocks_per_row;
-        // Q8_0 has its own entry point (matvecQ8_0: 32-element blocks, row dot);
-        // reaching here with q8_0 would silently read it as 256-element blocks.
-        std.debug.assert(w.ttype != .q8_0);
-        const cols = bpr * 256;
+        // `blocks_per_row` counts the type's own row-blocks: 32 elements for
+        // Q8_0, 256 for everything else (`QuantRow.rowBlockElems`).  The row
+        // width is `bpr * rowBlockElems` (= bpr*256 for the 256-framed types)
+        // -- NOT `bpr * blockElems()`, which for q4_0 (32-element blocks, 8 per
+        // row-block) would give a 1/8-size row.
+        const cols = w.cols();
         std.debug.assert(out.len == rows and x.len >= cols);
+        // 32-element blocks <=> the type's own block IS 32 elements.  This is
+        // the single, data-layout-derived branch; all kernel selection below
+        // follows from it.
+        const act_b32 = blockElemsOf(w.ttype) == 32;
+        std.debug.assert(if (act_b32) bpr == cols / 32 else bpr == cols / 256);
         std.debug.assert(q8k.len >= q8kScratchBytes(cols));
+        std.debug.assert(q8.len >= q8ScratchBytes(cols));
 
-        // Types with a ported SIMD kernel (src/simd/kern256.zig): quantize the
-        // activation ONCE to Q8_K and reuse it across every row.  This is the
-        // llama.cpp vec_dot path -- integer dot products instead of per-element
-        // f32 dequant.
-        const dot256: ?simd_api.Dot256 = if (dbg_force_rowdot) null else switch (w.ttype) {
+        if (act_b32) {
+            // Q8_0 activation (34 B / 32 elems) + one 32-block row kernel per
+            // row.  Q8_0 weights land here too: their activation quantizer and
+            // dot call are exactly the family's, they are not special.
+            const dot = (if (dbg_force_rowdot) null else switch (w.ttype) {
+                .q8_0 => simd.d32row.q8_0_q8_0,
+                .q4_0 => simd.d32row.q4_0_q8_0,
+                .q4_1 => simd.d32row.q4_1_q8_0,
+                .iq4_nl => simd.d32row.iq4_nl_q8_0,
+                .q5_0 => simd.d32row.q5_0_q8_0,
+                .q5_1 => simd.d32row.q5_1_q8_0,
+                .q1_0 => simd.d32row.q1_0_q8_0,
+                .q2_0 => simd.d32row.q2_0_q8_0,
+                .mxfp4 => simd.d32row.mxfp4_q8_0,
+                .nvfp4 => simd.d32row.nvfp4_q8_0,
+                .f16 => simd.d32row.f16_q8_0,
+                .bf16 => simd.d32row.bf16_q8_0,
+                else => null,
+            }) orelse {
+                // No C row dot for this 32-block type: Zig scalar rowDot
+                // oracle (IQ types).  The .b32 shape is a bit-identity no-op
+                // loop, so the assert would be wrong; return early below.
+                matvecQuantScalar(out, w, x, cols, rows, bpr, pool);
+                return;
+            };
+            simd.actQ8_0(cols, x.ptr, q8.ptr);
+            // kernelCheck32 wants `rb` = bytes of ONE 32-element block and
+            // `bpr` = 32-element blocks per row-block (1 for the 32-block
+            // native types, 8 for the 8x32-framed q4_0/q4_1/iq4_nl).
+            if (dbg_kernel_check) kernelCheck32(w.data, w.ttype, x, q8, dot, blockElemBytes(w.ttype), bpr * blockElemsOf(.q4_0) / 32, rows);
+            pool_mod.parallel(pool, .{ .quantN = .{
+                .act_block = .b32,
+                .out = out.ptr,
+                .data = w.data,
+                .act = q8.ptr,
+                .act_len = q8ScratchBytes(cols),
+                .blk_bytes = blockElemBytes(w.ttype),
+                .blk_elems = blockElemsOf(w.ttype),
+                .bpr = bpr,
+                .cols = cols,
+                .rows = rows,
+                .k = 1,
+                .dot32 = dot,
+                .dot256 = undefined,
+            } });
+            return;
+        }
+
+        // 256-element blocks: Q8_K activation (292 B / 256 elems) + one C dot
+        // over the whole row.
+        const dot = (if (dbg_force_rowdot) null else switch (w.ttype) {
             .q2_k => simd.d256.q2_k_q8_k,
             .q3_k => simd.d256.q3_k_q8_k,
             .q4_k => simd.d256.q4_k_q8_k,
             .q5_k => simd.d256.q5_k_q8_k,
             .q6_k => simd.d256.q6_k_q8_k,
-            // Importance-sampled types: same Q8_K activation framing, codebook
-            // gather instead of bit-unpacking (src/simd/kerniq*.zig).
+            // Importance-sampled types: same Q8_K activation framing,
+            // codebook gather instead of bit-unpacking.
             .iq2_xxs => simd.diq.iq2_xxs_q8_k,
             .iq2_xs => simd.diq.iq2_xs_q8_k,
             .iq2_s => simd.diq.iq2_s_q8_k,
@@ -1369,113 +1373,46 @@ pub const Engine = struct {
             .iq1_m => simd.diq.iq1_m_q8_k,
             .iq4_xs => simd.diq.iq4_xs_q8_k,
             else => null,
-        };
-        if (dot256) |dot| {
-            simd.actQ8_K(cols, x.ptr, q8k.ptr);
-            const rb256 = quantRowBytes(w.ttype);
-            kernelCheck(w.data, w.ttype, x, q8k, dot, rb256, true, bpr, rows);
-            pool_mod.parallel(pool, .{ .quant256 = .{
-                .out = out.ptr,
-                .data = w.data,
-                .q8k = q8k.ptr,
-                .row_bytes = rb256,
-                .bpr = bpr,
-                .rows = rows,
-                .dot = dot,
-            } });
+        }) orelse {
+            matvecQuantScalar(out, w, x, cols, rows, bpr, pool);
             return;
-        }
-
-        // 32-element-block types framed as 256-element rows (Q4_0 = 8x18,
-        // Q4_1 = 8x20, IQ4_NL = 8x18): quantize the activation to Q8_0 once and
-        // do 8 SIMD 32-block dots per row (src/simd/kern32.zig).
-        const dot32: ?simd_api.Dot32 = if (dbg_force_rowdot) null else switch (w.ttype) {
-            .q4_0 => simd.d32.q4_0_q8_0,
-            .q4_1 => simd.d32.q4_1_q8_0,
-            .iq4_nl => simd.d32.iq4_nl_q8_0,
-            else => null,
         };
-        if (dot32 != null) {
-            const rb32 = quantRowBytes(w.ttype) / 8; // bytes per 32-element block
-            simd.actQ8_0(cols, x.ptr, q8.ptr);
-            kernelCheck(w.data, w.ttype, x, q8, dot32.?, rb32, false, bpr, rows);
-            const dotr: simd_api.Dot32 = switch (w.ttype) {
-                .q4_0 => simd.d32row.q4_0_q8_0,
-                .q4_1 => simd.d32row.q4_1_q8_0,
-                .iq4_nl => simd.d32row.iq4_nl_q8_0,
-                else => unreachable,
-            };
-            pool_mod.parallel(pool, .{ .quant32 = .{
-                .out = out.ptr,
-                .data = w.data,
-                .q8 = q8.ptr,
-                .rb32 = rb32,
-                .bpr = bpr,
-                .rows = rows,
-                .dot = dotr,
-            } });
-            return;
-        }
+        simd.actQ8_K(cols, x.ptr, q8k.ptr);
+        const rb256 = w.blockBytes(); // one 256-element block
+        kernelCheck(w.data, w.ttype, x, q8k, dot, rb256, true, bpr, rows);
+        pool_mod.parallel(pool, .{ .quantN = .{
+            .act_block = .b256,
+            .out = out.ptr,
+            .data = w.data,
+            .act = q8k.ptr,
+            .act_len = q8kScratchBytes(cols),
+            .blk_bytes = rb256,
+            .blk_elems = blockElemsOf(w.ttype),
+            .bpr = bpr,
+            .cols = cols,
+            .rows = rows,
+            .k = 1,
+            .dot32 = undefined,
+            .dot256 = dot,
+        } });
+    }
 
-        // f16 / bf16 rows: quantize the activation to Q8_0 once and dot against
-        // the packed 2-byte weights directly (no whole-row f32 materialization).
-        // These types are not part of LinearW.f32 any more, so they land here
-        // instead of the scalar rowDot path.
-        const dot32x: ?simd_api.Dot32 = if (dbg_force_rowdot) null else switch (w.ttype) {
-            .f16 => simd.d32row.f16_q8_0,
-            .bf16 => simd.d32row.bf16_q8_0,
-            else => null,
-        };
-        if (dot32x) |dot| {
-            simd.actQ8_0(cols, x.ptr, q8.ptr);
-            if (dbg_kernel_check) std.debug.print("  DIAGPRE xlen={d} x0={e:.3} x1={e:.3} act0={d} act2={d} q8len={d}\n", .{
-                x.len, x[0], x[1], q8[0], q8[2], q8.len,
-            });
-            if (dbg_kernel_check) kernelCheck32(w.data, w.ttype, x, q8, dot, 8 * 2, bpr, rows);
-            pool_mod.parallel(pool, .{
-                .q8_0_d32 = .{
-                    .out = out.ptr,
-                    .data = w.data,
-                    .q8 = q8.ptr,
-                    .rb32 = 8 * 2, // 8 blocks of 32 elements, 2 bytes per weight
-                    .row_blocks = bpr * 8,
-                    .rows = rows,
-                    .dot = dot,
-                },
-            });
-            return;
-        }
-
-        // Remaining types (IQ family) keep the scalar per-block rowDot until
-        // their SIMD kernels land.
-        const rowDot: *const fn (row: []const u8, x: []const f32) f32 = switch (w.ttype) {
-            .q4_0 => &quant.rowDotQ4_0,
-            .q4_1 => &quant.rowDotQ4_1,
-            .q4_k => &quant.rowDotQ4K,
-            .q5_k => &quant.rowDotQ5K,
-            .q6_k => &quant.rowDotQ6K,
-            .q3_k => &quant.rowDotQ3K,
-            .q2_k => &quant.rowDotQ2K,
-            .iq4_xs => &quant.rowDotIQ4XS,
-            .iq4_nl => &quant.rowDotIQ4NL,
-            .iq3_s => &quant.rowDotIQ3S,
-            .iq3_xxs => &quant.rowDotIQ3XXS,
-            .iq2_s => &quant.rowDotIQ2S,
-            .iq2_xxs => &quant.rowDotIQ2XXS,
-            .iq2_xs => &quant.rowDotIQ2XS,
-            .iq1_s => &quant.rowDotIQ1S,
-            .iq1_m => &quant.rowDotIQ1M,
-            .f16 => &quant.rowDotF16,
-            .bf16 => &quant.rowDotBF16,
-            else => unreachable, // only supported types load as .quant
-        };
+    /// Zig scalar reference path (`quant.rowDotXXX` over f32 activations),
+    /// shared by the serial matvec, the K-token batch and
+    /// QWEN35_FORCE_ROWDOT.  `act_b32` only decides which activation block
+    /// width the caller's scratch arrays were sized for; it is unused here
+    /// because this path never quantizes the activation.
+    fn matvecQuantScalar(out: []f32, w: QuantRow, x: []const f32, cols: usize, rows: usize, bpr: usize, pool: ?*pool_mod.Pool) void {
+        const rowDot = rowDotFor(w.ttype) orelse unreachable; // only supported types load as .quant
         pool_mod.parallel(pool, .{ .quant_scalar = .{
             .out = out.ptr,
             .data = w.data,
-            .x = x,
-            .row_bytes = quantRowBytes(w.ttype),
+            .x = x.ptr,
+            .x_len = cols,
+            .row_bytes = w.blockBytes(), // per row-block; pool indexes r*bpr*row_bytes
             .bpr = bpr,
             .rows = rows,
+            .k = 1,
             .dot = rowDot,
         } });
     }
@@ -1483,41 +1420,62 @@ pub const Engine = struct {
     /// Batched K-token matvec: `out` is [K, rows] row-major, `xK` is
     /// [K, cols] row-major.  The activation is quantized once per token into
     /// that token's slot of q8K/q8kK, then a single pool task covers K*rows
-    /// virtual rows (`t = r/rows`, `rr = r%rows`).  The per-row dot call is
-    /// identical to the serial matvec, so out[t*rows+rr] is bit-identical to
-    /// `linMatvec(out[t*rows .. t*rows+rows], w, xK[t*cols..])` run per token.
+    /// virtual rows (`tok = r/rows`, `rr = r%rows`).  It is the *same*
+    /// `quantN` task as the serial `matvecQuant` with `k > 1`; the per-row
+    /// kernel call is identical, so out[t*rows+rr] is bit-identical to
+    /// `linMatvec(out[t*rows .. t*rows+rows], w, xK[t*cols..])` per token.
+    /// There is no per-type branch here either: only the activation block
+    /// width of the weight decides between the two shapes.
     fn matvecBatchK(out: []f32, w: LinearW, xK: []const f32, k: usize, q8K: []u8, q8kK: []u8, pool: ?*pool_mod.Pool) void {
         const rows = out.len / k;
         std.debug.assert(out.len % k == 0);
         switch (w) {
             .quant => |qrow| {
-                if (qrow.ttype == .q8_0) {
-                    // Q8_0 batch: 32-element blocks, row-granular C dot.  Same
-                    // kernel (q8_0_q8_0) as the serial `.q8_0` task below.
-                    const cols = qrow.row_blocks() * q8_0_block_elems;
-                    const blen = qrow.rowBytes();
-                    std.debug.assert(xK.len >= k * cols);
+                const cols = qrow.cols();
+                std.debug.assert(xK.len >= k * cols);
+                const act_b32 = blockElemsOf(qrow.ttype) == 32;
+                if (act_b32) {
+                    const dot = (if (dbg_force_rowdot) null else switch (qrow.ttype) {
+                        .q8_0 => simd.d32row.q8_0_q8_0,
+                        .q4_0 => simd.d32row.q4_0_q8_0,
+                        .q4_1 => simd.d32row.q4_1_q8_0,
+                        .iq4_nl => simd.d32row.iq4_nl_q8_0,
+                        .q5_0 => simd.d32row.q5_0_q8_0,
+                        .q5_1 => simd.d32row.q5_1_q8_0,
+                        .q1_0 => simd.d32row.q1_0_q8_0,
+                        .q2_0 => simd.d32row.q2_0_q8_0,
+                        .mxfp4 => simd.d32row.mxfp4_q8_0,
+                        .nvfp4 => simd.d32row.nvfp4_q8_0,
+                        .f16 => simd.d32row.f16_q8_0,
+                        .bf16 => simd.d32row.bf16_q8_0,
+                        else => null,
+                    }) orelse {
+                        matvecBatchKScalar(out, qrow, xK, k, rows, cols, pool);
+                        return;
+                    };
+                    const blen = q8ScratchBytes(cols);
                     std.debug.assert(q8K.len >= k * blen);
                     var t: usize = 0;
                     while (t < k) : (t += 1)
                         simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen ..].ptr);
-                    pool_mod.parallel(pool, .{ .q8_0b = .{
+                    pool_mod.parallel(pool, .{ .quantN = .{
+                        .act_block = .b32,
                         .out = out.ptr,
                         .data = qrow.data,
-                        .q8 = q8K.ptr,
-                        .q8_len = blen,
-                        .row_blocks = qrow.blocks_per_row,
+                        .act = q8K.ptr,
+                        .act_len = blen,
+                        .blk_bytes = blockElemBytes(qrow.ttype),
+                        .blk_elems = blockElemsOf(qrow.ttype),
+                        .bpr = qrow.blocks_per_row,
+                        .cols = cols,
                         .rows = rows,
                         .k = k,
+                        .dot32 = dot,
+                        .dot256 = undefined,
                     } });
                     return;
                 }
-                const cols = qrow.blocks_per_row * 256;
-                const klen = q8kScratchBytes(cols);
-                const rb32 = quantRowBytes(qrow.ttype) / 8;
-                std.debug.assert(q8kK.len >= k * klen);
-                // 256-block SIMD dot types: one Q8_K per token, reused across rows
-                const dot256: ?simd_api.Dot256 = if (dbg_force_rowdot) null else switch (qrow.ttype) {
+                const dot = (if (dbg_force_rowdot) null else switch (qrow.ttype) {
                     .q2_k => simd.d256.q2_k_q8_k,
                     .q3_k => simd.d256.q3_k_q8_k,
                     .q4_k => simd.d256.q4_k_q8_k,
@@ -1532,118 +1490,35 @@ pub const Engine = struct {
                     .iq1_m => simd.diq.iq1_m_q8_k,
                     .iq4_xs => simd.diq.iq4_xs_q8_k,
                     else => null,
-                };
-                if (dot256) |dot| {
-                    var t: usize = 0;
-                    while (t < k) : (t += 1)
-                        simd.actQ8_K(cols, xK[t * cols ..].ptr, q8kK[t * klen ..].ptr);
-                    pool_mod.parallel(pool, .{ .quant256b = .{
-                        .out = out.ptr,
-                        .data = qrow.data,
-                        .q8k = q8kK.ptr,
-                        .q8k_len = klen,
-                        .row_bytes = quantRowBytes(qrow.ttype),
-                        .bpr = qrow.blocks_per_row,
-                        .rows = rows,
-                        .k = k,
-                        .dot = dot,
-                    } });
+                }) orelse {
+                    matvecBatchKScalar(out, qrow, xK, k, rows, cols, pool);
                     return;
-                }
-                const dot32: ?simd_api.Dot32 = if (dbg_force_rowdot) null else switch (qrow.ttype) {
-                    .q4_0 => simd.d32.q4_0_q8_0,
-                    .q4_1 => simd.d32.q4_1_q8_0,
-                    .iq4_nl => simd.d32.iq4_nl_q8_0,
-                    else => null,
                 };
-                if (dot32 != null) {
-                    const blen32 = q8ScratchBytes(cols);
-                    std.debug.assert(q8K.len >= k * blen32);
-                    var t: usize = 0;
-                    while (t < k) : (t += 1)
-                        simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen32 ..].ptr);
-                    const dotr: simd_api.Dot32 = switch (qrow.ttype) {
-                        .q4_0 => simd.d32row.q4_0_q8_0,
-                        .q4_1 => simd.d32row.q4_1_q8_0,
-                        .iq4_nl => simd.d32row.iq4_nl_q8_0,
-                        else => unreachable,
-                    };
-                    pool_mod.parallel(pool, .{ .quant32b = .{
-                        .out = out.ptr,
-                        .data = qrow.data,
-                        .q8 = q8K.ptr,
-                        .q8_len = blen32,
-                        .rb32 = rb32,
-                        .bpr = qrow.blocks_per_row,
-                        .rows = rows,
-                        .k = k,
-                        .dot = dotr,
-                    } });
-                    return;
-                }
-                // f16 / bf16: same Q8_0 activation framing as the 32-block
-                // quant types, but the weight row stays packed at 2 B/elem.
-                const dot32x: ?simd_api.Dot32 = if (dbg_force_rowdot) null else switch (qrow.ttype) {
-                    .f16 => simd.d32row.f16_q8_0,
-                    .bf16 => simd.d32row.bf16_q8_0,
-                    else => null,
-                };
-                if (dot32x) |dot| {
-                    const blen32 = q8ScratchBytes(cols);
-                    std.debug.assert(q8K.len >= k * blen32);
-                    var t: usize = 0;
-                    while (t < k) : (t += 1)
-                        simd.actQ8_0(cols, xK[t * cols ..].ptr, q8K[t * blen32 ..].ptr);
-                    pool_mod.parallel(pool, .{ .q8_0_d32b = .{
-                        .out = out.ptr,
-                        .data = qrow.data,
-                        .q8 = q8K.ptr,
-                        .q8_len = blen32,
-                        .rb32 = 8 * 2,
-                        .row_blocks = qrow.blocks_per_row * 8,
-                        .rows = rows,
-                        .k = k,
-                        .dot = dot,
-                    } });
-                    return;
-                }
-                const rowDot: *const fn (row: []const u8, x: []const f32) f32 = switch (qrow.ttype) {
-                    .q4_0 => &quant.rowDotQ4_0,
-                    .q4_1 => &quant.rowDotQ4_1,
-                    .q4_k => &quant.rowDotQ4K,
-                    .q5_k => &quant.rowDotQ5K,
-                    .q6_k => &quant.rowDotQ6K,
-                    .q3_k => &quant.rowDotQ3K,
-                    .q2_k => &quant.rowDotQ2K,
-                    .iq4_xs => &quant.rowDotIQ4XS,
-                    .iq4_nl => &quant.rowDotIQ4NL,
-                    .iq3_s => &quant.rowDotIQ3S,
-                    .iq3_xxs => &quant.rowDotIQ3XXS,
-                    .iq2_s => &quant.rowDotIQ2S,
-                    .iq2_xxs => &quant.rowDotIQ2XXS,
-                    .iq2_xs => &quant.rowDotIQ2XS,
-                    .iq1_s => &quant.rowDotIQ1S,
-                    .iq1_m => &quant.rowDotIQ1M,
-                    .f16 => &quant.rowDotF16,
-                    .bf16 => &quant.rowDotBF16,
-                    else => unreachable,
-                };
-                pool_mod.parallel(pool, .{ .quant_scalarb = .{
+                const klen = q8kScratchBytes(cols);
+                std.debug.assert(q8kK.len >= k * klen);
+                var t: usize = 0;
+                while (t < k) : (t += 1)
+                    simd.actQ8_K(cols, xK[t * cols ..].ptr, q8kK[t * klen ..].ptr);
+                pool_mod.parallel(pool, .{ .quantN = .{
+                    .act_block = .b256,
                     .out = out.ptr,
                     .data = qrow.data,
-                    .x = xK.ptr,
-                    .x_len = cols,
-                    .row_bytes = quantRowBytes(qrow.ttype),
+                    .act = q8kK.ptr,
+                    .act_len = klen,
+                    .blk_bytes = qrow.blockBytes(), // one 256-element row-block
+                    .blk_elems = blockElemsOf(qrow.ttype),
                     .bpr = qrow.blocks_per_row,
+                    .cols = cols,
                     .rows = rows,
                     .k = k,
-                    .dot = rowDot,
+                    .dot32 = undefined,
+                    .dot256 = dot,
                 } });
             },
             .f32 => |m| {
                 const cols = m.len / rows;
                 std.debug.assert(xK.len >= k * cols);
-                pool_mod.parallel(pool, .{ .f32b = .{
+                pool_mod.parallel(pool, .{ .f32 = .{
                     .out = out.ptr,
                     .mat = m,
                     .x = xK.ptr,
@@ -1656,10 +1531,27 @@ pub const Engine = struct {
         }
     }
 
+    /// Batched twin of `matvecQuantScalar`: identical zig rowDot per block,
+    /// just with `k` tokens in one task.
+    fn matvecBatchKScalar(out: []f32, qrow: QuantRow, xK: []const f32, k: usize, rows: usize, cols: usize, pool: ?*pool_mod.Pool) void {
+        const rowDot = rowDotFor(qrow.ttype) orelse unreachable;
+        pool_mod.parallel(pool, .{ .quant_scalar = .{
+            .out = out.ptr,
+            .data = qrow.data,
+            .x = xK.ptr,
+            .x_len = cols,
+            .row_bytes = qrow.blockBytes(), // per row-block; pool indexes r*bpr*row_bytes
+            .bpr = qrow.blocks_per_row,
+            .rows = rows,
+            .k = k,
+            .dot = rowDot,
+        } });
+    }
+
     /// [rows, cols] so cols = len / rows.
     fn matvecCols(w: LinearW, out_len: usize) usize {
         return switch (w) {
-            .quant => |q| q.blocks_per_row * q.blockElems(),
+            .quant => |q| q.cols(),
             .f32 => |m| m.len / out_len,
         };
     }
@@ -1672,13 +1564,19 @@ pub const Engine = struct {
     fn quantRowOf(g: *gguf.File, t: *const gguf.Tensor) !QuantRow {
         std.debug.assert(t.dims.len == 2);
         const cols: usize = t.dims[0];
-        const block_elems: usize = if (t.ttype == .q8_0) q8_0_block_elems else 256;
-        const block_bytes: usize = if (t.ttype == .q8_0) q8_0_block_bytes else quantRowBytes(t.ttype);
-        if (block_bytes == 0) return error.UnsupportedTensorType;
+        // Block geometry comes from the GGUF layout table (single source); a
+        // ttype without a layout is rejected here, as the old "0 = unknown"
+        // sentinel did.
+        if (!t.ttype.isKnown()) return error.UnsupportedTensorType;
+        // `blocks_per_row` is `cols / rowBlockElems()`: 256-element row-blocks
+        // for every framed type, 32-element blocks for Q8_0 (which has no 256
+        // framing).  Both numbers come from the layout table -- see
+        // `QuantRow.rowBlockElems()`.
+        const block_elems: usize = if (t.ttype == .q8_0) blockElemsOf(.q8_0) else 256;
         if (cols % block_elems != 0) return error.NotMultipleOfRow;
         const bpr: usize = cols / block_elems;
         const rows: usize = t.dims[1];
-        const expected: usize = rows * bpr * block_bytes;
+        const expected: usize = rows * cols / blockElemsOf(t.ttype) * blockElemBytes(t.ttype);
         const data = try g.tensorData(t);
         if (data.len < expected) return error.SizeMismatch;
         return .{
@@ -2174,13 +2072,7 @@ pub const Engine = struct {
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant => |qrow| {
-                    if (qrow.ttype == .q8_0) {
-                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
-                    } else {
-                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
-                    }
-                },
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
                 .f32 => |m| {
                     matvec(self.logits, m, self.x1, c.vocab, hidden, self.pool);
                 },
@@ -2188,13 +2080,7 @@ pub const Engine = struct {
         } else {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
-                .quant => |qrow| {
-                    if (qrow.ttype == .q8_0) {
-                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
-                    } else {
-                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
-                    }
-                },
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -2229,11 +2115,17 @@ pub const Engine = struct {
         switch (self.token_embd) {
             .f32 => |m| @memcpy(dst, m[token * hidden ..][0..hidden]),
             .quant => |qrow| {
+                // KEPT ON PURPOSE, and it is NOT a dot special case: this is
+                // a DEQUANT of one embedding row, not a dot.  `dequantToRows`
+                // works in whole 256-element rows (`row_elems = 256`); Q8_0
+                // packs plain 32-element blocks and has no 256 framing, so its
+                // row (bpr*34 bytes) is not consistently a 256-element unit --
+                // routing it through the generic path silently drops the tail
+                // when cols % 256 != 0 and the dequant ends up short.
                 if (qrow.ttype == .q8_0) {
                     dequantizeQ8_0(qrow.row(token), dst) catch unreachable;
                 } else {
-                    const rb = quantRowBytes(qrow.ttype);
-                    const rb_row = qrow.blocks_per_row * rb;
+                    const rb_row = qrow.rowBytes();
                     const off = token * rb_row;
                     dequantToRows(self.alloc, qrow.ttype, qrow.data[off .. off + rb_row], dst) catch unreachable;
                 }
@@ -2325,26 +2217,14 @@ pub const Engine = struct {
         rmsNorm(self.x1, self.xK[(k - 1) * hidden ..][0..hidden], self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant => |qrow| {
-                    if (qrow.ttype == .q8_0) {
-                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
-                    } else {
-                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
-                    }
-                },
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
                 .f32 => |m| {
                     matvec(self.logits, m, self.x1, c.vocab, hidden, self.pool);
                 },
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| {
-                    if (qrow.ttype == .q8_0) {
-                        matvecQ8_0(self.logits, qrow, self.x1, self.q8_scratch, self.pool);
-                    } else {
-                        Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool);
-                    }
-                },
+                .quant => |qrow| Engine.matvecQuant(self.logits, qrow, self.x1, self.q8k_scratch, self.q8_scratch, self.pool),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -2929,7 +2809,7 @@ test "matvec 2x3 hand computed" {
     try std.testing.expectEqual(@as(f32, 122), out[1]);
 }
 
-test "matvecQ8_0 matches f32 matvec on dequantized weights" {
+test "matvecQuant Q8_0 matches f32 matvec on dequantized weights" {
     var prng = std.Random.DefaultPrng.init(42);
     const rand = prng.random();
 
@@ -2951,7 +2831,8 @@ test "matvecQ8_0 matches f32 matvec on dequantized weights" {
     const w: Engine.QuantRow = .{ .data = &wq, .ttype = .q8_0, .rows = rows, .blocks_per_row = cols / q8_0_block_elems };
     var out_q8: [rows]f32 = undefined;
     var q8scratch: [cols / q8_0_block_elems * q8_0_block_bytes]u8 = undefined;
-    matvecQ8_0(&out_q8, w, &x, &q8scratch, null);
+    var q8kscratch: [q8kScratchBytes(cols)]u8 = undefined;
+    Engine.matvecQuant(&out_q8, w, &x, &q8kscratch, &q8scratch, null);
 
     // reference: f32 matvec over dequantized weights AND dequantized x
     // (the q8 path necessarily quantizes x, so feed the same values in)
@@ -2968,7 +2849,7 @@ test "matvecQ8_0 matches f32 matvec on dequantized weights" {
     }
 }
 
-test "matvecQ8_0 zero x gives zero out" {
+test "matvecQuant Q8_0 zero x gives zero out" {
     const cols = 32;
     var wq: [2 * q8_0_block_bytes]u8 = undefined;
     const wvals = [3]f32{ 1, 2, 3 } ++ @as([29]f32, @splat(0));
@@ -2977,7 +2858,8 @@ test "matvecQ8_0 zero x gives zero out" {
     var x: [cols]f32 = @splat(0);
     var out: [2]f32 = undefined;
     var scratch: [q8_0_block_bytes]u8 = undefined;
-    matvecQ8_0(&out, .{ .data = &wq, .ttype = .q8_0, .rows = 2, .blocks_per_row = 1 }, &x, &scratch, null);
+    var kscratch: [q8kScratchBytes(cols)]u8 = undefined;
+    Engine.matvecQuant(&out, .{ .data = &wq, .ttype = .q8_0, .rows = 2, .blocks_per_row = 1 }, &x, &kscratch, &scratch, null);
     try std.testing.expectEqual(@as(f32, 0), out[0]);
     try std.testing.expectEqual(@as(f32, 0), out[1]);
 }

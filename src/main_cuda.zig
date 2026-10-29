@@ -273,7 +273,7 @@ fn uploadLinear(arena: std.mem.Allocator, gpu: *Gpu, lw: engine.Engine.LinearW, 
 
 // ---------------------------------------------------------------------------
 // matvec: out[rows] = W[rows, cols] * x[cols]; x is f32, quantized to Q8_0
-// first (matches CPU linMatvec / matvecQ8_0 exactly).
+// first (matches the CPU 32-block `quantN` path in engine.matvecQuant).
 // ---------------------------------------------------------------------------
 
 fn linMatvec(gpu: *Gpu, w: *const LinearGpu, x: ?*anyopaque, out: ?*anyopaque) void {
