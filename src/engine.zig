@@ -2725,6 +2725,11 @@ pub const Engine = struct {
         self.reset();
 
         const io = self.io;
+        // Profiling covers prefill too: prof_phase used to be set only after
+        // the prefill loop, so every prefill sample reported calls=0 and the
+        // batched kernels -- exactly the part worth profiling -- were invisible.
+        pool_mod.profReset();
+        pool_mod.prof_phase = true;
         const t_start = Io.Clock.Timestamp.now(io, .awake);
         var last_logits: []f32 = &.{};
         if (self.nbatch == 0) {
@@ -2750,9 +2755,8 @@ pub const Engine = struct {
         var pos: u32 = @intCast(prompt.len);
         var gen_ns: i96 = 0;
         var hit_eos = false;
-        // prof: accumulate pool parallel() segments over the decode loop only
-        pool_mod.profReset();
-        pool_mod.prof_phase = true;
+        // prof_phase stays on across prefill and decode (set above); do not
+        // reset here or the prefill samples are thrown away.
         var next: u32 = self.sampler.sample(last_logits, self.sample_scratch);
         while (pos < max_tokens) : (pos += 1) {
             if (next == self.cfg.eos_token_id) {
