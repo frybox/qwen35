@@ -25,12 +25,7 @@ const std = @import("std");
 const gguf = @import("gguf.zig");
 const backend = @import("backend.zig");
 const backend_cpu = @import("backend_cpu.zig");
-const simd_ref = @import("simd_ref.zig");
 const sampler = @import("sampler.zig");
-const quant = @import("quant_dequant.zig");
-const simd = @import("simd_dispatch.zig");
-const simd_api = @import("simd_api.zig");
-const pool_mod = @import("pool.zig");
 const Io = std.Io;
 
 /// Re-export so the CPU and CUDA hosts share one sampler implementation.
@@ -382,7 +377,7 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
                 } else {
                     const bb = q.blockBytes(); // one block of this type
                     const be = q.blockElems();
-                    const deq = dequantRowFnFor(q.ttype) orelse return -2;
+                    const deq = backend_cpu.dequantRowFnFor(q.ttype) orelse return -2;
                     for (0..q.blocks_per_row) |b| {
                         const i = rr * q.blocks_per_row + b;
                         if (i * bb + bb > q.data.len) return -4;
@@ -407,18 +402,6 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
 }
 
 /// Row-major [rows, cols] matvec: out[r] = sum_c mat[r*cols + c] * x[c].
-pub fn matvec(out: []f32, mat: []const f32, x: []const f32, rows: usize, cols: usize, pool: ?*pool_mod.Pool) void {
-    std.debug.assert(mat.len == rows * cols and out.len == rows and x.len == cols);
-    pool_mod.parallel(pool, .{ .f32 = .{
-        .out = out.ptr,
-        .mat = mat,
-        .x = x.ptr,
-        .x_len = cols,
-        .cols = cols,
-        .rows = rows,
-        .k = 1,
-    } });
-}
 
 
 // ---------------------------------------------------------------------------
@@ -507,118 +490,6 @@ pub fn checkQ8Scratch(scratch: []const u8, cols: usize) !void {
 // element count of the tensor (rows * 256).
 // ---------------------------------------------------------------------------
 
-const dequantRowFn = *const fn ([]const u8, []f32) void;
-
-/// The pure-Zig scalar row dequant for a K/IQ type (null if unsupported).
-fn dequantRowFnFor(ttype: gguf.TensorType) ?dequantRowFn {
-    return switch (ttype) {
-        .q4_0 => &quant.dequantQ4_0,
-        .q4_1 => &quant.dequantQ4_1,
-        .q4_k => &quant.dequantQ4K,
-        .q5_k => &quant.dequantQ5K,
-        .q6_k => &quant.dequantQ6K,
-        .q3_k => &quant.dequantQ3K,
-        .iq4_xs => &quant.dequantIQ4XS,
-        .iq4_nl => &quant.dequantIQ4NL,
-        .iq3_s => &quant.dequantIQ3S,
-        .iq3_xxs => &quant.dequantIQ3XXS,
-        .iq2_s => &quant.dequantIQ2S,
-        .iq2_xxs => &quant.dequantIQ2XXS,
-        .iq2_xs => &quant.dequantIQ2XS,
-        .iq1_s => &quant.dequantIQ1S,
-        .iq1_m => &quant.dequantIQ1M,
-        .q2_k => &quant.dequantQ2K,
-        else => null,
-    };
-}
-
-fn dequantRowF16(row: []const u8, out: []f32) void {
-    const src: [*]const u16 = @ptrCast(@alignCast(row.ptr));
-    for (0..out.len) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
-}
-
-fn dequantRowBF16(row: []const u8, out: []f32) void {
-    const src: [*]const u16 = @ptrCast(@alignCast(row.ptr));
-    for (0..out.len) |i| out[i] = @as(f32, @bitCast(@as(u32, src[i]) << 16));
-}
-
-/// Dequantize a flat packed block stream into f32, one block per iteration.
-/// The unit walked here is the type's own block, taken from the layout table
-/// (`blockElemsOf`/`blockElemBytes`) -- the old per-type row-byte table
-/// (144 for Q4_0, 512 for f16, ...) was a second, divergent copy of exactly
-/// that geometry.
-fn dequantToRows(alloc: std.mem.Allocator, ttype: gguf.TensorType, data: []const u8, out: []f32) !void {
-    const deq: dequantRowFn = dequantRowFnFor(ttype) orelse switch (ttype) {
-        .f16 => &dequantRowF16,
-        .bf16 => &dequantRowBF16,
-        else => return error.UnsupportedTensorType,
-    };
-    const row_elems = 256; // every K-quant type packs 256 elems per row
-    // byte size of one such row, from the block geometry (was a per-type
-    // table: 144 for Q4_0, 512 for f16, ...)
-    const row_bytes: usize = row_elems / blockElemsOf(ttype) * blockElemBytes(ttype);
-    const nf: usize = out.len;
-    if (nf % row_elems != 0) return error.NotMultipleOfRow;
-    const nrows = nf / row_elems;
-    const expected_bytes = nrows * row_bytes;
-    if (data.len < expected_bytes) return error.SizeMismatch;
-
-    const row = try alloc.alloc(f32, row_elems);
-    defer alloc.free(row);
-    for (0..nrows) |r| {
-        const in = data[r * row_bytes .. (r + 1) * row_bytes];
-        deq(in, row);
-        const o0 = r * row_elems;
-        @memcpy(out[o0..][0..row_elems], row);
-    }
-}
-
-fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8) ![]f32 {
-    const t = g.findTensor(name) orelse return error.MissingTensor;
-    const n: usize = @intCast(t.nElems());
-    const out = try alloc.alloc(f32, n);
-    errdefer alloc.free(out);
-    const data = try g.tensorData(t);
-    switch (t.ttype) {
-        .f32 => @memcpy(out, @as([*]const f32, @ptrCast(@alignCast(data)))[0..n]),
-        .f16 => {
-            const src: [*]const u16 = @ptrCast(@alignCast(data));
-            for (0..n) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
-        },
-        .bf16 => {
-            // BF16 is the high 16 bits of an f32: widen by shifting into the
-            // top half of the significand (exact, no rounding).
-            const src: [*]const u16 = @ptrCast(@alignCast(data));
-            for (0..n) |i| out[i] = @as(f32, @bitCast(@as(u32, @intCast(src[i])) << 16));
-        },
-        .q8_0 => try quant.dequantizeQ8_0(data, out),
-        .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s => try dequantToRows(alloc, t.ttype, data, out),
-        else => return error.UnsupportedTensorType,
-    }
-    return out;
-}
-
-/// Load a 2D linear weight: Q8_0 and K/IQ quant types stay in their native
-/// packed format (zero-copy view into the mmap); F32/F16 load as f32.
-fn loadLinear(alloc: std.mem.Allocator, g: *gguf.File, name: []const u8) !Engine.LinearW {
-    const t = g.findTensor(name) orelse return error.MissingTensor;
-    switch (t.ttype) {
-        .q8_0, .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
-            return .{ .quant = try Engine.quantRowOf(g, t) };
-        },
-        // REVERTED: f16/bf16 used to take the zero-copy packed quant path
-        // (matvecQuant + simd.d32row.f16_q8_0/bf16_q8_0).  That path produced
-        // garbage output on real models -- the packed row layout (2 B/element,
-        // no block metadata) was framed as 256-element blocks inconsistently
-        // between matvecCols / rowDot / the q8_0 kernel, so every row wider
-        // than one block was mis-strided.  Correctness first: go back to
-        // materialising f32.  The 3.5x speedup is NOT worth garbled text; if we
-        // want it back it needs a proper block layout + coverage tests (there
-        // is currently no bf16/f16 kernel test at all).
-        .f16, .bf16, .f32 => return .{ .f32 = try loadTensorF32(alloc, g, name) },
-        else => return error.UnsupportedTensorType,
-    }
-}
 
 // ---------------------------------------------------------------------------
 // RoPE (SPEC B9/B10/B11): rotary_dim=64, cross-half pairing (i, i+32),
@@ -660,7 +531,7 @@ pub var prof = false;
 pub fn profReport() void {
     const tot: f64 = prof_emb + prof_gdn + prof_full + prof_mlp + prof_lm;
     std.debug.print("PROF emb={d:.2}ms gdn={d:.2}ms full={d:.2}ms mlp={d:.2}ms lm={d:.2}ms total={d:.2}\n", .{ prof_emb / 1e6, prof_gdn / 1e6, prof_full / 1e6, prof_mlp / 1e6, prof_lm / 1e6, tot / 1e6 });
-    pool_mod.profReport();
+    backend_cpu.pool_profReport();
 }
 
 fn profNs(io: Io, t0: Io.Clock.Timestamp) f64 {
@@ -845,9 +716,6 @@ pub const Engine = struct {
     }
 
     pub fn load(alloc: std.mem.Allocator, path: []const u8, io: std.Io, n_threads: usize, backend_kind: backend.Kind) !Engine {
-        // Bind the SIMD kernels to the widest ISA tier this CPU supports
-        // (CPUID + XGETBV).  Idempotent; before this, pointers are baseline.
-        simd.init();
         var nt = n_threads;
         if (nt == 0) {
             const ncpu = std.Thread.getCpuCount() catch 1;
@@ -967,7 +835,7 @@ pub const Engine = struct {
             error.MissingTensor => null,
             else => return err,
         };
-        e.output_norm = try loadTensorF32(alloc, &g, "output_norm.weight");
+        e.output_norm = try backend_cpu.loadTensorF32(alloc, &g, "output_norm.weight");
 
         const n_layers = cfg.n_layers;
         e.layers = try alloc.alloc(LayerWeights, n_layers);
@@ -978,8 +846,8 @@ pub const Engine = struct {
             var b2: [64]u8 = undefined;
             const idx: u32 = @intCast(li);
             const lw = LayerWeights{
-                .attn_norm = try loadTensorF32(alloc, &g, std.fmt.bufPrint(&b1, "blk.{d}.attn_norm.weight", .{idx}) catch unreachable),
-                .post_attention_norm = try loadTensorF32(alloc, &g, std.fmt.bufPrint(&b2, "blk.{d}.post_attention_norm.weight", .{idx}) catch unreachable),
+                .attn_norm = try backend_cpu.loadTensorF32(alloc, &g, std.fmt.bufPrint(&b1, "blk.{d}.attn_norm.weight", .{idx}) catch unreachable),
+                .post_attention_norm = try backend_cpu.loadTensorF32(alloc, &g, std.fmt.bufPrint(&b2, "blk.{d}.post_attention_norm.weight", .{idx}) catch unreachable),
                 .ffn_gate = try exec.loadLinear(tname(&b1, "blk.{d}.ffn_gate.weight", idx)),
                 .ffn_up = try exec.loadLinear(tname(&b2, "blk.{d}.ffn_up.weight", idx)),
                 .ffn_down = try exec.loadLinear(tname(&b1, "blk.{d}.ffn_down.weight", idx)),
@@ -1029,18 +897,18 @@ pub const Engine = struct {
                 e.layers[li].attn_q = try exec.loadLinear(tname(&b1, "blk.{d}.attn_q.weight", idx));
                 e.layers[li].attn_k = try exec.loadLinear(tname(&b2, "blk.{d}.attn_k.weight", idx));
                 e.layers[li].attn_v = try exec.loadLinear(tname(&b1, "blk.{d}.attn_v.weight", idx));
-                e.layers[li].attn_q_norm = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_q_norm.weight", idx));
-                e.layers[li].attn_k_norm = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_k_norm.weight", idx));
+                e.layers[li].attn_q_norm = try backend_cpu.loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_q_norm.weight", idx));
+                e.layers[li].attn_k_norm = try backend_cpu.loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_k_norm.weight", idx));
                 e.layers[li].attn_output = try exec.loadLinear(tname(&b2, "blk.{d}.attn_output.weight", idx));
             } else {
                 e.layers[li].attn_qkv = try exec.loadLinear(tname(&b1, "blk.{d}.attn_qkv.weight", idx));
                 e.layers[li].attn_gate = try exec.loadLinear(tname(&b2, "blk.{d}.attn_gate.weight", idx));
                 e.layers[li].ssm_alpha = try exec.loadLinear(tname(&b1, "blk.{d}.ssm_alpha.weight", idx));
                 e.layers[li].ssm_beta = try exec.loadLinear(tname(&b2, "blk.{d}.ssm_beta.weight", idx));
-                e.layers[li].ssm_conv1d = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_conv1d.weight", idx));
-                e.layers[li].ssm_dt_bias = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_dt.bias", idx));
-                e.layers[li].ssm_a = try loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_a", idx));
-                e.layers[li].ssm_norm = try loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_norm.weight", idx));
+                e.layers[li].ssm_conv1d = try backend_cpu.loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_conv1d.weight", idx));
+                e.layers[li].ssm_dt_bias = try backend_cpu.loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_dt.bias", idx));
+                e.layers[li].ssm_a = try backend_cpu.loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_a", idx));
+                e.layers[li].ssm_norm = try backend_cpu.loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_norm.weight", idx));
                 e.layers[li].ssm_out = try exec.loadLinear(tname(&b1, "blk.{d}.ssm_out.weight", idx));
             }
             loaded2 += 1;
@@ -1818,8 +1686,8 @@ pub const Engine = struct {
         // Profiling covers prefill too: prof_phase used to be set only after
         // the prefill loop, so every prefill sample reported calls=0 and the
         // batched kernels -- exactly the part worth profiling -- were invisible.
-        pool_mod.profReset();
-        pool_mod.prof_phase = true;
+        self.exec.profReset();
+        self.exec.profPhase(true);
         const t_start = Io.Clock.Timestamp.now(io, .awake);
         var last_logits: []f32 = &.{};
         if (self.nbatch == 0) {
@@ -1859,7 +1727,7 @@ pub const Engine = struct {
             next = self.step(next, pos);
             gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
         }
-        pool_mod.prof_phase = false;
+        self.exec.profPhase(false);
         const per: f64 = if (out.items.len > 0)
             @as(f64, @floatFromInt(gen_ns)) / 1e6 / @as(f64, @floatFromInt(out.items.len))
         else
@@ -1961,15 +1829,6 @@ test "config layer typing" {
     try std.testing.expect(!c.isFullAttention(2));
     try std.testing.expect(c.isFullAttention(3));
     try std.testing.expect(c.isFullAttention(23));
-}
-
-test "matvec 2x3 hand computed" {
-    const m = [_]f32{ 1, 2, 3, 4, 5, 6 };
-    const x = [_]f32{ 7, 8, 9 };
-    var out: [2]f32 = undefined;
-    matvec(&out, &m, &x, 2, 3, null);
-    try std.testing.expectEqual(@as(f32, 50), out[0]);
-    try std.testing.expectEqual(@as(f32, 122), out[1]);
 }
 
 test "convStep: causal left-pad semantics" {

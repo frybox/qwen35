@@ -16,7 +16,6 @@ const backend = @import("backend.zig");
 const quant = @import("quant_dequant.zig");
 const pool_mod = @import("pool.zig");
 const simd = @import("simd_dispatch.zig");
-const simd_api = @import("simd_api.zig");
 
 const LinearW = backend.LinearW;
 const QuantRow = backend.QuantRow;
@@ -67,6 +66,11 @@ fn profNs(io: Io, t0: Io.Clock.Timestamp) f64 {
 }
 
 /// Dump the per-(ttype, rows) matvec timings, heaviest first.
+/// The thread pool's own call/timing counters (PROF-P line).
+pub fn pool_profReport() void {
+    pool_mod.profReport();
+}
+
 pub fn profReportMatvec() void {
     var idx: [64]usize = undefined;
     for (0..prof_n) |i| idx[i] = i;
@@ -457,13 +461,43 @@ fn matvecF32(out: []f32, mat: []const f32, x: []const f32) void {
 // Weight loading
 // ---------------------------------------------------------------------------
 
-/// Expand a whole packed tensor into `out` (f32), `cols` elements per row.
-fn dequantRows(ttype: gguf.TensorType, data: []const u8, out: []f32, cols: usize) !void {
-    const deq: dequantRowFn = dequantRowFnFor(ttype) orelse return error.UnsupportedTensorType;
-    const row_bytes = cols / gguf.blockElems(ttype) * gguf.blockBytes(ttype);
-    const nrows = out.len / cols;
-    for (0..nrows) |r| deq(data[r * row_bytes ..][0..row_bytes], out[r * cols ..][0..cols]);
+/// Load a 1D tensor as f32: f32/f16/bf16 are widened exactly, packed types
+/// go through the reference dequant.  Small vectors (norms, biases) use this.
+pub fn loadTensorF32(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8) ![]f32 {
+    const t = g.findTensor(name) orelse return error.MissingTensor;
+    const n: usize = @intCast(t.nElems());
+    const out = try alloc.alloc(f32, n);
+    errdefer alloc.free(out);
+    const data = try g.tensorData(t);
+    switch (t.ttype) {
+        .f32 => @memcpy(out, @as([*]const f32, @ptrCast(@alignCast(data)))[0..n]),
+        .f16 => {
+            const src: [*]const u16 = @ptrCast(@alignCast(data));
+            for (0..n) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
+        },
+        .bf16 => {
+            // BF16 is the high 16 bits of an f32: widen by shifting into the
+            // top half of the significand (exact, no rounding).
+            const src: [*]const u16 = @ptrCast(@alignCast(data));
+            for (0..n) |i| out[i] = @as(f32, @bitCast(@as(u32, @intCast(src[i])) << 16));
+        },
+        .q8_0 => try quant.dequantizeQ8_0(data, out),
+        // Packed types: walk the tensor in the type's own blocks, so the
+        // framing comes from the layout table instead of a per-type table.
+        else => {
+            const deq = dequantRowFnFor(t.ttype) orelse return error.UnsupportedTensorType;
+            const be = gguf.blockElems(t.ttype);
+            const bb = gguf.blockBytes(t.ttype);
+            if (n % be != 0) return error.NotMultipleOfBlock;
+            var b: usize = 0;
+            while (b < n / be) : (b += 1) {
+                deq(data[b * bb ..][0..bb], out[b * be ..][0..be]);
+            }
+        },
+    }
+    return out;
 }
+
 
 /// Zero-copy view of a quantized 2D weight; geometry comes from the GGUF
 /// layout table (see gguf.QuantRow).
@@ -525,6 +559,10 @@ pub const CpuBackend = struct {
     q8kK: []u8 = &.{},
 
     pub fn init(alloc: std.mem.Allocator, g: *const gguf.File) CpuBackend {
+        // Bind the dispatch tables to the widest ISA tier this CPU supports
+        // (CPUID + XGETBV).  Idempotent; before this the pointers are the
+        // baseline scalar implementations.
+        simd.init();
         return .{ .alloc = alloc, .g = g };
     }
 
@@ -624,6 +662,16 @@ pub const CpuBackend = struct {
         prof_io = io;
     }
 
+    fn vProfPhase(ctx: *anyopaque, on: bool) void {
+        _ = ctx;
+        pool_mod.prof_phase = on;
+    }
+
+    fn vProfReset(ctx: *anyopaque) void {
+        _ = ctx;
+        pool_mod.profReset();
+    }
+
     fn vName(ctx: *anyopaque) []const u8 {
         _ = ctx;
         return "cpu";
@@ -654,6 +702,8 @@ pub const CpuBackend = struct {
         .matvec = vMatvec,
         .matvecBatchK = vMatvecBatchK,
         .setThreads = vSetThreads,
+        .profPhase = vProfPhase,
+        .profReset = vProfReset,
         .name = vName,
         .describe = vDescribe,
         .setTier = vSetTier,
@@ -764,4 +814,13 @@ test "q8_0 dequantize rejects bad sizes" {
     try std.testing.expectError(error.NotMultipleOfBlock, quant.dequantizeQ8_0(&data, &out));
     var out2: [64]f32 = undefined;
     try std.testing.expectError(error.SizeMismatch, quant.dequantizeQ8_0(data[0 .. 2 * q8_0_block_bytes - 1], &out2));
+}
+
+test "matvecF32 2x3 hand computed" {
+    const m = [_]f32{ 1, 2, 3, 4, 5, 6 };
+    const x = [_]f32{ 7, 8, 9 };
+    var out: [2]f32 = undefined;
+    matvecF32(&out, &m, &x);
+    try std.testing.expectEqual(@as(f32, 50), out[0]);
+    try std.testing.expectEqual(@as(f32, 122), out[1]);
 }

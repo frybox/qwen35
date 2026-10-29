@@ -83,6 +83,11 @@ pub const Exec = struct {
         /// `nt` is the worker count, 1 = serial.
         setThreads: *const fn (ctx: *anyopaque, io: std.Io, nt: usize) void,
 
+        /// Mark a phase boundary in the pool's timing counters (no-op for a
+        /// device backend, which reports its own timings).
+        profPhase: *const fn (ctx: *anyopaque, on: bool) void,
+        profReset: *const fn (ctx: *anyopaque) void,
+
         // ---- introspection --------------------------------------------------
         name: *const fn (ctx: *anyopaque) []const u8,
         /// Human-readable one-liner for the tier actually in use.
@@ -121,6 +126,12 @@ pub const Exec = struct {
     }
     pub fn matvecBatchK(self: Exec, out: []f32, w: LinearW, xK: []const f32, k: usize) void {
         self.vtable.matvecBatchK(self.ptr, out, w, xK, k);
+    }
+    pub fn profPhase(self: Exec, on: bool) void {
+        self.vtable.profPhase(self.ptr, on);
+    }
+    pub fn profReset(self: Exec) void {
+        self.vtable.profReset(self.ptr);
     }
     pub fn setThreads(self: Exec, io: std.Io, nt: usize) void {
         self.vtable.setThreads(self.ptr, io, nt);
