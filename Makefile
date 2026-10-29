@@ -17,7 +17,7 @@ ZIGCACHE := --cache-dir /tmp/qwen35-cache
 HOST_OBJ := .zig-cache/qwen35_cuda_host.o
 CUDA_EXE := zig-out/bin/qwen35-cuda
 
-.PHONY: all build cpu cpufast cuda test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
+.PHONY: all build cpu cpufast cudabackend cuda test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
 
 all: build cpu cuda
 
@@ -29,6 +29,12 @@ cpu:
 
 cpufast:
 	$(ZIG) build -Doptimize=ReleaseFast $(ZIGCACHE)
+
+# `--backend cuda` kernels (src/kernels/cuda/).  Separate from the `cuda`
+# target below, which builds the OLD whole-model GPU binary ($(CUDA_EXE)).
+# This one only adds the Q8_0 device kernels + libqwen35-cuda-kernels.so.
+cudabackend:
+	$(ZIG) build -Dcuda=true -Doptimize=ReleaseFast $(ZIGCACHE)
 
 cuda: $(CUDA_EXE)
 

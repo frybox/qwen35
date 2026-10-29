@@ -39,6 +39,10 @@ const StreamCtx = struct {
 var dump_ids = false;
 
 pub fn main(init: std.process.Init) !void {
+    // Hand the environment to the CUDA backend: Zig 0.17 only exposes it
+    // through `Init`, and the backend needs $QWEN35_CUDART / $PATH to locate
+    // libcudart and nvcc's sibling lib64.
+    qwen35.cudart.environ_map = init.environ_map;
     if (init.environ_map.get("QWEN35_SIMD_TIER")) |t| qwen35.engine.Engine.setSimdTier(t);
     if (init.environ_map.get("QWEN35_NO_BATCH") != null) qwen35.engine.no_batch = true;
     if (init.environ_map.get("QWEN35_PROF") != null) {

@@ -53,6 +53,45 @@ fn kernelTarget(b: *std.Build, isa: KernelIsa) std.Build.ResolvedTarget {
     });
 }
 
+/// Locates `nvcc` the same way the Makefile does -- through PATH, never a
+/// hardcoded /usr/local/cuda/bin.  Returns null when the toolkit is absent so
+/// `-Dcuda=true` on a CUDA-less host fails with a readable message instead of
+/// an inscrutable "file not found".
+fn findNvcc(b: *std.Build) ?[]const u8 {
+    const path_env = b.graph.environ_map.get("PATH") orelse return null;
+    var it = std.mem.splitScalar(u8, path_env, ':');
+    while (it.next()) |dir| {
+        if (dir.len == 0) continue;
+        const candidate = std.fs.path.join(b.allocator, &.{ dir, "nvcc" }) catch continue;
+        std.Io.Dir.cwd().access(b.graph.io, candidate, .{}) catch continue;
+        return candidate;
+    }
+    return null;
+}
+
+/// Every regular file under src/kernels/cuda/.  These become explicit inputs of
+/// the nvcc steps so that a `.cuh` edit invalidates the cached invocation --
+/// Zig's cache tracks only the declared inputs, and `addDirectoryArg` (needed
+/// for `-I`) does not create a dependency.
+fn listCudaInputs(b: *std.Build) ![]const []const u8 {
+    const alloc = b.allocator;
+    var dir = try std.Io.Dir.cwd().openDir(b.graph.io, "src/kernels/cuda", .{ .iterate = true });
+    defer dir.close(b.graph.io);
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (try it.next(b.graph.io)) |e| {
+        if (e.kind != .file) continue;
+        const path = try std.fmt.allocPrint(alloc, "src/kernels/cuda/{s}", .{e.name});
+        try list.append(alloc, path);
+    }
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn lt(_: void, a: []const u8, c: []const u8) bool {
+            return std.mem.lessThan(u8, a, c);
+        }
+    }.lt);
+    return list.toOwnedSlice(alloc);
+}
+
 pub fn build(b: *std.Build) void {
     // Default to the x86-64 *baseline* CPU model instead of `native`.
     //
@@ -202,6 +241,82 @@ pub fn build(b: *std.Build) void {
 
     // Link all C kernel units (each built for its own ISA).
     linkKernels(exe, &kernel_libs);
+
+    // -------------------------------------------------------------------------
+    // CUDA kernels for the `--backend cuda` path (src/kernels/cuda/)
+    // -------------------------------------------------------------------------
+    // Option-driven, because the CUDA half must not become a dependency of the
+    // plain `qwen35`/`mod_tests` builds: those must keep working on hosts with
+    // no toolkit installed.  `-Dcuda=true` compiles the .cu files with nvcc and
+    // links the resulting objects into the CLI.
+    //
+    // Why a system command: Zig cannot compile .cu, and nvcc's own host
+    // compilation must stay outside the Zig cache (it is a *reproducible*
+    // external step, but Zig has no device-code support).  The cost is that the
+    // cache does NOT track includes for us -- so every file in
+    // src/kernels/cuda/ is declared as an input explicitly
+    // (`addDirectoryArg`).  Without that, editing a .cuh would be a no-op.
+    const cuda_enabled = b.option(bool, "cuda", "Build the CUDA backend kernels (requires nvcc on PATH)") orelse false;
+    if (cuda_enabled) {
+        const nvcc = findNvcc(b) orelse {
+            std.debug.print("error: -Dcuda=true but nvcc was not found on PATH\n", .{});
+            @panic("nvcc not found; install the CUDA toolkit or build without -Dcuda");
+        };
+        const cuda_dir = "src/kernels/cuda";
+        const cuda_sources = [_][]const u8{ "convert.cu", "mmvq.cu" };
+        // Every file in the directory, used as an *input dependency* below so a
+        // .cuh edit invalidates the nvcc step.
+        const cuda_files = listCudaInputs(b) catch |e| {
+            std.debug.print("error: -Dcuda=true but src/kernels/cuda/ could not be read: {s}\n", .{@errorName(e)});
+            @panic("cannot enumerate src/kernels/cuda");
+        };
+
+        // Two-stage, because the kernels must NOT be linked into the
+        // executable: the nvcc runtime support the host stubs pull in
+        // (__cudaLaunchKernel, __cudaPushCallConfiguration, ...) lives in
+        // libcudart, and a link-time reference would give the CLI a DT_NEEDED
+        // on cudart on *every* machine -- breaking `--backend cpu` on hosts
+        // without CUDA.  Instead the objects are packed into a shared library
+        // that src/cudart.zig dlopen()s at run time, after it has opened
+        // libcudart itself with RTLD_GLOBAL so those symbols resolve.
+        //
+        // Stage 1: one plain object per .cu (no -rdc, no device link, no CUB).
+        var objs: []std.Build.LazyPath = &.{};
+        for (cuda_sources) |src| {
+            const step = b.addSystemCommand(&.{ nvcc, "-arch=sm_89", "-O3", "--std=c++17", "-c", "-Xcompiler", "-fPIC" });
+            step.addArg("-I");
+            step.addDirectoryArg(b.path(cuda_dir));
+            step.addFileArg(b.path(b.fmt("{s}/{s}", .{ cuda_dir, src })));
+            step.addArg("-o");
+            const obj = step.addOutputFileArg(b.fmt("{s}.o", .{src[0 .. src.len - 3]}));
+            // Inputs that are NOT on the command line: headers and siblings.
+            // `addDirectoryArg` only sets the include search path, so without
+            // these the nvcc step would not be invalidated by a .cuh edit (the
+            // trap called out in docs/cuda-backend-brief.md §4).
+            // `addFileInput` registers the dependency without appending an
+            // argument, which `addFileArg` would do (and break the single-input
+            // `nvcc -c ... -o` contract).
+            for (cuda_files) |p| step.addFileInput(b.path(p));
+            objs = b.allocator.realloc(objs, objs.len + 1) catch @panic("oom");
+            objs[objs.len - 1] = obj;
+        }
+
+        // Stage 2: link the objects into libqwen35-cuda-kernels.so.
+        const link = b.addSystemCommand(&.{ nvcc, "-arch=sm_89", "-shared", "-o" });
+        const so = link.addOutputFileArg("libqwen35-cuda-kernels.so");
+        for (objs) |o| link.addFileArg(o);
+        // The .so gets its DT_NEEDED from nvcc's own -lcudart default.  That is
+        // fine: it is the *kernels* library that depends on cudart, and it is
+        // only ever opened when `--backend cuda` is selected and a usable
+        // device was found.  The CLI itself stays independent.
+        // Install next to the CLI's other libraries: <prefix>/lib/.  (A plain
+        // addInstallFile with "../lib/..." resolves *above* the prefix.)
+        const install_so = b.addInstallFileWithDir(so, .lib, "libqwen35-cuda-kernels.so");
+        b.getInstallStep().dependOn(&install_so.step);
+
+        // The device side resolves its runtime through dlopen (src/cudart.zig),
+        // so nothing here links -lcudart.
+    }
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default

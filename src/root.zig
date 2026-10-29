@@ -8,6 +8,7 @@ pub const gguf = @import("gguf.zig");
 pub const backend = @import("backend.zig");
 pub const backend_cpu = @import("backend_cpu.zig");
 pub const backend_cuda = @import("backend_cuda.zig");
+pub const cudart = @import("cudart.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const engine = @import("engine.zig");
 pub const quant_dequant = @import("quant_dequant.zig");

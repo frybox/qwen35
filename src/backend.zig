@@ -43,6 +43,11 @@ pub const LoadError = error{
     MissingTensor,
     UnsupportedTensorType,
     OutOfMemory,
+    /// The selected backend (e.g. `--backend cuda`) cannot run on this host:
+    /// no libcudart, no device, or a device too old for the compiled kernels.
+    /// The reason is printed by the backend itself, because this error set only
+    /// carries names.
+    BackendUnavailable,
 };
 
 /// The hardware boundary.  One instance per loaded model.
