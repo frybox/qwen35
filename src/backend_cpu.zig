@@ -162,7 +162,12 @@ fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, poo
     // the single, data-layout-derived branch; all kernel selection below
     // follows from it.
     const act_b32 = blockElemsOf(w.ttype) == 32;
-    std.debug.assert(if (act_b32) bpr == cols / 32 else bpr == cols / 256);
+    // `bpr` is always in row-blocks, and only q8_0 has 32-element row-blocks
+    // (see `QuantRow.rowBlockElems`).  The framed 32-element-block types
+    // (q4_0/q4_1/q5_*/iq4_nl/mxfp4...) still count 256-element row-blocks, so
+    // they divide by 256 here exactly like the K/IQ types -- dividing by 32
+    // would demand a bpr 8x too large and trip this assert on every Q4_0 row.
+    std.debug.assert(bpr == cols / gguf.rowBlockElems(w.ttype));
     std.debug.assert(q8k.len >= q8kScratchBytes(cols));
     std.debug.assert(q8.len >= q8ScratchBytes(cols));
 
@@ -554,6 +559,41 @@ fn loadLinear(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8) b
 // Backend state + Exec implementation
 // ---------------------------------------------------------------------------
 
+/// Dequantize one row of `w` into `dst` (len == w.cols()).
+///
+/// Q8_0 must NOT go through the generic per-row path: `dequantRowFnFor` covers
+/// the 256-element K/IQ types, whose row framing is QK_K-based.  Q8_0 packs
+/// plain 32-element blocks with no 256 framing, so a row of it is not a whole
+/// number of 256-element units and the generic path would drop the tail
+/// whenever cols % 256 != 0.
+///
+/// `dequantRowFn` is the one-256-element-row-block reference: it loops `0..8`
+/// over 8 x 32-element sub-blocks and writes exactly 256 floats.  A row wider
+/// than 256 elements therefore has to be fed block by block -- handing the
+/// whole row to one call fills only the first 256 entries and leaves the rest
+/// of `dst` untouched.  That is a real case: the q4_0/q4_1/iq4_nl
+/// 32-element-block types are still framed as 256-element row-blocks by GGUF,
+/// so they reach this with cols > 256 (e.g. 1024).
+pub fn dequantRowInto(dst: []f32, w: QuantRow, row: usize) void {
+    if (w.ttype == .q8_0) {
+        quant.dequantizeQ8_0(w.row(row), dst) catch unreachable;
+        return;
+    }
+    const deq = dequantRowFnFor(w.ttype) orelse unreachable;
+    // One call per 256-element row-block: `deq` consumes 8 x 32-element
+    // sub-blocks and emits exactly `rbe` floats.  Walk `blocks_per_row`
+    // (the row-block unit), NOT `rowBlocks()` (the type's own block unit,
+    // which for q4_0 is 8x larger).
+    const rbe = w.rowBlockElems();
+    const blk = w.blockBytes();
+    const per_rb = rbe / w.blockElems(); // 32-element blocks per row-block
+    const src = w.row(row);
+    var b: usize = 0;
+    while (b < w.blocks_per_row) : (b += 1) {
+        deq(src[b * per_rb * blk ..], dst[b * rbe ..]);
+    }
+}
+
 pub const CpuBackend = struct {
     alloc: std.mem.Allocator,
     g: *const gguf.File,
@@ -636,17 +676,7 @@ pub const CpuBackend = struct {
 
     fn vDequantRow(ctx: *anyopaque, dst: []f32, w: QuantRow, row: usize) void {
         _ = ctx;
-        // Q8_0 must NOT go through the generic per-row path: `dequantRowFnFor`
-        // covers the 256-element K/IQ types, whose row framing is QK_K-based.
-        // Q8_0 packs plain 32-element blocks with no 256 framing, so a row of
-        // it is not a whole number of 256-element units and the generic path
-        // silently drops the tail whenever cols % 256 != 0.
-        if (w.ttype == .q8_0) {
-            quant.dequantizeQ8_0(w.row(row), dst) catch unreachable;
-            return;
-        }
-        const deq = dequantRowFnFor(w.ttype) orelse unreachable;
-        deq(w.row(row), dst);
+        dequantRowInto(dst, w, row);
     }
 
     fn vMatvec(ctx: *anyopaque, out: []f32, w: LinearW, x: []const f32) void {
@@ -831,4 +861,70 @@ test "matvecF32 2x3 hand computed" {
     matvecF32(&out, &m, &x);
     try std.testing.expectEqual(@as(f32, 50), out[0]);
     try std.testing.expectEqual(@as(f32, 122), out[1]);
+}
+
+test "matvecQuant Q4_0: 256-framed 32-block type matches rowDotQ4_0" {
+    // Regression: q4_0 reports blockElems == 32 but GGUF frames its rows as
+    // 256-element row-blocks, so `blocks_per_row` is cols/256 while the
+    // activation is a Q8_0 (34 B / 32 elems) buffer over the whole row.  Two
+    // bugs lived here: an assert demanding bpr == cols/32 (8x too large), and
+    // dequantizing only the first 256 elements of a wider row.  Q8_0 alone
+    // covers neither, because q8_0 really does have 32-element row-blocks.
+    const cols = 256; // exactly one 256-element row-block
+    const rows = 1;
+
+    var wq: [rows * 8 * 18]u8 = undefined;
+    var x: [cols]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.25 - 0.75;
+    for (0..8) |b| {
+        // f16 d, then 16 bytes of packed nibbles; vary per block so a wrong
+        // stride or activation window cannot silently match.
+        const bits: u16 = @bitCast(@as(f16, 0.0625));
+        wq[b * 18 + 0] = @truncate(bits);
+        wq[b * 18 + 1] = @truncate(bits >> 8);
+        for (0..16) |j| wq[b * 18 + 2 + j] = @truncate(j *% 37 +% b *% 11 +% 5);
+    }
+
+    const w: QuantRow = .{ .data = &wq, .ttype = .q4_0, .rows = rows, .blocks_per_row = cols / 256 };
+    try std.testing.expectEqual(cols, w.cols());
+
+    var out: [rows]f32 = undefined;
+    var q8scratch: [q8ScratchBytes(cols)]u8 = undefined;
+    var q8kscratch: [q8kScratchBytes(cols)]u8 = undefined;
+    matvecQuant(&out, w, &x, &q8kscratch, &q8scratch, null);
+
+    // The kernel quantizes x to Q8_0; the scalar reference does not, so the
+    // two differ by the activation's quantization noise (measured ~0.2% here).
+    const ref = quant.rowDotQ4_0(&wq, &x);
+    try std.testing.expectApproxEqAbs(ref, out[0], @abs(ref) * 5e-3 + 5e-3);
+}
+
+test "dequantRowInto q4_0: every 256-element row-block of a wide row is written" {
+    // Regression: `dequantRowFn` writes exactly 256 floats (it loops 0..8 over
+    // 8 x 32-element sub-blocks).  Handing a whole 512-element row to one call
+    // leaves the second half of the destination untouched -- silent garbage in
+    // token embeddings, and on a real 1024-wide model row three quarters of
+    // every embedding row stays zero.  Q8_0 has its own path, so a Q8_0-only
+    // suite cannot see this.
+    const cols = 512; // two 256-element row-blocks
+    var wq: [16 * 18]u8 = undefined; // 16 x 32-element blocks
+    for (0..16) |b| {
+        const bits: u16 = @bitCast(@as(f16, 0.0625));
+        wq[b * 18 + 0] = @truncate(bits);
+        wq[b * 18 + 1] = @truncate(bits >> 8);
+        for (0..16) |j| wq[b * 18 + 2 + j] = @truncate(j *% 13 +% b *% 7 +% 3);
+    }
+
+    const w: QuantRow = .{ .data = &wq, .ttype = .q4_0, .rows = 1, .blocks_per_row = cols / 256 };
+    try std.testing.expectEqual(cols, w.cols());
+
+    var out: [cols]f32 = @splat(0);
+    dequantRowInto(&out, w, 0);
+
+    // The second row-block must be written, not left at the 0 sentinel.
+    try std.testing.expect(out[cols - 1] != 0);
+    // ...and it must equal a direct 256-element dequant of those same bytes.
+    var direct: [256]f32 = undefined;
+    dequantRowFnFor(.q4_0).?(wq[8 * 18 ..], &direct);
+    for (0..256) |i| try std.testing.expectEqual(direct[i], out[256 + i]);
 }
