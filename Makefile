@@ -243,6 +243,9 @@ run27bq4:
 run27biq3xxs:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48
 
+run27biq3xxs-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run27biq3xxs-cuda:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48 --backend cuda
 

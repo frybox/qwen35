@@ -157,6 +157,66 @@ __global__ void q35_k_mul_mat_vec_q(const unsigned char *__restrict__ w,
         q35_dot_row(ttype, wrow, arow, info.block_bytes, info.act_bytes, nblk);
 }
 
+// ---------------------------------------------------------------------------
+// Cooperative-row variant: one warp per output row.
+//
+// Why this exists.  The kernel above maps thread -> row, so the 32 threads of a
+// warp walk 32 *different* rows: at any step their addresses are
+// `nblk * block_bytes` apart (2200 B for IQ3_XXS at cols=5120), i.e. every load
+// touches its own 128 B sector and the warp uses 1/128th of each.  Measured
+// effect: the batchK path ran at ~80 GB/s of the 4090D's ~1008 GB/s.
+// Flipping the mapping so a warp covers consecutive *blocks of one row* makes
+// the warp read a contiguous 32 x block_bytes stretch -> fully coalesced.
+//
+// Reduced precision concern: the reduction order is NOT changed.  Each lane
+// computes one block's term with `q35_dot_1blk`, the partial sums go to shared
+// memory, and lane 0 folds them strictly b = 0 .. nblk-1 -- the same left-to-
+// right order `q35_dot_row` uses, so the result is bit-identical (the file
+// header forbids reordering; this respects it).
+// ---------------------------------------------------------------------------
+#define Q35_WARP 32
+
+__global__ void q35_k_mul_mat_vec_q_coop(const unsigned char *__restrict__ w,
+                                         const unsigned char *__restrict__ xq,
+                                         float *__restrict__ out,
+                                         int rows, int cols, int tokens, int ttype) {
+    __shared__ float part[/*warps*/ 4][Q35_WARP];
+    const Q35QuantInfo info = q35_quant_info(ttype);
+    const int nblk = cols / info.block_elems;
+    const int lane = threadIdx.x & (Q35_WARP - 1);
+    const int warp = threadIdx.x / Q35_WARP;
+    if (nblk > Q35_WARP) return;  // caller picks the other kernel in that case
+
+    const int warps_per_block = blockDim.x / Q35_WARP;
+    const int row_in_block = blockIdx.x * warps_per_block + warp;
+    if (row_in_block >= rows) return;
+
+    const unsigned char *wrow = w + (size_t)row_in_block * (size_t)nblk * (size_t)info.block_bytes;
+
+    // Loop over tokens so a prefill chunk reuses the same tile mapping.
+    for (int t = 0; t < tokens; ++t) {
+        const unsigned char *arow = xq + (size_t)t * (size_t)nblk * (size_t)info.act_bytes;
+
+        // Lane `b` owns block b: the warp reads nblk consecutive blocks, one per
+        // lane, which is what makes the load coalesced.
+        float s = 0.0f;
+        if (lane < nblk) {
+            s = q35_dot_1blk(ttype, wrow + (size_t)lane * (size_t)info.block_bytes,
+                             arow + (size_t)lane * (size_t)info.act_bytes, 0.0f);
+        }
+        part[warp][lane] = s;
+        __syncwarp();
+
+        if (lane == 0) {
+            // Strict left-to-right fold over b = 0..nblk-1: the same order
+            // q35_dot_row produces, so the value is bit-identical.
+            float acc = 0.0f;
+            for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, part[warp][b]);
+            out[(size_t)t * rows + row_in_block] = acc;
+        }
+    }
+}
+
 // f32 weights x f32 activation, same one-thread-per-element mapping.
 __global__ void q35_k_mul_mat_vec_f32(const float *__restrict__ w,
                                       const float *__restrict__ x,
@@ -251,6 +311,22 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     if (cols % info.block_elems != 0) return (int)cudaErrorInvalidValue;
     const int threads = 128;
     const int total = rows * tokens;
+    const int nblk = cols / info.block_elems;
+    // The warp-per-row mapping wins only for single-token decoding: with a
+    // prefill chunk the tile is reused across `tokens`, and the per-token
+    // `__syncwarp()` plus lane-0 fold cost more than the coalescing saves
+    // (measured: 27B IQ3_XXS prefill 11.3 -> 10.1 t/s).  Keep the thread-per-row
+    // kernel for tokens > 1, where each token already fills the SMs.
+    if (tokens == 1 && nblk <= Q35_WARP) {
+        // One warp per row: coalesced because the warp's lanes read consecutive
+        // blocks of a single row.  See q35_k_mul_mat_vec_q_coop for why this is
+        // numerically identical to the thread-per-row mapping.
+        const int warps_per_block = threads / Q35_WARP;
+        const int blocks = (rows + warps_per_block - 1) / warps_per_block;
+        q35_k_mul_mat_vec_q_coop<<<blocks, threads, 0, stream>>>(d_w, d_xq, d_out, rows, cols,
+                                                                 tokens, ttype);
+        return (int)cudaGetLastError();
+    }
     const int blocks = (total + threads - 1) / threads;
     q35_k_mul_mat_vec_q<<<blocks, threads, 0, stream>>>(d_w, d_xq, d_out, rows, cols,
                                                         tokens, ttype);
@@ -274,6 +350,9 @@ extern "C" int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x,
     const int threads = 256;
     const int total = rows * tokens;
     const int blocks = (total + threads - 1) / threads;
+    // Scalar order on purpose: the warp-per-row fold (~1 ulp different) changed
+    // the BF16 token stream on the 0.8B probe for only +12% throughput, which is
+    // not a trade worth making while the quantized path is the hot one.
     q35_k_mul_mat_vec_f32<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, rows, cols,
                                                           tokens);
     return (int)cudaGetLastError();
