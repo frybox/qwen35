@@ -69,6 +69,34 @@ fn findNvcc(b: *std.Build) ?[]const u8 {
     return null;
 }
 
+/// The device code target.  Fixed rather than `-arch=native`: the build has to
+/// be reproducible, and docs/cuda-backend-brief.md §4 pins sm_89 (the 4090D on
+/// this box).  Both the per-.cu compile and the -shared link use it, so the two
+/// stages can never disagree about what SASS/PTX the .so contains.
+const cuda_arch = "-arch=sm_89";
+
+/// The .cu files that make up libqwen35-cuda-kernels.so.
+///
+/// Why an explicit list instead of globbing the directory: `b.path()` needs a
+/// static path, so a directory scan cannot feed `addFileArg` without the build
+/// script reaching into the filesystem behind Zig's back.  The consequence is
+/// that **a NEW .cu file must be registered here** -- otherwise it silently
+/// does not get compiled into the .so and the Zig side's dlopen/lookup of its
+/// launcher fails at run time with "missing kernel", not at build time.
+/// `listCudaInputs` below enumerates every file in the directory, and the
+/// `cuda-check` step (`zig build cuda-check -Dcuda=true`) compares the two so
+/// the omission fails loudly at build time instead of silently at run time.
+const cuda_sources = [_][]const u8{
+    // block quantize / dequantize launchers (q35_launch_quantize_q8_0,
+    // q35_launch_dequantize_q8_0)
+    "convert.cu",
+    // IQ codebook definitions (__device__ __constant__), instantiated once.
+    // Must be here: the other .cu files only declare them extern.
+    "iq_tables.cu",
+    // mat-vec launchers (q35_launch_mul_mat_vec_q8_0, q35_launch_mul_mat_vec_f32)
+    "mmvq.cu",
+};
+
 /// Every regular file under src/kernels/cuda/.  These become explicit inputs of
 /// the nvcc steps so that a `.cuh` edit invalidates the cached invocation --
 /// Zig's cache tracks only the declared inputs, and `addDirectoryArg` (needed
@@ -288,13 +316,39 @@ pub fn build(b: *std.Build) void {
             @panic("nvcc not found; install the CUDA toolkit or build without -Dcuda");
         };
         const cuda_dir = "src/kernels/cuda";
-        const cuda_sources = [_][]const u8{ "convert.cu", "mmvq.cu" };
         // Every file in the directory, used as an *input dependency* below so a
         // .cuh edit invalidates the nvcc step.
         const cuda_files = listCudaInputs(b) catch |e| {
             std.debug.print("error: -Dcuda=true but src/kernels/cuda/ could not be read: {s}\n", .{@errorName(e)});
             @panic("cannot enumerate src/kernels/cuda");
         };
+
+        // Registration check: every .cu on disk must be in `cuda_sources` at the
+        // top of this file.  Without this, adding a kernel file is a silent
+        // no-op at build time and only shows up at run time as
+        // `missingKernel(lib, path, "q35_launch_...")` from backend_cuda.zig.
+        std.debug.print("cuda: {} file(s) in {s}, {} registered for nvcc -c\n", .{ cuda_files.len, cuda_dir, cuda_sources.len });
+        var unregistered: usize = 0;
+        for (cuda_files) |p| {
+            if (!std.mem.endsWith(u8, p, ".cu")) continue; // .cuh/.h need no -c
+            const base = p["src/kernels/cuda/".len..];
+            var listed = false;
+            for (cuda_sources) |src| {
+                if (std.mem.eql(u8, src, base)) listed = true;
+            }
+            if (!listed) {
+                unregistered += 1;
+                std.debug.print("error: {s} is not registered in `cuda_sources` (build.zig); " ++
+                    "it would not be compiled into libqwen35-cuda-kernels.so\n", .{p});
+            }
+        }
+        if (unregistered != 0) @panic("unregistered .cu file(s); add them to `cuda_sources` in build.zig");
+
+        // Standalone compile check: `zig build cuda-check -Dcuda=true` nvcc's
+        // every registered .cu with `-c` into a throwaway object (nvcc has no
+        // `-fsyntax-only`) and starts no link, so a failure here is always a
+        // source problem, never the .so link.  Not part of the default step.
+        const cuda_check_step = b.step("cuda-check", "compile each src/kernels/cuda/*.cu with nvcc -c only (needs -Dcuda=true)");
 
         // Two-stage, because the kernels must NOT be linked into the
         // executable: the nvcc runtime support the host stubs pull in
@@ -305,10 +359,24 @@ pub fn build(b: *std.Build) void {
         // that src/cudart.zig dlopen()s at run time, after it has opened
         // libcudart itself with RTLD_GLOBAL so those symbols resolve.
         //
-        // Stage 1: one plain object per .cu (no -rdc, no device link, no CUB).
+        // Stage 1: one object per .cu, with -rdc=true (relocatable device code).
+        //
+        // -rdc is what makes the IQ codebooks exist ONCE.  Without it nvcc
+        // closes each .cu into its own device module, so every .cu that
+        // includes iq_tables.cuh got its own private copy of the twelve
+        // __constant__ tables -- ~52 KB of duplicated constant bank per
+        // translation unit, and no way for the linker to merge them.  With
+        // -rdc the definition in iq_tables.cu stays a single strong symbol and
+        // the other units carry only relocations against it; nvlink (stage 2,
+        // below) resolves them.  Verified by inspecting the objects: only
+        // iq_tables.o defines the grids, convert.o and mmvq.o no longer do.
         var objs: []std.Build.LazyPath = &.{};
         for (cuda_sources) |src| {
-            const step = b.addSystemCommand(&.{ nvcc, "-arch=sm_89", "-O3", "--std=c++17", "-c", "-Xcompiler", "-fPIC" });
+            // -I points at src/kernels/cuda so the sibling `common.cuh`,
+            // `vecdotq.cuh`, `iq_tables.cuh` and `api.h` includes resolve.
+            // -Xcompiler -fPIC: the objects end up in a .so, so they must be PIC.
+            const step = b.addSystemCommand(&.{ nvcc, cuda_arch, "-O3", "--std=c++17", "-rdc=true", "-c", "-Xcompiler", "-fPIC" });
+            step.has_side_effects = false;
             step.addArg("-I");
             step.addDirectoryArg(b.path(cuda_dir));
             step.addFileArg(b.path(b.fmt("{s}/{s}", .{ cuda_dir, src })));
@@ -324,11 +392,28 @@ pub fn build(b: *std.Build) void {
             for (cuda_files) |p| step.addFileInput(b.path(p));
             objs = b.allocator.realloc(objs, objs.len + 1) catch @panic("oom");
             objs[objs.len - 1] = obj;
+
+            // cuda-check: same flags, but `-c` into a scratch output and no
+            // link, so it isolates "source does not compile" from "does not
+            // link".  Reuses cuda-check only to keep its inputs in the cache.
+            const check = b.addSystemCommand(&.{ nvcc, cuda_arch, "-O3", "--std=c++17", "-c", "-I" });
+            check.has_side_effects = false;
+            check.addDirectoryArg(b.path(cuda_dir));
+            check.addFileArg(b.path(b.fmt("{s}/{s}", .{ cuda_dir, src })));
+            check.addArg("-o");
+            _ = check.addOutputFileArg(b.fmt("check-{s}.o", .{src[0 .. src.len - 3]}));
+            for (cuda_files) |p| check.addFileInput(b.path(p));
+            cuda_check_step.dependOn(&check.step);
         }
 
-        // Stage 2: link the objects into libqwen35-cuda-kernels.so.
-        const link = b.addSystemCommand(&.{ nvcc, "-arch=sm_89", "-shared", "-o" });
+        // Stage 2: link the objects into libqwen35-cuda-kernels.so, with
+        // -rdc=true so nvcc runs nvlink over the relocatable device code.
+        // Stage 1 objects hold -rdc device objects; without -rdc here the device
+        // link never happens and the extern __constant__ declarations in
+        // convert.cu / mmvq.cu would stay unresolved at run time.
+        const link = b.addSystemCommand(&.{ nvcc, cuda_arch, "-rdc=true", "-shared", "-o" });
         const so = link.addOutputFileArg("libqwen35-cuda-kernels.so");
+        // Every stage-1 object, in `cuda_sources` order.
         for (objs) |o| link.addFileArg(o);
         // The .so gets its DT_NEEDED from nvcc's own -lcudart default.  That is
         // fine: it is the *kernels* library that depends on cudart, and it is

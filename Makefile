@@ -17,7 +17,7 @@ ZIGCACHE := --cache-dir /tmp/qwen35-cache
 HOST_OBJ := .zig-cache/qwen35_cuda_host.o
 CUDA_EXE := zig-out/bin/qwen35-cuda
 
-.PHONY: all build cpu cpufast cudabackend cuda test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
+.PHONY: all build cpu cpufast cudabackend cuda cuda-check legacy-cuda test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
 
 all: build cpu cuda
 
@@ -36,7 +36,39 @@ cpufast:
 cudabackend:
 	$(ZIG) build -Dcuda=true -Doptimize=ReleaseFast $(ZIGCACHE)
 
-cuda: $(CUDA_EXE)
+# `make cuda` = the backend kernel library only.
+#
+# It used to build $(CUDA_EXE) (src/main_cuda.zig + src/kernel.cu), the
+# parallel whole-model GPU forward that docs/cuda-backend-brief.md §6 retires.
+# That legacy host entry no longer compiles -- it still calls
+# `engine.Engine.load(arena, path, io)` while engine.zig:746 now takes
+# (alloc, path, io, n_threads, backend_kind) -- so the target could not be kept
+# as-is and it has nothing to do with the kernels being wired here.  The
+# kernels reach the CLI by dlopen (src/backend_cuda.zig + src/cudart.zig), not
+# by link, so the .so is the whole build output.
+CUDA_SO := zig-out/lib/libqwen35-cuda-kernels.so
+
+# No .cu/.cuh prerequisites on purpose: build.zig registers every file in
+# src/kernels/cuda/ as an explicit input of the nvcc steps, so Zig's own cache
+# already re-runs nvcc when a kernel or a header changes.  Listing them again
+# here would be a second, silently-drifting copy of that list.
+cuda: $(CUDA_SO)
+
+$(CUDA_SO): build.zig src/kernels/cuda/api.h
+	$(ZIG) build -Dcuda=true -Doptimize=ReleaseFast $(ZIGCACHE)
+
+# Compile-only check of every registered src/kernels/cuda/*.cu, no link, no
+# install.  Use it to tell "build script wrong" from "kernel source wrong".
+cuda-check:
+	$(ZIG) build -Dcuda=true cuda-check $(ZIGCACHE) --summary all
+
+# ---------------------------------------------------------------------------
+# LEGACY whole-model GPU binary (src/main_cuda.zig + src/kernel.cu).
+# Broken at HEAD: src/main_cuda.zig:1105 calls engine.Engine.load with 3 args,
+# engine.zig:746 now wants 5.  Kept (not deleted) so the paths stay visible;
+# `make cuda` no longer depends on it and `make` / `make all` do not build it.
+# ---------------------------------------------------------------------------
+legacy-cuda: $(CUDA_EXE)
 
 $(CUDA_EXE): $(HOST_OBJ) src/kernel.cu
 	$(NVCC) -O3 -arch=native -o=$@ $(HOST_OBJ) src/kernel.cu -lcudart -lm
@@ -58,6 +90,9 @@ run0.8bud-llamacpp: run0.8biq2m-llamacpp run0.8biq2xxs-llamacpp run0.8biq3xxs-ll
 
 run0.8bq80:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+
+run0.8bq80-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
 
 run0.8bq80-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
@@ -209,7 +244,7 @@ run27biq3xxs:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48
 
 run27biq3xxs-cuda:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？
+	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48 --backend cuda
 
 run27biq2xxs:
 	zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ2_XXS.gguf 天空为什么是蓝色的？ -n 48

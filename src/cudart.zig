@@ -29,12 +29,71 @@ const builtin = @import("builtin");
 /// the library we dlopen actually implements).
 pub const cudaSuccess: c_int = 0;
 
+/// Mirrors `cudaDeviceProp`.  Only the fields this backend reads are named; the
+/// padding is sized so that every one of them lands on its real offset, because
+/// the struct is filled by the **installed** runtime, not by a header we
+/// control.
+///
+/// Verified against CUDA 13's `driver_types.h` (`sizeof == 1008`; the same
+/// numbers hold for CUDA 11/12).
+///
+/// The previous definition here was 784 bytes with `totalGlobalMem` at 256 and
+/// `major`/`minor` at 272/276 -- 32 bytes short of the first field and 88 bytes
+/// short of the compute capability.  Reading those made `cc()` cast garbage
+/// into a u32 (`@intCast` panics in Debug; in ReleaseFast it yields a value
+/// that passes or fails the `min_cc` check at random), so the layout is
+/// corrected to the truth instead of papered over with a bigger `_pad`:
+///
+///     +0    name[256]
+///     +256  uuid[16]                 <- the 32-byte gap the old layout missed
+///     +272  luid[8]
+///     +280  luidDeviceNodeMask (4) + 4 bytes padding to 8-byte alignment
+///     +288  totalGlobalMem (size_t)
+///     +296  sharedMemPerBlock (size_t)
+///     +304  regsPerBlock, warpSize (int, int)
+///     +312  memPitch (size_t)
+///     +320  maxThreadsPerBlock (int)
+///     +324  maxThreadsDim[3] (12)
+///     +336  maxGridSize[3] (12)
+///     +348  clockRate (int)
+///     +352  totalConstMem (size_t)
+///     +360  major (int)
+///     +364  minor (int)
+///     +368  textureAlignment, texturePitchAlignment (size_t, size_t)
+///     +384  deviceOverlap (int)
+///     +388  multiProcessorCount (int)
+///
+/// The tail is padded to the true 1008 bytes so that a caller which ever copies
+/// the struct by value cannot read past what the runtime wrote.
 pub const DeviceProp = extern struct {
     name: [256]u8,
+    uuid: [16]u8,
+    luid: [8]u8,
+    luid_device_node_mask: u32,
+    _pad0: u32,
     total_global_mem: usize,
+    shared_mem_per_block: usize,
+    _pad1: [8]u8, // regsPerBlock, warpSize
+    mem_pitch: usize,
+    _pad2: [28]u8, // maxThreadsPerBlock, maxThreadsDim[3], maxGridSize[3], clockRate
+    total_const_mem: usize,
     major: c_int,
     minor: c_int,
-    _pad: [512]u8,
+    _pad3: [16]u8, // textureAlignment, texturePitchAlignment
+    device_overlap: c_int,
+    multi_processor_count: c_int,
+    _pad_tail: [1008 - 392]u8,
+
+    comptime {
+        // A wrong offset here is silent garbage, not a compile error, so pin the
+        // three fields the backend actually reads.
+        std.debug.assert(@offsetOf(DeviceProp, "name") == 0);
+        std.debug.assert(@offsetOf(DeviceProp, "total_global_mem") == 288);
+        std.debug.assert(@offsetOf(DeviceProp, "major") == 360);
+        std.debug.assert(@offsetOf(DeviceProp, "minor") == 364);
+        std.debug.assert(@offsetOf(DeviceProp, "multi_processor_count") == 388);
+        std.debug.assert(@sizeOf(DeviceProp) == 1008);
+    }
 
     pub fn cc(self: DeviceProp) u32 {
         return @as(u32, @intCast(self.major)) * 10 + @as(u32, @intCast(self.minor));
