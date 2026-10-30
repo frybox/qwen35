@@ -4,9 +4,10 @@
 // ONE source file serves three consumers; there is no other copy of this data:
 //
 //   * CUDA kernels  -- src/kernels/cuda/iq_tables.cu defines Q35_TABLES_CUDA and
-//                      includes this header, so the tables land in __constant__
-//                      memory.  The other .cu files include iq_tables.cuh, which
-//                      only declares them `extern __device__ __constant__`.
+//                      includes this header, so the tables are emitted as
+//                      `__device__` arrays in global memory.  The other .cu files
+//                      include iq_tables.cuh, which only declares them
+//                      `extern __device__`.
 //   * x86 C kernels -- src/kernels/x86/iq_tables.h declares them `extern const`;
 //                      the objects are the ones translate-c emits for Zig (below).
 //   * Zig           -- src/iq_tables.zig imports the translate-c output of this
@@ -40,15 +41,17 @@
 #define Q35_IQ_TABLES_H
 
 #if defined(Q35_TABLES_CUDA)
-   /* Device code.  nvcc is a C++ front end, so <cstdint>; the tables land in the
-    * constant bank (see src/kernels/cuda/iq_tables.cuh for why __constant__). */
+   /* Device code.  nvcc is a C++ front end, so <cstdint>; the tables land in
+    * device global memory, deliberately not `__constant__` (see
+    * src/kernels/cuda/iq_tables.cuh: the grids are gathered per element, which
+    * the constant cache serialises). */
 #  include <cstdint>
-   /* No `extern` keyword here: nvcc rejects `extern __constant__ const T[n];`
-    * as "uninitialized const", and a plain `__constant__` *definition* is
-    * already external in CUDA (the qualifier lands it in the module's constant
-    * bank, not in a file-local).  The single definition lives in
-    * src/kernels/cuda/iq_tables.cu; see iq_tables.cuh for the declarations. */
-#  define Q35_TAB_DECL(t, n, s) __device__ __constant__ t n[s] = {
+   /* No `extern` keyword here: nvcc rejects `extern __device__ const T[n];` as
+    * "uninitialized const", and a plain `__device__` *definition* is already
+    * external in CUDA (the qualifier puts it in the module's global data, not in
+    * a file-local).  The single definition lives in src/kernels/cuda/iq_tables.cu;
+    * see iq_tables.cuh for the declarations. */
+#  define Q35_TAB_DECL(t, n, s) __device__ t n[s] = {
 #elif defined(Q35_TABLES_HOST_CHECK)
    /* Host-only capture form: `static`, so a .c compiled purely to dump the
     * values does not compete with the real definitions at link time. */
