@@ -177,6 +177,10 @@ pub const CudaBackend = struct {
     /// `TensorType` has holes, so index by the raw tag and size for the largest
     /// value we count (tq2_0 = 35).
     stat_by_type: [64]usize = @splat(0),
+    /// Nanoseconds spent per backing type, summed over the same calls that
+    /// `stat_by_type` counts.  Diagnostics only ($QWEN35_PROF): answers "which
+    /// quant type owns the matvec time", which the count alone cannot.
+    stat_ns_by_type: [64]u64 = @splat(0),
     /// Which types the `$QWEN35_MVCHECK` cross-check has already covered (see
     /// `mvCheck`).  Per type, not per process: a model has one type per tensor
     /// family, so a single sample would leave e.g. iq4_xs unchecked.
@@ -755,7 +759,11 @@ pub const CudaBackend = struct {
                 self.downloadOut(out[0..rows]);
                 self.stat_ns_matvec += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
+                self.stat_ns_by_type[@backingInt(q.ttype)] += durNs(t0, self.io);
                 self.stat_n_matvec += 1;
+                if (cudart.getenv("QWEN35_PROF") != null and self.stat_n_matvec % 500 == 0) {
+                    self.reportStats("matvec");
+                }
                 if (cudart.getenv("QWEN35_PROF") != null and self.stat_n_matvec == 1) {
                     // `reportProfile` has no call site on the CLI path and the engine
                     // is arena-allocated (so `deinit` never runs).  Announce the device
@@ -932,7 +940,15 @@ pub const CudaBackend = struct {
                 self.downloadOut(out[0 .. k * rows]);
                 self.stat_ns_batchk += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
+                self.stat_ns_by_type[@backingInt(q.ttype)] += durNs(t0, self.io);
                 self.stat_n_batchk += 1;
+                // Interim dump: the CLI path never runs `deinit` (the engine is
+                // arena-allocated), so without a periodic report the only profile
+                // line is the one printed on the first matvec.  Every 200th chunk
+                // keeps generation-phase numbers visible without spamming.
+                if (cudart.getenv("QWEN35_PROF") != null and self.stat_n_batchk % 200 == 0) {
+                    self.reportStats("batchk");
+                }
                 // Token 0 of the chunk is enough: all K rows run through the same
                 // kernel, so a per-type mismatch shows up on the first one.
                 self.mvCheck(out[0..rows], q, xK[0..cols]);
@@ -1029,6 +1045,29 @@ pub const CudaBackend = struct {
         }
         if (!any) n += (std.fmt.bufPrint(line[n..], " (none)", .{}) catch line[n..n]).len;
         std.debug.print("{s}\n", .{line[0..n]});
+
+        // Per-type wall time, largest first.  `stat_ns_matvec` includes the
+        // blocking activation upload and the output download, so these sums add
+        // up to more than the kernel time -- that is deliberate: the question
+        // being answered is "where does the wall clock go per type".
+        var tline: [448]u8 = undefined;
+        var tn: usize = 0;
+        tn += (std.fmt.bufPrint(tline[tn..], "CUDA-M  time:", .{}) catch return).len;
+        const total: u64 = blk: {
+            var s: u64 = 0;
+            for (self.stat_ns_by_type) |v| s += v;
+            break :blk s;
+        };
+        for (0..self.stat_by_type.len) |i| {
+            const ns = self.stat_ns_by_type[i];
+            if (ns == 0) continue;
+            const tt: gguf.TensorType = @fromBackingInt(@intCast(@as(u32, @intCast(i))));
+            const pct: u64 = if (total == 0) 0 else ns * 100 / total;
+            tn += (std.fmt.bufPrint(tline[tn..], " {s}={d}ms/{d}%", .{
+                @tagName(tt), ns / 1_000_000, pct,
+            }) catch break).len;
+        }
+        std.debug.print("{s}\n", .{tline[0..tn]});
     }
 
     fn vName(ctx: *anyopaque) []const u8 {
@@ -1083,6 +1122,7 @@ pub const CudaBackend = struct {
         self.stat_n_batchk = 0;
         self.stat_n_dequant = 0;
         self.stat_by_type = @splat(0);
+        self.stat_ns_by_type = @splat(0);
         self.cpu.exec().profReset();
     }
 
