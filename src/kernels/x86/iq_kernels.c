@@ -50,7 +50,8 @@ static inline __m128i get_scale_shuffle(int i) {
 // QK_K: number of elements per block
 #define QK_K 256
 
-// kmask_iq2xs is now defined in iq_tables.h
+// kmask_iq2xs is declared in src/kernels/x86/iq_tables.h (defined via the Zig
+// side's translate-c of src/iq_tables.h; see AGENTS.md 1.0)
 
 /*
  * All IQ lookup tables (iq1s_grid, iq2xxs_grid, iq2xs_grid, iq2s_grid,

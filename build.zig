@@ -134,7 +134,32 @@ pub fn build(b: *std.Build) void {
         // Later on we'll use this module as the root module of a test executable
         // which requires us to specify a target.
         .target = target,
+        .link_libc = true,
     });
+
+    // ---------------------------------------------------------------------------
+    // The IQ lookup tables: ONE C source file, translated for Zig
+    // ---------------------------------------------------------------------------
+    // src/iq_tables.h is the only place the twelve IQ codebooks are written
+    // down.  Three consumers instantiate it three ways:
+    //
+    //   * CUDA kernels  -- src/kernels/cuda/iq_tables.cuh defines
+    //                      Q35_TABLES_CUDA   -> `__device__ __constant__`
+    //   * Zig           -- translated here      -> `pub export const`; this IS
+    //                      the host-side definition, and src/kernels/x86/
+    //                      iq_tables.h declares the same objects extern for the
+    //                      C kernels (so the x86 side compiles no copy)
+    //
+    // Zig 0.17 has no `@cImport` builtin; C headers go through a translate-c
+    // step that produces a normal Zig module (see src/iq_tables.zig).
+    const tables_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/iq_tables.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tables_c.addIncludePath(b.path("src"));
+    mod.addImport("iq_tables_c", tables_c.createModule());
 
     // ---------------------------------------------------------------------------
     // C kernels for SIMD-optimized IQ quantization (ported from llama.cpp)

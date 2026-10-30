@@ -1,16 +1,20 @@
 /*
- * IQ-series lookup tables: declarations only.
+ * IQ-series lookup tables as seen by the x86 C kernels: declarations only.
  *
- * The data lives in src/iq_tables.zig, generated from llama.cpp's
- * ggml/src/ggml-common.h by scripts/gen_iq_tables.py.  Zig emits these as
- * global objects (`pub export const`), so every C kernel here shares one copy
- * of the data instead of carrying its own.  This is the C-side equivalent of
- * llama.cpp's GGML_TABLE_BEGIN/GGML_TABLE_END mechanism (ggml-common.h:469-502),
- * except there is no per-TU copy: the symbol is defined once.
+ * The data is written once, in the repo-root src/iq_tables.h.  For host code its
+ * single definition is the translate-c output that Zig builds from that header
+ * (see src/iq_tables.zig), which is why everything here is `extern const`: the
+ * x86 kernels reference the Zig-emitted objects, they do not compile their own
+ * copy.  CUDA cannot reference host objects, so the device image instantiates
+ * the same header separately as __constant__ (src/kernels/cuda/iq_tables.cu).
  *
- * Do not add a table definition to this header.  If a kernel needs a new
- * table, add it to src/iq_tables.zig (canonical data) or derive it there
- * (comptime function), then declare it here.
+ * An earlier revision did compile a third copy here; the linker kept its
+ * symbol and translate-c's apart, and the "one copy, not two" test in
+ * src/iq_table_tests.zig caught it.  Do not reintroduce a definition here.
+ *
+ * The derived tables (keven_signs_q2xs, ksigns64_derived, k32_iq4nl_tab,
+ * k32_nvfp4_values) are pure functions of the canonical tables; Zig computes
+ * them at comptime and exports them, so they are declared `extern` below too.
  */
 
 #ifndef IQ_TABLES_H
@@ -22,7 +26,8 @@
 extern "C" {
 #endif
 
-/* Canonical tables, one value per upstream ggml-common.h entry. */
+/* Canonical tables: defined in src/iq_tables.h, compiled by build.zig's
+ * qwen35_iq_tables unit, consumed by the kernels through these declarations. */
 extern const uint8_t  kmask_iq2xs[8];      /* ggml-common.h:509 */
 extern const uint8_t  ksigns_iq2xs[128];   /* ggml-common.h:513 */
 extern const uint64_t ksigns64[128];       /* ggml-common.h:524 */
@@ -36,7 +41,8 @@ extern const int8_t   kvalues_fp4[16];     /* ggml-common.h:1126 */
 extern const uint64_t iq1s_grid[2048];     /* ggml-common.h:1135 */
 extern const uint8_t  iq_pow3[6];          /* ggml-cpu/quants.c:493 */
 
-/* Derived tables, computed at Zig comptime from the canonical ones. */
+/* Derived tables, computed at Zig comptime from the canonical ones and exported
+ * by src/iq_tables.zig. */
 extern const int8_t   keven_signs_q2xs[1024];  /* sign expansion of ksigns_iq2xs */
 extern const uint64_t ksigns64_derived[128];   /* must equal ksigns64 */
 extern const int32_t  k32_iq4nl_tab[16];       /* int32 mirror of kvalues_iq4nl */
@@ -50,6 +56,7 @@ extern const float    k32_nvfp4_values[16];    /* f32 view of kvalues_fp4 */
  * products.
  */
 int iq_table_spotcheck(void);
+
 
 #ifdef __cplusplus
 }

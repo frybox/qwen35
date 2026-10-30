@@ -1,20 +1,39 @@
 #!/usr/bin/env python3
-"""Regenerate src/iq_tables.zig from the upstream ggml table definitions.
+"""Regenerate src/iq_tables.h from the upstream ggml table definitions.
 
-This is the single authoritative source of IQ lookup tables in this repository:
-the Zig module defines the data, and the C kernels (src/kernels/x86/*.c) reach
-the same objects through `extern const` declarations instead of carrying their
-own copies.  See src/iq_tables.zig for the derived tables (keven_signs_q2xs,
-ksigns64, k32_iq4nl_tab), which are computed at comptime from the canonical
-tables rather than hand-copied.
+`src/iq_tables.h` is the single authoritative source of the IQ lookup tables in
+this repository.  It is one C header that three consumers instantiate three
+ways, chosen by which macro is defined before including it:
 
-Run after touching the upstream file:
+    Q35_TABLES_CUDA      -> `__device__ __constant__ const T[n] = {...}`
+                            (src/kernels/cuda/iq_tables.cu -- the one CUDA
+                            translation unit that defines them; the other .cu
+                            files include src/kernels/cuda/iq_tables.cuh, which
+                            only declares them `extern __device__ __constant__`)
+    (nothing defined)    -> `const T[n] = {...}`, which translate-c turns into
+                            Zig's `pub export const` (src/iq_tables.zig imports
+                            that; src/kernels/x86/iq_tables.h declares the same
+                            objects `extern const` for the C kernels)
+    Q35_TABLES_HOST_CHECK -> `static const`, for a host-only capture
 
-    python3 scripts/gen_iq_tables.py
-    python3 scripts/gen_iq_tables.py --check   # fail if src/iq_tables.zig is stale
+So the bytes are written down exactly once.  Do NOT add a second copy: an
+earlier revision had a hand-maintained src/kernels/cuda/iq_tables.cuh duplicating
+this data, and a generated src/iq_tables.zig as well, and they were free to
+drift apart silently.
+
+Derived tables (keven_signs_q2xs, ksigns64_derived, k32_iq4nl_tab,
+k32_nvfp4_values) are NOT emitted here: they are pure functions of the canonical
+tables, so src/iq_tables.zig computes them at comptime and exports them.  That
+is what makes the cross-checks in src/iq_table_tests.zig meaningful (they compare
+two independently-derived forms instead of a copy against itself).
+
+Usage, after touching the upstream file:
+
+    python3 scripts/gen_iq_tables.py            # rewrite src/iq_tables.h
+    python3 scripts/gen_iq_tables.py --check    # fail if it is stale
 
 The upstream path defaults to the local llama.cpp checkout; override with
---source if that checkout moves.
+--source when that checkout moves.
 """
 
 import argparse
@@ -24,52 +43,99 @@ import re
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-DEST = ROOT / "src" / "iq_tables.zig"
+DEST = ROOT / "src" / "iq_tables.h"
 DEFAULT_SOURCE = pathlib.Path("/mnt/llm-dev/llama.cpp/ggml/src/ggml-common.h")
 
-# name -> Zig type.  Order is the order emitted in the generated file.
+# name -> (C type, note).  Order is the order emitted in the generated file, and
+# is the order the kernels' extern declarations use.
 TABLES = [
-    ("kmask_iq2xs", "u8"),
-    ("ksigns_iq2xs", "u8"),
-    ("ksigns64", "u64"),
-    ("iq2xxs_grid", "u64"),
-    ("iq2xs_grid", "u64"),
-    ("iq2s_grid", "u64"),
-    ("iq3xxs_grid", "u32"),
-    ("iq3s_grid", "u32"),
-    ("kvalues_iq4nl", "i8"),
-    ("kvalues_fp4", "i8"),
-    ("iq1s_grid", "u64"),
+    ("kmask_iq2xs", "uint8_t", "bit j of the byte -> element j set to -k"),
+    ("ksigns_iq2xs", "uint8_t", "sign bytes; mask form consumed by the scalar path"),
+    ("ksigns64", "uint64_t", "same masks packed as one u64, 0xFF == -1"),
+    ("iq2xxs_grid", "uint64_t", "IQ2_XXS codebook"),
+    ("iq2xs_grid", "uint64_t", "IQ2_XS codebook"),
+    ("iq2s_grid", "uint64_t", "IQ2_S codebook"),
+    ("iq3xxs_grid", "uint32_t", "IQ3_XXS codebook"),
+    ("iq3s_grid", "uint32_t", "IQ3_S codebook"),
+    ("kvalues_iq4nl", "int8_t", "IQ4_NL nibble values"),
+    ("kvalues_fp4", "int8_t", "NVFP4/MXFP4 nibble values (kvalues_mxfp4 is an alias)"),
+    ("iq1s_grid", "uint64_t", "IQ1_S codebook"),
     # Not a GGML_TABLE: upstream declares it as a local array inside
     # ggml-cpu/quants.c:493.  Kept here so the Q3_K kernels have one source too.
-    ("iq_pow3", "u8"),
+    ("iq_pow3", "uint8_t", "source ggml-cpu/quants.c:493 (uint8_t pow3[6])"),
 ]
 
-# Tables that upstream does not expose via GGML_TABLE_BEGIN, so we cannot parse
-# them out of ggml-common.h.  Values verified against the upstream source; the
-# anchor is recorded so a future upstream change is a diff, not a guess.
+# Tables upstream does not expose via GGML_TABLE_BEGIN, so they cannot be parsed
+# out of ggml-common.h.  Values verified against the upstream source; the anchor
+# is recorded so a future upstream change is a diff, not a guess.
 LOCAL_TABLES = {
-    "iq_pow3": (6, [1, 3, 9, 27, 81, 243], "ggml-cpu/quants.c:493 (uint8_t pow3[6])"),
+    "iq_pow3": (6, [1, 3, 9, 27, 81, 243]),
 }
 
 CONSTANTS = {
     "NGRID_IQ1S": 2048,
 }
 
-HEADER = """// AUTO-GENERATED by scripts/gen_iq_tables.py -- DO NOT EDIT BY HAND.
+PREAMBLE = """// AUTO-GENERATED by scripts/gen_iq_tables.py -- DO NOT EDIT BY HAND.
 //
 // Single authoritative definition of the IQ lookup tables in this repository.
-// The C kernels in src/kernels/x86/ declare these as `extern const` and link
-// against the symbols Zig emits, so there is exactly one copy of the data.
-// Derived tables (keven_signs_q2xs, ksigns64, k32_iq4nl_tab) are computed at
-// comptime from the canonical tables below -- they are not hand-copied, which
-// is what previously let the Zig oracle and the C kernel disagree.
+// ONE source file serves three consumers; there is no other copy of this data:
+//
+//   * CUDA kernels  -- src/kernels/cuda/iq_tables.cu defines Q35_TABLES_CUDA and
+//                      includes this header, so the tables land in __constant__
+//                      memory.  The other .cu files include iq_tables.cuh, which
+//                      only declares them `extern __device__ __constant__`.
+//   * x86 C kernels -- src/kernels/x86/iq_tables.h declares them `extern const`;
+//                      the objects are the ones translate-c emits for Zig (below).
+//   * Zig           -- src/iq_tables.zig imports the translate-c output of this
+//                      header, whose `const` definitions come out as
+//                      `pub export const`, and so names the same symbols.
+//
+// Derived tables (keven_signs_q2xs, ksigns64_derived, k32_iq4nl_tab,
+// k32_nvfp4_values) are NOT stored here: they are pure functions of the tables
+// below, computed at Zig comptime.  Keeping them derived is what lets
+// src/iq_table_tests.zig cross-check one form against another instead of
+// comparing a hand-maintained copy with itself.
 //
 // Source: {source}
 // Source sha256: {sha}
 //
-// Upstream anchors (ggml-common.h):
+// Upstream anchors (ggml-common.h line numbers):
 {anchors}
+
+#ifndef Q35_IQ_TABLES_H
+#define Q35_IQ_TABLES_H
+
+#if defined(Q35_TABLES_CUDA)
+   /* Device code.  nvcc is a C++ front end, so <cstdint>; the tables land in the
+    * constant bank (see src/kernels/cuda/iq_tables.cuh for why __constant__). */
+#  include <cstdint>
+   /* No `extern` keyword here: nvcc rejects `extern __constant__ const T[n];`
+    * as "uninitialized const", and a plain `__constant__` *definition* is
+    * already external in CUDA (the qualifier lands it in the module's constant
+    * bank, not in a file-local).  The single definition lives in
+    * src/kernels/cuda/iq_tables.cu; see iq_tables.cuh for the declarations. */
+#  define Q35_TAB_DECL(t, n, s) __device__ __constant__ t n[s] = {
+#elif defined(Q35_TABLES_HOST_CHECK)
+   /* Host-only capture form: `static`, so a .c compiled purely to dump the
+    * values does not compete with the real definitions at link time. */
+#  include <stdint.h>
+#  define Q35_TAB_DECL(t, n, s) static const t n[s] = {
+#else
+   /* Fallback: plain C/C++.  Zig's translate-c takes this branch, which is why
+    * the tables come out as `pub export const` on the Zig side, and it is also
+    * what a stray host `#include` gets -- never a silently empty unit. */
+#  include <stdint.h>
+#  define Q35_TAB_DECL(t, n, s) const t n[s] = {
+#endif
+#define Q35_TAB_END() };
+
+"""
+
+FOOTER = """#undef Q35_TAB_DECL
+#undef Q35_TAB_END
+
+#endif /* Q35_IQ_TABLES_H */
 """
 
 
@@ -92,133 +158,62 @@ def extract(source: pathlib.Path):
     return out
 
 
-def render(tables, source: pathlib.Path) -> str:
-    sha = hashlib.sha256(source.read_bytes()).hexdigest()
-    anchors = "\n".join(
-        f"//   {name}: ggml-common.h line {line}"
-        for name, line in line_numbers(source)
-    )
-    out = [HEADER.format(source=source, sha=sha, anchors=anchors)]
-
-    for name, ztype in TABLES:
-        if name in LOCAL_TABLES:
-            n, vals, anchor = LOCAL_TABLES[name]
-            ctype, source_note = "local", anchor
-        else:
-            if name not in tables:
-                sys.exit(f"table {name} not found in {source}")
-            ctype, n, vals = tables[name]
-            source_note = "ggml-common.h"
-        out.append(f"/// {name}: {n} x {ztype} (upstream C type: {ctype}; source: {source_note})\n")
-        out.append(f"pub export const {name}: [{n}]{ztype} = .{{\n")
-        for i in range(0, n, 8):
-            chunk = ", ".join(
-                f"0x{v:016x}" if ztype == "u64"
-                else f"0x{v:08x}" if ztype == "u32"
-                else str(v)
-                for v in vals[i:i + 8]
-            )
-            out.append(f"    {chunk},\n")
-        out.append("};\n\n")
-
-    out.append("""// ---------------------------------------------------------------------------
-// Derived tables -- computed from the canonical tables above at comptime.
-// ---------------------------------------------------------------------------
-
-// keven_signs_q2xs: the SIMD-only int8 +-1 expansion of ksigns_iq2xs.  There is
-// no such table in upstream ggml-common.h; every x86/riscv kernel in llama.cpp
-// hand-writes it (ggml-cpu/arch/x86/quants.c:2688).  Generating it here removes
-// the class of bug where the Zig oracle and the C kernel use different sign
-// tables (see the kerniq runtime-quantization failures).
-pub export const keven_signs_q2xs: [1024]i8 align(64) = blk: {
-    @setEvalBranchQuota(100000);
-    var t: [1024]i8 = undefined;
-    for (ksigns_iq2xs, 0..) |mask, i| {
-        for (0..8) |b| {
-            t[i * 8 + b] = if (mask & (1 << @as(u3, @intCast(b))) != 0) -1 else 1;
-        }
-    }
-    break :blk t;
-};
-
-// ksigns64: the same sign mask as keven_signs_q2xs, packed into one u64 per
-// entry, with -1 encoded as 0xFF and +1 as 0x00.  Upstream ships this table
-// (ggml-common.h); we derive it and assert against the upstream copy below.
-pub export const ksigns64_derived: [128]u64 align(64) = blk: {
-    @setEvalBranchQuota(100000);
-    var t: [128]u64 = undefined;
-    for (ksigns_iq2xs, 0..) |mask, i| {
-        var w: u64 = 0;
-        for (0..8) |b| {
-            if (mask & (1 << @as(u3, @intCast(b))) != 0) w |= 0xFF << @as(u64, b * 8);
-        }
-        t[i] = w;
-    }
-    break :blk t;
-};
-
-// int32 mirror of kvalues_iq4nl for the AVX2 hot path in kernels32.c (widening
-// is free there, so the table is stored as i32 to avoid a per-element cvt).
-pub export const k32_iq4nl_tab: [16]i32 align(64) = blk: {
-    var t: [16]i32 = undefined;
-    for (kvalues_iq4nl, 0..) |v, i| t[i] = @as(i32, v);
-    break :blk t;
-};
-
-// f32 view of kvalues_fp4 for the nvfp4 kernel, which needs float lanes.
-// kvalues_mxfp4 is an alias of kvalues_fp4 upstream (ggml-common.h:1129), so
-// the int8 table above serves the mxfp4 path; the upper half of the table is
-// already negative, so no sign flip is needed here.
-pub export const k32_nvfp4_values: [16]f32 align(64) = blk: {
-    var t: [16]f32 = undefined;
-    for (kvalues_fp4, 0..) |v, i| t[i] = @as(f32, v);
-    break :blk t;
-};
-
-// ---------------------------------------------------------------------------
-// Comptime self-checks: these fail the build, not the test run.
-// ---------------------------------------------------------------------------
-comptime {
-    @setEvalBranchQuota(100000);
-    // 1. every derived sign lane must agree with its canonical mask bit
-    for (ksigns_iq2xs, 0..) |mask, i| {
-        for (0..8) |b| {
-            const want: i8 = if (mask & (1 << @as(u3, @intCast(b))) != 0) -1 else 1;
-            if (keven_signs_q2xs[i * 8 + b] != want) {
-                @compileError("keven_signs_q2xs disagrees with ksigns_iq2xs");
-            }
-        }
-    }
-    // 2. derived ksigns64 must equal the upstream table byte for byte
-    for (ksigns64, 0..) |want, i| {
-        if (ksigns64_derived[i] != want) {
-            @compileError("derived ksigns64 disagrees with the upstream table");
-        }
-    }
-    // 3. IQ4_NL values must fit in int8_t (the C kernels cast them)
-    for (k32_iq4nl_tab) |v| {
-        if (v < -128 or v > 127) @compileError("kvalues_iq4nl entry does not fit in int8_t");
-    }
-    // 4. grid sizes the kernels index into must match the documented widths
-    if (iq3s_grid.len != 512) @compileError("iq3s_grid must be 512 entries");
-    if (iq3xxs_grid.len != 256) @compileError("iq3xxs_grid must be 256 entries");
-    if (iq2xs_grid.len != 512) @compileError("iq2xs_grid must be 512 entries");
-    if (iq2xxs_grid.len != 256) @compileError("iq2xxs_grid must be 256 entries");
-    if (iq2s_grid.len != 1024) @compileError("iq2s_grid must be 1024 entries");
-    if (iq1s_grid.len != 2048) @compileError("iq1s_grid must be 2048 entries");
-}
-""")
-    return "".join(out)
-
-
 def line_numbers(source: pathlib.Path):
-    text = source.read_text().splitlines()
     out = []
-    for i, line in enumerate(text, 1):
+    for i, line in enumerate(source.read_text().splitlines(), 1):
         m = re.match(r"GGML_TABLE_BEGIN\(\w+, (\w+), \w+\)", line)
         if m:
             out.append((m.group(1), i))
     return out
+
+
+def fmt(v: int, ctype: str) -> str:
+    """Format one value the way upstream writes it.
+
+    64-bit grids are hex (0x0011223344556677ULL is a codebook word, not a
+    number), 32-bit grids are hex, and the small signed byte tables are decimal
+    because that is how a human checks kvalues_iq4nl.
+    """
+    if ctype == "uint64_t":
+        return f"0x{v:016x}ULL"
+    if ctype == "uint32_t":
+        return f"0x{v:08x}U"
+    return str(v)
+
+
+def render(tables, source: pathlib.Path) -> str:
+    sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    lines = dict(line_numbers(source))
+    anchors = []
+    for name, _ctype, note in TABLES:
+        if name in lines:
+            anchors.append(f"//   {name}: ggml-common.h line {lines[name]}")
+        else:
+            anchors.append(f"//   {name}: {note}")
+
+    out = [
+        PREAMBLE.replace("{source}", str(source))
+        .replace("{sha}", sha)
+        .replace("{anchors}", "\n".join(anchors))
+    ]
+
+    for name, ctype, note in TABLES:
+        if name in LOCAL_TABLES:
+            n, vals = LOCAL_TABLES[name]
+        else:
+            if name not in tables:
+                sys.exit(f"table {name} not found in {source}")
+            _upstream_ctype, n, vals = tables[name]
+        out.append(f"/* {name}: {n} entries, {ctype}. {note} */\n")
+        out.append(f"Q35_TAB_DECL({ctype}, {name}, {n})\n")
+        # Leading four spaces so the numbers line up the way upstream does; 8 per
+        # line keeps the diff readable and the file under a reasonable width.
+        for i in range(0, n, 8):
+            out.append("    " + ", ".join(fmt(v, ctype) for v in vals[i:i + 8]) + ",\n")
+        out.append("Q35_TAB_END()\n\n")
+
+    out.append(FOOTER)
+    return "".join(out)
 
 
 def main() -> int:
@@ -234,8 +229,8 @@ def main() -> int:
     if args.check:
         have = DEST.read_text() if DEST.exists() else ""
         if have != want:
-            sys.exit("src/iq_tables.zig is stale: regenerate with scripts/gen_iq_tables.py")
-        print("src/iq_tables.zig is up to date")
+            sys.exit(f"{DEST} is stale: regenerate with scripts/gen_iq_tables.py")
+        print(f"{DEST} is up to date")
         return 0
     DEST.write_text(want)
     print(f"wrote {DEST} ({len(want)} bytes)")

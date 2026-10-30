@@ -103,3 +103,4 @@ int iq_table_spotcheck(void) {
 
     return bad;
 }
+
