@@ -7,14 +7,36 @@
 
 - **x86 SIMD kernel**（SSE / AVX / AVX2 / AVX512 等）：使用 **C** 开发，放在 `src/kernels/x86/`。
   现状：`iq_kernels.c`（IQ 量化点积）、`kernels256.c`、`kernels32.c`、`kernels512.c`、
-  `cpu_caps.c`（特性探测，单一来源）、`iq_tables.h`、
-  `src/ggml_tables.zig` / `src/ggml_tables_extra.zig`（Zig 侧表）。
-  其中 `iq_tables.h` 文件头写明是从 `llama.cpp/ggml/src/ggml-common.h` **手工提取**的，
-  并无生成脚本——改它必须对照 ggml 原文，不要凭记忆。
-  （注意：`scripts/gen_simd_tables.py` 生成的是 `src/simd/tables.zig`，而 `src/simd/` 已随
-  "去 Zig SIMD" 改造被删除，该脚本目前**过期失效**，不要执行它。）
-- **CUDA kernel**：使用 **CUDA C/C++**，放在 `src/kernels/cuda/`（尚未建立，新建时遵循同一约定）。
-- Zig 侧只负责模型加载、内存布局、调度、`extern` 声明与分发（`src/c_kernels.zig`、
+  `cpu_caps.c`（特性探测，单一来源）、`iq_tables.h`（**纯 extern 声明**，不含数据）。
+- **CUDA kernel**：使用 **CUDA C/C++**，放在 `src/kernels/cuda/`（`vecdotq.cuh`、`mmvq.cu`、
+  `convert.cu`、`iq_tables.{cu,cuh}`、`api.h`）。
+
+### 1.0 IQ 查找表只有一份数据源（2026-10 改造，必须遵守）
+
+`src/iq_tables.h`（仓库根，**由 `scripts/gen_iq_tables.py` 从
+`llama.cpp/ggml/src/ggml-common.h` 生成**，文件头有源 sha256 与逐表行号锚点）
+是 12 张 IQ 表的**唯一定义**。同一份头文件被三种宏各实例化一次：
+
+| 消费者 | 宏 | 形态 | 位置 |
+|--------|----|------|------|
+| Zig（宿主侧唯一定义） | 无 | `const T[n] = {...}` → translate-c 产出 `pub export const` | `src/iq_tables.zig` import 的 `iq_tables_c` 模块 |
+| x86 C kernel | 无（只声明） | `extern const T[n];` | `src/kernels/x86/iq_tables.h` |
+| CUDA device | `Q35_TABLES_CUDA` | `__device__ __constant__ T[n]` | `src/kernels/cuda/iq_tables.cu` |
+
+- **Zig 侧持有宿主侧的定义**（translate-c 的 `pub export const`），x86 kernel 只 `extern` 引用，
+  **不要**再写 `src/kernels/x86/iq_tables_data.c` 之类的定义单元——曾试过，链接器把它和
+  translate-c 的符号分开，出现同一张表两个地址，被 `src/iq_table_tests.zig` 抓到。
+- **CUDA 侧必须 `-rdc=true` 编译并做设备链接**：否则每个包含表的 `.cu` 各得一份
+  `__constant__` 副本（实测 convert+mmvq 各 52 KB）。`build.zig` 的 stage1/stage2 都带该 flag。
+- **派生表**（`keven_signs_q2xs`、`ksigns64_derived`、`k32_iq4nl_tab`、`k32_nvfp4_values`）
+  不写进头文件，由 `src/iq_tables.zig` 在 comptime 从规范表算出并 `pub export`；
+  C 侧只 `extern` 声明。这样对拍测试比较的是"两种独立推导"，而不是"抄件对抄件"。
+- 改表流程：改 `ggml-common.h` 对应内容 → `python3 scripts/gen_iq_tables.py` →
+  `python3 scripts/gen_iq_tables.py --check` 应通过 → `zig build test`。
+  **不要手改 `src/iq_tables.h` 的数据行**，它会被下次生成覆盖。
+- 注意：`scripts/gen_simd_tables.py` 生成的是 `src/simd/tables.zig`，而 `src/simd/` 已随
+  "去 Zig SIMD" 改造被删除，该脚本**过期失效**，不要执行它。
+- Zig 侧只负责模型加载、内存布局、调度、`extern` 声明与分发（`src/iq_tables.zig`、`src/c_kernels.zig`、
   `src/simd_dispatch.zig`、`src/simd_api.zig`）。quant / dequant / matvec 等数值核心都应在 C kernel 中完成。
 
 ### 1.1 模块分层（2026-10 重构后，必须遵守）
