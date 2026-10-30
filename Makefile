@@ -1,23 +1,23 @@
-# qwen35 — one command builds BOTH binaries (CPU + CUDA) into zig-out/bin/.
+# qwen35 — one command builds the CLI, optionally with the CUDA backend linked in.
 #
-#   make          -> zig-out/bin/qwen35        (CPU,   via `zig build`)
-#                   zig-out/bin/qwen35-cuda   (CUDA,  via zig cc + nvcc)
+#   make          -> zig-out/bin/qwen35        (CPU only, via `zig build`)
+#   make cuda     -> zig-out/bin/qwen35        (same binary, CUDA kernels linked in,
+#                    via `zig build -Dcuda=true`: nvcc -c -> nvcc -dlink ->
+#                    addObjectFile.  There is no kernel .so -- one executable.)
 #   make test     -> `zig build test` (CPU unit tests, must stay green)
-#   make run0.8b  / run4b / run0.8b-cuda / run4b-cuda  (convenience)
+#   make run0.8b / run4b / run0.8b-cuda / run4b-cuda  (convenience)
 #
-# CUDA two-step chain (mirrors /mnt/llm-dev/llama2/zig): zig cc can't emit a
-# .cu and zig's lld can't resolve CUB device symbols, so nvcc compiles
-# engine_cuda.cu AND does the final link of the Zig host object.
+# There is no legacy CUDA binary any more: the retired whole-model GPU forward
+# (src/main_cuda.zig + src/kernel.cu + src/kernel_gdn.cu + src/kernel_matvec.cu)
+# was deleted.  `--backend cuda` on the single CLI is the only CUDA path.  See
+# git history for the deleted files.
 ZIG := $(shell command -v zig || echo /home/wisedu/software/zig-x86_64-linux-0.17.0/zig)
-NVCC := $(shell command -v nvcc || echo /usr/local/cuda/bin/nvcc)
 # Build cache on LOCAL disk: the project .zig-cache lives on NFS (/mnt/LLMs)
 # and zig intermittently fails with "failed to write cache manifest: Unexpected"
 # there. /tmp is local and fast.
 ZIGCACHE := --cache-dir /tmp/qwen35-cache
-HOST_OBJ := .zig-cache/qwen35_cuda_host.o
-CUDA_EXE := zig-out/bin/qwen35-cuda
 
-.PHONY: all build cpu cpufast cudabackend cuda cuda-check legacy-cuda test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
+.PHONY: all build cpu cpufast cudabackend cuda cuda-check test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
 
 all: build cpu cuda
 
@@ -30,52 +30,40 @@ cpu:
 cpufast:
 	$(ZIG) build -Doptimize=ReleaseFast $(ZIGCACHE)
 
-# `--backend cuda` kernels (src/kernels/cuda/).  Separate from the `cuda`
-# target below, which builds the OLD whole-model GPU binary ($(CUDA_EXE)).
-# This one only adds the Q8_0 device kernels + libqwen35-cuda-kernels.so.
+# `--backend cuda` kernels (src/kernels/cuda/).  Builds the CLI with the CUDA
+# kernels STATICALLY LINKED INTO zig-out/bin/qwen35 (nvcc -c -> nvcc -dlink ->
+# addObjectFile + -lcudart/-lc++).  No kernel .so is produced or dlopen'd;
+# libcudart is the only thing still opened at run time (src/cudart.zig).
 cudabackend:
 	$(ZIG) build -Dcuda=true -Doptimize=ReleaseFast $(ZIGCACHE)
 
-# `make cuda` = the backend kernel library only.
+# `make cuda` = rebuild the whole CLI with the CUDA backend linked in.
 #
-# It used to build $(CUDA_EXE) (src/main_cuda.zig + src/kernel.cu), the
-# parallel whole-model GPU forward that docs/cuda-backend-brief.md §6 retires.
-# That legacy host entry no longer compiles -- it still calls
-# `engine.Engine.load(arena, path, io)` while engine.zig:746 now takes
-# (alloc, path, io, n_threads, backend_kind) -- so the target could not be kept
-# as-is and it has nothing to do with the kernels being wired here.  The
-# kernels reach the CLI by dlopen (src/backend_cuda.zig + src/cudart.zig), not
-# by link, so the .so is the whole build output.
-CUDA_SO := zig-out/lib/libqwen35-cuda-kernels.so
-
+# It used to build a separate `libqwen35-cuda-kernels.so` kernel library, which
+# the CLI loaded with dlopen.  That is gone: the .cu objects are now linked into
+# the executable itself, so "building the CUDA backend" IS "rebuilding
+# zig-out/bin/qwen35" and there is no separate artefact to depend on.
+#
+# The retired whole-model GPU forward (src/main_cuda.zig + src/kernel.cu +
+# src/kernel_gdn.cu + src/kernel_matvec.cu) was deleted.  It was a PARALLEL
+# engine forward that docs/cuda-backend-brief.md §6 retires -- it no longer
+# compiled (main_cuda.zig called engine.Engine.load with 3 args while
+# engine.zig:746 wants 5) and it shared no source with src/kernels/cuda/.
+# `--backend cuda` on zig-out/bin/qwen35 is the only CUDA path.
+#
 # No .cu/.cuh prerequisites on purpose: build.zig registers every file in
 # src/kernels/cuda/ as an explicit input of the nvcc steps, so Zig's own cache
 # already re-runs nvcc when a kernel or a header changes.  Listing them again
-# here would be a second, silently-drifting copy of that list.
-cuda: $(CUDA_SO)
-
-$(CUDA_SO): build.zig src/kernels/cuda/api.h
+# here would be a second, silently-drifting copy of that list.  Left .PHONY so
+# zig always gets to decide what needs rebuilding; api.h is named only to
+# document where the launcher ABI lives.
+cuda: build.zig src/kernels/cuda/api.h
 	$(ZIG) build -Dcuda=true -Doptimize=ReleaseFast $(ZIGCACHE)
 
 # Compile-only check of every registered src/kernels/cuda/*.cu, no link, no
 # install.  Use it to tell "build script wrong" from "kernel source wrong".
 cuda-check:
 	$(ZIG) build -Dcuda=true cuda-check $(ZIGCACHE) --summary all
-
-# ---------------------------------------------------------------------------
-# LEGACY whole-model GPU binary (src/main_cuda.zig + src/kernel.cu).
-# Broken at HEAD: src/main_cuda.zig:1105 calls engine.Engine.load with 3 args,
-# engine.zig:746 now wants 5.  Kept (not deleted) so the paths stay visible;
-# `make cuda` no longer depends on it and `make` / `make all` do not build it.
-# ---------------------------------------------------------------------------
-legacy-cuda: $(CUDA_EXE)
-
-$(CUDA_EXE): $(HOST_OBJ) src/kernel.cu
-	$(NVCC) -O3 -arch=native -o=$@ $(HOST_OBJ) src/kernel.cu -lcudart -lm
-
-$(HOST_OBJ): src/main_cuda.zig src/engine.zig src/tokenizer.zig src/sampler.zig
-	mkdir -p $(dir $@)
-	$(ZIG) cc -c $< -o $@
 
 test:
 	$(ZIG) build test $(ZIGCACHE)
@@ -271,19 +259,19 @@ run27bq8kxl:
 run27b: run27bq8 run27bq4 run27biq4xs run27biq3xxs run27biq2xxs run27biq1s run27bq4kxl run27bq8kl run27bq8kxl
 
 run0.8b-cuda:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？
+	CUDA_VISIBLE_DEVICES=0 zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf 天空为什么是蓝色的？ --backend cuda
 
 run0.8b-cuda-long:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf "茶起源于中国，已有数千年的饮用历史。最早的茶是被当作药物使用的，神农尝百草的传说中就有茶的身影。后来人们发现茶可以解渴去乏，逐渐从药物变成了日常饮品。唐代陆羽写下一部茶经，系统记录了茶的种植、采摘、烹煮和饮用方法，被后人尊为茶圣。宋代点茶风靡一时，人们在茶汤上击拂出细腻泡沫，再在泡沫上作画，称为茶百戏。到了明清时期，散茶冲泡取代了团饼煎茶，紫砂壶与盖碗成为主要器具，工夫茶与盖碗茶等冲泡方式由此定型。 中国茶类繁多，按发酵程度可分为绿茶、白茶、黄茶、青茶、红茶和黑茶。绿茶不发酵，保留了鲜叶中 的大部分营养成分，汤色清亮，滋味鲜爽，西湖龙井、碧螺春、黄山毛峰都是名品。白茶不炒不揉，自然萎凋，滋味清淡回甘，白毫银针是其中的代表。青茶即乌龙茶，半发酵，既有绿茶的清香又有红茶的醇厚，铁观音、大红袍、凤凰单丛都属此类。红茶全发酵，汤色红艳，滋味甜醇，祁门红茶以独特的香气闻名。黑茶属后发酵，陈化后滋味醇厚，普洱熟茶便是典型。 泡茶讲究水温、时间和器具。嫩绿茶用八十度左右的水，避免烫出苦涩；乌龙茶用沸 水，高香高泡；红茶用九十五度的水，让内含物质充分释放。杯泡、壶泡、盖碗冲泡各有韵味，盖碗最考验手法，烫盏、投茶、注水、出汤一气呵成，方能泡出一杯干净纯正的茶。茶席之上，一盏清茶，几本闲书，慢煮光阴，是许多人向往的生活状态。 茶与饮食同样相配。饭后一杯浓茶消食解腻，午后 一盏清茶提神醒脑，深夜一盏老白茶温润养胃。茶席配茶点，桂花糕、绿豆糕、坚果蜜饯，甜而不腻，与茶汤相映成趣。 茶山多在高海拔云雾缭绕之处 ，昼夜温差大，茶树生长缓慢，内含物质积累丰富，因而滋味饱满耐泡，常能冲泡十余道而不减其韵。据此给我写篇不低于600字的作文。"
+	CUDA_VISIBLE_DEVICES=0 zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf "茶起源于中国，已有数千年的饮用历史。最早的茶是被当作药物使用的，神农尝百草的传说中就有茶的身影。后来人们发现茶可以解渴去乏，逐渐从药物变成了日常饮品。唐代陆羽写下一部茶经，系统记录了茶的种植、采摘、烹煮和饮用方法，被后人尊为茶圣。宋代点茶风靡一时，人们在茶汤上击拂出细腻泡沫，再在泡沫上作画，称为茶百戏。到了明清时期，散茶冲泡取代了团饼煎茶，紫砂壶与盖碗成为主要器具，工夫茶与盖碗茶等冲泡方式由此定型。 中国茶类繁多，按发酵程度可分为绿茶、白茶、黄茶、青茶、红茶和黑茶。绿茶不发酵，保留了鲜叶中 的大部分营养成分，汤色清亮，滋味鲜爽，西湖龙井、碧螺春、黄山毛峰都是名品。白茶不炒不揉，自然萎凋，滋味清淡回甘，白毫银针是其中的代表。青茶即乌龙茶，半发酵，既有绿茶的清香又有红茶的醇厚，铁观音、大红袍、凤凰单丛都属此类。红茶全发酵，汤色红艳，滋味甜醇，祁门红茶以独特的香气闻名。黑茶属后发酵，陈化后滋味醇厚，普洱熟茶便是典型。 泡茶讲究水温、时间和器具。嫩绿茶用八十度左右的水，避免烫出苦涩；乌龙茶用沸 水，高香高泡；红茶用九十五度的水，让内含物质充分释放。杯泡、壶泡、盖碗冲泡各有韵味，盖碗最考验手法，烫盏、投茶、注水、出汤一气呵成，方能泡出一杯干净纯正的茶。茶席之上，一盏清茶，几本闲书，慢煮光阴，是许多人向往的生活状态。 茶与饮食同样相配。饭后一杯浓茶消食解腻，午后 一盏清茶提神醒脑，深夜一盏老白茶温润养胃。茶席配茶点，桂花糕、绿豆糕、坚果蜜饯，甜而不腻，与茶汤相映成趣。 茶山多在高海拔云雾缭绕之处 ，昼夜温差大，茶树生长缓慢，内含物质积累丰富，因而滋味饱满耐泡，常能冲泡十余道而不减其韵。据此给我写篇不低于600字的作文。" --backend cuda
 
 run2b-cuda:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 天空为什么是蓝色的？
+	CUDA_VISIBLE_DEVICES=0 zig-out/bin/qwen35 run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 天空为什么是蓝色的？ --backend cuda
 
 run2b-cuda-long:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf "茶起源于中国，已有数千年的饮用历史。最早的茶是被当作药物使用的，神农尝百草的传说中就有茶的身影。后来人们发现茶可以解渴去乏，逐渐从药物变成了日常饮品。唐代陆羽写下一部茶经，系统记录了茶的种植、采摘、烹煮和饮用方法，被后人尊为茶圣。宋代点茶风靡一时，人们在茶汤上击拂出细腻泡沫，再在泡沫上作画，称为茶百戏。到了明清时期，散茶冲泡取代了团饼煎茶，紫砂壶与盖碗成为主要器具，工夫茶与盖碗茶等冲泡方式由此定型。 中国茶类繁多，按发酵程度可分为绿茶、白茶、黄茶、青茶、红茶和黑茶。绿茶不发酵，保留了鲜叶中 的大部分营养成分，汤色清亮，滋味鲜爽，西湖龙井、碧螺春、黄山毛峰都是名品。白茶不炒不揉，自然萎凋，滋味清淡回甘，白毫银针是其中的代表。青茶即乌龙茶，半发酵，既有绿茶的清香又有红茶的醇厚，铁观音、大红袍、凤凰单丛都属此类。红茶全发酵，汤色红艳，滋味甜醇，祁门红茶以独特的香气闻名。黑茶属后发酵，陈化后滋味醇厚，普洱熟茶便是典型。 泡茶讲究水温、时间和器具。嫩绿茶用八十度左右的水，避免烫出苦涩；乌龙茶用沸 水，高香高泡；红茶用九十五度的水，让内含物质充分释放。杯泡、壶泡、盖碗冲泡各有韵味，盖碗最考验手法，烫盏、投茶、注水、出汤一气呵成，方能泡出一杯干净纯正的茶。茶席之上，一盏清茶，几本闲书，慢煮光阴，是许多人向往的生活状态。 茶与饮食同样相配。饭后一杯浓茶消食解腻，午后 一盏清茶提神醒脑，深夜一盏老白茶温润养胃。茶席配茶点，桂花糕、绿豆糕、坚果蜜饯，甜而不腻，与茶汤相映成趣。 茶山多在高海拔云雾缭绕之处 ，昼夜温差大，茶树生长缓慢，内含物质积累丰富，因而滋味饱满耐泡，常能冲泡十余道而不减其韵。据此给我写篇不低于600字的作文。"
+	CUDA_VISIBLE_DEVICES=0 zig-out/bin/qwen35 run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf "茶起源于中国，已有数千年的饮用历史。最早的茶是被当作药物使用的，神农尝百草的传说中就有茶的身影。后来人们发现茶可以解渴去乏，逐渐从药物变成了日常饮品。唐代陆羽写下一部茶经，系统记录了茶的种植、采摘、烹煮和饮用方法，被后人尊为茶圣。宋代点茶风靡一时，人们在茶汤上击拂出细腻泡沫，再在泡沫上作画，称为茶百戏。到了明清时期，散茶冲泡取代了团饼煎茶，紫砂壶与盖碗成为主要器具，工夫茶与盖碗茶等冲泡方式由此定型。 中国茶类繁多，按发酵程度可分为绿茶、白茶、黄茶、青茶、红茶和黑茶。绿茶不发酵，保留了鲜叶中 的大部分营养成分，汤色清亮，滋味鲜爽，西湖龙井、碧螺春、黄山毛峰都是名品。白茶不炒不揉，自然萎凋，滋味清淡回甘，白毫银针是其中的代表。青茶即乌龙茶，半发酵，既有绿茶的清香又有红茶的醇厚，铁观音、大红袍、凤凰单丛都属此类。红茶全发酵，汤色红艳，滋味甜醇，祁门红茶以独特的香气闻名。黑茶属后发酵，陈化后滋味醇厚，普洱熟茶便是典型。 泡茶讲究水温、时间和器具。嫩绿茶用八十度左右的水，避免烫出苦涩；乌龙茶用沸 水，高香高泡；红茶用九十五度的水，让内含物质充分释放。杯泡、壶泡、盖碗冲泡各有韵味，盖碗最考验手法，烫盏、投茶、注水、出汤一气呵成，方能泡出一杯干净纯正的茶。茶席之上，一盏清茶，几本闲书，慢煮光阴，是许多人向往的生活状态。 茶与饮食同样相配。饭后一杯浓茶消食解腻，午后 一盏清茶提神醒脑，深夜一盏老白茶温润养胃。茶席配茶点，桂花糕、绿豆糕、坚果蜜饯，甜而不腻，与茶汤相映成趣。 茶山多在高海拔云雾缭绕之处 ，昼夜温差大，茶树生长缓慢，内含物质积累丰富，因而滋味饱满耐泡，常能冲泡十余道而不减其韵。据此给我写篇不低于600字的作文。" --backend cuda
 
 run4b-cuda:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 天空为什么是蓝色的？
+	CUDA_VISIBLE_DEVICES=0 zig-out/bin/qwen35 run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf 天空为什么是蓝色的？ --backend cuda
 
 run4b-cuda-long:
-	CUDA_VISIBLE_DEVICES=0 $(CUDA_EXE) run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf "茶起源于中国，已有数千年的饮用历史。最早的茶是被当作药物使用的，神农尝百草的传说中就有茶的身影。后来人们发现茶可以解渴去乏，逐渐从药物变成了日常饮品。唐代陆羽写下一部茶经，系统记录了茶的种植、采摘、烹煮和饮用方法，被后人尊为茶圣。宋代点茶风靡一时，人们在茶汤上击拂出细腻泡沫，再在泡沫上作画，称为茶百戏。到了明清时期，散茶冲泡取代了团饼煎茶，紫砂壶与盖碗成为主要器具，工夫茶与盖碗茶等冲泡方式由此定型。 中国茶类繁多，按发酵程度可分为绿茶、白茶、黄茶、青茶、红茶和黑茶。绿茶不发酵，保留了鲜叶中 的大部分营养成分，汤色清亮，滋味鲜爽，西湖龙井、碧螺春、黄山毛峰都是名品。白茶不炒不揉，自然萎凋，滋味清淡回甘，白毫银针是其中的代表。青茶即乌龙茶，半发酵，既有绿茶的清香又有红茶的醇厚，铁观音、大红袍、凤凰单丛都属此类。红茶全发酵，汤色红艳，滋味甜醇，祁门红茶以独特的香气闻名。黑茶属后发酵，陈化后滋味醇厚，普洱熟茶便是典型。 泡茶讲究水温、时间和器具。嫩绿茶用八十度左右的水，避免烫出苦涩；乌龙茶用沸 水，高香高泡；红茶用九十五度的水，让内含物质充分释放。杯泡、壶泡、盖碗冲泡各有韵味，盖碗最考验手法，烫盏、投茶、注水、出汤一气呵成，方能泡出一杯干净纯正的茶。茶席之上，一盏清茶，几本闲书，慢煮光阴，是许多人向往的生活状态。 茶与饮食同样相配。饭后一杯浓茶消食解腻，午后 一盏清茶提神醒脑，深夜一盏老白茶温润养胃。茶席配茶点，桂花糕、绿豆糕、坚果蜜饯，甜而不腻，与茶汤相映成趣。 茶山多在高海拔云雾缭绕之处 ，昼夜温差大，茶树生长缓慢，内含物质积累丰富，因而滋味饱满耐泡，常能冲泡十余道而不减其韵。据此给我写篇不低于600字的作文。"
+	CUDA_VISIBLE_DEVICES=0 zig-out/bin/qwen35 run /mnt/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q8_0.gguf "茶起源于中国，已有数千年的饮用历史。最早的茶是被当作药物使用的，神农尝百草的传说中就有茶的身影。后来人们发现茶可以解渴去乏，逐渐从药物变成了日常饮品。唐代陆羽写下一部茶经，系统记录了茶的种植、采摘、烹煮和饮用方法，被后人尊为茶圣。宋代点茶风靡一时，人们在茶汤上击拂出细腻泡沫，再在泡沫上作画，称为茶百戏。到了明清时期，散茶冲泡取代了团饼煎茶，紫砂壶与盖碗成为主要器具，工夫茶与盖碗茶等冲泡方式由此定型。 中国茶类繁多，按发酵程度可分为绿茶、白茶、黄茶、青茶、红茶和黑茶。绿茶不发酵，保留了鲜叶中 的大部分营养成分，汤色清亮，滋味鲜爽，西湖龙井、碧螺春、黄山毛峰都是名品。白茶不炒不揉，自然萎凋，滋味清淡回甘，白毫银针是其中的代表。青茶即乌龙茶，半发酵，既有绿茶的清香又有红茶的醇厚，铁观音、大红袍、凤凰单丛都属此类。红茶全发酵，汤色红艳，滋味甜醇，祁门红茶以独特的香气闻名。黑茶属后发酵，陈化后滋味醇厚，普洱熟茶便是典型。 泡茶讲究水温、时间和器具。嫩绿茶用八十度左右的水，避免烫出苦涩；乌龙茶用沸 水，高香高泡；红茶用九十五度的水，让内含物质充分释放。杯泡、壶泡、盖碗冲泡各有韵味，盖碗最考验手法，烫盏、投茶、注水、出汤一气呵成，方能泡出一杯干净纯正的茶。茶席之上，一盏清茶，几本闲书，慢煮光阴，是许多人向往的生活状态。 茶与饮食同样相配。饭后一杯浓茶消食解腻，午后 一盏清茶提神醒脑，深夜一盏老白茶温润养胃。茶席配茶点，桂花糕、绿豆糕、坚果蜜饯，甜而不腻，与茶汤相映成趣。 茶山多在高海拔云雾缭绕之处 ，昼夜温差大，茶树生长缓慢，内含物质积累丰富，因而滋味饱满耐泡，常能冲泡十余道而不减其韵。据此给我写篇不低于600字的作文。" --backend cuda
