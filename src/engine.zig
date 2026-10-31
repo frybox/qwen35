@@ -1637,19 +1637,29 @@ pub const Engine = struct {
         decode_ms: f64,
         /// true when generation stopped because the next sampled token was EOS
         hit_eos: bool,
+        /// true when generation stopped because the KV cache (`Engine.max_seq`)
+        /// ran out before `n_predict` tokens were produced
+        hit_context_limit: bool = false,
     };
 
     /// Prefill prompt (forward-only, no PRNG draws), then generate up to
-    /// max_tokens tokens with `self.sampler` (greedy argmax when its
-    /// temperature is 0 — the historical default), stopping at EOS.  The
-    /// first generated token is sampled from the last prefill position, so
-    /// the PRNG stream starts at the same point on CPU and CUDA.  Caller
-    /// owns result.tokens.
+    /// `n_predict` **new** tokens with `self.sampler` (greedy argmax when its
+    /// temperature is 0 — the historical default), stopping at EOS or when the
+    /// KV cache is full (`Engine.max_seq`).  The first generated token is
+    /// sampled from the last prefill position, so the PRNG stream starts at the
+    /// same point on CPU and CUDA.  Caller owns result.tokens.
+    ///
+    /// `n_predict` counts generated tokens, not the total sequence length.  The
+    /// two used to be conflated (`while (pos < max_tokens)` with `pos` starting
+    /// at `prompt.len`), so `-n 48` emitted `48 - prompt.len` tokens and `-n`
+    /// below the prompt length emitted nothing at all.  Anything comparing our
+    /// token counts against llama.cpp (whose `-n` already means "predict N")
+    /// must keep them separate.
     pub fn generate(
         self: *Engine,
         alloc: std.mem.Allocator,
         prompt: []const u32,
-        max_tokens: usize,
+        n_predict: usize,
         progress: ?*const fn (ctx: ?*anyopaque, tok: u32) void,
         progress_ctx: ?*anyopaque,
     ) !GenResult {
@@ -1659,6 +1669,17 @@ pub const Engine = struct {
         // is the first generated token — on CPU and CUDA alike.
         self.sampler.reseed();
         self.reset();
+
+        // The KV cache is `Engine.max_seq` slots; the prompt must fit and leave
+        // room for at least the sampled-but-not-yet-appended token, otherwise
+        // the prefill loop would run past the end of the cache.
+        if (prompt.len >= max_seq) {
+            std.debug.print(
+                "generate: prompt is {d} tokens, but the context holds {d}\n",
+                .{ prompt.len, max_seq },
+            );
+            return error.ContextLengthExceeded;
+        }
 
         const io = self.io;
         // Profiling covers prefill too: prof_phase used to be set only after
@@ -1689,12 +1710,20 @@ pub const Engine = struct {
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(alloc);
         var pos: u32 = @intCast(prompt.len);
+        var generated: usize = 0;
         var gen_ns: i96 = 0;
         var hit_eos = false;
+        var hit_context_limit = false;
         // prof_phase stays on across prefill and decode (set above); do not
         // reset here or the prefill samples are thrown away.
         var next: u32 = self.exec.sample(Buf.wrap(last_logits), Buf.wrap(self.sample_scratch), &self.sampler);
-        while (pos < max_tokens) : (pos += 1) {
+        // Two independent limits: how many tokens the caller asked for, and how
+        // many slots the KV cache has left.  `pos` advances regardless.
+        while (generated < n_predict) {
+            if (pos >= max_seq) {
+                hit_context_limit = true;
+                break;
+            }
             if (next == self.cfg.eos_token_id) {
                 hit_eos = true;
                 break;
@@ -1704,6 +1733,8 @@ pub const Engine = struct {
             const t0 = Io.Clock.Timestamp.now(io, .awake);
             next = self.step(next, pos);
             gen_ns += t0.durationTo(Io.Clock.Timestamp.now(io, .awake)).raw.nanoseconds;
+            pos += 1;
+            generated += 1;
         }
         self.exec.profPhase(false);
         const per: f64 = if (out.items.len > 0)
@@ -1716,6 +1747,7 @@ pub const Engine = struct {
             .ms_per_token = per,
             .decode_ms = @as(f64, @floatFromInt(gen_ns)) / 1e6,
             .hit_eos = hit_eos,
+            .hit_context_limit = hit_context_limit,
         };
     }
 };

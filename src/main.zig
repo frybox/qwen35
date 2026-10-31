@@ -113,12 +113,13 @@ fn runInference(
     if (args.len < 4) {
         try err_out.print(
             "usage: {s} run <file.gguf> <prompt> [-n N] [-t TEMPERATURE] [-k K] [-s SEED]\n" ++
+                "  -n  predict N new tokens (default: until the context fills)\n" ++
                 "  -t  temperature; 0 (default) = greedy argmax\n" ++
                 "  -k  top-k cutoff (0 = off, default)\n" ++
                 "  -s  PRNG seed for sampling (default 12345)\n" ++
                 "  --threads N  intra-op worker count (0 = default)\n" ++
-                "  --backend cpu|cuda  execution backend (default cpu; cuda is a\n" ++
-                "      CPU-backed trampoline today, numerically identical to cpu)\n",
+                "  --backend cpu|cuda  execution backend; cuda runs the quantized\n" ++
+                "      matvecs on the GPU and keeps the weights device-resident\n",
             .{args[0]},
         );
         try err_out.flush();
@@ -127,7 +128,7 @@ fn runInference(
     const path = args[2];
     const prompt_text = args[3];
     const engine = qwen35.engine;
-    var max_seq: usize = engine.Engine.max_seq;
+    var n_predict: usize = engine.Engine.max_seq; // default: until the context fills
     var temp: f32 = 0;
     var top_k: usize = 0;
     var seed: u64 = 12345;
@@ -152,7 +153,7 @@ fn runInference(
             };
             i += 1;
         } else if (std.mem.eql(u8, args[i], "-n") and i + 1 < args.len) {
-            max_seq = std.fmt.parseInt(usize, args[i + 1], 10) catch {
+            n_predict = std.fmt.parseInt(usize, args[i + 1], 10) catch {
                 try err_out.print("error: -n expects a number, got '{s}'\n", .{args[i + 1]});
                 try err_out.flush();
                 return error.InvalidArgument;
@@ -204,7 +205,7 @@ fn runInference(
     var stream_ctx = StreamCtx{ .out = out, .tok = &tok, .arena = arena };
     try out.print("Output: ", .{});
     try out.flush();
-    const res = try e.generate(arena, prompt, max_seq, StreamCtx.onToken, &stream_ctx);
+    const res = try e.generate(arena, prompt, n_predict, StreamCtx.onToken, &stream_ctx);
 
     try out.print("\n\n-------------------\n", .{});
     try out.print("Prefill: {d} tokens in {d:.3} s  ({d:.2} tok/s)\n", .{
@@ -217,7 +218,12 @@ fn runInference(
         res.decode_ms / 1000.0,
         if (res.decode_ms > 0) @as(f64, @floatFromInt(res.tokens.len)) / (res.decode_ms / 1000.0) else 0.0,
     });
-    try out.print("{s}\n", .{if (res.hit_eos) "Stop reason: EOS" else "Stop reason: max tokens reached"});
+    try out.print("{s}\n", .{if (res.hit_eos)
+        "Stop reason: EOS"
+    else if (res.hit_context_limit)
+        "Stop reason: context limit reached"
+    else
+        "Stop reason: max tokens reached"});
     // `QWEN35_DUMP_IDS`: print the raw generated token ids.  Used for A/B md5
     // probes -- text output can hide a divergence that shows up in ids, and ids
     // are what a refactor must keep byte-identical.
