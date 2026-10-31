@@ -1193,15 +1193,7 @@ pub const Engine = struct {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
                 .quant => |qrow| self.exec.matvec(Buf.wrap(self.logits), .{ .quant = qrow }, Buf.wrap(self.x1)),
-                .f32 => |m| {
-                    const vocab: usize = c.vocab;
-                    for (0..vocab) |vi| {
-                        const rowv = m[vi * hidden ..][0..hidden];
-                        var acc: f32 = 0;
-                        for (rowv, self.x1) |mv, vv| acc += mv * vv;
-                        self.logits[vi] = acc;
-                    }
-                },
+                .f32 => |m| self.exec.matvec(Buf.wrap(self.logits), .{ .f32 = m }, Buf.wrap(self.x1)),
             }
         }
         if (prof) prof_lm += profNs(io, b);
@@ -1320,30 +1312,17 @@ pub const Engine = struct {
         } else {
             switch (self.token_embd) {
                 .quant => |qrow| self.exec.matvec(Buf.wrap(self.logits), .{ .quant = qrow }, Buf.wrap(self.x1)),
-                .f32 => |m| {
-                    const vocab: usize = c.vocab;
-                    for (0..vocab) |vi| {
-                        const rowv = m[vi * hidden ..][0..hidden];
-                        var acc: f32 = 0;
-                        for (rowv, self.x1) |mv, vv| acc += mv * vv;
-                        self.logits[vi] = acc;
-                    }
-                },
+                .f32 => |m| self.exec.matvec(Buf.wrap(self.logits), .{ .f32 = m }, Buf.wrap(self.x1)),
             }
         }
         return self.logits;
     }
 
+    /// Greedy argmax over the last logits.  Forwards to the backend so the logits
+    /// never have to be readable from the host (doc comment on `Exec.argmax`);
+    /// the engine no longer carries its own copy of this loop.
     pub fn argmax(self: *Engine) u32 {
-        var best: u32 = 0;
-        var bv = -std.math.floatMax(f32);
-        for (self.logits, 0..) |v, i| {
-            if (v > bv) {
-                bv = v;
-                best = @intCast(i);
-            }
-        }
-        return best;
+        return self.exec.argmax(Buf.wrap(self.logits));
     }
 
     // ------------- GDN block (SPEC A, GDN_IMPL §2) -------------
