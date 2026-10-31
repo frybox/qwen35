@@ -823,9 +823,9 @@ pub const CpuBackend = struct {
         ew.bufAttnDecode(q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
-    fn vGdnGamma(ctx: *anyopaque, ab: Buf, a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+    fn vGdnGamma(ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
         _ = ctx;
-        ew.bufGdnGamma(ab, a, dt_bias, gamma, nv);
+        ew.bufGdnGamma(a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
     fn vCopyRange(ctx: *anyopaque, dst: Buf, src: Buf) void {

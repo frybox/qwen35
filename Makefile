@@ -86,7 +86,11 @@ test:
 
 run0.8b: run0.8bq80 run0.8bbf16 run0.8biq4nl run0.8biq4xs run0.8bq3km run0.8bq3ks run0.8bq40 run0.8bq41 run0.8bq4km run0.8bq4ks run0.8bq5km run0.8bq5ks run0.8bq6k run0.8biq2m run0.8biq2xxs run0.8biq3xxs run0.8bq2kxl run0.8bq3kxl run0.8bq4kxl run0.8bq5kxl run0.8bq6kxl run0.8bq8kxl
 
+run0.8b-cuda: run0.8bq80-cuda run0.8bbf16-cuda run0.8biq4nl-cuda run0.8biq4xs-cuda run0.8bq3km-cuda run0.8bq3ks-cuda run0.8bq40-cuda run0.8bq41-cuda run0.8bq4km-cuda run0.8bq4ks-cuda run0.8bq5km-cuda run0.8bq5ks-cuda run0.8bq6k-cuda run0.8biq2m-cuda run0.8biq2xxs-cuda run0.8biq3xxs-cuda run0.8bq2kxl-cuda run0.8bq3kxl-cuda run0.8bq4kxl-cuda run0.8bq5kxl-cuda run0.8bq6kxl-cuda run0.8bq8kxl-cuda
+
 run0.8b-llamacpp: run0.8bq80-llamacpp run0.8bbf16-llamacpp run0.8biq4nl-llamacpp run0.8biq4xs-llamacpp run0.8bq3km-llamacpp run0.8bq3ks-llamacpp run0.8bq40-llamacpp run0.8bq41-llamacpp run0.8bq4km-llamacpp run0.8bq4ks-llamacpp run0.8bq5km-llamacpp run0.8bq5ks-llamacpp run0.8bq6k-llamacpp run0.8biq2m-llamacpp run0.8biq2xxs-llamacpp run0.8biq3xxs-llamacpp run0.8bq2kxl-llamacpp run0.8bq3kxl-llamacpp run0.8bq4kxl-llamacpp run0.8bq5kxl-llamacpp run0.8bq6kxl-llamacpp run0.8bq8kxl-llamacpp
+
+run0.8b-llamacpp-cuda: run0.8bq80-llamacpp-cuda run0.8bbf16-llamacpp-cuda run0.8biq4nl-llamacpp-cuda run0.8biq4xs-llamacpp-cuda run0.8bq3km-llamacpp-cuda run0.8bq3ks-llamacpp-cuda run0.8bq40-llamacpp-cuda run0.8bq41-llamacpp-cuda run0.8bq4km-llamacpp-cuda run0.8bq4ks-llamacpp-cuda run0.8bq5km-llamacpp-cuda run0.8bq5ks-llamacpp-cuda run0.8bq6k-llamacpp-cuda run0.8biq2m-llamacpp-cuda run0.8biq2xxs-llamacpp-cuda run0.8biq3xxs-llamacpp-cuda run0.8bq2kxl-llamacpp-cuda run0.8bq3kxl-llamacpp-cuda run0.8bq4kxl-llamacpp-cuda run0.8bq5kxl-llamacpp-cuda run0.8bq6kxl-llamacpp-cuda run0.8bq8kxl-llamacpp-cuda
 
 run0.8bud: run0.8biq2m run0.8biq2xxs run0.8biq3xxs run0.8bq2kxl run0.8bq3kxl run0.8bq4kxl run0.8bq5kxl run0.8bq6kxl run0.8bq8kxl
 
@@ -101,132 +105,261 @@ run0.8bq80-cuda:
 run0.8bq80-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq80-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bbf16:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+
+run0.8bbf16-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
 
 run0.8bbf16-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bbf16-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8biq4nl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_NL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8biq4nl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_NL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8biq4nl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_NL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8biq4nl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_NL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8biq4xs:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8biq4xs-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8biq4xs-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8biq4xs-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-IQ4_XS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq3km:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq3km-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq3km-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq3km-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq3ks:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq3ks-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq3ks-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq3ks-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q3_K_S.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq40:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq40-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq40-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq40-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq41:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_1.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq41-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_1.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq41-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_1.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq41-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_1.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq4km:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq4km-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq4km-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq4km-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq4ks:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_S.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq4ks-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_S.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq4ks-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_S.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq4ks-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q4_K_S.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq5km:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq5km-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq5km-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq5km-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq5ks:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_S.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq5ks-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_S.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq5ks-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_S.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq5ks-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q5_K_S.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq6k:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q6_K.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq6k-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q6_K.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq6k-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q6_K.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq6k-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q6_K.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8biq2m:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8biq2m-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_M.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8biq2m-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8biq2m-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_M.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8biq2xxs:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_XXS.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8biq2xxs-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_XXS.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8biq2xxs-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_XXS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8biq2xxs-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ2_XXS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 
 run0.8biq3xxs:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8biq3xxs-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ3_XXS.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8biq3xxs-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ3_XXS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8biq3xxs-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-IQ3_XXS.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq2kxl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q2_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq2kxl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q2_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq2kxl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q2_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq2kxl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q2_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq3kxl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q3_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq3kxl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q3_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq3kxl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q3_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq3kxl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q3_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq4kxl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq4kxl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq4kxl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq4kxl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q4_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq5kxl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q5_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq5kxl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q5_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq5kxl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q5_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq5kxl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q5_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq6kxl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q6_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq6kxl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q6_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq6kxl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q6_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
+run0.8bq6kxl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q6_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+
 run0.8bq8kxl:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q8_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1
+run0.8bq8kxl-cuda:
+	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q8_K_XL.gguf 天空为什么是蓝色的？ -n 48 --threads 1 --backend cuda
+
 
 run0.8bq8kxl-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q8_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
+
+run0.8bq8kxl-llamacpp-cuda:
+	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-UD-Q8_K_XL.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
 
 run2b:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-2B-GGUF/Qwen3.5-2B-Q8_0.gguf 天空为什么是蓝色的？

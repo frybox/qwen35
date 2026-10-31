@@ -187,7 +187,7 @@ pub const Exec = struct {
             att: Buf, gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
             kv_dim: usize, scale: f32) void,
         /// GDN per-token beta/gamma from the raw a/b projections.
-        gdnGamma: *const fn (ctx: *anyopaque, ab: Buf, a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
+        gdnGamma: *const fn (ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
         /// Region-to-region copy (KV writes, MTP state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
         copyRange: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
@@ -301,8 +301,14 @@ pub const Exec = struct {
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         self.vtable.attnDecode(self.ptr, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
-    pub fn gdnGamma(self: Exec, ab: Buf, a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
-        self.vtable.gdnGamma(self.ptr, ab, a, dt_bias, gamma, nv);
+    /// beta = sigmoid(b_raw) written IN PLACE into `b_raw`, and
+    /// gamma[h] = exp(ssm_a[h] * softplus(a_raw[h] + dt_bias[h])).
+    /// `a_raw` and `b_raw` are separate buffers because the batched prefill
+    /// writes alpha as `abK[0..k*nv]` and beta as `abK[k*nv..]` -- two
+    /// non-contiguous regions -- while the serial path passes the two halves
+    /// of one row.
+    pub fn gdnGamma(self: Exec, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+        self.vtable.gdnGamma(self.ptr, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
     pub fn copyRange(self: Exec, dst: Buf, src: Buf) void {
         self.vtable.copyRange(self.ptr, dst, src);

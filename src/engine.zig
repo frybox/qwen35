@@ -1182,7 +1182,7 @@ pub const Engine = struct {
         }
         const b = Io.Clock.Timestamp.now(io, .awake);
 
-        rmsNorm(self.x1, self.x, self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(self.output_norm), c.rms_eps);
         // lm_head: untied `output.weight` when present, else tied token_embd.
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
@@ -1217,7 +1217,7 @@ pub const Engine = struct {
     /// temperature is 0 — the historical default.
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
         const logits = self.forwardLogits(token, pos);
-        return self.sampler.sample(logits, self.sample_scratch);
+        return self.exec.sample(Buf.wrap(logits), Buf.wrap(self.sample_scratch), &self.sampler);
     }
 
     /// Dequantize the embedding row of `token` into `dst` (hidden wide).
@@ -1230,7 +1230,7 @@ pub const Engine = struct {
         // the backend's business.  Q8_0's 32-element framing is handled
         // there rather than special-cased here.
         switch (self.token_embd) {
-            .f32 => |m| @memcpy(dst, m[token * hidden ..][0..hidden]),
+            .f32 => |m| self.exec.copyRange(Buf.wrap(dst), Buf.wrap(m[token * hidden ..][0..hidden])),
             .quant => |qrow| self.exec.dequantRow(Buf.wrap(dst), qrow, token),
         }
     }
@@ -1271,7 +1271,7 @@ pub const Engine = struct {
             // projections (weight bytes read once for the whole chunk) ----
             t = 0;
             while (t < k) : (t += 1)
-                rmsNorm(self.x1K[t * hidden ..][0..hidden], self.xK[t * hidden ..][0..hidden], lw.attn_norm, c.rms_eps);
+                self.exec.rmsnorm(Buf.wrap(self.x1K[t * hidden ..][0..hidden]), Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(lw.attn_norm), c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
                 self.exec.matvecBatchK(Buf.wrap(self.qkvK[0 .. k * 2 * q_dim]), lw.attn_q.?, Buf.wrap(self.x1K), k);
@@ -1292,31 +1292,27 @@ pub const Engine = struct {
 
             // ---- per-token residual add ----
             t = 0;
-            while (t < k) : (t += 1) {
-                for (self.xK[t * hidden ..][0..hidden], self.x2K[t * hidden ..][0..hidden]) |*xo, v| xo.* += v;
-            }
+            while (t < k) : (t += 1)
+                self.exec.addResid(Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(self.x2K[t * hidden ..][0..hidden]));
 
             // ---- MLP: norm, batched gate/up, per-token SwiGLU, batched down, residual ----
             t = 0;
             while (t < k) : (t += 1)
-                rmsNorm(self.x1K[t * hidden ..][0..hidden], self.xK[t * hidden ..][0..hidden], lw.post_attention_norm, c.rms_eps);
+                self.exec.rmsnorm(Buf.wrap(self.x1K[t * hidden ..][0..hidden]), Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(lw.post_attention_norm), c.rms_eps);
             self.exec.matvecBatchK(Buf.wrap(self.mlpK[0 .. k * n_ff]), lw.ffn_gate, Buf.wrap(self.x1K), k);
             self.exec.matvecBatchK(Buf.wrap(self.mlpK1[0 .. k * n_ff]), lw.ffn_up, Buf.wrap(self.x1K), k);
             t = 0;
-            while (t < k) : (t += 1) {
-                for (self.mlpK[t * n_ff ..][0..n_ff], self.mlpK1[t * n_ff ..][0..n_ff]) |*gi, uv|
-                    gi.* = silu(gi.*) * uv;
-            }
+            while (t < k) : (t += 1)
+                self.exec.swiglu(Buf.wrap(self.mlpK[t * n_ff ..][0..n_ff]), Buf.wrap(self.mlpK1[t * n_ff ..][0..n_ff]));
             self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.ffn_down, Buf.wrap(self.mlpK), k);
             t = 0;
-            while (t < k) : (t += 1) {
-                for (self.xK[t * hidden ..][0..hidden], self.x2K[t * hidden ..][0..hidden]) |*xo, v| xo.* += v;
-            }
+            while (t < k) : (t += 1)
+                self.exec.addResid(Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(self.x2K[t * hidden ..][0..hidden]));
         }
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
         // path, so the first sampled logits are bit-identical) ----
-        rmsNorm(self.x1, self.xK[(k - 1) * hidden ..][0..hidden], self.output_norm, c.rms_eps);
+        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.xK[(k - 1) * hidden ..][0..hidden]), Buf.wrap(self.output_norm), c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
                 .quant, .f32 => self.exec.matvec(Buf.wrap(self.logits), ow, Buf.wrap(self.x1)),
@@ -1363,7 +1359,7 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd; // Q and K sections are nk*kd wide each
         const value_dim: usize = nv * vd; // 2048 (0.8B) / 4096 (4B)
 
-        rmsNorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(lw.attn_norm), c.rms_eps);
 
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
@@ -1385,19 +1381,13 @@ pub const Engine = struct {
         // convStep handles history + silu for all channels; beta/gamma
         // are computed after, on the RAW a/b projections (not conv'd).
         const st = &self.gdn[li];
-        self.convStep(st, qkv, lw.ssm_conv1d.?, c.conv_kernel);
+        self.exec.convStep(Buf.wrap(st.conv), Buf.wrap(qkv), Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
 
         // beta = sigmoid(b); g = A * softplus(a + dt_bias) with A = ssm_a
         // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
-        const beta = self.ab[0..nv]; // reuse: store beta in first half
+        const beta = self.ab[nv..]; // beta lives in the b half, written in place
         var gamma: [64]f32 = undefined;
-        for (0..nv) |h| {
-            const a_raw = ab[h];
-            const b_raw = ab[nv + h];
-            beta[h] = sigmoid(b_raw);
-            const g = lw.ssm_a.?[h] * softplus(a_raw + lw.ssm_dt_bias.?[h]);
-            gamma[h] = @exp(g); // g <= 0 -> gamma in (0,1]
-        }
+        self.exec.gdnGamma(Buf.wrap(ab[0..nv]), Buf.wrap(beta), Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out[0..value_dim];
@@ -1411,29 +1401,29 @@ pub const Engine = struct {
             const sh = state[h * kd * vd ..][0 .. kd * vd];
 
             // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128)
-            l2norm(q_h);
-            l2norm(k_h);
+            self.exec.l2norm(Buf.wrap(q_h));
+            self.exec.l2norm(Buf.wrap(k_h));
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            scaleVec(q_h, qscale);
+            self.exec.scaleVec(Buf.wrap(q_h), qscale);
 
             // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q
             // in a second pass (see gdnFused).
             const km = self.kv_mem[0..vd];
             const out_h = gout[h * vd ..][0..vd];
-            gdnFused(sh, k_h, v_h, q_h, km, self.delta[0..vd], out_h, gamma[h], beta[h], vd);
+            self.exec.gdnStep(Buf.wrap(sh), Buf.wrap(k_h), Buf.wrap(v_h), Buf.wrap(q_h), Buf.wrap(km), Buf.wrap(self.delta[0..vd]), Buf.wrap(out_h), gamma[h], beta[h], vd);
         }
 
         // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6)
         for (0..nv) |h| {
             const out_h = gout[h * vd ..][0..vd];
             const zh = z[h * vd ..][0..vd];
-            rmsNorm(out_h, out_h, lw.ssm_norm.?, c.rms_eps);
-            mulSiluVec(out_h, zh);
+            self.exec.rmsnorm(Buf.wrap(out_h), Buf.wrap(out_h), Buf.wrap(lw.ssm_norm.?), c.rms_eps);
+            self.exec.mulSilu(Buf.wrap(out_h), Buf.wrap(zh));
         }
 
         // out projection [2048 -> 1024]
         self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.ssm_out.?, Buf.wrap(gout));
-        for (0..hidden) |i| self.x[i] += self.x2[i];
+        self.exec.addResid(Buf.wrap(self.x[0..hidden]), Buf.wrap(self.x2[0..hidden]));
     }
 
     /// Causal conv step: out[i] = sum_t w[i][t] * hist[i][t], where hist =
@@ -1480,8 +1470,8 @@ pub const Engine = struct {
         const q = self.qK[t * q_dim ..][0..q_dim];
         const gate = self.gateK[t * q_dim ..][0..q_dim];
         for (0..heads) |h| {
-            @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
-            @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
+            self.exec.copyRange(Buf.wrap(q[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd ..][0..hd]));
+            self.exec.copyRange(Buf.wrap(gate[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd + hd ..][0..hd]));
         }
         const k = self.kK[t * kv_dim ..][0..kv_dim];
         const v = self.vK[t * kv_dim ..][0..kv_dim];
@@ -1489,45 +1479,31 @@ pub const Engine = struct {
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
             const qs = q[h * hd ..][0..hd];
-            rmsNorm(qs, qs, lw.attn_q_norm.?, c.rms_eps);
+            self.exec.rmsnorm(Buf.wrap(qs), Buf.wrap(qs), Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
         }
         for (0..kv_heads) |h| {
             const ks = k[h * hd ..][0..hd];
-            rmsNorm(ks, ks, lw.attn_k_norm.?, c.rms_eps);
+            self.exec.rmsnorm(Buf.wrap(ks), Buf.wrap(ks), Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
         }
-        for (0..heads) |h| applyRope64(q[h * hd ..][0..hd], pos, c.rope_freq_base);
-        for (0..kv_heads) |h| applyRope64(k[h * hd ..][0..hd], pos, c.rope_freq_base);
+        for (0..heads) |h| self.exec.rope64(Buf.wrap(q[h * hd ..][0..hd]), pos, c.rope_freq_base);
+        for (0..kv_heads) |h| self.exec.rope64(Buf.wrap(k[h * hd ..][0..hd]), pos, c.rope_freq_base);
 
         // KV cache: slot == cache.len, exactly as the serial path
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        @memcpy(cache.k[slot * kv_dim ..][0..kv_dim], k);
-        @memcpy(cache.v[slot * kv_dim ..][0..kv_dim], v);
+        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), Buf.wrap(k));
+        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), Buf.wrap(v));
         cache.len += 1;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const gout = self.goutK[t * q_dim ..][0..q_dim];
-        for (0..heads) |h| {
-            const kvh = h / gqa;
-            const qs = q[h * hd ..][0..hd];
-            const att = self.attn[0 .. slot + 1];
-            for (0..slot + 1) |ti| {
-                const ks = cache.k[ti * kv_dim + kvh * hd ..][0..hd];
-                var acc: f32 = 0;
-                for (qs, ks) |a, b| acc += a * b;
-                att[ti] = acc * scale;
-            }
-            softmax(att);
-            var accv: [256]f32 = @splat(0);
-            for (0..slot + 1) |ti| {
-                const w = att[ti];
-                const vs = cache.v[ti * kv_dim + kvh * hd ..][0..hd];
-                for (vs, 0..) |vv, j| accv[j] += w * vv;
-            }
-            @memcpy(gout[h * hd ..][0..hd], accv[0..hd]);
-        }
-        mulSigmoidVec(gout[0..q_dim], gate[0..q_dim]);
+        // scores -> softmax -> PV -> sigmoid gate in one backend call
+        // (`attnDecode`), reading the cache rows written so far.
+        self.exec.attnDecode(Buf.wrap(q[0..q_dim]), Buf.wrap(gate[0..q_dim]),
+            Buf.wrap(cache.k[0 .. (slot + 1) * kv_dim]), Buf.wrap(cache.v[0 .. (slot + 1) * kv_dim]),
+            Buf.wrap(self.attn[0 .. slot + 1]), Buf.wrap(gout[0..q_dim]),
+            slot, heads, gqa, hd, kv_dim, scale);
     }
 
     /// Batched-chunk twin of `forwardGdn`: qkv / gate / alpha / beta were
@@ -1553,15 +1529,9 @@ pub const Engine = struct {
         const ab_a = self.abK[t * nv ..][0..nv];
         const beta = self.abK[k * nv + t * nv ..][0..nv];
         const st = &self.gdn[li];
-        self.convStep(st, qkv, lw.ssm_conv1d.?, c.conv_kernel);
+        self.exec.convStep(Buf.wrap(st.conv), Buf.wrap(qkv), Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
         var gamma: [64]f32 = undefined;
-        for (0..nv) |h| {
-            const a_raw = ab_a[h];
-            const b_raw = beta[h];
-            beta[h] = sigmoid(b_raw);
-            const g = lw.ssm_a.?[h] * softplus(a_raw + lw.ssm_dt_bias.?[h]);
-            gamma[h] = @exp(g);
-        }
+        self.exec.gdnGamma(Buf.wrap(ab_a), Buf.wrap(beta), Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
 
         const state = st.state;
         const gout = self.goutK[t * value_dim ..][0..value_dim];
@@ -1572,21 +1542,21 @@ pub const Engine = struct {
             const v_h = qkv[2 * kq_dim + h * kd ..][0..kd];
             const sh = state[h * kd * vd ..][0 .. kd * vd];
 
-            l2norm(q_h);
-            l2norm(k_h);
+            self.exec.l2norm(Buf.wrap(q_h));
+            self.exec.l2norm(Buf.wrap(k_h));
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            scaleVec(q_h, qscale);
+            self.exec.scaleVec(Buf.wrap(q_h), qscale);
 
             const km = self.kv_mem[0..vd];
             const out_h = gout[h * vd ..][0..vd];
-            gdnFused(sh, k_h, v_h, q_h, km, self.delta[0..vd], out_h, gamma[h], beta[h], vd);
+            self.exec.gdnStep(Buf.wrap(sh), Buf.wrap(k_h), Buf.wrap(v_h), Buf.wrap(q_h), Buf.wrap(km), Buf.wrap(self.delta[0..vd]), Buf.wrap(out_h), gamma[h], beta[h], vd);
         }
 
         for (0..nv) |h| {
             const out_h = gout[h * vd ..][0..vd];
             const zh = z[h * vd ..][0..vd];
-            rmsNorm(out_h, out_h, lw.ssm_norm.?, c.rms_eps);
-            mulSiluVec(out_h, zh);
+            self.exec.rmsnorm(Buf.wrap(out_h), Buf.wrap(out_h), Buf.wrap(lw.ssm_norm.?), c.rms_eps);
+            self.exec.mulSilu(Buf.wrap(out_h), Buf.wrap(zh));
         }
     }
 
@@ -1600,7 +1570,7 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd; // 512
         const gqa: usize = heads / kv_heads; // 4
 
-        rmsNorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
+        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(lw.attn_norm), c.rms_eps);
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv[0 .. 2 * q_dim];
@@ -1609,8 +1579,8 @@ pub const Engine = struct {
         const gate = self.z[0..q_dim];
         for (0..heads) |h| {
             // interleave: q(256) = qg[h*512 .. h*512+256], gate = next 256
-            @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
-            @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
+            self.exec.copyRange(Buf.wrap(q[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd ..][0..hd]));
+            self.exec.copyRange(Buf.wrap(gate[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd + hd ..][0..hd]));
         }
         self.exec.matvec(Buf.wrap(self.k[0..kv_dim]), lw.attn_k.?, Buf.wrap(self.x1));
         self.exec.matvec(Buf.wrap(self.v[0..kv_dim]), lw.attn_v.?, Buf.wrap(self.x1));
@@ -1618,55 +1588,39 @@ pub const Engine = struct {
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
             const qs = q[h * hd ..][0..hd];
-            rmsNorm(qs, qs, lw.attn_q_norm.?, c.rms_eps);
+            self.exec.rmsnorm(Buf.wrap(qs), Buf.wrap(qs), Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
         }
         for (0..kv_heads) |h| {
             const ks = self.k[h * hd ..][0..hd];
-            rmsNorm(ks, ks, lw.attn_k_norm.?, c.rms_eps);
+            self.exec.rmsnorm(Buf.wrap(ks), Buf.wrap(ks), Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
         }
         // RoPE on first 64 dims of each q/k head
         for (0..heads) |h| {
-            applyRope64(q[h * hd ..][0..hd], pos, c.rope_freq_base);
+            self.exec.rope64(Buf.wrap(q[h * hd ..][0..hd]), pos, c.rope_freq_base);
         }
         for (0..kv_heads) |h| {
-            applyRope64(self.k[h * hd ..][0..hd], pos, c.rope_freq_base);
+            self.exec.rope64(Buf.wrap(self.k[h * hd ..][0..hd]), pos, c.rope_freq_base);
         }
 
         // KV cache
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        @memcpy(cache.k[slot * kv_dim ..][0..kv_dim], self.k[0..kv_dim]);
-        @memcpy(cache.v[slot * kv_dim ..][0..kv_dim], self.v[0..kv_dim]);
+        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), Buf.wrap(self.k[0..kv_dim]));
+        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), Buf.wrap(self.v[0..kv_dim]));
         cache.len += 1;
 
         // attention: kv = h // gqa (B13), scale = hd^-0.5
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
         const gout = self.gdn_out[0..q_dim];
-        for (0..heads) |h| {
-            const kvh = h / gqa;
-            const qs = q[h * hd ..][0..hd];
-            const att = self.attn[0 .. slot + 1];
-            for (0..slot + 1) |t| {
-                const ks = cache.k[t * kv_dim + kvh * hd ..][0..hd];
-                var acc: f32 = 0;
-                for (qs, ks) |a, b| acc += a * b;
-                att[t] = acc * scale;
-            }
-            softmax(att);
-            var accv: [256]f32 = @splat(0);
-            for (0..slot + 1) |t| {
-                const w = att[t];
-                const vs = cache.v[t * kv_dim + kvh * hd ..][0..hd];
-                for (vs, 0..) |vv, j| accv[j] += w * vv;
-            }
-            @memcpy(gout[h * hd ..][0..hd], accv[0..hd]);
-        }
-
-        // sigmoid gate (B14), then o_proj [2048 -> 1024]
-        mulSigmoidVec(gout[0..q_dim], gate[0..q_dim]);
+        // scores -> softmax -> PV -> sigmoid gate in one backend call
+        self.exec.attnDecode(Buf.wrap(q[0..q_dim]), Buf.wrap(gate[0..q_dim]),
+            Buf.wrap(cache.k[0 .. (slot + 1) * kv_dim]), Buf.wrap(cache.v[0 .. (slot + 1) * kv_dim]),
+            Buf.wrap(self.attn[0 .. slot + 1]), Buf.wrap(gout[0..q_dim]),
+            slot, heads, gqa, hd, kv_dim, scale);
+        // o_proj [2048 -> 1024]
         self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.attn_output.?, Buf.wrap(gout));
-        for (0..hidden) |i| self.x[i] += self.x2[i];
+        self.exec.addResid(Buf.wrap(self.x[0..hidden]), Buf.wrap(self.x2[0..hidden]));
     }
 
     // ------------- MLP (SPEC C16) -------------
@@ -1674,12 +1628,12 @@ pub const Engine = struct {
     fn forwardMlp(self: *Engine, lw: *LayerWeights) void {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        rmsNorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
+        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(lw.post_attention_norm), c.rms_eps);
         self.exec.matvec(Buf.wrap(self.mlp_h), lw.ffn_gate, Buf.wrap(self.x1));
         self.exec.matvec(Buf.wrap(self.mlp_h1), lw.ffn_up, Buf.wrap(self.x1));
-        for (0..c.n_ff) |i| self.mlp_h[i] = silu(self.mlp_h[i]) * self.mlp_h1[i];
+        self.exec.swiglu(Buf.wrap(self.mlp_h), Buf.wrap(self.mlp_h1));
         self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.ffn_down, Buf.wrap(self.mlp_h));
-        for (0..hidden) |i| self.x[i] += self.x2[i];
+        self.exec.addResid(Buf.wrap(self.x[0..hidden]), Buf.wrap(self.x2[0..hidden]));
     }
 
     // -----------------------------------------------------------------
@@ -1760,7 +1714,7 @@ pub const Engine = struct {
         var hit_eos = false;
         // prof_phase stays on across prefill and decode (set above); do not
         // reset here or the prefill samples are thrown away.
-        var next: u32 = self.sampler.sample(last_logits, self.sample_scratch);
+        var next: u32 = self.exec.sample(Buf.wrap(last_logits), Buf.wrap(self.sample_scratch), &self.sampler);
         while (pos < max_tokens) : (pos += 1) {
             if (next == self.cfg.eos_token_id) {
                 hit_eos = true;

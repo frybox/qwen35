@@ -373,12 +373,12 @@ pub fn attnDecodeKernel(q: []const f32, gate: []const f32, kcache: []const f32, 
 
 /// Byte-exact copy of the beta/gamma loop of Engine.forwardGdn (engine.zig
 /// L1392-1398): beta = sigmoid(b) written in place, gamma = exp(A*softplus(a+dt_bias)).
-pub fn gdnGammaKernel(ab: []f32, a: []const f32, dt_bias: []const f32, gamma: []f32, nv: usize) void {
+/// `a_raw`/`b_raw` are separate slices: the serial path passes the two halves of
+/// one `ab` row, the batched path passes `abK[t*nv..]` and `abK[k*nv + t*nv..]`.
+pub fn gdnGammaKernel(a_raw: []const f32, b_raw: []f32, ssm_a: []const f32, dt_bias: []const f32, gamma: []f32, nv: usize) void {
     for (0..nv) |h| {
-        const a_raw = ab[h];
-        const b_raw = ab[nv + h];
-        ab[h] = sigmoid(b_raw);
-        const g = a[h] * softplus(a_raw + dt_bias[h]);
+        b_raw[h] = sigmoid(b_raw[h]);
+        const g = ssm_a[h] * softplus(a_raw[h] + dt_bias[h]);
         gamma[h] = @exp(g); // g <= 0 -> gamma in (0,1]
     }
 }
@@ -410,8 +410,8 @@ pub fn bufAttnDecode(q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout
         gout.slice(), slot, heads, gqa, hd, kv_dim, scale);
 }
 
-pub fn bufGdnGamma(ab: Buf, a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
-    gdnGammaKernel(ab.slice(), a.slice(), dt_bias.slice(), gamma.slice(), nv);
+pub fn bufGdnGamma(a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+    gdnGammaKernel(a_raw.slice(), b_raw.slice(), ssm_a.slice(), dt_bias.slice(), gamma.slice(), nv);
 }
 
 pub fn bufCopyRange(dst: Buf, src: Buf) void {
