@@ -30,7 +30,8 @@
 三条候选：
 
 - **(a) 每次 matvec 传激活**（引擎零改动）：0.8B ≈ **2.2 MB/token**（lm_head 输出 0.99 MB 独占），PCIe4 ≈0.11 ms，相对 CPU 单线程 70 ms/token 可忽略；27B ≈ **14 MB/token ≈0.7 ms**（30 tok/s 时占 2%）。真实成本是 ~50 次小 memcpy 的**启动延迟** ≈0.3–0.5 ms/token，用 pinned staging + 批量合并可压。
-- **(b) 激活常驻显存**：需要把 `engine.zig:814-822` 起的激活 slice 语义整体改成 device slice，`engine.zig` 大改 → 违背分层目标，暂不做。
+- **(b) 激活常驻显存**：需要把 `engine.zig:814-822` 起的激活 slice 语义整体改成 device slice，`engine.zig` 大改 → 违背分层目标，**原因被推翻，见 §2bis**。
+  ~~暂不做。~~
 - **旧实现走的是第三条路**（`main_cuda.zig` + `kernel.cu`）：整套前向平行复刻在 GPU 侧，激活全常驻，CUDA Graph 把 ~900 次 launch 压成 1 次（`main_cuda.zig:66-73, 339-344, 692-702`）。代价是 `uploadLinear:252-273` 只认 `is_q8` 或 f32 —— K/IQ 在宿主 dequant 后上传。
 
 **决策：P0–P2 走 (a)**（先把正确性打通，engine 不动）。
@@ -46,7 +47,50 @@
 CPU 后端把这两者实现为对宿主 `cache.k`/`cache.v`（`engine.zig:872`）的原地操作，行为不变；
 CUDA 后端让 cache 常驻显存、用 `k_gqa_partial:704` + `k_gqa_reduce:790` 计算，只上传 q 与取回 out
 （每 token 每层 `q_dim + q_dim` 个 f32，27B 约 8 KB × 65 层 ≈ 0.5 MB）。激活仍按 (a) 每次上传。
-**P4（可选，暂不做）**：把激活整体搬上显存。
+**P4：把激活整体搬上显存 —— 已升为当前目标，见 §2bis。**
+
+---
+
+## 2bis. 目标转向：host↔device 只传 token id（2026-10-31）
+
+用户的决定改变了上面 (a)/(b) 的取舍：**embedding 与 logits 都常驻显存，host 与 device 之间只传
+token id**。整个 forward（embedding 查表 → 逐层 norm/attention/GDN/MLP/residual → final norm →
+lm_head → argmax/sample）都在设备侧完成，host 不再碰 hidden state 与 logits。
+
+### 为什么 (b) 当年判「暂不做」的障碍已经不成立
+
+`:33` 的否决理由是「激活 slice 语义整体改成 device slice → `engine.zig` 大改 → 违背分层目标」。
+两个前提此后都变了：
+
+1. **`Buf` 已有设备指针语义**（`backend.zig:58`：`ptr` 在 CPU 后端是 host 指针、在 device 后端是
+   设备指针，**引擎永不解引用**；`span()` 是纯指针算术，两侧都成立）。所以在 `engine.zig` 里把
+   `[]f32` 换成 `Buf` 不需要引擎知道任何硬件细节——这是接口既有的约定，不是新增泄漏。
+2. **`Exec` 已覆盖全部算子**（36 个槽，`8296541` 把 elementwise 从 engine 剥离到
+   `src/elementwise.zig` 并经 vtable 转发）。引擎不再直接写数值循环，下沉的接缝已经存在。
+
+结论：**(b) 现在可以在不破坏 `engine.zig` 分层的前提下做**，前提是只经由 `Exec` 与 `Buf`。
+
+### 但顺序不能跳：先常驻，后下沉
+
+踩坑提醒：**在激活还没常驻之前先做 elementwise 下沉，收益是负的**。`exec.allocBuf` 目前无调用者、
+`backend_cuda.zig:1340` 把它委托给 CPU 分配器，engine 仍握 host `[]f32`；此时单个 `rmsnorm` 沉到
+device 就得在它前后各加一次 H2D/D2H，比在 CPU 上直接算更慢。所以收益要等激活常驻之后才兑现。
+
+**但反过来也不行**：不能先把 `allocBuf` 切到设备内存 —— 那 21 个 elementwise 槽位还指向 CPU 函数，
+会立刻解引用设备指针崩掉。因此顺序固定为 §5 的
+**P2a（engine 激活 `Buf` 化，分配器仍给 host）→ P2b（逐个下沉 kernel，性能持平）→ P2c（才切
+`allocBuf` 到设备内存，一次性兑现收益）**。先重构、再设备化、最后换分配器。
+
+### 验收标准（取代「复现 CPU token id」）
+
+GPU 侧的归约顺序与超越函数本来就不可能逐位复现 host（`docs/cuda-elementwise-ulp.md` 实测
+`exp`/`cos` 有 1–2 ulp 差），所以：
+
+- ~~`QWEN35_DUMP_IDS` md5 与 CPU 逐 token 相同~~
+- **改为**：同 prompt 的 token id 分布一致（允许个别位置因 logits 接近而翻转）、top-5 logits 在
+  容差内、困惑度不退化；**kernel 级**仍要求严格对拍（`QWEN35_MVCHECK` 逐行 + Zig 标量参照）。
+- **反模式**：「`rmsnorm` 的平方和必须逐元素串行累加才 bit-identical」—— 照做等于 GPU 上只能单线程
+  串行归约，把性能动机整个抵消。宁可在容差内接受树形归约，也不要在设备上复刻 host 的串行顺序。
 
 ---
 
@@ -61,7 +105,7 @@ CUDA 后端让 cache 常驻显存、用 `k_gqa_partial:704` + `k_gqa_reduce:790`
 | `convert.cu` | `dequantize_block_*`（`dequantRow` 用）；**需新增** `quantize_row_q8_1`（旧 `k_quantize_q8` 只写 34 B 的 `d`，缺 `s`，`kernel.cu:170-197`） | `convert.cu` |
 | `mmvq.cu` | 单 token / 小 batch matvec（每行一 warp 或一 block，量化权重 × q8 激活） | `mmvq.cu`, `mmvq.cuh` |
 | `mmq.cu` | 多 token GEMM（prefill，`matvecBatchK`） | `mmq.cu`, `mmq-load-tiles.cuh` |
-| `elementwise.cu` | 暂不需要（rmsNorm/rope/silu 留在引擎 Zig，见 `backend.zig:18-21`） | — |
+| `elementwise.cu` | **需新增**（原判「暂不需要」，§2bis 已推翻）：`rmsnorm`、`l2norm`、`scaleVec`、`addResid`、`silu/mulSilu/mulSigmoid/swiglu`、`rope`、`copyRange/zeroBuf`、`embedRow`（查表）、`argmax`。**前置**是激活先常驻显存（§5 P2），否则每调一次都要 H2D/D2H，净负收益 | `—`（待写） |
 | `api.cpp` | 与 Zig 的扁平 `extern "C"` 边界 | — |
 
 阶段划分（每阶段都有端到端可跑 + 对拍）：
@@ -77,6 +121,24 @@ CUDA 后端让 cache 常驻显存、用 `k_gqa_partial:704` + `k_gqa_reduce:790`
   CUDA 后端 attention 与 CPU 版 logits top-5 一致。
 - **P3：27B 主要类型**（IQ3_XXS / Q4_K_M / Q6_K / Q8_K_XL）。判据同 P1，另加全部权重驻留显存成功。
 - **P4：prefill GEMM（mmq）+ CUDA Graph + prof**。判据：prefill tok/s 超过 CPU 版 ≥5 倍，decode 给出基线。
+
+### §5 目标转向后的执行顺序（2026-10-31，取代上面 P2/P4 的排期）
+
+依赖顺序不能跳，每步都可独立对拍：
+
+- **P2a：engine 激活类型 `[]f32` → `Buf`，但 `allocBuf` 仍返回 host 内存**（CUDA 后端也走 CPU 分配器）。
+  **纯重构、零行为变化**：这步只是消除「engine 直接索引激活」这个障碍，把 `self.x[a..b]` 改成
+  `self.x.span(a, b-a)`、`Buf.wrap(self.x)` 改成 `self.x`。判据 `make test` 不退化
+  （18/18 steps、74/74 tests）+ CPU 输出逐字节相同。
+  **注意顺序**：不能在这一步就把 `allocBuf` 切到 device —— 那时 21 个 elementwise 槽位还指向 CPU
+  函数，它们会去解引用设备指针并立刻崩。`Buf` 化与「分配器换设备内存」必须拆成两步。
+- **P2b：逐个下沉 elementwise kernel**（`elementwise.cu`），一个函数一个 commit，各配 Zig 标量参照对拍。
+  此时激活仍在 host，故每个 kernel 前后各一次 memcpy —— **功能正确、性能持平**，先不优化。
+- **P2c：全部槽位设备化后，才把 `allocBuf` 切到设备内存**，一次性消掉所有 H2D/D2H
+  （`backend_cuda.zig:495`/`:504`/`:720`）。判据：`QWEN35_PROF` 的 `up_MiB` 从 ~25 MiB/token 降到 0。
+- **P2d：K/V cache 与 GDN 状态常驻**（§2 末的 `Exec.attention`/`kvWrite`；`gdnStep` 的 state 同理）。
+- **P3b：`embedRow` 查表与 `argmax`/`sample` 上 device**。至此 host↔device 只传 token id，
+  用 `QWEN35_DUMP_IDS` 与 CPU 版比 token 分布（容差口径见 §2bis）。
 
 ---
 
