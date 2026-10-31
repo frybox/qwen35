@@ -574,23 +574,32 @@ pub const Engine = struct {
     /// worker count (1 = serial); set by load from `n_threads`
     n_threads: usize = 1,
 
-    // scratch
-    x: []f32, // hidden residual stream
-    x1: []f32, // hidden normed input
-    x2: []f32, // hidden output projection target
-    qkv: []f32, // GDN conv_dim / reused for q,k,v of full layers
-    z: []f32, // gate (GDN value_dim / full-attn q_dim)
-    ab: []f32, // a|b (2*nv scalars)
-    gdn_out: []f32, // GDN output / full-attn attention out
-    q: []f32, // full-attn q
-    k: []f32, // full-attn k
-    v: []f32, // full-attn v
-    attn: []f32, // full-attn scores [max_seq]
-    mlp_h: []f32, // n_ff
-    mlp_h1: []f32, // n_ff
-    logits: []f32,
-    delta: []f32, // 128 per-head scratch
-    kv_mem: []f32, // 128
+    /// Transient activations live in backend-owned buffers
+    /// (`Exec.allocBuf`): the engine names a `Buf` (base + length), never a
+    /// host slice, so a device backend can hand back device memory without the
+    /// engine changing.  This step (P2a) still gets host memory from both
+    /// backends; every `exec.*` call therefore receives a `Buf` directly, and
+    /// the few places the engine itself reads scalar elements go through
+    /// `.slice()`.
+    ///
+    /// NOTE: these regions are owned by the backend (`Exec.freeScratch`
+    /// releases them all at once).  The engine must never `alloc.free` one.
+    x: backend.Buf, // hidden residual stream
+    x1: backend.Buf, // hidden normed input
+    x2: backend.Buf, // hidden output projection target
+    qkv: backend.Buf, // GDN conv_dim / reused for q,k,v of full layers
+    z: backend.Buf, // gate (GDN value_dim / full-attn q_dim)
+    ab: backend.Buf, // a|b (2*nv scalars)
+    gdn_out: backend.Buf, // GDN output / full-attn attention out
+    q: backend.Buf, // full-attn q
+    k: backend.Buf, // full-attn k
+    v: backend.Buf, // full-attn v
+    attn: backend.Buf, // full-attn scores [max_seq]
+    mlp_h: backend.Buf, // n_ff
+    mlp_h1: backend.Buf, // n_ff
+    logits: backend.Buf,
+    delta: backend.Buf, // 128 per-head scratch
+    kv_mem: backend.Buf, // 128
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
     /// through cache).  0 => the batched path is unavailable.
@@ -601,20 +610,20 @@ pub const Engine = struct {
     /// outputs; `goutK/x2K` per-token attention/GDN output and out-projection
     /// result; `mlpK/mlpK1` the ffn intermediates; `q8kK/q8K` the per-token
     /// quantized activations for the batched matvecs.
-    xK: []f32 = &.{},
-    x1K: []f32 = &.{},
-    qkvK: []f32 = &.{},
-    gateK: []f32 = &.{},
-    abK: []f32 = &.{},
-    qK: []f32 = &.{},
-    kK: []f32 = &.{},
-    vK: []f32 = &.{},
-    goutK: []f32 = &.{},
-    x2K: []f32 = &.{},
-    mlpK: []f32 = &.{},
-    mlpK1: []f32 = &.{},
+    xK: backend.Buf = backend.Buf.empty,
+    x1K: backend.Buf = backend.Buf.empty,
+    qkvK: backend.Buf = backend.Buf.empty,
+    gateK: backend.Buf = backend.Buf.empty,
+    abK: backend.Buf = backend.Buf.empty,
+    qK: backend.Buf = backend.Buf.empty,
+    kK: backend.Buf = backend.Buf.empty,
+    vK: backend.Buf = backend.Buf.empty,
+    goutK: backend.Buf = backend.Buf.empty,
+    x2K: backend.Buf = backend.Buf.empty,
+    mlpK: backend.Buf = backend.Buf.empty,
+    mlpK1: backend.Buf = backend.Buf.empty,
     /// Top-k order-statistic workspace (quickselect); sized vocab.
-    sample_scratch: []f32 = &.{},
+    sample_scratch: backend.Buf = backend.Buf.empty,
     /// Sampling policy applied to every produced token.  Default is greedy
     /// (temperature 0), i.e. exactly the historical behaviour; the CLI sets
     /// it from -t/-k/-s.
@@ -635,14 +644,14 @@ pub const Engine = struct {
     /// true once the model's nextn layer is loaded (27B).
     has_nextn: bool = false,
     /// scratch for nextn_forward: concat (2*hidden) + h/e/z rows (hidden each).
-    nxt_concat: []f32 = &.{},
-    nxt_h: []f32 = &.{},
-    nxt_e: []f32 = &.{},
-    nxt_z: []f32 = &.{},
+    nxt_concat: backend.Buf = backend.Buf.empty,
+    nxt_h: backend.Buf = backend.Buf.empty,
+    nxt_e: backend.Buf = backend.Buf.empty,
+    nxt_z: backend.Buf = backend.Buf.empty,
     /// per-position final-normed hidden states from the last batched verify
     /// (K rows of `hidden`), plus per-position logits row for argmax.
-    verify_h: []f32 = &.{}, // [K*hidden]
-    verify_logits: []f32 = &.{}, // [K*vocab]
+    verify_h: backend.Buf = backend.Buf.empty, // [K*hidden]
+    verify_logits: backend.Buf = backend.Buf.empty, // [K*vocab]
     /// GDN rollback snapshots: `mtp_snap` holds, per GDN layer, K copies of the
     /// state (delta-rule [nv*kd*kd] + conv [conv_dim*(conv_kernel-1)]) taken
     /// after each consumed token during the batched verify.
@@ -849,22 +858,22 @@ pub const Engine = struct {
             .kv = &.{},
             .gdn = &.{},
             .n_threads = 1,
-            .x = &.{},
-            .x1 = &.{},
-            .x2 = &.{},
-            .qkv = &.{},
-            .z = &.{},
-            .ab = &.{},
-            .gdn_out = &.{},
-            .q = &.{},
-            .k = &.{},
-            .v = &.{},
-            .attn = &.{},
-            .mlp_h = &.{},
-            .mlp_h1 = &.{},
-            .logits = &.{},
-            .delta = &.{},
-            .kv_mem = &.{},
+            .x = backend.Buf.empty,
+            .x1 = backend.Buf.empty,
+            .x2 = backend.Buf.empty,
+            .qkv = backend.Buf.empty,
+            .z = backend.Buf.empty,
+            .ab = backend.Buf.empty,
+            .gdn_out = backend.Buf.empty,
+            .q = backend.Buf.empty,
+            .k = backend.Buf.empty,
+            .v = backend.Buf.empty,
+            .attn = backend.Buf.empty,
+            .mlp_h = backend.Buf.empty,
+            .mlp_h1 = backend.Buf.empty,
+            .logits = backend.Buf.empty,
+            .delta = backend.Buf.empty,
+            .kv_mem = backend.Buf.empty,
         };
         errdefer e.freeAll();
 
@@ -960,9 +969,10 @@ pub const Engine = struct {
         }
 
         // scratch
-        e.x = try alloc.alloc(f32, cfg.hidden);
-        e.x1 = try alloc.alloc(f32, cfg.hidden);
-        e.x2 = try alloc.alloc(f32, cfg.hidden);
+        // scratch: backend-owned regions (release = Exec.freeScratch at teardown)
+        e.x = try e.exec.allocBuf(cfg.hidden);
+        e.x1 = try e.exec.allocBuf(cfg.hidden);
+        e.x2 = try e.exec.allocBuf(cfg.hidden);
         const gdn_nv: usize = @as(usize, cfg.gdn_n_heads);
         const gdn_kd: usize = @as(usize, cfg.gdn_head_dim);
         const gdn_value_dim: usize = gdn_nv * gdn_kd;
@@ -1014,38 +1024,38 @@ pub const Engine = struct {
         }
         std.debug.assert(measured == max_q8_cols);
 
-        e.qkv = try alloc.alloc(f32, @max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * cfg.head_dim));
-        e.z = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
-        e.ab = try alloc.alloc(f32, 2 * gdn_nv);
-        e.gdn_out = try alloc.alloc(f32, @max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
-        e.q = try alloc.alloc(f32, @as(usize, cfg.n_heads) * cfg.head_dim);
-        e.k = try alloc.alloc(f32, @as(usize, cfg.n_kv_heads) * cfg.head_dim);
-        e.v = try alloc.alloc(f32, @as(usize, cfg.n_kv_heads) * cfg.head_dim);
-        e.attn = try alloc.alloc(f32, max_seq);
-        e.mlp_h = try alloc.alloc(f32, cfg.n_ff);
-        e.mlp_h1 = try alloc.alloc(f32, cfg.n_ff);
-        e.logits = try alloc.alloc(f32, cfg.vocab);
-        e.delta = try alloc.alloc(f32, gdn_kd);
-        e.kv_mem = try alloc.alloc(f32, gdn_kd);
-        e.sample_scratch = try alloc.alloc(f32, cfg.vocab);
+        e.qkv = try e.exec.allocBuf(@max(gdn_conv_dim, 2 * @as(usize, cfg.n_heads) * cfg.head_dim));
+        e.z = try e.exec.allocBuf(@max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
+        e.ab = try e.exec.allocBuf(2 * gdn_nv);
+        e.gdn_out = try e.exec.allocBuf(@max(gdn_value_dim, @as(usize, cfg.n_heads) * cfg.head_dim));
+        e.q = try e.exec.allocBuf(@as(usize, cfg.n_heads) * cfg.head_dim);
+        e.k = try e.exec.allocBuf(@as(usize, cfg.n_kv_heads) * cfg.head_dim);
+        e.v = try e.exec.allocBuf(@as(usize, cfg.n_kv_heads) * cfg.head_dim);
+        e.attn = try e.exec.allocBuf(max_seq);
+        e.mlp_h = try e.exec.allocBuf(cfg.n_ff);
+        e.mlp_h1 = try e.exec.allocBuf(cfg.n_ff);
+        e.logits = try e.exec.allocBuf(cfg.vocab);
+        e.delta = try e.exec.allocBuf(gdn_kd);
+        e.kv_mem = try e.exec.allocBuf(gdn_kd);
+        e.sample_scratch = try e.exec.allocBuf(cfg.vocab);
 
         // ---- K-token batched prefill scratch (K = 16) ----
         const K: usize = 16;
         const q_dimK: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
         const kv_dimK: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
         e.nbatch = if (no_batch) 0 else K;
-        e.xK = try alloc.alloc(f32, K * cfg.hidden);
-        e.x1K = try alloc.alloc(f32, K * cfg.hidden);
-        e.qkvK = try alloc.alloc(f32, K * @max(gdn_conv_dim, 2 * q_dimK));
-        e.gateK = try alloc.alloc(f32, K * @max(gdn_value_dim, q_dimK));
-        e.abK = try alloc.alloc(f32, K * 2 * gdn_nv);
-        e.qK = try alloc.alloc(f32, K * q_dimK);
-        e.kK = try alloc.alloc(f32, K * kv_dimK);
-        e.vK = try alloc.alloc(f32, K * kv_dimK);
-        e.goutK = try alloc.alloc(f32, K * @max(gdn_value_dim, q_dimK));
-        e.x2K = try alloc.alloc(f32, K * cfg.hidden);
-        e.mlpK = try alloc.alloc(f32, K * cfg.n_ff);
-        e.mlpK1 = try alloc.alloc(f32, K * cfg.n_ff);
+        e.xK = try e.exec.allocBuf(K * cfg.hidden);
+        e.x1K = try e.exec.allocBuf(K * cfg.hidden);
+        e.qkvK = try e.exec.allocBuf(K * @max(gdn_conv_dim, 2 * q_dimK));
+        e.gateK = try e.exec.allocBuf(K * @max(gdn_value_dim, q_dimK));
+        e.abK = try e.exec.allocBuf(K * 2 * gdn_nv);
+        e.qK = try e.exec.allocBuf(K * q_dimK);
+        e.kK = try e.exec.allocBuf(K * kv_dimK);
+        e.vK = try e.exec.allocBuf(K * kv_dimK);
+        e.goutK = try e.exec.allocBuf(K * @max(gdn_value_dim, q_dimK));
+        e.x2K = try e.exec.allocBuf(K * cfg.hidden);
+        e.mlpK = try e.exec.allocBuf(K * cfg.n_ff);
+        e.mlpK1 = try e.exec.allocBuf(K * cfg.n_ff);
         try e.exec.allocScratchK(max_q8_cols, K);
         prof_io = io;
         return e;
@@ -1113,9 +1123,9 @@ pub const Engine = struct {
         self.freeCachesUpTo(self.cfg.n_layers);
         if (self.kv.len > 0) a.free(self.kv);
         if (self.gdn.len > 0) a.free(self.gdn);
-        for ([_]*[]f32{ &self.x, &self.x1, &self.x2, &self.qkv, &self.z, &self.ab, &self.gdn_out, &self.q, &self.k, &self.v, &self.attn, &self.mlp_h, &self.mlp_h1, &self.logits, &self.delta, &self.kv_mem, &self.xK, &self.x1K, &self.qkvK, &self.gateK, &self.abK, &self.qK, &self.kK, &self.vK, &self.goutK, &self.x2K, &self.mlpK, &self.mlpK1 }) |p| {
-            if (p.len > 0) a.free(p.*);
-        }
+        // Transient activations are backend-owned (`Exec.allocBuf`), so
+        // `exec.freeScratch()` above already released every one of them: the
+        // engine must NOT free them individually (double free).
     }
 
     pub fn deinit(self: *Engine) void {
@@ -1163,7 +1173,7 @@ pub const Engine = struct {
         }
         const te = Io.Clock.Timestamp.now(io, .awake);
         // embedding lookup: dequantize the token row straight into x
-        self.embedTo(token, self.x[0..hidden]);
+        self.embedTo(token, self.x.span(0, hidden));
         if (prof) prof_emb += profNs(io, te);
 
         for (self.layers, 0..) |*lw, li| {
@@ -1182,22 +1192,22 @@ pub const Engine = struct {
         }
         const b = Io.Clock.Timestamp.now(io, .awake);
 
-        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(self.output_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(self.output_norm), c.rms_eps);
         // lm_head: untied `output.weight` when present, else tied token_embd.
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(Buf.wrap(self.logits), ow, Buf.wrap(self.x1)),
+                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
             }
         } else {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(Buf.wrap(self.logits), .{ .quant = qrow }, Buf.wrap(self.x1)),
-                .f32 => |m| self.exec.matvec(Buf.wrap(self.logits), .{ .f32 = m }, Buf.wrap(self.x1)),
+                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
             }
         }
         if (prof) prof_lm += profNs(io, b);
-        return self.logits;
+        return self.logits.slice();
     }
 
     pub fn profReport() void {
@@ -1209,11 +1219,11 @@ pub const Engine = struct {
     /// temperature is 0 — the historical default.
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
         const logits = self.forwardLogits(token, pos);
-        return self.exec.sample(Buf.wrap(logits), Buf.wrap(self.sample_scratch), &self.sampler);
+        return self.exec.sample(Buf.wrap(logits), self.sample_scratch, &self.sampler);
     }
 
     /// Dequantize the embedding row of `token` into `dst` (hidden wide).
-    fn embedTo(self: *Engine, token: u32, dst: []f32) void {
+    fn embedTo(self: *Engine, token: u32, dst: Buf) void {
         const hidden: usize = self.cfg.hidden;
         std.debug.assert(dst.len == hidden);
         // Expanding one row to f32 is the one place the model needs *values*
@@ -1222,8 +1232,8 @@ pub const Engine = struct {
         // the backend's business.  Q8_0's 32-element framing is handled
         // there rather than special-cased here.
         switch (self.token_embd) {
-            .f32 => |m| self.exec.copyRange(Buf.wrap(dst), Buf.wrap(m[token * hidden ..][0..hidden])),
-            .quant => |qrow| self.exec.dequantRow(Buf.wrap(dst), qrow, token),
+            .f32 => |m| self.exec.copyRange(dst, Buf.wrap(m[token * hidden ..][0..hidden])),
+            .quant => |qrow| self.exec.dequantRow(dst, qrow, token),
         }
     }
 
@@ -1256,73 +1266,73 @@ pub const Engine = struct {
         const n_ff: usize = c.n_ff;
 
         var t: usize = 0;
-        while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK[t * hidden ..][0..hidden]);
+        while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
 
         for (self.layers, 0..) |*lw, li| {
             // ---- per-token RMSNorm of the residual stream, then the batched
             // projections (weight bytes read once for the whole chunk) ----
             t = 0;
             while (t < k) : (t += 1)
-                self.exec.rmsnorm(Buf.wrap(self.x1K[t * hidden ..][0..hidden]), Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(lw.attn_norm), c.rms_eps);
+                self.exec.rmsnorm(self.x1K.span(t * hidden, hidden), self.xK.span(t * hidden, hidden), Buf.wrap(lw.attn_norm), c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
-                self.exec.matvecBatchK(Buf.wrap(self.qkvK[0 .. k * 2 * q_dim]), lw.attn_q.?, Buf.wrap(self.x1K), k);
-                self.exec.matvecBatchK(Buf.wrap(self.kK[0 .. k * kv_dim]), lw.attn_k.?, Buf.wrap(self.x1K), k);
-                self.exec.matvecBatchK(Buf.wrap(self.vK[0 .. k * kv_dim]), lw.attn_v.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
+                self.exec.matvecBatchK(self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
+                self.exec.matvecBatchK(self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
                 t = 0;
                 while (t < k) : (t += 1) self.forwardFullCore(lw, li, t, pos0 + @as(u32, @intCast(t)));
-                self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.attn_output.?, Buf.wrap(self.goutK), k);
+                self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
             } else {
-                self.exec.matvecBatchK(Buf.wrap(self.qkvK[0 .. k * conv_dim]), lw.attn_qkv.?, Buf.wrap(self.x1K), k);
-                self.exec.matvecBatchK(Buf.wrap(self.gateK[0 .. k * value_dim]), lw.attn_gate.?, Buf.wrap(self.x1K), k);
-                self.exec.matvecBatchK(Buf.wrap(self.abK[0 .. k * nv]), lw.ssm_alpha.?, Buf.wrap(self.x1K), k);
-                self.exec.matvecBatchK(Buf.wrap(self.abK[k * nv ..][0 .. k * nv]), lw.ssm_beta.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(self.qkvK.span(0, k * conv_dim), lw.attn_qkv.?, self.x1K, k);
+                self.exec.matvecBatchK(self.gateK.span(0, k * value_dim), lw.attn_gate.?, self.x1K, k);
+                self.exec.matvecBatchK(self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
+                self.exec.matvecBatchK(self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
                 t = 0;
                 while (t < k) : (t += 1) self.forwardGdnCore(lw, li, t, k);
-                self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.ssm_out.?, Buf.wrap(self.goutK), k);
+                self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
             }
 
             // ---- per-token residual add ----
             t = 0;
             while (t < k) : (t += 1)
-                self.exec.addResid(Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(self.x2K[t * hidden ..][0..hidden]));
+                self.exec.addResid(self.xK.span(t * hidden, hidden), self.x2K.span(t * hidden, hidden));
 
             // ---- MLP: norm, batched gate/up, per-token SwiGLU, batched down, residual ----
             t = 0;
             while (t < k) : (t += 1)
-                self.exec.rmsnorm(Buf.wrap(self.x1K[t * hidden ..][0..hidden]), Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(lw.post_attention_norm), c.rms_eps);
-            self.exec.matvecBatchK(Buf.wrap(self.mlpK[0 .. k * n_ff]), lw.ffn_gate, Buf.wrap(self.x1K), k);
-            self.exec.matvecBatchK(Buf.wrap(self.mlpK1[0 .. k * n_ff]), lw.ffn_up, Buf.wrap(self.x1K), k);
+                self.exec.rmsnorm(self.x1K.span(t * hidden, hidden), self.xK.span(t * hidden, hidden), Buf.wrap(lw.post_attention_norm), c.rms_eps);
+            self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
+            self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             t = 0;
             while (t < k) : (t += 1)
-                self.exec.swiglu(Buf.wrap(self.mlpK[t * n_ff ..][0..n_ff]), Buf.wrap(self.mlpK1[t * n_ff ..][0..n_ff]));
-            self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.ffn_down, Buf.wrap(self.mlpK), k);
+                self.exec.swiglu(self.mlpK.span(t * n_ff, n_ff), self.mlpK1.span(t * n_ff, n_ff));
+            self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
             t = 0;
             while (t < k) : (t += 1)
-                self.exec.addResid(Buf.wrap(self.xK[t * hidden ..][0..hidden]), Buf.wrap(self.x2K[t * hidden ..][0..hidden]));
+                self.exec.addResid(self.xK.span(t * hidden, hidden), self.x2K.span(t * hidden, hidden));
         }
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
         // path, so the first sampled logits are bit-identical) ----
-        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.xK[(k - 1) * hidden ..][0..hidden]), Buf.wrap(self.output_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.xK.span((k - 1) * hidden, hidden), Buf.wrap(self.output_norm), c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(Buf.wrap(self.logits), ow, Buf.wrap(self.x1)),
+                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(Buf.wrap(self.logits), .{ .quant = qrow }, Buf.wrap(self.x1)),
-                .f32 => |m| self.exec.matvec(Buf.wrap(self.logits), .{ .f32 = m }, Buf.wrap(self.x1)),
+                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
+                .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
             }
         }
-        return self.logits;
+        return self.logits.slice();
     }
 
     /// Greedy argmax over the last logits.  Forwards to the backend so the logits
     /// never have to be readable from the host (doc comment on `Exec.argmax`);
     /// the engine no longer carries its own copy of this loop.
     pub fn argmax(self: *Engine) u32 {
-        return self.exec.argmax(Buf.wrap(self.logits));
+        return self.exec.argmax(self.logits);
     }
 
     // ------------- GDN block (SPEC A, GDN_IMPL §2) -------------
@@ -1338,71 +1348,71 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd; // Q and K sections are nk*kd wide each
         const value_dim: usize = nv * vd; // 2048 (0.8B) / 4096 (4B)
 
-        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(lw.attn_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(lw.attn_norm), c.rms_eps);
 
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
-        const qkv = self.qkv[0..conv_dim];
-        self.exec.matvec(Buf.wrap(qkv), lw.attn_qkv.?, Buf.wrap(self.x1));
+        const qkv = self.qkv.span(0, conv_dim);
+        self.exec.matvec(qkv, lw.attn_qkv.?, self.x1);
 
         // z projection (attn_gate [hidden, value_dim])
-        const z = self.z[0..value_dim];
-        self.exec.matvec(Buf.wrap(z), lw.attn_gate.?, Buf.wrap(self.x1));
+        const z = self.z.span(0, value_dim);
+        self.exec.matvec(z, lw.attn_gate.?, self.x1);
 
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
         // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
         // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
-        const ab = self.ab[0 .. 2 * nv];
-        self.exec.matvec(Buf.wrap(ab[0..nv]), lw.ssm_alpha.?, Buf.wrap(self.x1));
-        self.exec.matvec(Buf.wrap(ab[nv..]), lw.ssm_beta.?, Buf.wrap(self.x1));
+        const ab = self.ab.span(0, 2 * nv);
+        self.exec.matvec(ab.span(0, nv), lw.ssm_alpha.?, self.x1);
+        self.exec.matvec(ab.span(nv, nv), lw.ssm_beta.?, self.x1);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all channels; beta/gamma
         // are computed after, on the RAW a/b projections (not conv'd).
         const st = &self.gdn[li];
-        self.exec.convStep(Buf.wrap(st.conv), Buf.wrap(qkv), Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
+        self.exec.convStep(Buf.wrap(st.conv), qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
 
         // beta = sigmoid(b); g = A * softplus(a + dt_bias) with A = ssm_a
         // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
-        const beta = self.ab[nv..]; // beta lives in the b half, written in place
+        const beta = self.ab.span(nv, nv); // beta lives in the b half, written in place
         var gamma: [64]f32 = undefined;
-        self.exec.gdnGamma(Buf.wrap(ab[0..nv]), Buf.wrap(beta), Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
+        self.exec.gdnGamma(ab.span(0, nv), beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
-        const gout = self.gdn_out[0..value_dim];
+        const gout = self.gdn_out.span(0, value_dim);
         for (0..nv) |h| {
             // GGUF v slots are in "tiled" order (converter _reorder_v_heads):
             // slot h <-> HF v head (h%nk)*nvp + h/nk, whose k head is h%nk.
             const kh = h % nk;
-            const q_h = qkv[kh * kd ..][0..kd];
-            const k_h = qkv[kq_dim + kh * kd ..][0..kd];
-            const v_h = qkv[2 * kq_dim + h * kd ..][0..kd];
+            const q_h = qkv.span(kh * kd, kd);
+            const k_h = qkv.span(kq_dim + kh * kd, kd);
+            const v_h = qkv.span(2 * kq_dim + h * kd, kd);
             const sh = state[h * kd * vd ..][0 .. kd * vd];
 
             // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128)
-            self.exec.l2norm(Buf.wrap(q_h));
-            self.exec.l2norm(Buf.wrap(k_h));
+            self.exec.l2norm(q_h);
+            self.exec.l2norm(k_h);
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            self.exec.scaleVec(Buf.wrap(q_h), qscale);
+            self.exec.scaleVec(q_h, qscale);
 
             // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q
             // in a second pass (see gdnFused).
-            const km = self.kv_mem[0..vd];
-            const out_h = gout[h * vd ..][0..vd];
-            self.exec.gdnStep(Buf.wrap(sh), Buf.wrap(k_h), Buf.wrap(v_h), Buf.wrap(q_h), Buf.wrap(km), Buf.wrap(self.delta[0..vd]), Buf.wrap(out_h), gamma[h], beta[h], vd);
+            const km = self.kv_mem.span(0, vd);
+            const out_h = gout.span(h * vd, vd);
+            self.exec.gdnStep(Buf.wrap(sh), k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma[h], beta.slice()[h], vd);
         }
 
         // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6)
         for (0..nv) |h| {
-            const out_h = gout[h * vd ..][0..vd];
-            const zh = z[h * vd ..][0..vd];
-            self.exec.rmsnorm(Buf.wrap(out_h), Buf.wrap(out_h), Buf.wrap(lw.ssm_norm.?), c.rms_eps);
-            self.exec.mulSilu(Buf.wrap(out_h), Buf.wrap(zh));
+            const out_h = gout.span(h * vd, vd);
+            const zh = z.span(h * vd, vd);
+            self.exec.rmsnorm(out_h, out_h, Buf.wrap(lw.ssm_norm.?), c.rms_eps);
+            self.exec.mulSilu(out_h, zh);
         }
 
         // out projection [2048 -> 1024]
-        self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.ssm_out.?, Buf.wrap(gout));
-        self.exec.addResid(Buf.wrap(self.x[0..hidden]), Buf.wrap(self.x2[0..hidden]));
+        self.exec.matvec(self.x2.span(0, hidden), lw.ssm_out.?, gout);
+        self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
     /// Causal conv step: out[i] = sum_t w[i][t] * hist[i][t], where hist =
@@ -1445,43 +1455,43 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd;
         const gqa: usize = heads / kv_heads;
 
-        const qg = self.qkvK[t * 2 * q_dim ..][0 .. 2 * q_dim];
-        const q = self.qK[t * q_dim ..][0..q_dim];
-        const gate = self.gateK[t * q_dim ..][0..q_dim];
+        const qg = self.qkvK.span(t * 2 * q_dim, 2 * q_dim);
+        const q = self.qK.span(t * q_dim, q_dim);
+        const gate = self.gateK.span(t * q_dim, q_dim);
         for (0..heads) |h| {
-            self.exec.copyRange(Buf.wrap(q[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd ..][0..hd]));
-            self.exec.copyRange(Buf.wrap(gate[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd + hd ..][0..hd]));
+            self.exec.copyRange(q.span(h * hd, hd), qg.span(h * 2 * hd, hd));
+            self.exec.copyRange(gate.span(h * hd, hd), qg.span(h * 2 * hd + hd, hd));
         }
-        const k = self.kK[t * kv_dim ..][0..kv_dim];
-        const v = self.vK[t * kv_dim ..][0..kv_dim];
+        const k = self.kK.span(t * kv_dim, kv_dim);
+        const v = self.vK.span(t * kv_dim, kv_dim);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
-            const qs = q[h * hd ..][0..hd];
-            self.exec.rmsnorm(Buf.wrap(qs), Buf.wrap(qs), Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
+            const qs = q.span(h * hd, hd);
+            self.exec.rmsnorm(qs, qs, Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
         }
         for (0..kv_heads) |h| {
-            const ks = k[h * hd ..][0..hd];
-            self.exec.rmsnorm(Buf.wrap(ks), Buf.wrap(ks), Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
+            const ks = k.span(h * hd, hd);
+            self.exec.rmsnorm(ks, ks, Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
         }
-        for (0..heads) |h| self.exec.rope64(Buf.wrap(q[h * hd ..][0..hd]), pos, c.rope_freq_base);
-        for (0..kv_heads) |h| self.exec.rope64(Buf.wrap(k[h * hd ..][0..hd]), pos, c.rope_freq_base);
+        for (0..heads) |h| self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);
+        for (0..kv_heads) |h| self.exec.rope64(k.span(h * hd, hd), pos, c.rope_freq_base);
 
         // KV cache: slot == cache.len, exactly as the serial path
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), Buf.wrap(k));
-        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), Buf.wrap(v));
+        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), k);
+        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), v);
         cache.len += 1;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        const gout = self.goutK[t * q_dim ..][0..q_dim];
+        const gout = self.goutK.span(t * q_dim, q_dim);
         // scores -> softmax -> PV -> sigmoid gate in one backend call
         // (`attnDecode`), reading the cache rows written so far.
-        self.exec.attnDecode(Buf.wrap(q[0..q_dim]), Buf.wrap(gate[0..q_dim]),
+        self.exec.attnDecode(q.span(0, q_dim), gate.span(0, q_dim),
             Buf.wrap(cache.k[0 .. (slot + 1) * kv_dim]), Buf.wrap(cache.v[0 .. (slot + 1) * kv_dim]),
-            Buf.wrap(self.attn[0 .. slot + 1]), Buf.wrap(gout[0..q_dim]),
+            self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
     }
 
@@ -1499,43 +1509,43 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd;
         const value_dim: usize = nv * vd;
 
-        const qkv = self.qkvK[t * conv_dim ..][0..conv_dim];
-        const z = self.gateK[t * value_dim ..][0..value_dim];
+        const qkv = self.qkvK.span(t * conv_dim, conv_dim);
+        const z = self.gateK.span(t * value_dim, value_dim);
         // forwardChunk wrote alpha as abK[0..k*nv] (token t at t*nv) and beta
         // as abK[k*nv..2*k*nv] (token t at k*nv + t*nv) — two half-regions,
         // matching the two linMatvecBatchK calls.  Read them back in exactly
         // that layout; beta is stored in place (same order as the serial path).
-        const ab_a = self.abK[t * nv ..][0..nv];
-        const beta = self.abK[k * nv + t * nv ..][0..nv];
+        const ab_a = self.abK.span(t * nv, nv);
+        const beta = self.abK.span(k * nv + t * nv, nv);
         const st = &self.gdn[li];
-        self.exec.convStep(Buf.wrap(st.conv), Buf.wrap(qkv), Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
+        self.exec.convStep(Buf.wrap(st.conv), qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
         var gamma: [64]f32 = undefined;
-        self.exec.gdnGamma(Buf.wrap(ab_a), Buf.wrap(beta), Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
+        self.exec.gdnGamma(ab_a, beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
 
         const state = st.state;
-        const gout = self.goutK[t * value_dim ..][0..value_dim];
+        const gout = self.goutK.span(t * value_dim, value_dim);
         for (0..nv) |h| {
             const kh = h % nk;
-            const q_h = qkv[kh * kd ..][0..kd];
-            const k_h = qkv[kq_dim + kh * kd ..][0..kd];
-            const v_h = qkv[2 * kq_dim + h * kd ..][0..kd];
+            const q_h = qkv.span(kh * kd, kd);
+            const k_h = qkv.span(kq_dim + kh * kd, kd);
+            const v_h = qkv.span(2 * kq_dim + h * kd, kd);
             const sh = state[h * kd * vd ..][0 .. kd * vd];
 
-            self.exec.l2norm(Buf.wrap(q_h));
-            self.exec.l2norm(Buf.wrap(k_h));
+            self.exec.l2norm(q_h);
+            self.exec.l2norm(k_h);
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            self.exec.scaleVec(Buf.wrap(q_h), qscale);
+            self.exec.scaleVec(q_h, qscale);
 
-            const km = self.kv_mem[0..vd];
-            const out_h = gout[h * vd ..][0..vd];
-            self.exec.gdnStep(Buf.wrap(sh), Buf.wrap(k_h), Buf.wrap(v_h), Buf.wrap(q_h), Buf.wrap(km), Buf.wrap(self.delta[0..vd]), Buf.wrap(out_h), gamma[h], beta[h], vd);
+            const km = self.kv_mem.span(0, vd);
+            const out_h = gout.span(h * vd, vd);
+            self.exec.gdnStep(Buf.wrap(sh), k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma[h], beta.slice()[h], vd);
         }
 
         for (0..nv) |h| {
-            const out_h = gout[h * vd ..][0..vd];
-            const zh = z[h * vd ..][0..vd];
-            self.exec.rmsnorm(Buf.wrap(out_h), Buf.wrap(out_h), Buf.wrap(lw.ssm_norm.?), c.rms_eps);
-            self.exec.mulSilu(Buf.wrap(out_h), Buf.wrap(zh));
+            const out_h = gout.span(h * vd, vd);
+            const zh = z.span(h * vd, vd);
+            self.exec.rmsnorm(out_h, out_h, Buf.wrap(lw.ssm_norm.?), c.rms_eps);
+            self.exec.mulSilu(out_h, zh);
         }
     }
 
@@ -1549,57 +1559,57 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd; // 512
         const gqa: usize = heads / kv_heads; // 4
 
-        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(lw.attn_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(lw.attn_norm), c.rms_eps);
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
-        const qg = self.qkv[0 .. 2 * q_dim];
-        self.exec.matvec(Buf.wrap(qg), lw.attn_q.?, Buf.wrap(self.x1));
-        const q = self.q[0..q_dim];
-        const gate = self.z[0..q_dim];
+        const qg = self.qkv.span(0, 2 * q_dim);
+        self.exec.matvec(qg, lw.attn_q.?, self.x1);
+        const q = self.q.span(0, q_dim);
+        const gate = self.z.span(0, q_dim);
         for (0..heads) |h| {
             // interleave: q(256) = qg[h*512 .. h*512+256], gate = next 256
-            self.exec.copyRange(Buf.wrap(q[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd ..][0..hd]));
-            self.exec.copyRange(Buf.wrap(gate[h * hd ..][0..hd]), Buf.wrap(qg[h * 2 * hd + hd ..][0..hd]));
+            self.exec.copyRange(q.span(h * hd, hd), qg.span(h * 2 * hd, hd));
+            self.exec.copyRange(gate.span(h * hd, hd), qg.span(h * 2 * hd + hd, hd));
         }
-        self.exec.matvec(Buf.wrap(self.k[0..kv_dim]), lw.attn_k.?, Buf.wrap(self.x1));
-        self.exec.matvec(Buf.wrap(self.v[0..kv_dim]), lw.attn_v.?, Buf.wrap(self.x1));
+        self.exec.matvec(self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
+        self.exec.matvec(self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
-            const qs = q[h * hd ..][0..hd];
-            self.exec.rmsnorm(Buf.wrap(qs), Buf.wrap(qs), Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
+            const qs = q.span(h * hd, hd);
+            self.exec.rmsnorm(qs, qs, Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
         }
         for (0..kv_heads) |h| {
-            const ks = self.k[h * hd ..][0..hd];
-            self.exec.rmsnorm(Buf.wrap(ks), Buf.wrap(ks), Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
+            const ks = self.k.span(h * hd, hd);
+            self.exec.rmsnorm(ks, ks, Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
         }
         // RoPE on first 64 dims of each q/k head
         for (0..heads) |h| {
-            self.exec.rope64(Buf.wrap(q[h * hd ..][0..hd]), pos, c.rope_freq_base);
+            self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);
         }
         for (0..kv_heads) |h| {
-            self.exec.rope64(Buf.wrap(self.k[h * hd ..][0..hd]), pos, c.rope_freq_base);
+            self.exec.rope64(self.k.span(h * hd, hd), pos, c.rope_freq_base);
         }
 
         // KV cache
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), Buf.wrap(self.k[0..kv_dim]));
-        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), Buf.wrap(self.v[0..kv_dim]));
+        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), self.k.span(0, kv_dim));
+        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), self.v.span(0, kv_dim));
         cache.len += 1;
 
         // attention: kv = h // gqa (B13), scale = hd^-0.5
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        const gout = self.gdn_out[0..q_dim];
+        const gout = self.gdn_out.span(0, q_dim);
         // scores -> softmax -> PV -> sigmoid gate in one backend call
-        self.exec.attnDecode(Buf.wrap(q[0..q_dim]), Buf.wrap(gate[0..q_dim]),
+        self.exec.attnDecode(q.span(0, q_dim), gate.span(0, q_dim),
             Buf.wrap(cache.k[0 .. (slot + 1) * kv_dim]), Buf.wrap(cache.v[0 .. (slot + 1) * kv_dim]),
-            Buf.wrap(self.attn[0 .. slot + 1]), Buf.wrap(gout[0..q_dim]),
+            self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
         // o_proj [2048 -> 1024]
-        self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.attn_output.?, Buf.wrap(gout));
-        self.exec.addResid(Buf.wrap(self.x[0..hidden]), Buf.wrap(self.x2[0..hidden]));
+        self.exec.matvec(self.x2.span(0, hidden), lw.attn_output.?, gout);
+        self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
     // ------------- MLP (SPEC C16) -------------
@@ -1607,12 +1617,12 @@ pub const Engine = struct {
     fn forwardMlp(self: *Engine, lw: *LayerWeights) void {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        self.exec.rmsnorm(Buf.wrap(self.x1), Buf.wrap(self.x), Buf.wrap(lw.post_attention_norm), c.rms_eps);
-        self.exec.matvec(Buf.wrap(self.mlp_h), lw.ffn_gate, Buf.wrap(self.x1));
-        self.exec.matvec(Buf.wrap(self.mlp_h1), lw.ffn_up, Buf.wrap(self.x1));
-        self.exec.swiglu(Buf.wrap(self.mlp_h), Buf.wrap(self.mlp_h1));
-        self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.ffn_down, Buf.wrap(self.mlp_h));
-        self.exec.addResid(Buf.wrap(self.x[0..hidden]), Buf.wrap(self.x2[0..hidden]));
+        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(lw.post_attention_norm), c.rms_eps);
+        self.exec.matvec(self.mlp_h, lw.ffn_gate, self.x1);
+        self.exec.matvec(self.mlp_h1, lw.ffn_up, self.x1);
+        self.exec.swiglu(self.mlp_h, self.mlp_h1);
+        self.exec.matvec(self.x2.span(0, hidden), lw.ffn_down, self.mlp_h);
+        self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
     // -----------------------------------------------------------------
@@ -1716,7 +1726,7 @@ pub const Engine = struct {
         var hit_context_limit = false;
         // prof_phase stays on across prefill and decode (set above); do not
         // reset here or the prefill samples are thrown away.
-        var next: u32 = self.exec.sample(Buf.wrap(last_logits), Buf.wrap(self.sample_scratch), &self.sampler);
+        var next: u32 = self.exec.sample(Buf.wrap(last_logits), self.sample_scratch, &self.sampler);
         // Two independent limits: how many tokens the caller asked for, and how
         // many slots the KV cache has left.  `pos` advances regardless.
         while (generated < n_predict) {
@@ -1862,22 +1872,22 @@ test "convStep: causal left-pad semantics" {
         .layers = &.{},
         .kv = &.{},
         .gdn = &.{},
-        .x = &.{},
-        .x1 = &.{},
-        .x2 = &.{},
-        .qkv = &.{},
-        .z = &.{},
-        .ab = &.{},
-        .gdn_out = &.{},
-        .q = &.{},
-        .k = &.{},
-        .v = &.{},
-        .attn = &.{},
-        .mlp_h = &.{},
-        .mlp_h1 = &.{},
-        .logits = &.{},
-        .delta = &.{},
-        .kv_mem = &.{},
+        .x = backend.Buf.empty,
+        .x1 = backend.Buf.empty,
+        .x2 = backend.Buf.empty,
+        .qkv = backend.Buf.empty,
+        .z = backend.Buf.empty,
+        .ab = backend.Buf.empty,
+        .gdn_out = backend.Buf.empty,
+        .q = backend.Buf.empty,
+        .k = backend.Buf.empty,
+        .v = backend.Buf.empty,
+        .attn = backend.Buf.empty,
+        .mlp_h = backend.Buf.empty,
+        .mlp_h1 = backend.Buf.empty,
+        .logits = backend.Buf.empty,
+        .delta = backend.Buf.empty,
+        .kv_mem = backend.Buf.empty,
         .prefill_ms = 0,
     };
     // taps: w = [1, 0.5, 0.25, 2]

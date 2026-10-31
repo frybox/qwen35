@@ -79,6 +79,12 @@ pub const Buf = struct {
     pub fn wrap(s: []const f32) Buf {
         return .{ .ptr = @constCast(s.ptr), .len = s.len };
     }
+
+    /// The "nothing allocated" sentinel: `len == 0`, pointer never
+    /// dereferenced.  Use it for optional/unallocated scratch fields instead
+    /// of `&.{}`, which is a host-slice value and says nothing about which
+    /// address space the region lives in.
+    pub const empty: Buf = .{ .ptr = undefined, .len = 0 };
 };
 
 /// Errors every backend can report while loading weights.

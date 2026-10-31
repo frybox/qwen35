@@ -1134,6 +1134,18 @@ pub const CudaBackend = struct {
         self.iq_tables_state = .done;
     }
 
+    /// `allocBuf` for the device backend: the trampoline stage keeps regions in
+    /// the *embedded* CPU backend (host memory + its `bufs` list, released by
+    /// `dFreeScratch`), so unlike the elementwise slots above this entry CANNOT
+    /// reuse `cpu.vtable.allocBuf` directly -- that would `@ptrCast` a
+    /// `*CudaBackend` to a `*CpuBackend` and read a garbage allocator
+    /// (measured: SIGSEGV inside `mem.Allocator.rawAlloc` on the first scratch
+    /// allocation).  Forward to `&self.cpu` instead.
+    fn dAllocBuf(ctx: *anyopaque, len: usize) anyerror!backend.Buf {
+        const self = self_(ctx);
+        return cpu_mod.CpuBackend.vtable.allocBuf(@ptrCast(&self.cpu), len);
+    }
+
     fn dFreeScratch(ctx: *anyopaque) void {
         const self = self_(ctx);
         // Regions handed out by `dAllocBuf` live in the embedded CPU backend
@@ -1337,6 +1349,8 @@ pub const vtable = backend.Exec.VTable{
     .sample = cpu_mod.CpuBackend.vtable.sample,
     // Trampoline stage: regions come from the embedded CPU backend's allocator,
     // and `dFreeScratch` releases them (`CpuBackend.vtable.freeScratch`).
-    .allocBuf = cpu_mod.CpuBackend.vtable.allocBuf,
+    // The trampoline is needed because the ctx is a `*CudaBackend`, not a
+    // `*CpuBackend`: `dAllocBuf` forwards to `&self.cpu`.
+    .allocBuf = CudaBackend.dAllocBuf,
 
 };
