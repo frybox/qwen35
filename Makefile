@@ -65,8 +65,24 @@ cuda: build.zig src/kernels/cuda/api.h
 cuda-check:
 	$(ZIG) build -Dcuda=true cuda-check $(ZIGCACHE) --summary all
 
+# `--summary all` is REQUIRED for a trustworthy signal, not cosmetic.
+#
+# Zig 0.17.0 runs test artifacts over the `--listen=-` IPC protocol, and the
+# handshake noise prints `failed command: ...test --listen=-` even when every
+# test passes -- with exit code 0.  Reproduced on a bare 2-test project with no
+# C code, so it is not this repo's bug.  Plain `zig build test` therefore prints
+# a scary line while being green, and (worse) does not surface a REAL test
+# failure in a way a scripted caller can rely on.
+#
+# `--summary all` fixes both: the last line is
+#   Build Summary: 18/18 steps succeeded; 74/74 tests passed
+# when green (exit 0), and
+#   Build Summary: 16/18 steps succeeded (1 failed); 71/74 tests passed (3 failed)
+# + `test transitive failure` when a test fails (exit 1).  Verified by
+# perturbing a sign-table lookup in quant_dequant.zig: 3 parity tests caught it.
+# The `failed command` line still prints; ignore it, read the summary.
 test:
-	$(ZIG) build test $(ZIGCACHE)
+	$(ZIG) build test $(ZIGCACHE) --summary all
 
 run0.8b: run0.8bq80 run0.8bbf16 run0.8biq4nl run0.8biq4xs run0.8bq3km run0.8bq3ks run0.8bq40 run0.8bq41 run0.8bq4km run0.8bq4ks run0.8bq5km run0.8bq5ks run0.8bq6k run0.8biq2m run0.8biq2xxs run0.8biq3xxs run0.8bq2kxl run0.8bq3kxl run0.8bq4kxl run0.8bq5kxl run0.8bq6kxl run0.8bq8kxl
 
