@@ -28,6 +28,33 @@ test {
     _ = @import("iq_table_tests.zig");
 }
 
+// C-kernel parity coverage (restored after `33e2bb8` unmounted them).
+// Each file compares the C kernels (`simd_c.zig`, extern symbols from
+// src/kernels/x86/) against the Zig scalar oracle (`simd_ref.zig`), and against
+// the engine's own `rowDot*` on real packed rows from testdata/udtest.
+// This is the only automated guard for the AGENTS.md §4 symbol-table hazard
+// (`ksigns_iq2xs` vs `keven_signs_q2xs`): no test catches a swapped table if
+// these files are unmounted.
+test {
+    _ = @import("simd_tests32.zig");
+}
+
+test {
+    _ = @import("simd_tests256.zig");
+}
+
+test {
+    _ = @import("simd_tests_iq_a.zig");
+}
+
+test {
+    _ = @import("simd_tests_iq_b.zig");
+}
+
+test {
+    _ = @import("simd_tests_iq_c.zig");
+}
+
 test {
     _ = @import("backend_cpu.zig");
     // Referenced so the trampoline is type-checked by `zig build test` even
