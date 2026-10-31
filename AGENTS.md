@@ -13,27 +13,69 @@
 
 ### 1.0 IQ 查找表只有一份数据源（2026-10 改造，必须遵守）
 
-`src/iq_tables.h`（仓库根，**由 `scripts/gen_iq_tables.py` 从
+`src/iq_tables.zig`（**由 `scripts/gen_iq_tables.py` 从
 `llama.cpp/ggml/src/ggml-common.h` 生成**，文件头有源 sha256 与逐表行号锚点）
-是 12 张 IQ 表的**唯一定义**。同一份头文件被三种宏各实例化一次：
+是 12 张 IQ 表的**唯一定义**，形如 `pub export const iq1s_grid: [2048]u64 = .{...}`。
+**仓库根不再有 `src/iq_tables.h`**（2026-10 删除：它是 translate-c 的中间产物，
+数据挪进 Zig 源后成了多余的第二份）。三种消费者都只是引用同一批符号：
 
-| 消费者 | 宏 | 形态 | 位置 |
-|--------|----|------|------|
-| Zig（宿主侧唯一定义） | 无 | `const T[n] = {...}` → translate-c 产出 `pub export const` | `src/iq_tables.zig` import 的 `iq_tables_c` 模块 |
-| x86 C kernel | 无（只声明） | `extern const T[n];` | `src/kernels/x86/iq_tables.h` |
-| CUDA device | `Q35_TABLES_CUDA` | `__device__ __constant__ T[n]` | `src/kernels/cuda/iq_tables.cu` |
+| 消费者 | 形态 | 位置 |
+|--------|------|------|
+| Zig（宿主侧唯一定义） | `pub export const T[n]` | `src/iq_tables.zig` |
+| x86 C kernel | `extern const T[n];`（只声明） | `src/kernels/x86/iq_tables.h` |
+| CUDA device | `extern __device__ const T *q35_d_<name>;`（指针）+ `#define <name> q35_d_<name>` 别名 | `src/kernels/cuda/iq_tables.cuh` |
 
-- **Zig 侧持有宿主侧的定义**（translate-c 的 `pub export const`），x86 kernel 只 `extern` 引用，
+- **Zig 侧持有宿主侧的定义**，x86 kernel 只 `extern` 引用，
   **不要**再写 `src/kernels/x86/iq_tables_data.c` 之类的定义单元——曾试过，链接器把它和
-  translate-c 的符号分开，出现同一张表两个地址，被 `src/iq_table_tests.zig` 抓到。
-- **CUDA 侧必须 `-rdc=true` 编译并做设备链接**：否则每个包含表的 `.cu` 各得一份
-  `__constant__` 副本（实测 convert+mmvq 各 52 KB）。`build.zig` 的 stage1/stage2 都带该 flag。
+  生成物的符号分开，出现同一张表两个地址，被 `src/iq_table_tests.zig` 抓到。
+- **CUDA 侧的表是 host 符号 + 启动时 H2D**（2026-10 改造，取代旧的
+  `Q35_TABLES_CUDA` 宏实例化 `__device__` 数组）。数据仍只有一份：
+  12 张表是**可执行文件里** `src/iq_tables.zig` 的那批 host 符号，
+  `.cu` 目标文件被链接进同一个 `zig-out/bin/qwen35`，因此设备侧既没有第二份数据、
+  也没有 `.so` 或任何运行期符号查找（`src/backend_cuda.zig` 头部注释是这条约定的权威表述）。
+  - `src/kernels/cuda/iq_tables.cuh` 用 X-macro 声明 12 个 `extern __device__ const T *q35_d_<表名>;`
+    —— 是**指针**，每个 device 指针指向一份 `cudaMalloc` 常驻缓冲里的一段，
+    再由 `q35_launch_init_tables()` 把表数据 H2D 拷进去。
+    同文件底部另有 12 条 `#define <表名> q35_d_<表名>` 别名，把 `iq1s_grid[idx]` 这类
+    索引表达式（`convert.cu` + `vecdotq.cuh` 约 46 处）原样还原成表名，调用点一字不改。
+  - `src/kernels/cuda/iq_tables.cu` 定义这 12 个指针 + 一份常驻设备缓冲（一次 `cudaMalloc` 装下
+    12 张表），`q35_launch_init_tables()` 在**首次 GPU 计算前**（`CudaBackend` 的 scratch 分配里）
+    先逐表 `cudaMemcpyAsync` 拷数据，再用**每表一次 `cudaMemcpyToSymbolAsync`** 把该表的设备地址
+    写进对应的 `q35_d_*` 指针符号。显式**不用** init kernel（`<<<1,1>>>` 里写 `__device__` 指针，
+    `iq_tables.cu` 头部注释记录了当年实测翻车的经过）。幂等，失败即报错不静默继续。
+  - 主机地址来自 `src/kernels/cuda/iq_tables_host.c`（纯 C，无设备命名空间）：
+    它直接 `extern const T <表名>[n];` —— 与 Zig 侧导出名完全相同、**没有前缀** ——
+    并实现 `q35_host_tables()` 返回 (地址, 字节数) 的静态记录数组，顺序即
+    `iq_tables_list.inc` 的顺序。`build.zig` 用 `zig cc` 单独把它编成 .o 再
+    `addObjectFile` 给可执行文件（不登记进 CPU kernel 静态库），所以只有 `-Dcuda=true` 的
+    exe 带它。
+  - **设备指针符号为什么叫 `q35_d_<表名>`（踩过的坑，不要改回去）**：
+    `__device__ const T *iq1s_grid;` 的定义会**同时生成一个同名 host stub**
+    （`readelf -sW` 显示 `OBJECT GLOBAL HIDDEN ... 8 iq1s_grid`）。CUDA kernel 以前在独立的
+    `libqwen35-cuda-kernels.so` 里，那里 `extern __device__` 只产生未定义引用，没有东西可冲突；
+    现在 `.cu` 目标文件与 `src/iq_tables.zig`（`pub export const iq1s_grid[2048]`）
+    在**同一个可执行文件**里，于是链接器直接报
+    `ld: multiple definition of 'iq1s_grid'`（实测）。强行加
+    `--allow-multiple-definition` 能链过但**运行期段错误**，所以改名不是打包细节。
+  - 需全局内存而非 `__constant__`：网格是逐元素索引，同一 warp 的 lane 读不同偏移，
+    常量缓存会串行化；表约 40 KB，放 L1/L2 更好。
+- **`src/kernels/cuda/iq_tables_list.inc` 是"表名 ↔ 元素类型 ↔ 长度 ↔ 顺序"的唯一来源**，
+  `iq_tables.cuh`（设备指针声明）、`iq_tables_host.c`（host 记录）都只展开它，
+  `iq_tables.cu` 的偏移与 symbol 数组也由它推。**新增/删除表必须同时改它和
+  `src/iq_tables.zig`**（漏改的表现是 `q35_host_tables()` 的 count 与 `.cu` 侧不一致，
+  或某个消费方编译不过）。
+- **`-rdc=true` + 设备链接**仍由 `build.zig` 的 stage1/stage2 带着
+  （全链：`nvcc -rdc=true -c` 编每个 `.cu` → `zig cc` 编 `iq_tables_host.c` →
+  `nvcc -rdc=true -dlink` 合并设备镜像 → 全部 `addObjectFile` 进 exe，
+  并 `linkSystemLibrary` 上 cudart/c++ 的导入库）：
+  `.cu` 之间的 `__device__` 引用（`iq_tables.cuh` 的 12 个指针在 `mmvq.cu` /
+  `convert.cu` 里被读）需要 nvlink 才能跨编译单元解析，不要摘掉。
 - **派生表**（`keven_signs_q2xs`、`ksigns64_derived`、`k32_iq4nl_tab`、`k32_nvfp4_values`）
-  不写进头文件，由 `src/iq_tables.zig` 在 comptime 从规范表算出并 `pub export`；
+  不写进生成物，由 `src/iq_tables.zig` 在 comptime 从规范表算出并 `pub export`；
   C 侧只 `extern` 声明。这样对拍测试比较的是"两种独立推导"，而不是"抄件对抄件"。
 - 改表流程：改 `ggml-common.h` 对应内容 → `python3 scripts/gen_iq_tables.py` →
   `python3 scripts/gen_iq_tables.py --check` 应通过 → `zig build test`。
-  **不要手改 `src/iq_tables.h` 的数据行**，它会被下次生成覆盖。
+  **不要手改 `src/iq_tables.zig` 的数据行**，它会被下次生成覆盖。
 - 注意：`scripts/gen_simd_tables.py` 生成的是 `src/simd/tables.zig`，而 `src/simd/` 已随
   "去 Zig SIMD" 改造被删除，该脚本**过期失效**，不要执行它。
 - Zig 侧只负责模型加载、内存布局、调度、`extern` 声明与分发（`src/iq_tables.zig`、`src/c_kernels.zig`、
@@ -79,26 +121,42 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 - 常用命令：
   - `make cpu` / `make`（CPU + CUDA）
   - `make cpufast`（`-Doptimize=ReleaseFast`，性能测试用这个，Debug 数值路径慢且不可比）
-  - `make cuda`（两步链：`zig cc` 出 host.o，再由 `nvcc` 编译 `src/kernel.cu` 并完成最终链接）
+  - `make cuda`（= `zig build -Dcuda=true`：nvcc 编 `src/kernels/cuda/*.cu` → `-dlink`
+    设备链接 → 静态链进 `zig-out/bin/qwen35`，产物仍是**一个** CLI 可执行文件）
   - `make test`
 - 新增 C 源文件必须同时登记到 `build.zig` 的 `c_kernels.root_module.addCSourceFile`
   并带上对应 `-m*-` 指令集 flag，否则不会进静态库。
 
 ## 4. 正确性与测试
 
-- **当前 `zig build test` 是绿的：17/17 steps succeeded, `test success`**（2026-10 重构后实测）。
-  在此之前旧的 simd 对拍用例（60 用例 / 54 pass / 4 fail / 2 crash）已随 `33e2bb8`
-  连同 `simd_tests*.zig`、`bench.zig` 一起**删除**。
-- **必须知道的代价**：删掉那 5 个 `simd_tests*.zig` 后，**C kernel 不再有 Zig 侧对拍覆盖**。
-  §1 提到的 IQ 符号表风险（`ksigns_iq2xs` vs `keven_signs_q2xs` 混用）现在**没有任何自动化测试能发现**，
-  只能靠端到端探针（见 §6）肉眼看输出是否通顺。
-  规则：**改动前先跑一遍 `zig build test` 与 §6 的探针记录基线，改动后不得新增失败或让探针退化**。
+- **当前 `zig build test` 是绿的：18/18 steps succeeded, 74/74 tests passed**（2026-10-31 实测）。
+  必须用 `make test`（它已带 `--summary all`）：Zig 0.17.0 用 `--listen=-` IPC 协议跑 test artifact，
+  握手噪音会打印 `failed command: ...test --listen=-` **且退出码 0、全部测试其实通过**
+  （裸的 2 测试空项目也复现，不是本仓库的 bug）。**只有 `--summary all` 的最后一行才是可信信号**：
+  绿 = `Build Summary: 18/18 steps succeeded; 74/74 tests passed`（exit 0）；
+  真失败 = `16/18 steps succeeded (1 failed); 71/74 tests passed (3 failed)` + `test transitive failure`（exit 1）。
+- **C kernel 的 Zig 侧对拍覆盖已恢复**（`33e2bb8` 删掉的 5 个 `src/simd_tests*.zig` 已取回并重新接进
+  `src/root.zig`：`simd_tests32`、`simd_tests256`、`simd_tests_iq_a/b/c`，共 15 个用例）。
+  辅助层从未被删，所以取回即可用：`src/simd_c.zig`（C kernel 的 extern 声明，测试专用 tier 模块）
+  + `src/simd_ref.zig`（Zig 标量 oracle）。每个 kernel 三路校验：C kernel vs Zig 标量参照、
+  vs 引擎自己的 `rowDot*`（用 `testdata/udtest` 的真实打包行）、row kernel == 各 block kernel 之和。
+  **已实证敏感性**：把 `quant_dequant.zig` IQ3_XXS rowDot 的 `ksigns_iq2xs` 位反转后，
+  3 个用例立刻抓到（`quant_dequant` rowDot、`kerniq synthetic`、`kerniq testdata`，worst=2.0），exit 1。
+  §1 的 IQ 符号表风险（`ksigns_iq2xs` vs `keven_signs_q2xs` 混用）**重新被自动化覆盖**。
+  - 已知覆盖缺口（要补时先看清）：`simd_ref.zig` 的 `deq*` 系列（`deqIQ2XXS`/`deqIQ3XXS`/`deqIQ4XS` …）
+    **没有被任何用例调用**——对拍只走 `simd_ref.dot32` 与 `simd_ref.dotiq`。往这些 `deq*` 里注入扰动
+    测试不会报警，别把它们当作已有保护。
+  - 数量口径（实测）：恢复前 `zig build test` = 54；恢复后 74 = 54 + 15 个对拍用例
+    + 5 个 `test { _ = @import("simd_testsX.zig"); }` 包装块（每个包装块自身算一个 test）。
+    15 个用例名逐个核对确认真在跑（`grep simd_tests /tmp/…` = 15 行），不是空跑。
+- 规则：**改动前先跑一遍 `make test` 与 §6 的探针记录基线，改动后不得新增失败或让探针退化**。
   不要用 `skip` / 放宽阈值 / 删用例的方式"变绿"。
 - 现有测试入口：`src/root.zig` 的 import 列表 + `refAllDecls`；`make test` 跑两个 test artifact
   （`mod_tests` 与 `exe_tests`，见 `build.zig`），`mod_tests` 会 `linkLibrary(c_kernels)`。
+  注意 `-Doptimize=ReleaseFast` 下 `exe_tests` 那条链不参与，`make test` 用默认 optimize。
 - `src/backend_cpu.zig` 内有少量内联测试（如 Q8_0 matvec 用例），新增后端能力时在此补对拍。
-  **新增 kernel 仍应补一个"Zig 标量参照 vs C SIMD 结果"的用例**——对被删掉的这批，
-  想要恢复保护就得重建（可用 `git show 33e2bb8^:src/simd_tests32.zig` 取回原文）。
+  **新增 kernel 仍应同时补一个"Zig 标量参照 vs C 结果"的用例**（照 `src/simd_tests*.zig` 的形状办），
+  不接受"只有 SIMD 路径、没有标量参照"的改动。
 - 端到端验收：`tests/run_acceptance.sh [file.gguf]`（注意其默认 ZIG 仍指向 0.16.0，
   与本项目 0.17.0 不一致，跑之前显式 `ZIG=<0.17.0 路径>`）。
 - 量化格式的**权威源码**在本机可直接查：
@@ -126,6 +184,8 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_DUMP_OUT` / `QWEN35_DUMP_IDS` | 导出中间输出 / token id |
 | `QWEN35_NO_BATCH` | 关闭 K-token 批量 prefill chunk |
 | `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析（`PROF-M` 行由 `backend_cpu` 输出） |
+| `QWEN35_MVCHECK` | **仅 CUDA 后端、仅调试用，不是计算路径**。每个量化 matvec 之后，用内嵌的 CPU 后端对同一行再算一遍并逐行比对，打印 `MVCHECK[<type>] rows= cols= mismatched= batchk= k=`。用于确认"GPU kernel 结果与 CPU 参照一致"（CUDA 逐格式验收的自动化手段）。开销极大，只在 A/B 时开 |
+| `QWEN35_MVCHECK_ONLY` | 限定只对某一种量化类型做 MVCHECK（值 = `q.ttype` 的 tagName，如 `iq1_s`）。batch-K 参照需要 CPU scratch 按 K 塑形，不是每种类型在每个 launch 顺序下都能活，所以追单一 kernel 时用这个定向跑 |
 
 调试方法论：
 1. **先定位是"哪一层"错**，不要猜。重构后只剩 `QWEN35_SIMD_TIER` 与 `QWEN35_FORCE_SCALAR`
@@ -158,6 +218,9 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 - 量化格式覆盖很广，`make run0.8b` 会跑全部 22 个 GGUF 变体；回归时按需单独跑
   （如 `make run0.8biq3xxs`、`make run27biq3xxs`、`make run0.8biq2xxs-llamacpp`）。
 - 模型位于 `/mnt/Qwen3.5-0.8B-GGUF/` 等目录；`-ud` 变体用 `make run0.8bud`。
+  **文件名是大小写混合的**：`/mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf`（大写 `Qwen3.5-0.8B-` 前缀
+  + 大写格式名）。写成 `qwen35-0.8b-q8_0.gguf` 会得到 `OpenFailed`——这个错看起来像"模型坏了"，
+  其实是路径不存在。
 - **llama-cli 必须加 `--single-turn`**（脚本/非交互调用时）。不带它 llama-cli 进入交互 REPL
   模式，非交互上下文里读不到输入就静默退出：stdout 0 行、退出码 0、无任何日志——
   看起来像"没跑"。性能对比命令模板：
