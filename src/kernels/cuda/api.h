@@ -105,6 +105,20 @@ int q35_launch_mul_mat_vec_q8_0(const void *d_w, const void *d_xq, float *d_out,
 int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x, float *d_out,
                                int rows, int cols, int tokens, void *stream);
 
+// --- pure elementwise activations (src/kernels/cuda/elementwise.cu) --------
+//
+// `n` is always an ELEMENT count of f32 (never bytes), and every buffer is a
+// contiguous span.  `n <= 0` returns cudaSuccess without launching.
+//
+// All four are BIT-EXACT with their CPU counterparts in src/elementwise.zig
+// (one IEEE single multiply / add / copy / zero per element, no fusion, no
+// reassociation), which is why the engine's token stream must not change when
+// these are served by the GPU.  See the file's own comment.
+int q35_launch_scale_vec(float *d_x, float s, int n, void *stream);
+int q35_launch_add_resid(float *d_dst, const float *d_src, int n, void *stream);
+int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream);
+int q35_launch_zero_buf(float *d_buf, int n, void *stream);
+
 // --- IQ codebook upload (call ONCE, before the first IQ kernel) -------------
 //
 // The twelve IQ lookup tables are DEFINED ONCE, in src/iq_tables.zig, and are

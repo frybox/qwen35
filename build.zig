@@ -99,6 +99,9 @@ const cuda_sources = [_][]const u8{
     "iq_tables.cu",
     // mat-vec launchers (q35_launch_mul_mat_vec_q8_0, q35_launch_mul_mat_vec_f32)
     "mmvq.cu",
+    // pure elementwise activation launchers (q35_launch_scale_vec,
+    // _add_resid, _copy_range, _zero_buf) -- P2b, first batch
+    "elementwise.cu",
 };
 
 /// Every regular file under src/kernels/cuda/.  These become explicit inputs of
