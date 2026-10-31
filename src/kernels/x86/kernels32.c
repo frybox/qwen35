@@ -937,7 +937,7 @@ float mxfp4_q8_0(int n, const void* vx, const void* vy) {
 /* Note: QK_NVFP4 = 64, so each block has 64 elements                 */
 /* ------------------------------------------------------------------ */
 
-/* k32_nvfp4_values comes from iq_tables.h (defined in src/iq_tables.zig as the
+/* k32_nvfp4_values comes from iq_tables.zig, declared extern in iq_tables.h (the
  * f32 view of kvalues_fp4).  The old local copy was halved, which is why nvfp4
  * came out exactly 2x low; the upstream table is the integer E2M1 code domain
  * with the 0.5 folded into the ue4m3 group scale. */

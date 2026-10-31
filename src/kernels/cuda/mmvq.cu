@@ -9,10 +9,11 @@
 //   ggml/src/ggml-cuda/mmvq.cu          mul_mat_vec_q (grid/shape idea)
 //   ggml/src/ggml-cuda/vecdotq.cuh      per-type vec_dot_* (numerics live in
 //                                       this repo's vecdotq.cuh instead)
-//   src/kernel.cu:239                   k_matvec_q8 (dp4a + prefetch idea)
+//   src/kernel.cu:239 (deleted)           k_matvec_q8 (dp4a + prefetch idea)
 //
-// DELIBERATE DIFFERENCE from src/kernel.cu: that kernel parallelises a row
-// across a warp and reduces with shuffles.  Here one thread owns one whole row
+// DELIBERATE DIFFERENCE from the retired src/kernel.cu (deleted): that kernel
+// parallelises a row across a warp and reduces with shuffles.  Here one thread
+// owns one whole row
 // and accumulates strictly left to right (block by block), which is exactly
 // the CPU kernel's float addition tree.  A warp reduction reorders that tree,
 // was measured to be ~1 ulp off, and compounds over 150+ matvecs per token into

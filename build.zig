@@ -71,27 +71,31 @@ fn findNvcc(b: *std.Build) ?[]const u8 {
 
 /// The device code target.  Fixed rather than `-arch=native`: the build has to
 /// be reproducible, and docs/cuda-backend-brief.md §4 pins sm_89 (the 4090D on
-/// this box).  Both the per-.cu compile and the -shared link use it, so the two
-/// stages can never disagree about what SASS/PTX the .so contains.
+/// this box).  Both the per-.cu compile (stage 1) and the device link (stage 2,
+/// `nvcc -dlink`) use it, so the two stages can never disagree about what
+/// SASS/PTX the executable ends up carrying.
 const cuda_arch = "-arch=sm_89";
 
-/// The .cu files that make up libqwen35-cuda-kernels.so.
+/// The .cu files that make up the CUDA backend.
 ///
 /// Why an explicit list instead of globbing the directory: `b.path()` needs a
 /// static path, so a directory scan cannot feed `addFileArg` without the build
 /// script reaching into the filesystem behind Zig's back.  The consequence is
 /// that **a NEW .cu file must be registered here** -- otherwise it silently
-/// does not get compiled into the .so and the Zig side's dlopen/lookup of its
-/// launcher fails at run time with "missing kernel", not at build time.
+/// does not get compiled, the object never reaches the executable, and the Zig
+/// side's lookup of its launcher fails at run time with "missing kernel"
+/// instead of at build time.
 /// `listCudaInputs` below enumerates every file in the directory, and the
-/// `cuda-check` step (`zig build cuda-check -Dcuda=true`) compares the two so
-/// the omission fails loudly at build time instead of silently at run time.
+/// registration check inside `if (cuda_enabled)` compares the two so the
+/// omission fails loudly at build time instead of silently at run time.
 const cuda_sources = [_][]const u8{
     // block quantize / dequantize launchers (q35_launch_quantize_q8_0,
     // q35_launch_dequantize_q8_0)
     "convert.cu",
-    // IQ codebook definitions (__device__ __constant__), instantiated once.
-    // Must be here: the other .cu files only declare them extern.
+    // Placeholder for the device-side IQ codebooks.  The data used to be defined
+    // here (via the macro-instantiated host header); it now lives only in
+    // src/iq_tables.zig, and the device side has not been ported yet.  Kept in
+    // the list so the build graph is unchanged; see the file's header comment.
     "iq_tables.cu",
     // mat-vec launchers (q35_launch_mul_mat_vec_q8_0, q35_launch_mul_mat_vec_f32)
     "mmvq.cu",
@@ -144,6 +148,35 @@ pub fn build(b: *std.Build) void {
     // target and optimize options) will be listed when running `zig build --help`
     // in this directory.
 
+    // ---------------------------------------------------------------------------
+    // `build_options`: the one build-time bit the Zig code is allowed to read
+    // ---------------------------------------------------------------------------
+    // The CUDA backend needs exactly one compile-time fact -- "were the .cu
+    // objects put on the link line?" -- and it must come from the build, not
+    // from probing the symbol table.  The previous mechanism
+    // (`@hasDecl(Kernels, "q35_launch_mul_mat_vec")` over a struct of
+    // `extern fn`) was wrong: `@hasDecl` asks "does this type have such a
+    // member?", and it answers `false` for these even when the C definition is
+    // linked into the very same executable -- so every CUDA build silently took
+    // the CPU-only stub branch, printing "this executable was built without CUDA
+    // kernels" while `nm` showed all nine `T q35_launch_*` linked in.
+    //
+    // ONE variable, ONE source of truth: `cuda_enabled` is read here and used
+    // both for this option and for the `if (cuda_enabled)` block below that
+    // actually compiles and links the nvcc objects, so "the bit is true" and
+    // "the objects are on the link line" cannot drift apart.
+    //
+    // Attached to `mod` (below) rather than to each executable's root module:
+    // `backend_cuda.zig` lives inside `mod`, and the import table of the module
+    // a file belongs to is what `@import("build_options")` resolves against.
+    // `mod` is shared by the CLI, `qwen35-tok` and BOTH test artifacts, so one
+    // `addOptions` covers every compilation of that file -- a target that pulls
+    // in `mod` without the option would otherwise fail with "no module named
+    // 'build_options'" before compiling a single line.
+    const cuda_enabled = b.option(bool, "cuda", "Build the CUDA backend kernels (requires nvcc on PATH)") orelse false;
+    const build_options = b.addOptions();
+    build_options.addOption(bool, "cuda_linked", cuda_enabled);
+
     // This creates a module, which represents a collection of source files alongside
     // some compilation options, such as optimization mode and linked system libraries.
     // Zig modules are the preferred way of making Zig code available to consumers.
@@ -165,29 +198,29 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
 
+    // `backend_cuda.zig` lives inside `mod`, so its `@import("build_options")`
+    // resolves against `mod`'s import table.  Attaching it here (and not on
+    // each consumer) is what covers every compilation of that file at once: the
+    // CLI, `qwen35-tok` and both test artifacts all pull `mod` in, and none of
+    // them can fail with "no module named 'build_options'".  Doing it twice --
+    // here and again on `exe.root_module` -- would be pointless: `exe` already
+    // imports `mod`, so it sees the same object; a second `addOptions` on the
+    // exe is a re-export of an identical value, not a distinct configuration.
+    mod.addOptions("build_options", build_options);
+
     // ---------------------------------------------------------------------------
-    // The IQ lookup tables: ONE C source file, translated for Zig
+    // The IQ lookup tables: ONE Zig source file, already the definition
     // ---------------------------------------------------------------------------
-    // src/iq_tables.h is the only place the twelve IQ codebooks are written
-    // down.  Three consumers instantiate it three ways:
+    // src/iq_tables.zig (generated by scripts/gen_iq_tables.py) is the only
+    // place the twelve IQ codebooks are written down, and it declares them
+    // `pub export const`, so the arrays ARE the global symbols the x86 kernels
+    // link against (src/kernels/x86/iq_tables.h declares them `extern const` --
+    // declarations only).  There is no translate-c step any more: the data used
+    // to live in a C header with three macro-selected instantiations, and Zig's
+    // module was the translate-c output of it.
     //
-    //   * CUDA kernels  -- src/kernels/cuda/iq_tables.cuh defines
-    //                      Q35_TABLES_CUDA   -> `__device__ __constant__`
-    //   * Zig           -- translated here      -> `pub export const`; this IS
-    //                      the host-side definition, and src/kernels/x86/
-    //                      iq_tables.h declares the same objects extern for the
-    //                      C kernels (so the x86 side compiles no copy)
-    //
-    // Zig 0.17 has no `@cImport` builtin; C headers go through a translate-c
-    // step that produces a normal Zig module (see src/iq_tables.zig).
-    const tables_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/iq_tables.h"),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    tables_c.addIncludePath(b.path("src"));
-    mod.addImport("iq_tables_c", tables_c.createModule());
+    // CUDA device code cannot reference host objects, so the device-side
+    // codebooks are not served by this file; see src/kernels/cuda/.
 
     // ---------------------------------------------------------------------------
     // C kernels for SIMD-optimized IQ quantization (ported from llama.cpp)
@@ -292,6 +325,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // `build_options` is attached to `mod` only (see where `mod` is built);
+    // `exe` imports `mod`, so re-attaching it here would duplicate the same
+    // value on the exe's own import table.
+
     // Link all C kernel units (each built for its own ISA).
     linkKernels(exe, &kernel_libs);
 
@@ -309,7 +346,10 @@ pub fn build(b: *std.Build) void {
     // cache does NOT track includes for us -- so every file in
     // src/kernels/cuda/ is declared as an input explicitly
     // (`addDirectoryArg`).  Without that, editing a .cuh would be a no-op.
-    const cuda_enabled = b.option(bool, "cuda", "Build the CUDA backend kernels (requires nvcc on PATH)") orelse false;
+    //
+    // `cuda_enabled` is read once, near the `build_options` step above: the same
+    // value both injects `cuda_linked` into the Zig code and gates the nvcc
+    // objects on the link line, so the two can never disagree.
     if (cuda_enabled) {
         const nvcc = findNvcc(b) orelse {
             std.debug.print("error: -Dcuda=true but nvcc was not found on PATH\n", .{});
@@ -339,7 +379,7 @@ pub fn build(b: *std.Build) void {
             if (!listed) {
                 unregistered += 1;
                 std.debug.print("error: {s} is not registered in `cuda_sources` (build.zig); " ++
-                    "it would not be compiled into libqwen35-cuda-kernels.so\n", .{p});
+                    "it would not be compiled into the CUDA objects linked into the executable\n", .{p});
             }
         }
         if (unregistered != 0) @panic("unregistered .cu file(s); add them to `cuda_sources` in build.zig");
@@ -347,34 +387,32 @@ pub fn build(b: *std.Build) void {
         // Standalone compile check: `zig build cuda-check -Dcuda=true` nvcc's
         // every registered .cu with `-c` into a throwaway object (nvcc has no
         // `-fsyntax-only`) and starts no link, so a failure here is always a
-        // source problem, never the .so link.  Not part of the default step.
+        // source problem, never the device/executable link.  Not part of the
+        // default step.
         const cuda_check_step = b.step("cuda-check", "compile each src/kernels/cuda/*.cu with nvcc -c only (needs -Dcuda=true)");
 
-        // Two-stage, because the kernels must NOT be linked into the
-        // executable: the nvcc runtime support the host stubs pull in
-        // (__cudaLaunchKernel, __cudaPushCallConfiguration, ...) lives in
-        // libcudart, and a link-time reference would give the CLI a DT_NEEDED
-        // on cudart on *every* machine -- breaking `--backend cpu` on hosts
-        // without CUDA.  Instead the objects are packed into a shared library
-        // that src/cudart.zig dlopen()s at run time, after it has opened
-        // libcudart itself with RTLD_GLOBAL so those symbols resolve.
+        // Two stages, then the objects go straight into the executable.
+        //
+        // The kernels are LINKED IN rather than packed into a .so: a shared
+        // object would be a second artifact (and a run-time dlopen target whose
+        // resolution depends on the loader's search order).  Static objects keep
+        // one binary, one artifact list.
         //
         // Stage 1: one object per .cu, with -rdc=true (relocatable device code).
         //
-        // -rdc is what makes the IQ codebooks exist ONCE.  Without it nvcc
-        // closes each .cu into its own device module, so every .cu that
-        // includes iq_tables.cuh got its own private copy of the twelve
-        // __constant__ tables -- ~52 KB of duplicated constant bank per
-        // translation unit, and no way for the linker to merge them.  With
-        // -rdc the definition in iq_tables.cu stays a single strong symbol and
-        // the other units carry only relocations against it; nvlink (stage 2,
-        // below) resolves them.  Verified by inspecting the objects: only
-        // iq_tables.o defines the grids, convert.o and mmvq.o no longer do.
+        // -rdc is what lets nvlink (stage 2) fold every .cu's device code into
+        // ONE device image.  Without it nvcc closes each .cu into its own device
+        // module: any definition shared across translation units (the IQ
+        // codebook pointers of iq_tables.cu) gets a private copy per unit, and a
+        // cross-unit device reference does not link at all.
+        //
+        // -Xcompiler -fPIC: the objects are handed to Zig's linker through
+        // `addObjectFile`, i.e. they end up in an ordinary (PIE) executable, so
+        // the host half must be position independent.
         var objs: []std.Build.LazyPath = &.{};
         for (cuda_sources) |src| {
             // -I points at src/kernels/cuda so the sibling `common.cuh`,
             // `vecdotq.cuh`, `iq_tables.cuh` and `api.h` includes resolve.
-            // -Xcompiler -fPIC: the objects end up in a .so, so they must be PIC.
             const step = b.addSystemCommand(&.{ nvcc, cuda_arch, "-O3", "--std=c++17", "-rdc=true", "-c", "-Xcompiler", "-fPIC" });
             step.has_side_effects = false;
             step.addArg("-I");
@@ -406,26 +444,91 @@ pub fn build(b: *std.Build) void {
             cuda_check_step.dependOn(&check.step);
         }
 
-        // Stage 2: link the objects into libqwen35-cuda-kernels.so, with
-        // -rdc=true so nvcc runs nvlink over the relocatable device code.
-        // Stage 1 objects hold -rdc device objects; without -rdc here the device
-        // link never happens and the extern __constant__ declarations in
-        // convert.cu / mmvq.cu would stay unresolved at run time.
-        const link = b.addSystemCommand(&.{ nvcc, cuda_arch, "-rdc=true", "-shared", "-o" });
-        const so = link.addOutputFileArg("libqwen35-cuda-kernels.so");
-        // Every stage-1 object, in `cuda_sources` order.
-        for (objs) |o| link.addFileArg(o);
-        // The .so gets its DT_NEEDED from nvcc's own -lcudart default.  That is
-        // fine: it is the *kernels* library that depends on cudart, and it is
-        // only ever opened when `--backend cuda` is selected and a usable
-        // device was found.  The CLI itself stays independent.
-        // Install next to the CLI's other libraries: <prefix>/lib/.  (A plain
-        // addInstallFile with "../lib/..." resolves *above* the prefix.)
-        const install_so = b.addInstallFileWithDir(so, .lib, "libqwen35-cuda-kernels.so");
-        b.getInstallStep().dependOn(&install_so.step);
+        // Stage 2: the device link.  `nvcc -rdc=true -dlink` runs nvlink over the
+        // stage-1 objects and emits a host-side object whose only job is to carry
+        // the merged device image (plus the registration stub that makes cudart
+        // load it).  It has no kernels of its own; it is what turns N per-unit
+        // device modules into one, and it must name the same `-arch` as stage 1
+        // or nvlink has nothing to merge.
+        //
+        // -Xcompiler -fPIC for the same reason as stage 1: this object is also
+        // fed to Zig's linker.
+        const dlink = b.addSystemCommand(&.{ nvcc, cuda_arch, "-rdc=true", "-dlink", "-Xcompiler", "-fPIC", "-o" });
+        const dlink_obj = dlink.addOutputFileArg("cuda-kernels.dlink.o");
+        // Every stage-1 object, in `cuda_sources` order, and only those: nvcc
+        // takes the object list, not the header dependencies (the .cu inputs
+        // already chain through stage 1).
+        for (objs) |o| dlink.addFileArg(o);
 
-        // The device side resolves its runtime through dlopen (src/cudart.zig),
-        // so nothing here links -lcudart.
+        // The host half of the IQ codebook upload: `q35_host_tables()` in
+        // src/kernels/cuda/iq_tables_host.c.  It is PLAIN C, not CUDA -- it only
+        // declares the twelve arrays that src/iq_tables.zig defines and records
+        // their addresses and `sizeof`s -- so it is compiled with Zig's own C
+        // compiler rather than nvcc, and it lands on the same link line as the
+        // .cu objects because that is where its caller (iq_tables.cu) lives.
+        //
+        // Why it must be in the CUDA block and not compiled unconditionally: the
+        // records are relocations against the IQ tables (`U iq1s_grid`, ...).
+        // Linking it into a CPU-only build would change the CPU artifact list for
+        // a file only the CUDA path needs.
+        //
+        // Why it is not an `extern` in a .cu instead: nvcc folds a host `extern
+        // const T name[n]` declared in the same translation unit as the
+        // `__device__ ... *name` pointer into one HIDDEN host object (bind to the
+        // pointer's bytes, not the table) -- see the file's own comment.  A
+        // separate C translation unit is what keeps the two names apart.
+        //
+        // Registered here, NOT with `addCSourceFile`: that would compile it into
+        // the CPU kernel archive, which every target (including the test
+        // binaries and the tok executable) links.  This way exactly one object
+        // exists and only the -Dcuda=true executable gets it.
+        {
+            const step = b.addSystemCommand(&.{ b.graph.zig_exe, "cc", "-std=c11", "-O2", "-c", "-I" });
+            step.has_side_effects = false;
+            step.addDirectoryArg(b.path(cuda_dir));
+            step.addFileArg(b.path(b.fmt("{s}/iq_tables_host.c", .{cuda_dir})));
+            step.addArg("-o");
+            const host_obj = step.addOutputFileArg("iq_tables_host.o");
+            // Same dependency discipline as stage 1: the .inc it expands and the
+            // .cuh it may include are not on the command line.
+            for (cuda_files) |p| step.addFileInput(b.path(p));
+            // `q35_host_tables` need not be device-linked, so it goes to the
+            // executable directly (nvlink would ignore a host-only object).
+            exe.root_module.addObjectFile(host_obj);
+        }
+
+        // Hand the objects to the executable.  `addObjectFile` appends to the
+        // module's link objects, so each object is linked exactly once, in the
+        // order the graph lists them.
+        for (objs) |o| exe.root_module.addObjectFile(o);
+        exe.root_module.addObjectFile(dlink_obj);
+
+        // The CUDA runtime, for the host stubs (`__cudaRegisterFatBinary`,
+        // `__cudaPushCallConfiguration`, ...) that the stage-2 object calls.
+        // The library directory is derived from nvcc's own location
+        // (`<toolkit>/bin/nvcc` -> `<toolkit>/lib64`, with `<toolkit>/lib` as the
+        // fallback) instead of hardcoding /usr/local/cuda, so a toolkit installed
+        // anywhere on PATH works.
+        //
+        // libc++ as well: nvcc compiles the host half of a .cu as C++, so the
+        // objects reference the C++ runtime (`__cxa_guard_acquire`,
+        // `__gxx_personality_v0`, `_Unwind_Resume`) even though the kernels are
+        // all `extern "C"`.  Nothing else in the graph pulls it in -- the Zig
+        // half is C-ABI only -- so the link fails with "undefined symbol:
+        // __cxa_guard_abort" without it.
+        exe.root_module.linkSystemLibrary("cudart", .{});
+        exe.root_module.linkSystemLibrary("c++", .{});
+        const nvcc_bin_dir = std.fs.path.dirname(nvcc) orelse ".";
+        const toolkit_dir = std.fs.path.dirname(nvcc_bin_dir) orelse nvcc_bin_dir;
+        const lib64_dir = b.pathJoin(&.{ toolkit_dir, "lib64" });
+        if (std.Io.Dir.cwd().access(b.graph.io, lib64_dir, .{})) |_| {
+            exe.root_module.addLibraryPath(.{ .cwd_relative = lib64_dir });
+        } else |_| {
+            exe.root_module.addLibraryPath(.{ .cwd_relative = b.pathJoin(&.{ toolkit_dir, "lib" }) });
+        }
+        // A DT_NEEDED on libcudart.so is deliberate: the executable is the only
+        // artifact now, so "contains CUDA kernels" and "needs cudart" are the
+        // same build (-Dcuda=true).  The CPU-only build never enters this block.
     }
 
     // This declares intent for the executable to be installed into the
@@ -493,9 +596,28 @@ pub fn build(b: *std.Build) void {
     // Creates an executable that will run `test` blocks from the executable's
     // root module. Note that test executables only test one module at a time,
     // hence why we have to create two separate ones.
+    //
+    // A fresh module rather than `exe.root_module`: the executable's module also
+    // carries the ISA-specific C kernel units (`linkKernels`), whose symbols are
+    // exactly what `mod` -- imported here as `qwen35` -- already provides, so
+    // reusing that module would link every kernel twice.  A test binary gets its
+    // kernels from `mod` (through the import) exactly as `mod_tests` does.
+    //
+    // (Historically this comment also named `src/kernels/cuda/iq_tables_host.c`:
+    // that file used to be compiled into the executable.  It is not any more --
+    // see the CUDA block above -- so the `h_*` duplicate-symbol reason no longer
+    // applies.)
     const exe_tests = b.addTest(.{
-        .root_module = exe.root_module,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "qwen35", .module = mod },
+            },
+        }),
     });
+    linkKernels(exe_tests, &kernel_libs);
 
     // A run step that will run the second test executable.
     const run_exe_tests = b.addRunArtifact(exe_tests);

@@ -1,10 +1,19 @@
 //! GPU backend: every numeric kernel in the forward pass runs on the device.
 //!
 //! Why this file exists at all (rather than a CUDA build of `backend_cpu`): the
-//! same `zig-out/bin/qwen35` binary has to run on hosts with no CUDA install, so
-//! libcudart and the kernel `.so` are dlopen'd at run time, not linked (see
-//! `cudart.zig`).  `--backend cpu` is then still a single binary, not a second
-//! build product.
+//! same `zig-out/bin/qwen35` binary has to run on hosts with no CUDA install.
+//! Two different mechanisms keep that true, and they must not be confused:
+//!
+//!   * **The kernels are linked in.**  `src/kernels/cuda/*.cu` are compiled by
+//!     `zig build -Dcuda=true` into objects that are linked into the executable;
+//!     every entry point below is a top-level `extern fn q35_launch_*` that the
+//!     linker resolves at build time.  There is no kernel `.so`, no `dlopen`, and
+//!     no symbol lookup here.  A plain CPU build simply never references them
+//!     (nothing calls this backend, see `main.zig`'s `--backend` parsing), and
+//!     the objects are not on the link line either.
+//!   * **libcudart is dlopen'd** (`cudart.zig`), so a CPU-only host never needs a
+//!     DT_NEEDED on it.  That is the only run-time library dependency left, and
+//!     `--backend cpu` still works on a host without any CUDA install.
 //!
 //! Division of labour with `backend_cpu` (deliberate, see AGENTS.md §1.1):
 //!
@@ -38,12 +47,150 @@ const cpu_mod = @import("backend_cpu.zig");
 const gguf = @import("gguf.zig");
 const cudart = @import("cudart.zig");
 
+/// Build-time facts injected by `build.zig` (`addOptions("build_options")`).
+/// `cuda_linked` is the *same* `-Dcuda` value that gates whether
+/// `src/kernels/cuda/*.cu` are put on the executable's link line.
+const build_options = @import("build_options");
+
 const mem = std.mem;
 const Io = std.Io;
 
-/// `zig-out/lib/libqwen35-cuda-kernels.so` unless `$QWEN35_CUDA_KERNELS` says
-/// otherwise.
-const default_kernel_so = "libqwen35-cuda-kernels.so";
+// ==== link-time kernel bindings =============================================
+//
+// One `extern` per entry point in src/kernels/cuda/api.h, with the header's name
+// and signature.  `zig build -Dcuda=true` puts the `.cu` objects on the link
+// line, so a missing or mismatched launcher is a **build** error instead of a
+// run-time `MissingSymbol` -- which is the whole point of linking them in rather
+// than dlopen'ing a `.so`.  Nothing can be rebound at run time, so these
+// declarations must track api.h by hand; the comments below restate the header's
+// contract so a change in one is visible in the other.
+//
+// ABI mapping: `int` -> `c_int`, `const void *` -> `?*const anyopaque`,
+// `void *` -> `?*anyopaque`, `float *` -> `?[*]f32`, `const float *` ->
+// `?[*]const f32`, `unsigned long long` -> `c_ulonglong`.
+//
+// Call sites go through the `Kernels` namespace below (`const kern = Launch;`)
+// purely so the launch sites keep reading like `kern.mul_mat_vec(...)`; it holds
+// no state and compiles to a direct call.
+const Kernels = struct {
+    /// `nblocks` counts 32-ELEMENT blocks (api.h Q35_API_QK8_0).
+    extern fn q35_launch_quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// `nblocks` counts 256-ELEMENT blocks.
+    extern fn q35_launch_quantize_q8_K(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+
+    /// Whole-tensor dequantization; `nblocks` is in the type's NATIVE blocks.
+    extern fn q35_launch_dequantize(ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// One row of `cols` elements.  The row offset is device-side pointer
+    /// arithmetic by the caller (see `vDequantRow`), so only `cols` is needed.
+    extern fn q35_launch_dequantize_row(ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+
+    /// Table-driven quantized matvec: `d_out[t*rows + r] = W[r] . act_t`.
+    /// Argument order is api.h's: rows, cols, tokens, **then** ttype.
+    extern fn q35_launch_mul_mat_vec(d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Same shape for an f32 weight matrix (embedding / norms).
+    extern fn q35_launch_mul_mat_vec_f32(d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+
+    /// Upload the twelve IQ codebooks to the device (src/kernels/cuda/
+    /// iq_tables.cu).  MUST succeed before any kernel that touches an IQ type:
+    /// those read the tables through `__device__` pointers that only this call
+    /// fills in, so a skipped or failed upload makes IQ matvecs index garbage
+    /// (silently wrong output, not a crash).  Idempotent; returns a cudaError_t.
+    extern fn q35_launch_init_tables(stream: ?*anyopaque) callconv(.c) c_int;
+    /// Release the device copy of the codebooks (process-wide, so it lives as
+    /// long as the backend does).
+    extern fn q35_launch_deinit_tables() callconv(.c) void;
+    /// Bytes of codebook resident on the device (0 before a successful upload).
+    extern fn q35_iq_tables_bytes() callconv(.c) c_ulonglong;
+};
+
+// ==== link-time vs. CPU-only build =========================================
+//
+// The launchers above only exist in a `-Dcuda=true` build (it is that build that
+// puts `src/kernels/cuda/*.cu` on the link line).  A plain `zig build` still
+// compiles this file -- `engine.zig` instantiates `CudaBackend` for
+// `--backend cuda` unconditionally, and the CLI advertises that flag either way
+// -- so on a CPU-only build every launch site would be an undefined symbol.
+//
+// The discriminator is a BUILD-TIME CONSTANT, not a symbol probe: `build.zig`
+// passes `-Dcuda` to the Zig code as `build_options.cuda_linked` (the same
+// `cuda_enabled` variable that decides whether the nvcc objects are handed to
+// `exe.root_module.addObjectFile`).  The `else` branch is a stub that reports
+// the situation instead of calling into nothing; the choice is comptime, so a
+// CPU-only binary has no dangling call to the launchers either.
+//
+// Probing for symbol existence does NOT work here, and must not be reintroduced.
+// `@hasDecl(Kernels, "q35_launch_mul_mat_vec")` looks like it answers "was this
+// linked in?" but it does not: the `fn`s above are *declarations inside the
+// `Kernels` struct*, and `@hasDecl` only reports whether that struct has such a
+// member.  Measured (2026-10): it is `false` even when the C definition is
+// linked into the very same executable, so `Launch` collapsed to the stub branch
+// in every build -- `-Dcuda=true` included -- and `--backend cuda` printed "this
+// executable was built without CUDA kernels" while `nm` showed all nine
+// `T q35_launch_*` present.  A true link-time check would have to ask the
+// linker (e.g. a weak reference), which Zig does not expose at comptime; the
+// build flag is exact, cheap, and single-sourced with the link itself.
+const cuda_linked = build_options.cuda_linked;
+
+/// Reason reported by every stub on a CPU-only build.  Deliberately points at
+/// the build flag, because that is the only thing that can fix it.
+const no_cuda_kernels_msg = "cuda backend: this executable was built without CUDA kernels (rebuild with -Dcuda=true, or use --backend cpu)";
+
+fn stubNoCudaKernels() c_int {
+    std.debug.print("error: {s}\n", .{no_cuda_kernels_msg});
+    // Non-zero (cudaErrorInvalidDeviceFunction), so callers' `rc != cudaSuccess`
+    // paths fire and surface the message instead of carrying on with garbage.
+    return 98;
+}
+
+/// Compile-time-resolved launcher table.  `cuda_linked` is comptime-known, so
+/// each field collapses to either the extern or the stub -- no indirection at
+/// run time.
+const Launch = if (cuda_linked) struct {
+    const quantize_q8_0 = Kernels.q35_launch_quantize_q8_0;
+    const quantize_q8_k = Kernels.q35_launch_quantize_q8_K;
+    const dequantize = Kernels.q35_launch_dequantize;
+    const dequantize_row = Kernels.q35_launch_dequantize_row;
+    const mul_mat_vec = Kernels.q35_launch_mul_mat_vec;
+    const mul_mat_vec_f32 = Kernels.q35_launch_mul_mat_vec_f32;
+    const init_tables = Kernels.q35_launch_init_tables;
+    const deinit_tables = Kernels.q35_launch_deinit_tables;
+    const tables_bytes = Kernels.q35_iq_tables_bytes;
+} else struct {
+    fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, d_out, nblocks, stream };
+        return stubNoCudaKernels();
+    }
+    fn quantize_q8_k(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, d_out, nblocks, stream };
+        return stubNoCudaKernels();
+    }
+    fn dequantize(ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ ttype, d_src, d_dst, nblocks, stream };
+        return stubNoCudaKernels();
+    }
+    fn dequantize_row(ttype: c_int, d_src_row: ?*const anyopaque, d_dst: ?[*]f32, cols: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ ttype, d_src_row, d_dst, cols, stream };
+        return stubNoCudaKernels();
+    }
+    fn mul_mat_vec(d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_w, d_xq, d_out, rows, cols, tokens, ttype, stream };
+        return stubNoCudaKernels();
+    }
+    fn mul_mat_vec_f32(d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_w, d_x, d_out, rows, cols, tokens, stream };
+        return stubNoCudaKernels();
+    }
+    fn init_tables(stream: ?*anyopaque) callconv(.c) c_int {
+        _ = stream;
+        return stubNoCudaKernels();
+    }
+    fn deinit_tables() callconv(.c) void {
+        // Already reported by the failed `init_tables`; stay silent.
+    }
+    fn tables_bytes() callconv(.c) c_ulonglong {
+        return 0;
+    }
+};
 
 // ==== activation geometry ====================================================
 
@@ -107,9 +254,9 @@ const DevRow = struct {
 
 const Geometry = struct { rows: usize, cols: usize };
 
-/// Resolved kernel entry points.  All of them come from the kernel `.so` (never
-/// from cudart), so this struct is the single place to audit against
-/// `src/kernels/cuda/api.h`.
+/// Resolved kernel entry points.  They are link-time symbols from
+/// `src/kernels/cuda/*.cu` (never from cudart), so `Kernels` above is the single
+/// place to audit against `src/kernels/cuda/api.h`.
 ///
 /// ABI, as landed in `src/kernels/cuda/api.h`:
 ///   ttype   : `@intFromEnum(gguf.TensorType)` -- GGML `u32` tag.  api.h's
@@ -120,27 +267,17 @@ const Geometry = struct { rows: usize, cols: usize };
 ///             the K/IQ family.
 ///   stream  : `cudaStream_t` as an opaque pointer; null = default stream.
 /// Everything returns `cudaError_t` as an int (0 == success).
-pub const Kernels = struct {
-    quantize_q8_0: *const fn (?[*]const f32, ?*anyopaque, c_int, ?*anyopaque) callconv(.c) c_int,
-    quantize_q8_k: *const fn (?[*]const f32, ?*anyopaque, c_int, ?*anyopaque) callconv(.c) c_int,
-    /// Whole-tensor dequantization; `nblocks` is in native blocks.
-    dequantize: *const fn (c_int, ?*const anyopaque, ?[*]f32, c_int, ?*anyopaque) callconv(.c) c_int,
-    /// One row of `cols` elements.  The row offset is device-side pointer
-    /// arithmetic by the caller (see `vDequantRow`), so only `cols` is needed.
-    dequantize_row: *const fn (c_int, ?*const anyopaque, ?[*]f32, c_int, ?*anyopaque) callconv(.c) c_int,
-    /// Table-driven quantized matvec: `d_out[t*rows + r] = W[r] . act_t`.
-    /// Note the argument order from api.h: rows, cols, tokens, **then** ttype.
-    mul_mat_vec: *const fn (?*const anyopaque, ?*const anyopaque, ?[*]f32, c_int, c_int, c_int, c_int, ?*anyopaque) callconv(.c) c_int,
-    /// Same shape for an f32 weight matrix (embedding / norms).
-    mul_mat_vec_f32: *const fn (?[*]const f32, ?[*]const f32, ?[*]f32, c_int, c_int, c_int, ?*anyopaque) callconv(.c) c_int,
-};
+/// State of the IQ codebook upload (see `CudaBackend.uploadIqTables`).
+/// `failed` is terminal on purpose: the upload is one cudaMalloc + twelve
+/// cudaMemcpy + one kernel, so a failure is a device/driver-level problem, not
+/// something a retry would fix, and the caller must not proceed to index the
+/// (never-written) device pointers.
+const IqTablesState = enum { pending, done, failed };
 
 // Buffers for formatted error/description strings.  Static because
 // `describe`/`name` return slices with no allocator in scope (same pattern as
 // the CPU backend, which reports through `std.debug.print`).
 var msg_buf: [512]u8 = undefined;
-var kernel_path_buf: [std.fs.max_path_bytes]u8 = undefined;
-var exe_dir_buf: [std.fs.max_path_bytes]u8 = undefined;
 pub const CudaBackend = struct {
     alloc: std.mem.Allocator,
     /// Metadata/geometry authority (see the file comment).  Never used for
@@ -156,8 +293,10 @@ pub const CudaBackend = struct {
     /// turns it into a load error instead of silently running on the CPU.
     init_error: []const u8 = "cuda backend: not initialized",
 
-    kernel_lib: ?std.DynLib = null,
-    kernel_fns: ?Kernels = null,
+    /// Whether the IQ codebooks are on the device.  `pending` -> `done` on the
+    /// first successful `uploadIqTables`, `failed` if that never happened (and
+    /// then stays put: see `uploadIqTables`).
+    iq_tables_state: IqTablesState = .pending,
 
     /// Host data pointer -> device copy.  Keyed by `q.data.ptr` (mmap view) or the
     /// arena slice pointer (f32), so a `LinearW` handed back to us resolves
@@ -240,12 +379,11 @@ pub const CudaBackend = struct {
         };
         self.cu = cand;
 
-        if (!self.loadKernels()) {
-            // Keep the device open so `deinit` and the profile line still work;
-            // `init_error` carries the reason for `allocScratch` to repeat.
-            self.init_error = "cuda backend: kernel library unusable (see the error above)";
-            return self;
-        }
+        // The launchers themselves need no setup: they are link-time symbols, so
+        // "the kernels are there" is enforced by the build.  The one run-time
+        // precondition left is the IQ codebook upload, which `allocScratch`
+        // performs (see `uploadIqTables`) because it is the first hook the engine
+        // calls after this.
         return self;
     }
 
@@ -265,13 +403,18 @@ pub const CudaBackend = struct {
             self.d_xq = null;
             self.d_out = null;
             self.d_deq = null;
+            // The codebook buffer is process-wide (it lives in the linked-in
+            // iq_tables.cu, not in this struct), so release it here and reset the
+            // flag: that re-arms the one-shot upload for any backend created
+            // later in this process.
+            if (self.iq_tables_state == .done) {
+                Launch.deinit_tables();
+                self.iq_tables_state = .pending;
+            }
             cu.lib.close();
             self.cu = null;
         }
         self.dev_rows.deinit(self.alloc);
-        if (self.kernel_lib) |*l| l.close();
-        self.kernel_lib = null;
-        self.kernel_fns = null;
         self.cpu.deinit();
     }
 
@@ -281,98 +424,17 @@ pub const CudaBackend = struct {
         return @ptrCast(@alignCast(ctx));
     }
 
-    /// True when the runtime *and* every kernel symbol resolved.  False (e.g.
-    /// `--backend cuda` on a host without a GPU) is a hard error reported from
-    /// `allocScratch`, which is why no slot needs a CPU fallback for it.
+    /// True when the cudart runtime is up.  The kernels need no analogous check:
+    /// they are link-time symbols, so their presence was settled by the build.
+    /// False (e.g. `--backend cuda` on a host without a GPU) is a hard error
+    /// reported from `allocScratch`, which is why no slot needs a CPU fallback.
     fn gpuReady(self: *CudaBackend) bool {
-        return self.cu != null and self.kernel_fns != null;
+        return self.cu != null;
     }
 
     fn needHelp(self: *CudaBackend) []const u8 {
         if (!self.gpuReady()) return self.init_error;
         return "cuda backend: kernel launch failed";
-    }
-
-    fn kernels(self: *CudaBackend) *const Kernels {
-        return &self.kernel_fns.?;
-    }
-
-    fn loadKernels(self: *CudaBackend) bool {
-        const path = kernelPath();
-        var lib = std.DynLib.open(path) catch |e| {
-            std.debug.print(
-                "error: cuda backend: cannot open kernels library '{s}': {s}\n" ++
-                    "       build it with `zig build -Dcuda=true` (or set $QWEN35_CUDA_KERNELS); use --backend cpu\n",
-                .{ path, @errorName(e) },
-            );
-            return false;
-        };
-
-        const Q = *const fn (?[*]const f32, ?*anyopaque, c_int, ?*anyopaque) callconv(.c) c_int;
-        const D = *const fn (c_int, ?*const anyopaque, ?[*]f32, c_int, ?*anyopaque) callconv(.c) c_int;
-        const M = *const fn (?*const anyopaque, ?*const anyopaque, ?[*]f32, c_int, c_int, c_int, c_int, ?*anyopaque) callconv(.c) c_int;
-        const F = *const fn (?[*]const f32, ?[*]const f32, ?[*]f32, c_int, c_int, c_int, ?*anyopaque) callconv(.c) c_int;
-
-        // Every symbol is required.  A kernel `.so` from an older revision (e.g.
-        // the Q8_0-only one) is rejected here with a named symbol, instead of
-        // failing mid-run at the first non-Q8_0 tensor.
-        const quantize_q8_0 = lib.lookup(Q, "q35_launch_quantize_q8_0") orelse
-            return missingKernel(&lib, path, "q35_launch_quantize_q8_0");
-        const quantize_q8_k = lib.lookup(Q, "q35_launch_quantize_q8_K") orelse
-            return missingKernel(&lib, path, "q35_launch_quantize_q8_K");
-        const dequant = lib.lookup(D, "q35_launch_dequantize") orelse
-            return missingKernel(&lib, path, "q35_launch_dequantize");
-        const dequant_row = lib.lookup(D, "q35_launch_dequantize_row") orelse
-            return missingKernel(&lib, path, "q35_launch_dequantize_row");
-        const mmvq = lib.lookup(M, "q35_launch_mul_mat_vec") orelse
-            return missingKernel(&lib, path, "q35_launch_mul_mat_vec");
-        const mmvf = lib.lookup(F, "q35_launch_mul_mat_vec_f32") orelse
-            return missingKernel(&lib, path, "q35_launch_mul_mat_vec_f32");
-
-        self.kernel_lib = lib;
-        self.kernel_fns = .{
-            .quantize_q8_0 = quantize_q8_0,
-            .quantize_q8_k = quantize_q8_k,
-            .dequantize = dequant,
-            .dequantize_row = dequant_row,
-            .mul_mat_vec = mmvq,
-            .mul_mat_vec_f32 = mmvf,
-        };
-        return true;
-    }
-
-    fn missingKernel(lib: *std.DynLib, path: []const u8, name: []const u8) bool {
-        std.debug.print(
-            "error: cuda backend: '{s}' is missing symbol {s}\n" ++
-                "       rebuild the kernels (zig build -Dcuda=true); use --backend cpu\n",
-            .{ path, name },
-        );
-        lib.close();
-        return false;
-    }
-
-    /// `<exe dir>/../lib/libqwen35-cuda-kernels.so` (i.e. `zig-out/lib/` next to
-    /// `zig-out/bin/qwen35`), unless `$QWEN35_CUDA_KERNELS` says otherwise.
-    fn kernelPath() []const u8 {
-        if (cudart.getenv("QWEN35_CUDA_KERNELS")) |p| return p;
-        if (exeDir()) |d| {
-            return std.fmt.bufPrint(&kernel_path_buf, "{s}/../lib/{s}", .{ d, default_kernel_so }) catch default_kernel_so;
-        }
-        return default_kernel_so;
-    }
-
-    /// Directory holding the running executable, via /proc/self/exe.  Null when the
-    /// symlink cannot be read; callers then fall back to a plain relative name,
-    /// which works from `zig-out/bin`.
-    fn exeDir() ?[]const u8 {
-        const c = struct {
-            extern fn readlink(path: [*:0]const u8, buf: [*]u8, len: usize) isize;
-        };
-        const n = c.readlink("/proc/self/exe", &exe_dir_buf, exe_dir_buf.len);
-        if (n <= 0) return null;
-        const full = exe_dir_buf[0..@intCast(n)];
-        const slash = std.mem.lastIndexOfScalar(u8, full, '/') orelse return null;
-        return full[0..slash];
     }
 
     /// Grow `buf` to at least `need` bytes.
@@ -453,10 +515,11 @@ pub const CudaBackend = struct {
         const nb = cols / actBlockElems(ttype);
         std.debug.assert(nb * actBlockElems(ttype) == cols);
         const d_act: [*]const f32 = @ptrCast(@alignCast(self.d_act.?));
+        const kern = Launch;
         const rc = if (actBlockElems(ttype) == gguf.blockElems(.q8_0))
-            self.kernels().quantize_q8_0(d_act, self.d_xq.?, @intCast(nb), null)
+            kern.quantize_q8_0(d_act, self.d_xq.?, @intCast(nb), null)
         else
-            self.kernels().quantize_q8_k(d_act, self.d_xq.?, @intCast(nb), null);
+            kern.quantize_q8_k(d_act, self.d_xq.?, @intCast(nb), null);
         if (rc != cudart.cudaSuccess) {
             std.debug.print("cuda backend: quantize({s}) launch failed: {s}\n", .{
                 @tagName(ttype), std.mem.span(cu.lib.errStr(rc)),
@@ -600,11 +663,12 @@ pub const CudaBackend = struct {
     /// rowBytes` (device-side pointer arithmetic, no host round trip), so a 27B
     /// embedding table is never re-uploaded per token.  Only the `cols` f32 result
     /// is copied back.  Buffers are the shared pair, grown by `ensureBuf`, so a
-    /// repeated lookup does no `cudaMalloc`.
+    /// repeated call does no `cudaMalloc`.
     ///
     /// The engine calls this once per row (token embedding, lm_head), so it is a
     /// latency path rather than a throughput one.
-    fn vDequantRow(ctx: *anyopaque, dst: []f32, w: gguf.QuantRow, row: usize) void {
+    fn vDequantRow(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+        const dst = dstBuf.slice();
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: dequantRow: {s}\n", .{self.needHelp()});
@@ -633,10 +697,13 @@ pub const CudaBackend = struct {
         };
 
         const t0 = Io.Clock.Timestamp.now(self.io, .awake);
+        // Kernel entry points are link-time externs, so the "table" is just the
+        // namespace of those declarations -- see `Kernels` at the top of the file.
+        const kern = Launch;
         const src: [*]const u8 = @ptrCast(e.dev);
         const d_row = src + row * row_bytes;
         const d_out: [*]f32 = @ptrCast(@alignCast(self.d_out));
-        const rc = self.kernels().dequantize_row(
+        const rc = kern.dequantize_row(
             @intCast(@backingInt(w.ttype)),
             d_row,
             d_out,
@@ -666,7 +733,9 @@ pub const CudaBackend = struct {
     /// activation format matching the weight type, table-driven matvec, then
     /// download `rows` floats.  `ttype` only chooses the activation format and
     /// quantizer -- never a backend, and never a CPU branch.
-    fn vMatvec(ctx: *anyopaque, out: []f32, w: backend.LinearW, x: []const f32) void {
+    fn vMatvec(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+        const out = outBuf.slice();
+        const x = xBuf.slice();
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvec: {s}\n", .{self.needHelp()});
@@ -692,7 +761,8 @@ pub const CudaBackend = struct {
                     @memset(out, 0);
                     return;
                 };
-                const rc = self.kernels().mul_mat_vec_f32(
+                const kern = Launch;
+                const rc = kern.mul_mat_vec_f32(
                     @ptrCast(@alignCast(e.dev)),
                     @ptrCast(@alignCast(self.d_act)),
                     @ptrCast(@alignCast(self.d_out)),
@@ -738,8 +808,9 @@ pub const CudaBackend = struct {
                     @memset(out, 0);
                     return;
                 };
+                const kern = Launch;
                 // api.h order: (d_w, d_xq, d_out, rows, cols, tokens, ttype, stream).
-                const rc = self.kernels().mul_mat_vec(
+                const rc = kern.mul_mat_vec(
                     e.dev,
                     self.d_xq,
                     @ptrCast(@alignCast(self.d_out)),
@@ -785,7 +856,21 @@ pub const CudaBackend = struct {
     /// result and is never overwritten; the CPU value goes to a scratch slice that
     /// is freed here.
     fn mvCheck(self: *CudaBackend, out: []const f32, q: gguf.QuantRow, x: []const f32) void {
+        self.mvCheckVariant(out, q, x, false, 1);
+    }
+
+    /// `$QWEN35_MVCHECK` for the batch-K path: same comparison, CPU reference is
+    /// `matvecBatchK` with the same K, so a per-token mismatch inside the chunk is
+    /// visible instead of hidden behind token 0.
+    fn mvCheckVariant(self: *CudaBackend, out: []const f32, q: gguf.QuantRow, x: []const f32, batchk: bool, k: usize) void {
         if (cudart.getenv("QWEN35_MVCHECK") == null) return;
+        // `$QWEN35_MVCHECK_ONLY=iq1_s` restricts the check to one type: the
+        // batch-K reference needs the CPU scratch shaped for `matvecBatchK`, and
+        // not every type survives that in every launch order, so a targeted run
+        // is the useful one when hunting a single kernel.
+        if (cudart.getenv("QWEN35_MVCHECK_ONLY")) |only| {
+            if (!std.mem.eql(u8, only, @tagName(q.ttype))) return;
+        }
         if (self.mvcheck_seen[@backingInt(q.ttype)]) return;
         self.mvcheck_seen[@backingInt(q.ttype)] = true;
 
@@ -797,9 +882,20 @@ pub const CudaBackend = struct {
         const cpu = &self.cpu.exec();
         cpu.allocScratch(cols) catch return;
         defer cpu.freeScratch();
+        // `allocScratch` sizes one token; a batch-K launch needs K activation
+        // slots, so grow them here (same `q8ScratchBytes` / `q8kScratchBytes`
+        // arithmetic as `backend_cpu.vAllocScratch`, through the public sizes).
+        if (batchk and k > 1) {
+            self.cpu.q8K = self.alloc.alloc(u8, k * cpu_mod.q8ScratchBytes(cols)) catch return;
+            self.cpu.q8kK = self.alloc.alloc(u8, k * cpu_mod.q8kScratchBytes(cols)) catch return;
+        }
         const tmp = self.alloc.alloc(f32, out.len) catch return;
         defer self.alloc.free(tmp);
-        cpu.matvec(tmp, .{ .quant = q }, x);
+        if (batchk) cpu.matvecBatchK(backend.Buf.wrap(tmp), .{ .quant = q }, backend.Buf.wrap(x), k) else cpu.matvec(backend.Buf.wrap(tmp), .{ .quant = q }, backend.Buf.wrap(x));
+        // NOT `cpu.exec()` above: that is the diagnostic's OWN backend, whose
+        // scratch is sized here, one token wide -- `matvecBatchK` wants K slots.
+        // Those CPUs are never fully initialised (`setThreads` etc.), so this runs
+        // serially (`pool = null`) instead.
         var bad: usize = 0;
         for (out, tmp) |a, b| {
             // Relative tolerance, not bit equality: the device kernel may reorder
@@ -811,8 +907,8 @@ pub const CudaBackend = struct {
                 bad += 1;
             }
         }
-        std.debug.print("MVCHECK[{s}] rows={d} cols={d} mismatched={d}\n", .{
-            @tagName(q.ttype), q.rows, q.cols(), bad,
+        std.debug.print("MVCHECK[{s}] rows={d} cols={d} mismatched={d} batchk={} k={d}\n", .{
+            @tagName(q.ttype), q.rows, q.cols(), bad, batchk, k,
         });
     }
 
@@ -825,7 +921,9 @@ pub const CudaBackend = struct {
     /// in one `cudaMemcpy`, quantized as `K` consecutive block groups in one buffer
     /// (`d_xq`, group `j` at `j * actBytes(ttype, cols)`), then a single launch
     /// computes `K*rows` outputs and one download returns them.
-    fn vMatvecBatchK(ctx: *anyopaque, out: []f32, w: backend.LinearW, xK: []const f32, k: usize) void {
+    fn vMatvecBatchK(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+        const out = outBuf.slice();
+        const xK = xKBuf.slice();
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvecBatchK: {s}\n", .{self.needHelp()});
@@ -854,7 +952,8 @@ pub const CudaBackend = struct {
                     return;
                 }
                 ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
-                const rc = self.kernels().mul_mat_vec_f32(
+                const kern = Launch;
+                const rc = kern.mul_mat_vec_f32(
                     @ptrCast(@alignCast(e.dev)),
                     @ptrCast(@alignCast(self.d_act)),
                     @ptrCast(@alignCast(self.d_out)),
@@ -905,12 +1004,13 @@ pub const CudaBackend = struct {
                 const base_act: [*]const f32 = @ptrCast(@alignCast(self.d_act.?));
                 const base_xq: [*]u8 = @ptrCast(self.d_xq.?);
                 const q8_0_act = actBlockElems(q.ttype) == gguf.blockElems(.q8_0);
+                const kern = Launch;
                 for (0..k) |j| {
                     const xq_slot: ?*anyopaque = @ptrCast(base_xq + j * per_tok);
                     const rc = if (q8_0_act)
-                        self.kernels().quantize_q8_0(base_act + j * cols, xq_slot, @intCast(nb_tok), null)
+                        kern.quantize_q8_0(base_act + j * cols, xq_slot, @intCast(nb_tok), null)
                     else
-                        self.kernels().quantize_q8_k(base_act + j * cols, xq_slot, @intCast(nb_tok), null);
+                        kern.quantize_q8_k(base_act + j * cols, xq_slot, @intCast(nb_tok), null);
                     if (rc != cudart.cudaSuccess) {
                         std.debug.print("cuda backend: batchK quantize({s}) tok {d} failed: {s}\n", .{
                             @tagName(q.ttype), j, std.mem.span(cu.lib.errStr(rc)),
@@ -920,7 +1020,8 @@ pub const CudaBackend = struct {
                     }
                 }
 
-                const rc = self.kernels().mul_mat_vec(
+                const kern_mm = Launch;
+                const rc = kern_mm.mul_mat_vec(
                     e.dev,
                     self.d_xq,
                     @ptrCast(@alignCast(self.d_out)),
@@ -951,7 +1052,7 @@ pub const CudaBackend = struct {
                 }
                 // Token 0 of the chunk is enough: all K rows run through the same
                 // kernel, so a per-type mismatch shows up on the first one.
-                self.mvCheck(out[0..rows], q, xK[0..cols]);
+                self.mvCheckVariant(out[0..rows], q, xK[0..cols], true, k);
             },
         }
     }
@@ -969,6 +1070,7 @@ pub const CudaBackend = struct {
     fn dAllocScratch(ctx: *anyopaque, max_cols: usize) anyerror!void {
         const self = self_(ctx);
         if (!self.gpuReady()) return error.BackendUnavailable;
+        try self.uploadIqTables();
         const cu = &self.cu.?;
         try ensureBuf(&cu.lib, &self.d_act, &self.d_act_bytes, max_cols * @sizeOf(f32));
         // Both activation formats up front: which one a layer needs is only known at
@@ -983,14 +1085,60 @@ pub const CudaBackend = struct {
     fn dAllocScratchK(ctx: *anyopaque, max_cols: usize, k: usize) anyerror!void {
         const self = self_(ctx);
         if (!self.gpuReady()) return error.BackendUnavailable;
+        try self.uploadIqTables();
         const cu = &self.cu.?;
         try ensureBuf(&cu.lib, &self.d_act, &self.d_act_bytes, k * max_cols * @sizeOf(f32));
         try ensureBuf(&cu.lib, &self.d_xq, &self.d_xq_bytes, k * actBytes(.q8_k, max_cols));
         try ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * max_cols * @sizeOf(f32));
     }
 
+    /// Upload the twelve IQ codebooks to the device, at most once per process.
+    ///
+    /// WHY HERE: the tables are read by name through `__device__` pointers that
+    /// only `q35_launch_init_tables` fills in (src/kernels/cuda/iq_tables.cu).
+    /// A kernel that runs before the upload indexes address 0 -- wrong numbers,
+    /// no crash, and the failure looks like a bad quant kernel -- so the upload
+    /// has to be provably earlier than the first matvec/dequantRow.  Both
+    /// scratch-allocation hooks are the place: `Engine.load` calls
+    /// `exec.allocScratch(cols)` while opening the model, before it has any
+    /// weights resident or computes anything (src/engine.zig, `load`), and
+    /// `allocScratchK` only ever follows it.  Making this the first statement
+    /// after the `gpuReady` check means no device buffer -- IQ ones included --
+    /// exists before the codebooks do.
+    ///
+    /// Cached through `iq_tables_state` rather than re-called every time: the
+    /// C side is idempotent too, but this way a failed upload is reported once
+    /// instead of on every later matvec.
+    fn uploadIqTables(self: *CudaBackend) anyerror!void {
+        switch (self.iq_tables_state) {
+            .done => return,
+            // A previous attempt failed.  Do not retry: the reason was already
+            // recorded in `init_error` and repeated failures of the same kind
+            // would only spam the log.  Report the same error to the caller.
+            .failed => return error.IqTablesNotUploaded,
+            .pending => {},
+        }
+        // `gpuReady` is checked by both callers before they get here, so the
+        // runtime handle exists; no separate "kernels loaded" guard is needed
+        // because they are link-time symbols.
+        const rc = Launch.init_tables(null);
+        if (rc != cudart.cudaSuccess) {
+            std.debug.print(
+                "error: cuda backend: IQ codebook upload failed (cudaError {d}: {s})\n" ++
+                    "       IQ quant types cannot run on the GPU without it; use --backend cpu\n",
+                .{ rc, std.mem.span(self.cu.?.lib.GetErrorName(rc)) },
+            );
+            self.iq_tables_state = .failed;
+            return error.IqTablesNotUploaded;
+        }
+        self.iq_tables_state = .done;
+    }
+
     fn dFreeScratch(ctx: *anyopaque) void {
         const self = self_(ctx);
+        // Regions handed out by `dAllocBuf` live in the embedded CPU backend
+        // (trampoline stage); release them regardless of device state.
+        cpu_mod.CpuBackend.vtable.freeScratch(@ptrCast(&self.cpu));
         const cu = if (self.cu) |*c| c else return;
         if (self.d_act) |p| _ = cu.lib.Free(p);
         if (self.d_xq) |p| _ = cu.lib.Free(p);
@@ -1008,6 +1156,14 @@ pub const CudaBackend = struct {
 
     // ==== profiling / introspection =========================================
 
+    /// Bytes of IQ codebook currently on the device (0 when the upload has not
+    /// happened).  Asked of the kernel object rather than cached in Zig so the
+    /// number can never disagree with what the kernels actually index.
+    fn iqTablesBytes(self: *CudaBackend) u64 {
+        if (self.iq_tables_state != .done) return 0;
+        return @intCast(Launch.tables_bytes());
+    }
+
     /// `$QWEN35_PROF`: one `CUDA-M [...]` line with what actually ran on the device,
     /// plus a per-type breakdown, so "did this model mix backends?" is answerable
     /// from the log.  Uploaded MiB is the resident weight footprint; bufs_MiB is the
@@ -1016,7 +1172,7 @@ pub const CudaBackend = struct {
         if (self.cu == null) return;
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} resident_rows={d} bufs_MiB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
@@ -1025,6 +1181,7 @@ pub const CudaBackend = struct {
                 self.stat_uploaded_bytes >> 20,
                 self.dev_rows.items.len,
                 buf_bytes >> 20,
+                self.iqTablesBytes() >> 10,
                 self.stat_ns_matvec / 1_000_000,
                 self.stat_ns_batchk / 1_000_000,
                 self.stat_ns_dequant / 1_000_000,
@@ -1154,4 +1311,32 @@ pub const vtable = backend.Exec.VTable{
     .reportProfile = CudaBackend.dReportProfile,
     .name = CudaBackend.vName,
     .describe = CudaBackend.vDescribe,
+    // Elementwise / state slots: the trampoline stage reuses the CPU targets
+    // verbatim (`cpu.vtable` is exported for exactly this).  They ignore `ctx`,
+    // so handing them out with a `*CudaBackend` ctx is safe, and the numbers
+    // stay byte-identical to `--backend cpu` until device kernels exist.
+    .rmsnorm = cpu_mod.CpuBackend.vtable.rmsnorm,
+    .rope64 = cpu_mod.CpuBackend.vtable.rope64,
+    .l2norm = cpu_mod.CpuBackend.vtable.l2norm,
+    .scaleVec = cpu_mod.CpuBackend.vtable.scaleVec,
+    .siluInPlace = cpu_mod.CpuBackend.vtable.siluInPlace,
+    .mulSilu = cpu_mod.CpuBackend.vtable.mulSilu,
+    .mulSigmoid = cpu_mod.CpuBackend.vtable.mulSigmoid,
+    .softmax = cpu_mod.CpuBackend.vtable.softmax,
+    .addResid = cpu_mod.CpuBackend.vtable.addResid,
+    .swiglu = cpu_mod.CpuBackend.vtable.swiglu,
+    .convStep = cpu_mod.CpuBackend.vtable.convStep,
+    .gdnStep = cpu_mod.CpuBackend.vtable.gdnStep,
+    .constBuf = cpu_mod.CpuBackend.vtable.constBuf,
+    .attnDecode = cpu_mod.CpuBackend.vtable.attnDecode,
+    .gdnGamma = cpu_mod.CpuBackend.vtable.gdnGamma,
+    .copyRange = cpu_mod.CpuBackend.vtable.copyRange,
+    .copyFromHost = cpu_mod.CpuBackend.vtable.copyFromHost,
+    .zeroBuf = cpu_mod.CpuBackend.vtable.zeroBuf,
+    .argmax = cpu_mod.CpuBackend.vtable.argmax,
+    .sample = cpu_mod.CpuBackend.vtable.sample,
+    // Trampoline stage: regions come from the embedded CPU backend's allocator,
+    // and `dFreeScratch` releases them (`CpuBackend.vtable.freeScratch`).
+    .allocBuf = cpu_mod.CpuBackend.vtable.allocBuf,
+
 };

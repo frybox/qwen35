@@ -3,13 +3,19 @@
 //! Why dlopen instead of `-lcudart`: the same `zig-out/bin/qwen35` binary must
 //! run on hosts with no CUDA install at all, where `--backend cpu` is the only
 //! usable mode.  A link-time DT_NEEDED on libcudart.so would turn "no GPU" into
-//! a dynamic-loader failure before `main` even parses `--backend`.  (This is
-//! also why the executable does not link the .o from src/kernels/cuda/*.cu
-//! unless the CUDA build is requested -- see build.zig.)
+//! a dynamic-loader failure before `main` even parses `--backend`.
+//!
+//! libcudart is the *only* library still opened at run time.  The CUDA kernels
+//! (`src/kernels/cuda/*.cu`) are ordinary objects linked into the executable;
+//! `src/backend_cuda.zig` reaches them through plain `extern` declarations, so
+//! nothing here has to resolve `q35_launch_*` -- there is no kernel `.so` and no
+//! dynamic symbol lookup for them.  The `-Dcuda=true` build adds the objects
+//! (and their cudart import library); a plain CPU build does not, and this
+//! module is then simply never called.
 //!
 //! Every cudart entry point used by the backend is a function pointer resolved
-//! with `std.DynLib.lookup`.  A missing symbol is collected in `missing` and
-//! reported by the caller as a load error naming the symbol, never as a panic.
+//! with `dlsym`.  A missing symbol is collected in `missing` and reported by the
+//! caller as a load error naming the symbol, never as a panic.
 //!
 //! Library search order (first hit wins), mirroring what the CUDA toolkit
 //! itself does so a plain `nvcc` install works without LD_LIBRARY_PATH:
@@ -109,9 +115,9 @@ pub const MemcpyDeviceToHost: c_int = 2;
 
 /// Environment, injected by `main` before the backend is created.  Zig 0.17
 /// removed `std.posix.getenv`; environment now arrives through
-/// `std.process.Init.environ_map`, which only `main` has.  The backend needs it
-/// for `$QWEN35_CUDART` (explicit library path) and `$PATH` (find nvcc's
-/// sibling lib64), so `main.zig` hands the map over here.
+/// `std.process.Init.environ_map`, which only `main` has.  Needed for
+/// `$QWEN35_CUDART` (explicit library path) and `$PATH` (find nvcc's sibling
+/// lib64), so `main.zig` hands the map over here.
 pub var environ_map: ?*const std.process.Environ.Map = null;
 
 pub fn getenv(name: []const u8) ?[]const u8 {
@@ -132,10 +138,10 @@ const dl = struct {
     extern fn dlerror() ?[*:0]u8;
 };
 
-/// RTLD_GLOBAL is required: the kernel `.so` is opened afterwards and its nvcc
-/// host stubs (`__cudaLaunchKernel`, `__cudaPushCallConfiguration`, ...) must be
-/// able to bind to cudart's symbols from the global scope.  RTLD_NOW resolves
-/// everything up front so a broken library fails at open time, not mid-run.
+/// RTLD_GLOBAL keeps cudart's symbols visible to any object that was linked
+/// against its import library (`libcudart_static`-style stubs in the CUDA
+/// objects, resolved through the global scope).  RTLD_NOW resolves everything up
+/// front so a broken library fails at open time, not mid-run.
 const rtld_global_now = std.c.RTLD{ .GLOBAL = true, .NOW = true };
 
 pub const Lib = struct {
@@ -282,7 +288,8 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
 }
 
 /// dlopen in the order documented at the top of this file.  Returns the raw
-/// handle (RTLD_GLOBAL) so dlopen'd kernels can bind cudart symbols later.
+/// handle (RTLD_GLOBAL) so every cudart import of the executable binds to the
+/// same runtime instance.
 fn loadLibrary() OpenError!*anyopaque {
     // 1. Explicit override.  Authoritative: when set, no other candidate is
     //    tried, so pointing it at a nonexistent file is a deterministic way to

@@ -82,13 +82,23 @@ CUDA 后端让 cache 常驻显存、用 `k_gqa_partial:704` + `k_gqa_reduce:790`
 
 ## 4. 构建集成
 
+> 2026-10 更新：本节已实施，且有两处决策被推翻，论证保留存档。现况：
+> (a) **`-rdc=true` + `nvcc -dlink` 设备链接是必需的**，不是风险——`src/kernels/cuda/*.cu`
+> 之间的 `__device__` 引用（`iq_tables.cuh` 的 12 个表指针在 `convert.cu` / `vecdotq.cuh` /
+> `mmvq.cu` 里被读）跨编译单元，必须 nvlink 合并设备镜像；本项目仍不用 CUB。
+> 全链四步：`nvcc -rdc=true -c` 编每个 `.cu` → `zig cc` 编 `iq_tables_host.c` →
+> `nvcc -rdc=true -dlink` → 全部 `addObjectFile` 进 exe（+ cudart/c++ 导入库）。
+> (b) 下面"单 exe"里的 `--backend cuda` 惰性加载 cudart 仍然成立，而 **CUDA kernel 本身
+> 不再需要 dlopen**：`.cu` 目标文件直接静态链进 `zig-out/bin/qwen35`，`libcudart` 是唯一
+> 仍在运行期打开的库（`src/cudart.zig`）。
+
 **推荐方案 B**：`build.zig` 用 `addSystemCommand(nvcc -arch=sm_89 -O3 -c src/kernels/cuda/*.cu)` 产出 `.o`，再 `addObjectFile` 链进 exe。风险点与对策：
 
-- **禁 `-rdc`、禁 CUB**（device-link 会破坏 Zig 的链接流程；本项目不需要 CUB）。
+- **禁 `-rdc`、禁 CUB**（device-link 会破坏 Zig 的链接流程；本项目不需要 CUB）。→ 见上方更新：`-rdc` 已必需。
 - 架构写 `-arch=sm_89`（本机 4090D，compute_cap 8.9），不写 `-arch=native` —— 后者让构建不可复现也无法跨机。
 - 缓存：`.o` 由 nvcc 生成，Zig 的 cache 不跟踪 `.cu` 依赖，需要 `b.addSystemCommand` 里显式列出输入的 `addFileArg`/`addDirectoryArg`，否则改 `.cuh` 不重编。
 
-备选方案 A（沿用 Makefile 两步链：`zig cc -c` 出 host.o → nvcc 编译+链接）继续可用作 fallback，把 `src/main_cuda.zig` 换成新的 host 入口即可。
+备选方案 A（沿用 Makefile 两步链：`zig cc -c` 出 host.o → nvcc 编译+链接）**已随 legacy 二进制删除**，不再是 fallback；`zig build -Dcuda=true`（nvcc -c → nvcc -dlink → addObjectFile）是唯一构建路径。
 
 **单 exe**：`qwen35 run <gguf> ... --backend cuda`，在 `main.zig:130-160` 的 CLI 解析里加一支，映射到 `backend.Kind`（`backend.zig:155-161` 加 `.cuda`）。CUDA 后端**惰性加载** `libcudart`（`std.DynLib`），没有 GPU 的机器上 `--backend cpu` 照常工作，二进制不硬依赖 cudart。
 
@@ -104,6 +114,12 @@ CUDA 后端让 cache 常驻显存、用 `k_gqa_partial:704` + `k_gqa_reduce:790`
 ---
 
 ## 6. 旧代码处置
+
+> **状态更新（本次改动）**：`src/main_cuda.zig`、`src/kernel.cu`、`src/kernel_gdn.cu`、
+> `src/kernel_matvec.cu` **已删除**（`git rm`），Makefile 里的 `legacy-cuda` 目标与
+> `$(CUDA_EXE)`/`$(HOST_OBJ)` 也一并删除。本节保留作为设计理由与 kernel 清单的出处；
+> 下面的行号锚点只对该二进制在 git 里的最后一版有效（`git show HEAD^:src/kernel.cu`）。
+> 现役唯一 CUDA 路径是 `zig-out/bin/qwen35 --backend cuda`（`src/kernels/cuda/`）。
 
 `src/main_cuda.zig`（1158 行）+ `src/kernel.cu`（1739 行）是**平行前向**，不是后端。
 

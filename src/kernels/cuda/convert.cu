@@ -16,8 +16,9 @@
 //                                     against)
 //
 // Two traps this file deliberately avoids in quantize_q8_0:
-//  (1) src/kernel.cu's k_quantize_q8 divides by the f16-truncated scale via
-//      roundf(x/scale); that is a different rounding and is not reused here.
+//  (1) the retired src/kernel.cu (deleted) k_quantize_q8 divided by the
+//      f16-truncated scale via roundf(x/scale); that is a different rounding
+//      and is not reused here.
 //  (2) The caller passes the *number of blocks*, not elements.
 //
 // Dequantization has one more requirement: it must be BIT-EXACT with the Zig

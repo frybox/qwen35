@@ -2,7 +2,8 @@
 //
 // Why this file exists: the incremental `--backend cuda` backend needs only a
 // handful of kernels (Q8_0 activation quantize + Q8_0 x Q8_0 matvec + Q8_0
-// dequant), not the whole engine port that lives in src/kernel.cu.  Keeping
+// dequant), not the whole engine port that the retired whole-model GPU binary
+// (src/kernel.cu, deleted) used to contain.  Keeping
 // them in their own translation unit means the host object can be produced by
 // a single `nvcc -c` invocation with no relocatable-device-code (-rdc) link
 // step and no CUB dependency.

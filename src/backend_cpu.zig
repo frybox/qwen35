@@ -19,6 +19,9 @@ const simd = @import("simd_dispatch.zig");
 
 const LinearW = backend.LinearW;
 const QuantRow = backend.QuantRow;
+const Buf = backend.Buf;
+const ew = @import("elementwise.zig");
+const sampler = @import("sampler.zig");
 const Io = std.Io;
 
 pub const blockElemsOf = gguf.blockElems;
@@ -605,6 +608,11 @@ pub const CpuBackend = struct {
     /// Batched scratch for a K-token prefill chunk.
     q8K: []u8 = &.{},
     q8kK: []u8 = &.{},
+    /// Every region handed out by `allocBuf`, so `freeScratch` releases them
+    /// together with the matvec scratch.  The engine never frees a region
+    /// individually; a device backend keeps the same contract (all regions
+    /// released by `freeScratch`).
+    bufs: std.ArrayList([]f32) = .empty,
 
     pub fn init(alloc: std.mem.Allocator, g: *const gguf.File) CpuBackend {
         // Bind the dispatch tables to the widest ISA tier this CPU supports
@@ -630,6 +638,8 @@ pub const CpuBackend = struct {
             if (p.len > 0) a.free(p.*);
             p.* = &.{};
         }
+        for (self.bufs.items) |s| a.free(s);
+        self.bufs.clearAndFree(a);
     }
 
     // ---- vtable targets -----------------------------------------------------
@@ -674,22 +684,31 @@ pub const CpuBackend = struct {
         self.freeScratch();
     }
 
-    fn vDequantRow(ctx: *anyopaque, dst: []f32, w: QuantRow, row: usize) void {
+    fn vDequantRow(ctx: *anyopaque, dst: Buf, w: QuantRow, row: usize) void {
         _ = ctx;
-        dequantRowInto(dst, w, row);
+        dequantRowInto(dst.slice(), w, row);
     }
 
-    fn vMatvec(ctx: *anyopaque, out: []f32, w: LinearW, x: []const f32) void {
+    fn vMatvec(ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         switch (w) {
-            .f32 => |m| matvecF32(out, m, x),
-            .quant => |q| matvecQuant(out, q, x, self.q8k, self.q8, self.pool),
+            .f32 => |m| matvecF32(out.slice(), m, x.slice()),
+            .quant => |q| matvecQuant(out.slice(), q, x.slice(), self.q8k, self.q8, self.pool),
         }
     }
 
-    fn vMatvecBatchK(ctx: *anyopaque, out: []f32, w: LinearW, xK: []const f32, k: usize) void {
+    fn vMatvecBatchK(ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void {
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
-        matvecBatchK(out, w, xK, k, self.q8K, self.q8kK, self.pool);
+        matvecBatchK(out.slice(), w, xK.slice(), k, self.q8K, self.q8kK, self.pool);
+    }
+
+    /// The CPU `Buf` is a host slice allocated from the backend's allocator;
+    /// every region is recorded so `freeScratch` releases all of them.
+    fn vAllocBuf(ctx: *anyopaque, len: usize) anyerror!Buf {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        const s = try self.alloc.alloc(f32, len);
+        self.bufs.append(self.alloc, s) catch return error.OutOfMemory;
+        return Buf.wrap(s);
     }
 
     fn vSetThreads(ctx: *anyopaque, io: Io, nt: usize) void {
@@ -730,6 +749,115 @@ pub const CpuBackend = struct {
         profReportMatvec();
     }
 
+    // ---- elementwise / state slots ------------------------------------------
+    //
+    // The CPU `Buf` is a host slice, so each target is the engine's historical
+    // Zig kernel, reached through src/elementwise.zig.  `ctx` is unused: these
+    // kernels need no backend state, which is why a composing backend (the CUDA
+    // trampoline) can hand out these same targets unchanged.
+
+    fn vRmsnorm(ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void {
+        _ = ctx;
+        ew.bufRmsnorm(out, x, w, eps);
+    }
+
+    fn vRope64(ctx: *anyopaque, x: Buf, pos: u32, base: f32) void {
+        _ = ctx;
+        ew.bufRope64(x, pos, base);
+    }
+
+    fn vL2norm(ctx: *anyopaque, x: Buf) void {
+        _ = ctx;
+        ew.bufL2norm(x);
+    }
+
+    fn vScaleVec(ctx: *anyopaque, x: Buf, s: f32) void {
+        _ = ctx;
+        ew.bufScaleVec(x, s);
+    }
+
+    fn vSiluInPlace(ctx: *anyopaque, x: Buf) void {
+        _ = ctx;
+        ew.bufSiluInPlace(x);
+    }
+
+    fn vMulSilu(ctx: *anyopaque, out: Buf, gate: Buf) void {
+        _ = ctx;
+        ew.bufMulSilu(out, gate);
+    }
+
+    fn vMulSigmoid(ctx: *anyopaque, out: Buf, gate: Buf) void {
+        _ = ctx;
+        ew.bufMulSigmoid(out, gate);
+    }
+
+    fn vSoftmax(ctx: *anyopaque, x: Buf) void {
+        _ = ctx;
+        ew.bufSoftmax(x);
+    }
+
+    fn vAddResid(ctx: *anyopaque, dst: Buf, src: Buf) void {
+        _ = ctx;
+        ew.bufAddResid(dst, src);
+    }
+
+    fn vSwiglu(ctx: *anyopaque, gate: Buf, up: Buf) void {
+        _ = ctx;
+        ew.bufSwiglu(gate, up);
+    }
+
+    fn vConvStep(ctx: *anyopaque, conv: Buf, y: Buf, wconv: Buf, k: usize) void {
+        _ = ctx;
+        ew.bufConvStep(conv, y, wconv, k);
+    }
+
+    fn vGdnStep(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
+        _ = ctx;
+        ew.bufGdnStep(state, k, v, q, km, delta, out, gamma, beta, vd);
+    }
+
+    fn vAttnDecode(ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
+                   gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
+                   kv_dim: usize, scale: f32) void {
+        _ = ctx;
+        ew.bufAttnDecode(q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+    }
+
+    fn vGdnGamma(ctx: *anyopaque, ab: Buf, a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
+        _ = ctx;
+        ew.bufGdnGamma(ab, a, dt_bias, gamma, nv);
+    }
+
+    fn vCopyRange(ctx: *anyopaque, dst: Buf, src: Buf) void {
+        _ = ctx;
+        ew.bufCopyRange(dst, src);
+    }
+
+    fn vCopyFromHost(ctx: *anyopaque, dst: Buf, src: []const f32) void {
+        _ = ctx;
+        ew.bufCopyFromHost(dst, src);
+    }
+
+    fn vZeroBuf(ctx: *anyopaque, buf: Buf) void {
+        _ = ctx;
+        @memset(buf.slice(), 0);
+    }
+
+    fn vArgmax(ctx: *anyopaque, logits: Buf) u32 {
+        _ = ctx;
+        return ew.bufArgmax(logits);
+    }
+
+    fn vSample(ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
+        _ = ctx;
+        return ew.bufSample(logits, scratch, sp);
+    }
+
+    fn vConstBuf(ctx: *anyopaque, s: []const f32) Buf {
+        _ = ctx;
+        return Buf.wrap(s);
+    }
+
     /// `pub` so a backend that composes (rather than replaces) the CPU
     /// implementation -- see `backend_cuda.zig`'s trampoline stage -- can hand
     /// out the CPU vtable unchanged.  Every target is a free function that
@@ -744,6 +872,27 @@ pub const CpuBackend = struct {
         .dequantRow = vDequantRow,
         .matvec = vMatvec,
         .matvecBatchK = vMatvecBatchK,
+        .rmsnorm = vRmsnorm,
+        .rope64 = vRope64,
+        .l2norm = vL2norm,
+        .scaleVec = vScaleVec,
+        .siluInPlace = vSiluInPlace,
+        .mulSilu = vMulSilu,
+        .mulSigmoid = vMulSigmoid,
+        .softmax = vSoftmax,
+        .addResid = vAddResid,
+        .swiglu = vSwiglu,
+        .convStep = vConvStep,
+        .gdnStep = vGdnStep,
+        .constBuf = vConstBuf,
+        .allocBuf = vAllocBuf,
+        .attnDecode = vAttnDecode,
+        .gdnGamma = vGdnGamma,
+        .copyRange = vCopyRange,
+        .copyFromHost = vCopyFromHost,
+        .zeroBuf = vZeroBuf,
+        .argmax = vArgmax,
+        .sample = vSample,
         .setThreads = vSetThreads,
         .profPhase = vProfPhase,
         .profReset = vProfReset,

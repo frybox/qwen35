@@ -69,10 +69,11 @@ test "iq tables: C kernels read the same tables as Zig" {
 // ---------------------------------------------------------------------------
 // One copy of the data, not two
 // ---------------------------------------------------------------------------
-// The tables are written once, in src/iq_tables.h, and reach the kernels two
-// ways: CUDA instantiates the header as __constant__ in its own device image
-// (device code cannot reference host objects), and the x86 kernels + Zig share
-// the host instantiation.
+// The tables are written once, in src/iq_tables.zig, and reach the kernels two
+// ways: CUDA cannot reference host objects, so its device image carries its own
+// definition (src/kernels/cuda/), while the x86 kernels and Zig share the host
+// definition (the `pub export const` arrays themselves are the C side's
+// `extern const` objects).
 //
 // Comparing *addresses* across that boundary was tried and is useless: Zig
 // emits a private .rodata copy per use site for `const` data, and LLVM is free

@@ -28,6 +28,10 @@ const backend_cpu = @import("backend_cpu.zig");
 const sampler = @import("sampler.zig");
 const Io = std.Io;
 
+/// The engine hands backend-owned activation regions to every op.  It wraps its
+/// host slices here (CPU path); a device backend resolves its own base.
+const Buf = backend.Buf;
+
 /// Re-export so the CPU and CUDA hosts share one sampler implementation.
 pub const Sampler = sampler.Sampler;
 
@@ -1183,12 +1187,12 @@ pub const Engine = struct {
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(Buf.wrap(self.logits), ow, Buf.wrap(self.x1)),
             }
         } else {
             // tied lm_head: logits = W_emb @ x1 with W_emb row-major [vocab, hidden]
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
+                .quant => |qrow| self.exec.matvec(Buf.wrap(self.logits), .{ .quant = qrow }, Buf.wrap(self.x1)),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -1227,7 +1231,7 @@ pub const Engine = struct {
         // there rather than special-cased here.
         switch (self.token_embd) {
             .f32 => |m| @memcpy(dst, m[token * hidden ..][0..hidden]),
-            .quant => |qrow| self.exec.dequantRow(dst, qrow, token),
+            .quant => |qrow| self.exec.dequantRow(Buf.wrap(dst), qrow, token),
         }
     }
 
@@ -1270,20 +1274,20 @@ pub const Engine = struct {
                 rmsNorm(self.x1K[t * hidden ..][0..hidden], self.xK[t * hidden ..][0..hidden], lw.attn_norm, c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
-                self.exec.matvecBatchK(self.qkvK[0 .. k * 2 * q_dim], lw.attn_q.?, self.x1K, k);
-                self.exec.matvecBatchK(self.kK[0 .. k * kv_dim], lw.attn_k.?, self.x1K, k);
-                self.exec.matvecBatchK(self.vK[0 .. k * kv_dim], lw.attn_v.?, self.x1K, k);
+                self.exec.matvecBatchK(Buf.wrap(self.qkvK[0 .. k * 2 * q_dim]), lw.attn_q.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(Buf.wrap(self.kK[0 .. k * kv_dim]), lw.attn_k.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(Buf.wrap(self.vK[0 .. k * kv_dim]), lw.attn_v.?, Buf.wrap(self.x1K), k);
                 t = 0;
                 while (t < k) : (t += 1) self.forwardFullCore(lw, li, t, pos0 + @as(u32, @intCast(t)));
-                self.exec.matvecBatchK(self.x2K[0 .. k * hidden], lw.attn_output.?, self.goutK, k);
+                self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.attn_output.?, Buf.wrap(self.goutK), k);
             } else {
-                self.exec.matvecBatchK(self.qkvK[0 .. k * conv_dim], lw.attn_qkv.?, self.x1K, k);
-                self.exec.matvecBatchK(self.gateK[0 .. k * value_dim], lw.attn_gate.?, self.x1K, k);
-                self.exec.matvecBatchK(self.abK[0 .. k * nv], lw.ssm_alpha.?, self.x1K, k);
-                self.exec.matvecBatchK(self.abK[k * nv ..][0 .. k * nv], lw.ssm_beta.?, self.x1K, k);
+                self.exec.matvecBatchK(Buf.wrap(self.qkvK[0 .. k * conv_dim]), lw.attn_qkv.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(Buf.wrap(self.gateK[0 .. k * value_dim]), lw.attn_gate.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(Buf.wrap(self.abK[0 .. k * nv]), lw.ssm_alpha.?, Buf.wrap(self.x1K), k);
+                self.exec.matvecBatchK(Buf.wrap(self.abK[k * nv ..][0 .. k * nv]), lw.ssm_beta.?, Buf.wrap(self.x1K), k);
                 t = 0;
                 while (t < k) : (t += 1) self.forwardGdnCore(lw, li, t, k);
-                self.exec.matvecBatchK(self.x2K[0 .. k * hidden], lw.ssm_out.?, self.goutK, k);
+                self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.ssm_out.?, Buf.wrap(self.goutK), k);
             }
 
             // ---- per-token residual add ----
@@ -1296,14 +1300,14 @@ pub const Engine = struct {
             t = 0;
             while (t < k) : (t += 1)
                 rmsNorm(self.x1K[t * hidden ..][0..hidden], self.xK[t * hidden ..][0..hidden], lw.post_attention_norm, c.rms_eps);
-            self.exec.matvecBatchK(self.mlpK[0 .. k * n_ff], lw.ffn_gate, self.x1K, k);
-            self.exec.matvecBatchK(self.mlpK1[0 .. k * n_ff], lw.ffn_up, self.x1K, k);
+            self.exec.matvecBatchK(Buf.wrap(self.mlpK[0 .. k * n_ff]), lw.ffn_gate, Buf.wrap(self.x1K), k);
+            self.exec.matvecBatchK(Buf.wrap(self.mlpK1[0 .. k * n_ff]), lw.ffn_up, Buf.wrap(self.x1K), k);
             t = 0;
             while (t < k) : (t += 1) {
                 for (self.mlpK[t * n_ff ..][0..n_ff], self.mlpK1[t * n_ff ..][0..n_ff]) |*gi, uv|
                     gi.* = silu(gi.*) * uv;
             }
-            self.exec.matvecBatchK(self.x2K[0 .. k * hidden], lw.ffn_down, self.mlpK, k);
+            self.exec.matvecBatchK(Buf.wrap(self.x2K[0 .. k * hidden]), lw.ffn_down, Buf.wrap(self.mlpK), k);
             t = 0;
             while (t < k) : (t += 1) {
                 for (self.xK[t * hidden ..][0..hidden], self.x2K[t * hidden ..][0..hidden]) |*xo, v| xo.* += v;
@@ -1315,11 +1319,11 @@ pub const Engine = struct {
         rmsNorm(self.x1, self.xK[(k - 1) * hidden ..][0..hidden], self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
-                .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
+                .quant, .f32 => self.exec.matvec(Buf.wrap(self.logits), ow, Buf.wrap(self.x1)),
             }
         } else {
             switch (self.token_embd) {
-                .quant => |qrow| self.exec.matvec(self.logits, .{ .quant = qrow }, self.x1),
+                .quant => |qrow| self.exec.matvec(Buf.wrap(self.logits), .{ .quant = qrow }, Buf.wrap(self.x1)),
                 .f32 => |m| {
                     const vocab: usize = c.vocab;
                     for (0..vocab) |vi| {
@@ -1364,18 +1368,18 @@ pub const Engine = struct {
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
         const qkv = self.qkv[0..conv_dim];
-        self.exec.matvec(qkv, lw.attn_qkv.?, self.x1);
+        self.exec.matvec(Buf.wrap(qkv), lw.attn_qkv.?, Buf.wrap(self.x1));
 
         // z projection (attn_gate [hidden, value_dim])
         const z = self.z[0..value_dim];
-        self.exec.matvec(z, lw.attn_gate.?, self.x1);
+        self.exec.matvec(Buf.wrap(z), lw.attn_gate.?, Buf.wrap(self.x1));
 
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
         // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
         // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
         const ab = self.ab[0 .. 2 * nv];
-        self.exec.matvec(ab[0..nv], lw.ssm_alpha.?, self.x1);
-        self.exec.matvec(ab[nv..], lw.ssm_beta.?, self.x1);
+        self.exec.matvec(Buf.wrap(ab[0..nv]), lw.ssm_alpha.?, Buf.wrap(self.x1));
+        self.exec.matvec(Buf.wrap(ab[nv..]), lw.ssm_beta.?, Buf.wrap(self.x1));
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all channels; beta/gamma
@@ -1428,7 +1432,7 @@ pub const Engine = struct {
         }
 
         // out projection [2048 -> 1024]
-        self.exec.matvec(self.x2[0..hidden], lw.ssm_out.?, gout);
+        self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.ssm_out.?, Buf.wrap(gout));
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1600,7 +1604,7 @@ pub const Engine = struct {
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv[0 .. 2 * q_dim];
-        self.exec.matvec(qg, lw.attn_q.?, self.x1);
+        self.exec.matvec(Buf.wrap(qg), lw.attn_q.?, Buf.wrap(self.x1));
         const q = self.q[0..q_dim];
         const gate = self.z[0..q_dim];
         for (0..heads) |h| {
@@ -1608,8 +1612,8 @@ pub const Engine = struct {
             @memcpy(q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
             @memcpy(gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
         }
-        self.exec.matvec(self.k[0..kv_dim], lw.attn_k.?, self.x1);
-        self.exec.matvec(self.v[0..kv_dim], lw.attn_v.?, self.x1);
+        self.exec.matvec(Buf.wrap(self.k[0..kv_dim]), lw.attn_k.?, Buf.wrap(self.x1));
+        self.exec.matvec(Buf.wrap(self.v[0..kv_dim]), lw.attn_v.?, Buf.wrap(self.x1));
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
         for (0..heads) |h| {
@@ -1661,7 +1665,7 @@ pub const Engine = struct {
 
         // sigmoid gate (B14), then o_proj [2048 -> 1024]
         mulSigmoidVec(gout[0..q_dim], gate[0..q_dim]);
-        self.exec.matvec(self.x2[0..hidden], lw.attn_output.?, gout);
+        self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.attn_output.?, Buf.wrap(gout));
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 
@@ -1671,10 +1675,10 @@ pub const Engine = struct {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         rmsNorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
-        self.exec.matvec(self.mlp_h, lw.ffn_gate, self.x1);
-        self.exec.matvec(self.mlp_h1, lw.ffn_up, self.x1);
+        self.exec.matvec(Buf.wrap(self.mlp_h), lw.ffn_gate, Buf.wrap(self.x1));
+        self.exec.matvec(Buf.wrap(self.mlp_h1), lw.ffn_up, Buf.wrap(self.x1));
         for (0..c.n_ff) |i| self.mlp_h[i] = silu(self.mlp_h[i]) * self.mlp_h1[i];
-        self.exec.matvec(self.x2[0..hidden], lw.ffn_down, self.mlp_h);
+        self.exec.matvec(Buf.wrap(self.x2[0..hidden]), lw.ffn_down, Buf.wrap(self.mlp_h));
         for (0..hidden) |i| self.x[i] += self.x2[i];
     }
 

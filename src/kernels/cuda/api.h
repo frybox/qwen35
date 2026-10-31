@@ -105,6 +105,34 @@ int q35_launch_mul_mat_vec_q8_0(const void *d_w, const void *d_xq, float *d_out,
 int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x, float *d_out,
                                int rows, int cols, int tokens, void *stream);
 
+// --- IQ codebook upload (call ONCE, before the first IQ kernel) -------------
+//
+// The twelve IQ lookup tables are DEFINED ONCE, in src/iq_tables.zig, and are
+// compiled into this executable (the CUDA kernels are linked into the CLI now,
+// not into a separately dlopen'd .so, so their host addresses are ordinary
+// link-time symbols).  Device code cannot read host memory, so this call copies
+// all twelve to a single ~40 KB device buffer at start-up and points the
+// __device__ pointers of iq_tables.cuh at their slices; every kernel that
+// touches an IQ type reads that copy, and none of them can work before this has
+// succeeded.
+//
+// Returns 0 (cudaSuccess) or the numeric cudaError_t of the first failure -- a
+// failure is never swallowed, the backend turns it into a load error rather than
+// launching IQ kernels over a null table pointer.  Idempotent: later calls return
+// the first result without touching the device again.  See iq_tables.cu for the
+// upload plan and for why it uses cudaMemcpyToSymbolAsync rather than an init
+// kernel (measured, on this toolchain).
+int q35_launch_init_tables(void *stream);
+
+// Bytes resident on the device for the codebooks (0 before a successful init),
+// and 1 once the upload succeeded.  Both are pure host reads: no CUDA call.
+unsigned long long q35_iq_tables_bytes(void);
+int q35_iq_tables_ready(void);
+
+// Free the device buffer and reset the idempotence flag (so a later backend in
+// the same process re-uploads).  Safe to call when init never ran.
+void q35_launch_deinit_tables(void);
+
 // --- geometry queries (pure host code, no launch) --------------------------
 // 256 for types that want Q8_K activations, 32 for Q8_0, 0 for unknown types.
 int q35_quant_act_block_elems(int ttype);
