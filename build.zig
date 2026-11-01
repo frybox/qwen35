@@ -102,6 +102,20 @@ const cuda_sources = [_][]const u8{
     // pure elementwise activation launchers (q35_launch_scale_vec,
     // _add_resid, _copy_range, _zero_buf) -- P2b, first batch
     "elementwise.cu",
+    // normalisation launchers (q35_launch_rmsnorm, _l2norm) -- P2b, second
+    // batch; first kernels here whose reduction order differs from the CPU's
+    "norm.cu",
+    // activation launchers (q35_launch_silu, _mul_silu, _mul_sigmoid,
+    // _swiglu, _softmax, _conv_step) -- P2b, second batch.  ULP-level (the
+    // device expf is not glibc's), see the file header.
+    "act.cu",
+    // P2c: the state-machine kernels that only became device-able once KV and
+    // the GDN state are device regions -- q35_launch_attn_decode
+    // (scores/softmax/PV/gate) and q35_launch_gdn_step + _gdn_gamma (delta
+    // rule).  These are the only kernels here with a WRITTEN accumulation
+    // contract, because GDN state error carries across tokens; see both files.
+    "attn.cu",
+    "gdn.cu",
 };
 
 /// Every regular file under src/kernels/cuda/.  These become explicit inputs of

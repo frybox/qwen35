@@ -600,6 +600,11 @@ pub const Engine = struct {
     logits: backend.Buf,
     delta: backend.Buf, // 128 per-head scratch
     kv_mem: backend.Buf, // 128
+    /// Per-layer GDN decay scalars (`gdnGamma`'s output), `gdn_n_heads` long.
+    /// A backend region because `gdnGamma` runs on the backend under a device
+    /// backend; the forward path reads it back with `Exec.copyToHost` because
+    /// `gdnStep` takes gamma as an `f32` argument.
+    gamma_scratch: backend.Buf,
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
     /// through cache).  0 => the batched path is unavailable.
@@ -703,19 +708,30 @@ pub const Engine = struct {
         ffn_down: LinearW,
     };
 
+    /// KV cache for one full-attention layer: `max_seq` rows of `kv_dim`
+    /// floats each, in the backend's own address space (device memory under
+    /// `--backend cuda`).  `len` is the number of rows written so far.
+    ///
+    /// P2c: these are `backend.Buf`, not `[]f32`, and that is what lets
+    /// `attnDecode` read the rows without a round trip -- the engine never
+    /// dereferences them, it only takes `span()` sub-windows and hands them to
+    /// backend slots.
     const KvCache = struct {
-        k: []f32,
-        v: []f32,
+        k: backend.Buf,
+        v: backend.Buf,
         len: u32,
     };
 
     /// Causal conv state: [conv_dim] history of the last K-1=3 raw samples
     /// (channel-major, same order as the C ref's per-channel rows).
     /// delta-rule state: [nv, kd, kd] row-major S[k][v].
+    /// Same story as `KvCache` (P2c): backend-owned regions, addressed only
+    /// through `span()`.  `state` is [nv, kd, vd] row-major, one `kd*vd`
+    /// sub-window per value head.
     const GdnState = struct {
-        conv: []f32,
+        conv: backend.Buf,
         conv_len: u32,
-        state: []f32,
+        state: backend.Buf,
     };
 
     pub const max_seq: u32 = 4096;
@@ -874,6 +890,7 @@ pub const Engine = struct {
             .logits = backend.Buf.empty,
             .delta = backend.Buf.empty,
             .kv_mem = backend.Buf.empty,
+            .gamma_scratch = backend.Buf.empty,
         };
         errdefer e.freeAll();
 
@@ -923,19 +940,22 @@ pub const Engine = struct {
         for (0..n_layers) |li| {
             if (cfg.isFullAttention(@intCast(li))) {
                 e.kv[li] = .{
-                    .k = try alloc.alloc(f32, @as(usize, max_seq) * kv_dim),
-                    .v = try alloc.alloc(f32, @as(usize, max_seq) * kv_dim),
+                    .k = try exec.allocBuf(@as(usize, max_seq) * kv_dim),
+                    .v = try exec.allocBuf(@as(usize, max_seq) * kv_dim),
                     .len = 0,
                 };
-                e.gdn[li] = .{ .conv = &.{}, .conv_len = 0, .state = &.{} };
+                e.gdn[li] = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
             } else {
-                e.kv[li] = .{ .k = &.{}, .v = &.{}, .len = 0 };
+                e.kv[li] = .{ .k = backend.Buf.empty, .v = backend.Buf.empty, .len = 0 };
                 e.gdn[li] = .{
-                    .conv = try alloc.alloc(f32, gdn_conv_dim * (@as(usize, cfg.conv_kernel) - 1)),
+                    .conv = try exec.allocBuf(gdn_conv_dim * (@as(usize, cfg.conv_kernel) - 1)),
                     .conv_len = 0,
-                    .state = try alloc.alloc(f32, gdn_kv),
+                    .state = try exec.allocBuf(gdn_kv),
                 };
-                @memset(e.gdn[li].state, 0);
+                // The delta-rule state must start at zero.  The region is
+                // backend memory (device under `--backend cuda`), so the reset
+                // goes through the backend: a host `@memset` cannot reach it.
+                exec.zeroBuf(e.gdn[li].state);
             }
             inited += 1;
         }
@@ -1037,6 +1057,7 @@ pub const Engine = struct {
         e.logits = try e.exec.allocBuf(cfg.vocab);
         e.delta = try e.exec.allocBuf(gdn_kd);
         e.kv_mem = try e.exec.allocBuf(gdn_kd);
+        e.gamma_scratch = try e.exec.allocBuf(@as(usize, cfg.gdn_n_heads));
         e.sample_scratch = try e.exec.allocBuf(cfg.vocab);
 
         // ---- K-token batched prefill scratch (K = 16) ----
@@ -1091,22 +1112,24 @@ pub const Engine = struct {
         }
     }
 
+    /// Release the KV / GDN regions for the first `n` layers.
+    ///
+    /// P2c: these are backend regions now, so there is nothing per-cache to
+    /// free here -- `Exec.allocBuf` hands out regions that `Exec.freeScratch`
+    /// releases all at once at teardown.  What remains is the *reset* the
+    /// caller may want, and even that is a no-op: a re-`load` builds a fresh
+    /// backend.  The `O(n)` host frees that used to live here are gone with
+    /// the host allocations.
+    ///
+    /// Robust to partially-constructed state: `load`'s `errdefer freeAll` may
+    /// run before kv/gdn are allocated (an unsupported tensor type fails at
+    /// `loadLinear` first), in which case `self.kv`/`self.gdn` are still the
+    /// empty sentinel.
     fn freeCachesUpTo(self: *Engine, n: usize) void {
-        // Robust to partially-constructed state: `load`'s `errdefer freeAll`
-        // may run before kv/gdn are allocated (e.g. an unsupported tensor type
-        // fails at loadLinear before the caches exist), in which case
-        // self.kv/self.gdn are still the empty sentinel.  Clamp to the real
-        // allocated length so a clean error return does not read OOB.
         const nk = @min(n, self.kv.len);
-        for (self.kv[0..nk]) |c| {
-            if (c.k.len > 0) self.alloc.free(c.k);
-            if (c.v.len > 0) self.alloc.free(c.v);
-        }
+        for (self.kv[0..nk]) |*c| c.* = .{ .k = backend.Buf.empty, .v = backend.Buf.empty, .len = 0 };
         const ng = @min(n, self.gdn.len);
-        for (self.gdn[0..ng]) |s| {
-            if (s.conv.len > 0) self.alloc.free(s.conv);
-            if (s.state.len > 0) self.alloc.free(s.state);
-        }
+        for (self.gdn[0..ng]) |*s| s.* = .{ .conv = backend.Buf.empty, .conv_len = 0, .state = backend.Buf.empty };
     }
 
     fn freeAll(self: *Engine) void {
@@ -1157,10 +1180,14 @@ pub const Engine = struct {
     // Forward: one token at position `pos`
     // -----------------------------------------------------------------
 
-    /// Run the whole model for one token and return the raw logits (no
-    /// sampling, no PRNG draw).  Prefill uses this so the sampler's coin
+    /// Run the whole model for one token and return the raw logits as a backend
+    /// `Buf` -- device memory on the GPU backend, so the caller must go through
+    /// `Exec.argmax` / `Exec.sample` (or `copyToHost` explicitly) rather than
+    /// indexing it.  (P2d: this used to return `self.logits.slice()`, which was
+    /// the host dereference that forced a D2H of the whole vocabulary per token.)
+    /// No sampling, no PRNG draw.  Prefill uses this so the sampler's coin
     /// stream is untouched by the prompt.
-    pub fn forwardLogits(self: *Engine, token: u32, pos: u32) []f32 {
+    pub fn forwardLogits(self: *Engine, token: u32, pos: u32) Buf {
         const c = self.cfg;
         const hidden: usize = c.hidden;
         const io = self.io;
@@ -1207,7 +1234,7 @@ pub const Engine = struct {
             }
         }
         if (prof) prof_lm += profNs(io, b);
-        return self.logits.slice();
+        return self.logits;
     }
 
     pub fn profReport() void {
@@ -1219,7 +1246,7 @@ pub const Engine = struct {
     /// temperature is 0 — the historical default.
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
         const logits = self.forwardLogits(token, pos);
-        return self.exec.sample(Buf.wrap(logits), self.sample_scratch, &self.sampler);
+        return self.exec.sample(logits, self.sample_scratch, &self.sampler);
     }
 
     /// Dequantize the embedding row of `token` into `dst` (hidden wide).
@@ -1249,7 +1276,7 @@ pub const Engine = struct {
     /// state kernels (GDN conv + 128x128 state, full-attention scores, KV
     /// cache writes) run token-by-token in exactly the serial order, so the
     /// KV cache and GDN state end up bit-identical to the serial prefill.
-    pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) []f32 {
+    pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) Buf {
         const k = tokens.len;
         std.debug.assert(k > 0 and k <= self.nbatch);
         if (k == 1) return self.forwardLogits(tokens[0], pos0);
@@ -1325,7 +1352,7 @@ pub const Engine = struct {
                 .f32 => |m| self.exec.matvec(self.logits, .{ .f32 = m }, self.x1),
             }
         }
-        return self.logits.slice();
+        return self.logits;
     }
 
     /// Greedy argmax over the last logits.  Forwards to the backend so the logits
@@ -1370,13 +1397,26 @@ pub const Engine = struct {
         // convStep handles history + silu for all channels; beta/gamma
         // are computed after, on the RAW a/b projections (not conv'd).
         const st = &self.gdn[li];
-        self.exec.convStep(Buf.wrap(st.conv), qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
+        self.exec.convStep(st.conv, qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
 
         // beta = sigmoid(b); g = A * softplus(a + dt_bias) with A = ssm_a
         // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
-        const beta = self.ab.span(nv, nv); // beta lives in the b half, written in place
-        var gamma: [64]f32 = undefined;
-        self.exec.gdnGamma(ab.span(0, nv), beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
+        //
+        // `beta` is written IN PLACE into the b half of `ab`, and `gamma` is
+        // this layer's `nv` decay scalars.  Both are backend regions under a
+        // device backend, while `gdnStep`'s vtable contract takes them as
+        // `f32` arguments, so the two `nv`-long host arrays below are the one
+        // and only place a per-token forward pass reads back from the device
+        // (`Exec.copyToHost`: 2 * nv * 4 B per layer, ~16 KiB per token for the
+        // 0.8B's 24 GDN layers -- against the ~15 MiB/token the old staging
+        // path moved).
+        var beta_host: [64]f32 = undefined;
+        var gamma_host: [64]f32 = undefined;
+        const beta = self.ab.span(nv, nv); // b half, overwritten with sigmoid(b)
+        const gamma = self.gamma_scratch.span(0, nv);
+        self.exec.gdnGamma(ab.span(0, nv), beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), gamma, nv);
+        self.exec.copyToHost(gamma_host[0..nv], gamma);
+        self.exec.copyToHost(beta_host[0..nv], beta);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out.span(0, value_dim);
@@ -1387,7 +1427,7 @@ pub const Engine = struct {
             const q_h = qkv.span(kh * kd, kd);
             const k_h = qkv.span(kq_dim + kh * kd, kd);
             const v_h = qkv.span(2 * kq_dim + h * kd, kd);
-            const sh = state[h * kd * vd ..][0 .. kd * vd];
+            const sh = state.span(h * kd * vd, kd * vd);
 
             // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128)
             self.exec.l2norm(q_h);
@@ -1399,7 +1439,7 @@ pub const Engine = struct {
             // in a second pass (see gdnFused).
             const km = self.kv_mem.span(0, vd);
             const out_h = gout.span(h * vd, vd);
-            self.exec.gdnStep(Buf.wrap(sh), k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma[h], beta.slice()[h], vd);
+            self.exec.gdnStep(sh, k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma_host[h], beta_host[h], vd);
         }
 
         // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6)
@@ -1415,12 +1455,16 @@ pub const Engine = struct {
         self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
     }
 
-    /// Causal conv step: out[i] = sum_t w[i][t] * hist[i][t], where hist =
-    /// [3 previous raw samples (oldest..newest), current raw sample].
-    fn convStep(self: *Engine, st: *GdnState, qkv: []f32, wconv: []const f32, K: usize) void {
+    /// Causal conv step, HOST-slice form: the unit test of this file drives it
+    /// directly (the forward path calls `exec.convStep` with backend regions
+    /// instead, and never reaches this function).
+    ///
+    /// out[i] = sum_t w[i][t] * hist[i][t], where hist = [3 previous raw
+    /// samples (oldest..newest), current raw sample].
+    fn convStep(self: *Engine, conv: []f32, qkv: []f32, wconv: []const f32, K: usize) void {
         _ = self;
         std.debug.assert(K == 4);
-        const h: [*]f32 = st.conv.ptr;
+        const h: [*]f32 = conv.ptr;
         const w: [*]const f32 = wconv.ptr;
         const out: [*]f32 = qkv.ptr;
         for (0..qkv.len) |i| {
@@ -1481,8 +1525,8 @@ pub const Engine = struct {
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), k);
-        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), v);
+        self.exec.copyRange(cache.k.span(slot * kv_dim, kv_dim), k);
+        self.exec.copyRange(cache.v.span(slot * kv_dim, kv_dim), v);
         cache.len += 1;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
@@ -1490,7 +1534,7 @@ pub const Engine = struct {
         // scores -> softmax -> PV -> sigmoid gate in one backend call
         // (`attnDecode`), reading the cache rows written so far.
         self.exec.attnDecode(q.span(0, q_dim), gate.span(0, q_dim),
-            Buf.wrap(cache.k[0 .. (slot + 1) * kv_dim]), Buf.wrap(cache.v[0 .. (slot + 1) * kv_dim]),
+            cache.k.span(0, (slot + 1) * kv_dim), cache.v.span(0, (slot + 1) * kv_dim),
             self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
     }
@@ -1518,9 +1562,16 @@ pub const Engine = struct {
         const ab_a = self.abK.span(t * nv, nv);
         const beta = self.abK.span(k * nv + t * nv, nv);
         const st = &self.gdn[li];
-        self.exec.convStep(Buf.wrap(st.conv), qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
-        var gamma: [64]f32 = undefined;
-        self.exec.gdnGamma(ab_a, beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), Buf.wrap(gamma[0..nv]), nv);
+        self.exec.convStep(st.conv, qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
+        // Same device->host scalars as the serial path above: gamma is the
+        // backend's `nv` decay values, beta has been overwritten in place by
+        // `gdnGamma` with sigmoid(b), and `gdnStep` wants both as `f32`s.
+        var beta_host: [64]f32 = undefined;
+        var gamma_host: [64]f32 = undefined;
+        const gamma = self.gamma_scratch.span(0, nv);
+        self.exec.gdnGamma(ab_a, beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), gamma, nv);
+        self.exec.copyToHost(gamma_host[0..nv], gamma);
+        self.exec.copyToHost(beta_host[0..nv], beta);
 
         const state = st.state;
         const gout = self.goutK.span(t * value_dim, value_dim);
@@ -1529,7 +1580,7 @@ pub const Engine = struct {
             const q_h = qkv.span(kh * kd, kd);
             const k_h = qkv.span(kq_dim + kh * kd, kd);
             const v_h = qkv.span(2 * kq_dim + h * kd, kd);
-            const sh = state[h * kd * vd ..][0 .. kd * vd];
+            const sh = state.span(h * kd * vd, kd * vd);
 
             self.exec.l2norm(q_h);
             self.exec.l2norm(k_h);
@@ -1538,7 +1589,7 @@ pub const Engine = struct {
 
             const km = self.kv_mem.span(0, vd);
             const out_h = gout.span(h * vd, vd);
-            self.exec.gdnStep(Buf.wrap(sh), k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma[h], beta.slice()[h], vd);
+            self.exec.gdnStep(sh, k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma_host[h], beta_host[h], vd);
         }
 
         for (0..nv) |h| {
@@ -1595,8 +1646,8 @@ pub const Engine = struct {
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRange(Buf.wrap(cache.k[slot * kv_dim ..][0..kv_dim]), self.k.span(0, kv_dim));
-        self.exec.copyRange(Buf.wrap(cache.v[slot * kv_dim ..][0..kv_dim]), self.v.span(0, kv_dim));
+        self.exec.copyRange(cache.k.span(slot * kv_dim, kv_dim), self.k.span(0, kv_dim));
+        self.exec.copyRange(cache.v.span(slot * kv_dim, kv_dim), self.v.span(0, kv_dim));
         cache.len += 1;
 
         // attention: kv = h // gqa (B13), scale = hd^-0.5
@@ -1604,7 +1655,7 @@ pub const Engine = struct {
         const gout = self.gdn_out.span(0, q_dim);
         // scores -> softmax -> PV -> sigmoid gate in one backend call
         self.exec.attnDecode(q.span(0, q_dim), gate.span(0, q_dim),
-            Buf.wrap(cache.k[0 .. (slot + 1) * kv_dim]), Buf.wrap(cache.v[0 .. (slot + 1) * kv_dim]),
+            cache.k.span(0, (slot + 1) * kv_dim), cache.v.span(0, (slot + 1) * kv_dim),
             self.attn.span(0, slot + 1), gout.span(0, q_dim),
             slot, heads, gqa, hd, kv_dim, scale);
         // o_proj [2048 -> 1024]
@@ -1632,8 +1683,8 @@ pub const Engine = struct {
     pub fn reset(self: *Engine) void {
         for (self.kv) |*cache| cache.len = 0;
         for (self.gdn) |*st| {
-            if (st.conv.len > 0) @memset(st.conv, 0);
-            if (st.state.len > 0) @memset(st.state, 0);
+            if (st.conv.len > 0) self.exec.zeroBuf(st.conv);
+            if (st.state.len > 0) self.exec.zeroBuf(st.state);
             st.conv_len = 0;
         }
     }
@@ -1698,7 +1749,7 @@ pub const Engine = struct {
         self.exec.profReset();
         self.exec.profPhase(true);
         const t_start = Io.Clock.Timestamp.now(io, .awake);
-        var last_logits: []f32 = &.{};
+        var last_logits: Buf = Buf.empty;
         if (self.nbatch == 0) {
             for (prompt, 0..) |t, i| last_logits = self.forwardLogits(t, @intCast(i));
         } else {
@@ -1726,7 +1777,7 @@ pub const Engine = struct {
         var hit_context_limit = false;
         // prof_phase stays on across prefill and decode (set above); do not
         // reset here or the prefill samples are thrown away.
-        var next: u32 = self.exec.sample(Buf.wrap(last_logits), self.sample_scratch, &self.sampler);
+        var next: u32 = self.exec.sample(last_logits, self.sample_scratch, &self.sampler);
         // Two independent limits: how many tokens the caller asked for, and how
         // many slots the KV cache has left.  `pos` advances regardless.
         while (generated < n_predict) {
@@ -1857,7 +1908,6 @@ test "convStep: causal left-pad semantics" {
     const conv = try alloc.alloc(f32, 4);
     defer alloc.free(conv);
     @memset(conv, 0);
-    var st = Engine.GdnState{ .conv = conv, .conv_len = 0, .state = &.{} };
     var eng = Engine{
         .alloc = alloc,
         .cfg = .{},
@@ -1888,20 +1938,21 @@ test "convStep: causal left-pad semantics" {
         .logits = backend.Buf.empty,
         .delta = backend.Buf.empty,
         .kv_mem = backend.Buf.empty,
+        .gamma_scratch = backend.Buf.empty,
         .prefill_ms = 0,
     };
     // taps: w = [1, 0.5, 0.25, 2]
     const wc = [_]f32{ 1, 0.5, 0.25, 2 };
     var qkv = [_]f32{1};
-    eng.convStep(&st, &qkv, &wc, 4);
+    eng.convStep(conv, &qkv, &wc, 4);
     // token0: state all zero -> out = 1*2 = 2, silu(2)
     try std.testing.expectApproxEqAbs(@as(f32, 2.0 / (1.0 + @exp(@as(f32, -2)))), qkv[0], 1e-5);
     qkv[0] = 10; // token1
-    eng.convStep(&st, &qkv, &wc, 4);
+    eng.convStep(conv, &qkv, &wc, 4);
     // window: [0,0,1(raw t0),10] -> 0*1+0*.5+1*.25+10*2 = 20.25
     try std.testing.expectApproxEqAbs(silu(@as(f32, 20.25)), qkv[0], 1e-4);
     qkv[0] = 100; // token2
-    eng.convStep(&st, &qkv, &wc, 4);
+    eng.convStep(conv, &qkv, &wc, 4);
     // window: [0,1,10,100] -> 0+0.5+2.5+200 = 203
     try std.testing.expectApproxEqAbs(silu(@as(f32, 203)), qkv[0], 1e-3);
 }

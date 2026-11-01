@@ -200,6 +200,16 @@ pub const Exec = struct {
         /// Copy a host tensor row into a backend region (the f32 embedding row
         /// when token_embd is unquantized).
         copyFromHost: *const fn (ctx: *anyopaque, dst: Buf, src: []const f32) void,
+        /// Copy a small backend region back into a host slice.
+        ///
+        /// This is the ONLY device->host path on the per-token execution and
+        /// exists for exactly one thing: the per-layer `nv` scalars
+        /// (`beta`/`gamma`) that `gdnGamma` produces on the backend but that
+        /// `gdnStep` takes as `f32` arguments per the vtable contract.  It is
+        /// `nv` (64) floats ONCE PER LAYER PER TOKEN, against the megabyte
+        /// traffic the old staging path moved per operator.  Never use it to
+        /// bring activations back -- that is what P2c removed.
+        copyToHost: *const fn (ctx: *anyopaque, dst: []f32, src: Buf) void,
         /// Zero a region (reset of the conv history / GDN state).
         zeroBuf: *const fn (ctx: *anyopaque, buf: Buf) void,
         /// Greedy argmax over logits.  On a device backend this runs on the
@@ -321,6 +331,9 @@ pub const Exec = struct {
     }
     pub fn copyFromHost(self: Exec, dst: Buf, src: []const f32) void {
         self.vtable.copyFromHost(self.ptr, dst, src);
+    }
+    pub fn copyToHost(self: Exec, dst: []f32, src: Buf) void {
+        self.vtable.copyToHost(self.ptr, dst, src);
     }
     pub fn zeroBuf(self: Exec, buf: Buf) void {
         self.vtable.zeroBuf(self.ptr, buf);

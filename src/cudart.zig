@@ -159,6 +159,9 @@ pub const Lib = struct {
     Malloc: *const fn (*?*anyopaque, usize) callconv(.c) c_int,
     Free: *const fn (?*anyopaque) callconv(.c) c_int,
     Memcpy: *const fn (?*anyopaque, ?*const anyopaque, usize, c_int) callconv(.c) c_int,
+    /// Device-side `memset`.  Needed so the error paths of the numeric slots can
+    /// zero a device result without staging it through the host.
+    Memset: *const fn (?*anyopaque, c_int, usize) callconv(.c) c_int,
     MemGetInfo: *const fn (*usize, *usize) callconv(.c) c_int,
     /// Blocking on the default stream; device synchronize is the cheapest way
     /// to make an async launch error observable before we read results back.
@@ -257,6 +260,7 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
     L.Free = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaFree", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.Memcpy = bind(&out.lib, *const fn (?*anyopaque, ?*const anyopaque, usize, c_int) callconv(.c) c_int, "cudaMemcpy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.MemGetInfo = bind(&out.lib, *const fn (*usize, *usize) callconv(.c) c_int, "cudaMemGetInfo", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.Memset = bind(&out.lib, *const fn (?*anyopaque, c_int, usize) callconv(.c) c_int, "cudaMemset", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.DeviceSynchronize = bind(&out.lib, *const fn () callconv(.c) c_int, "cudaDeviceSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamCreate = bind(&out.lib, *const fn (*?*anyopaque) callconv(.c) c_int, "cudaStreamCreate", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaStreamDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;

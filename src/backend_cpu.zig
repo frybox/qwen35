@@ -838,6 +838,14 @@ pub const CpuBackend = struct {
         ew.bufCopyFromHost(dst, src);
     }
 
+    /// Host slices on this backend, so the "copy" is a plain memcpy (and for
+    /// the `beta`/`gamma` scalars, the very same region the caller reads).
+    fn vCopyToHost(ctx: *anyopaque, dst: []f32, src: Buf) void {
+        _ = ctx;
+        std.debug.assert(dst.len <= src.len);
+        @memcpy(dst, src.slice()[0..dst.len]);
+    }
+
     fn vZeroBuf(ctx: *anyopaque, buf: Buf) void {
         _ = ctx;
         @memset(buf.slice(), 0);
@@ -890,6 +898,7 @@ pub const CpuBackend = struct {
         .gdnGamma = vGdnGamma,
         .copyRange = vCopyRange,
         .copyFromHost = vCopyFromHost,
+        .copyToHost = vCopyToHost,
         .zeroBuf = vZeroBuf,
         .argmax = vArgmax,
         .sample = vSample,

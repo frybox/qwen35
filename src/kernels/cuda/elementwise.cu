@@ -43,6 +43,7 @@
 // `addResid` / `scaleVec` safe, and it is also why the result does not depend
 // on the block size.
 #include "common.cuh"
+#include <math_constants.h>
 
 namespace {
 
@@ -100,5 +101,55 @@ extern "C" int q35_launch_zero_buf(float *d_buf, int n, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;
     k_zero_buf<<<gridFor(n), kThreads, 0, stream>>>(d_buf, n);
+    return (int)cudaGetLastError();
+}
+
+// ---------------------------------------------------------------------------
+// argmax -- the one REDUCTION here, because it cannot be avoided: `sample`
+// needs the index of the largest logit and the engine holds logits in device
+// memory (P2c).  Doing it on the host would mean a D2H of the whole vocabulary
+// per token, which is exactly the kind of transfer P2c removes.
+//
+// EXACTNESS: a max over floats is order-independent (no rounding), so the
+// requirement is only that the TIE-BREAK matches `elementwise.argmaxKernel`:
+// it uses `v > best` scanning ascending, so the FIRST index of the maximum
+// wins.  This kernel therefore reduces (value, index) pairs with
+// "greater value wins; equal value keeps the SMALLER index".
+// ---------------------------------------------------------------------------
+
+// Block reduction over (value, index).  Each thread scans a strided slice, then
+// the block folds 256 candidates down in shared memory.
+__global__ void k_argmax(const float *__restrict__ d_x, int n, int *d_out) {
+    __shared__ float s_val[256];
+    __shared__ int s_idx[256];
+    const int tid = threadIdx.x;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const float v = d_x[i];
+        // Strict > keeps the first index on ties within a thread's slice; the
+        // (value, index) combine below extends that across threads.
+        if (v > best) { best = v; best_i = i; }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    __syncthreads();
+    for (int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            if (s_val[tid + stride] > s_val[tid] ||
+                (s_val[tid + stride] == s_val[tid] && s_idx[tid + stride] < s_idx[tid])) {
+                s_val[tid] = s_val[tid + stride];
+                s_idx[tid] = s_idx[tid + stride];
+            }
+        }
+        __syncthreads();
+    }
+    if (tid == 0) *d_out = s_idx[0];
+}
+
+extern "C" int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream_v) {
+    if (n <= 0) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_argmax<<<1, 256, 0, stream>>>(d_x, n, d_out);
     return (int)cudaGetLastError();
 }

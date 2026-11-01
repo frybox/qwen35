@@ -119,6 +119,70 @@ int q35_launch_add_resid(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_zero_buf(float *d_buf, int n, void *stream);
 
+// --- normalisation slots (src/kernels/cuda/norm.cu) ------------------------
+//
+// `rows` blocks of `n` f32 each, contiguous.  `d_w` is a length-`n` weight
+// (the same one for every row); l2norm has none.  `eps` is passed by the Zig
+// side so the CPU reference's constant lives in one place (elementwise.zig
+// `l2norm` hardcodes 1e-6, `rmsNorm` takes it from the model config).
+//
+// NOT bit-exact with the CPU: the sum of squares is a block tree reduction
+// whereas the CPU sums serially, so the last bits of the scale differ.  The
+// elementwise multiply and the `1/sqrtf` are exact.  Measured max relative
+// error 8.8e-7 (13 ULP) for rmsnorm, 8.3e-7 (12 ULP) for l2norm; see norm.cu's
+// header for why the ULP count is higher than the scale's own 1-2.
+int q35_launch_rmsnorm(float *d_out, const float *d_x, const float *d_w,
+                       int rows, int n, float eps, void *stream);
+int q35_launch_l2norm(float *d_x, int rows, int n, float eps, void *stream);
+
+// --- activation / conv slots (src/kernels/cuda/act.cu) ---------------------
+//
+// Not bit-exact either, for one reason and one only: the device `expf` is a
+// different implementation from glibc's (max 2 ULP measured), while everything
+// around it is spelled as the same sequence of rounded operations the CPU
+// performs.  softmax additionally sums over a block instead of serially.
+// Measured: 4-5 ULP / <=3.7e-7 relative for the four activations, 34 ULP but
+// only 2.1e-6 relative for softmax (its outputs are all < 1).  See act.cu.
+int q35_launch_silu(float *d_x, int n, void *stream);
+int q35_launch_mul_silu(float *d_out, const float *d_gate, int n, void *stream);
+int q35_launch_mul_sigmoid(float *d_out, const float *d_gate, int n, void *stream);
+int q35_launch_swiglu(float *d_gate, const float *d_up, int n, void *stream);
+int q35_launch_softmax(float *d_x, int n, void *stream);
+// 4-tap causal conv over the per-channel history `d_conv` (3 f32 per channel,
+// shifted in place), then silu over the whole row.  Two launches internally.
+int q35_launch_conv_step(float *d_conv, float *d_y, const float *d_wconv,
+                         int n, void *stream);
+
+// index of the largest logit (first index wins on ties, matching
+// elementwise.argmaxKernel).  Input is device logits, output a single int.
+int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream);
+
+// --- Gated Delta Net state machine -----------------------------------------
+// One token of the delta-rule state update, one launch per value head.
+// d_state is the [kd, vd] slice for THIS head (row-major S[k][v], kd*vd floats),
+// updated in place; d_k/d_q are kd, d_v/d_km/d_delta/d_out are vd.  See
+// gdn.cu for the accumulation-order contract with engine.zig's gdnFused.
+int q35_launch_gdn_step(float *d_state, const float *d_k, const float *d_v,
+                        const float *d_q, float *d_km, float *d_delta,
+                        float *d_out, float gamma, float beta, int vd,
+                        void *stream);
+
+// beta = sigmoid(b) written IN PLACE into d_b_raw; gamma = exp(ssm_a *
+// softplus(a + dt_bias)).  nv = per-value-head scalars.
+int q35_launch_gdn_gamma(const float *d_a_raw, float *d_b_raw,
+                         const float *d_ssm_a, const float *d_dt_bias,
+                         float *d_gamma, int nv, void *stream);
+
+// --- Full-attention decode -------------------------------------------------
+// scores(q,K) -> softmax -> P.V -> sigmoid gate, for every head, in ONE launch.
+// d_q / d_gate / d_gout are heads*hd; d_kcache / d_vcache are (slot+1) rows of
+// kv_dim; d_att is scratch, (slot+1) floats (reused per head).
+int q35_launch_attn_decode(const float *d_q, const float *d_gate,
+                           const float *d_kcache, const float *d_vcache,
+                           float *d_att, float *d_gout, int slot, int heads,
+                           int gqa, int hd, int kv_dim, float scale,
+                           void *stream);
+
 // --- IQ codebook upload (call ONCE, before the first IQ kernel) -------------
 //
 // The twelve IQ lookup tables are DEFINED ONCE, in src/iq_tables.zig, and are

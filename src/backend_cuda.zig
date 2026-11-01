@@ -46,6 +46,7 @@ const backend = @import("backend.zig");
 const cpu_mod = @import("backend_cpu.zig");
 const gguf = @import("gguf.zig");
 const cudart = @import("cudart.zig");
+const sampler = @import("sampler.zig");
 
 /// Build-time facts injected by `build.zig` (`addOptions("build_options")`).
 /// `cuda_linked` is the *same* `-Dcuda` value that gates whether
@@ -110,6 +111,31 @@ const Kernels = struct {
     extern fn q35_launch_add_resid(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_copy_range(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_zero_buf(d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+
+    /// Norms (src/kernels/cuda/norm.cu), activations + conv
+    /// (src/kernels/cuda/act.cu) and rotary (src/kernels/cuda/rope.cu).
+    ///
+    /// `rows` blocks of `n` f32; `d_w`/`d_wconv` are length-`n` per-layer
+    /// weights reused for every row.  NONE of these is bit-exact with the CPU:
+    /// the reductions use a block tree and the transcendentals are the device
+    /// runtime's, not glibc's.  Per-kernel measured error is in api.h and in
+    /// each file's header.
+    extern fn q35_launch_rmsnorm(d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_l2norm(d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_silu(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_mul_silu(d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_mul_sigmoid(d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_swiglu(d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_softmax(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_conv_step(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Index of the largest logit; first index wins on ties.
+    extern fn q35_launch_argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int;
+
+    // P2c: the two state machines.  One launch per value head for gdn_step,
+    // one launch (block per head) for attn_decode; see the kernel headers.
+    extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
 };
 
 // ==== link-time vs. CPU-only build =========================================
@@ -168,6 +194,18 @@ const Launch = if (cuda_linked) struct {
     const add_resid = Kernels.q35_launch_add_resid;
     const copy_range = Kernels.q35_launch_copy_range;
     const zero_buf = Kernels.q35_launch_zero_buf;
+    const rmsnorm = Kernels.q35_launch_rmsnorm;
+    const l2norm = Kernels.q35_launch_l2norm;
+    const silu = Kernels.q35_launch_silu;
+    const mul_silu = Kernels.q35_launch_mul_silu;
+    const mul_sigmoid = Kernels.q35_launch_mul_sigmoid;
+    const swiglu = Kernels.q35_launch_swiglu;
+    const softmax = Kernels.q35_launch_softmax;
+    const conv_step = Kernels.q35_launch_conv_step;
+    const argmax = Kernels.q35_launch_argmax;
+    const attn_decode = Kernels.q35_launch_attn_decode;
+    const gdn_step = Kernels.q35_launch_gdn_step;
+    const gdn_gamma = Kernels.q35_launch_gdn_gamma;
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, stream };
@@ -217,6 +255,54 @@ const Launch = if (cuda_linked) struct {
     }
     fn zero_buf(d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_buf, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn rmsnorm(d_out: ?[*]f32, d_x: ?[*]const f32, d_w: ?[*]const f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_out, d_x, d_w, rows, n, eps, stream };
+        return stubNoCudaKernels();
+    }
+    fn l2norm(d_x: ?[*]f32, rows: c_int, n: c_int, eps: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, rows, n, eps, stream };
+        return stubNoCudaKernels();
+    }
+    fn silu(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn mul_silu(d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_out, d_gate, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn mul_sigmoid(d_out: ?[*]f32, d_gate: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_out, d_gate, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn swiglu(d_gate: ?[*]f32, d_up: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_gate, d_up, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn softmax(d_x: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn conv_step(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_conv, d_y, d_wconv, n, stream };
+        return stubNoCudaKernels();
+    }
+    fn argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, n, d_out, stream };
+        return stubNoCudaKernels();
+    }
+    fn attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
 };
@@ -283,6 +369,14 @@ const DevRow = struct {
 
 const Geometry = struct { rows: usize, cols: usize };
 
+/// A read-only per-layer weight (gamma, conv1d kernel) kept resident on the
+/// device.  `host`+`bytes` is the identity; see `CudaBackend.dev_const`.
+const DevConst = struct {
+    host: [*]const f32,
+    bytes: usize,
+    dev: *anyopaque,
+};
+
 /// Resolved kernel entry points.  They are link-time symbols from
 /// `src/kernels/cuda/*.cu` (never from cudart), so `Kernels` above is the single
 /// place to audit against `src/kernels/cuda/api.h`.
@@ -303,21 +397,6 @@ const Geometry = struct { rows: usize, cols: usize };
 /// (never-written) device pointers.
 const IqTablesState = enum { pending, done, failed };
 
-/// Number of staging slots the elementwise path bounces host buffers through
-/// (see `StageSlot`).  Two is the exact requirement: the widest slot,
-/// `addResid`/`copyRange`, reads one `Buf` and writes another.
-const stage_slots = 2;
-
-/// Which staging slot one `Buf` travels through during a single elementwise call.
-///
-/// TWO SLOTS, NOT ONE, and that is a correctness constraint rather than a
-/// memory optimisation: `addResid` and `copyRange` read from one `Buf` and write
-/// to a DIFFERENT one, so a single shared slot would have the source's upload
-/// overwrite the destination's copy before the kernel read it -- a silent
-/// wrong-value bug that no tolerance would hide.  `a` is always the buffer the
-/// kernel reads *and* writes (the destination, the first argument of the slot);
-/// `b` is the read-only source.
-const StageSlot = enum(usize) { a = 0, b = 1 };
 
 // Buffers for formatted error/description strings.  Static because
 // `describe`/`name` return slices with no allocator in scope (same pattern as
@@ -349,6 +428,33 @@ pub const CudaBackend = struct {
     dev_rows: std.ArrayList(DevRow) = .empty,
     /// Sum of successful uploads: the resident weight footprint.
     stat_uploaded_bytes: usize = 0,
+    /// Bytes moved host->device / device->host on the PER-TOKEN path, i.e. every
+    /// `cudaMemcpy` this file issues after the weights are resident.  P2c's
+    /// whole point is that this collapses: before it, every elementwise slot
+    /// bounced its operands through staging, so each operator cost 2 transfers.
+    /// Reported by `$QWEN35_STAT` so the claim is measurable rather than stated.
+    stat_h2d_bytes: usize = 0,
+    stat_d2h_bytes: usize = 0,
+    /// How many times a numeric slot fell back to a host round trip because the
+    /// caller passed a *host* `Buf` instead of a device region (`dBufPtr` null).
+    /// These are the only two paths that cost a memcpy per call after P2d, and
+    /// on the engine's per-token path both must stay at zero -- which is what
+    /// makes "no per-token H2D/D2H" an assertion rather than a hope.
+    /// `rope64`'s own round trip is counted separately (`stat_rope_trips`).
+    stat_host_act_uploads: usize = 0,
+    stat_host_out_downloads: usize = 0,
+    /// `dRope64` round trips (one H2D + one D2H per rotated head, per token).
+    /// The deliberate remainder described at that function: it buys bit-exact
+    /// rotation, and the report quantifies it instead of hiding it.
+    stat_rope_trips: usize = 0,
+    /// `$QWEN35_STAT_TALKY` grouping state: last uploaded element count and how
+    /// many consecutive uploads had that size.
+    debug_h2d_len: usize = 0,
+    debug_h2d_same: usize = 0,
+    /// `$QWEN35_SYNC=1`: barrier after every matvec, to test whether a result
+    /// depends on an unsynchronized producer.  Diagnostic only -- correctness
+    /// does not need it (default stream ordering + synchronous memcpy).
+    sync_debug: bool = false,
     /// Device time per slot, so the `CUDA-M` line answers "is the GPU actually
     /// doing the work, and where does it go".
     stat_ns_matvec: u64 = 0,
@@ -391,14 +497,37 @@ pub const CudaBackend = struct {
     /// f32 row-dequantization target (cols floats).
     d_deq: ?*anyopaque = null,
     d_deq_bytes: usize = 0,
-    /// Staging slots for the pure elementwise slots (P2b), one per `StageSlot`.
-    /// They exist only because activations are still HOST memory in this stage:
-    /// `stageIn`/`stageOut` bounce every elementwise operand through these.  P2c
-    /// (device-resident activations) makes them dead weight -- see the helpers'
-    /// comments for the one-line change -- and they can then be deleted along
-    /// with everything that frees them.
-    d_stage: [stage_slots]?*anyopaque = @splat(null),
-    d_stage_bytes: [stage_slots]usize = @splat(0),
+    /// Single `int` cell the argmax kernel writes its index into.  It has to be
+    /// device memory (the launcher stores through `d_out`), and it is the only
+    /// per-token download the greedy path makes: 4 bytes.
+    d_idx: ?*anyopaque = null,
+    d_idx_bytes: usize = 0,
+    /// Every region `dAllocBuf` handed to the engine (activations, KV cache,
+    /// GDN state).  The `Buf` values themselves are the engine's; this list is
+    /// only so `freeScratch` / `deinit` can release them, since a `Buf` carries
+    /// no ownership flag.
+    dev_bufs: std.ArrayList(*anyopaque) = .empty,
+    /// Resident copies of the read-only per-layer weights the new elementwise
+    /// slots consume (`rmsnorm`'s gamma, `convStep`'s conv1d kernel).  Their
+    /// host buffers (`lw.attn_norm`, `lw.ssm_conv1d`, ...) are model metadata
+    /// that lives for the whole run and is re-passed on EVERY token, so an H2D
+    /// per call would be pure waste -- and for a 0.8B model it is not
+    /// negligible: 18 layers x (1024 + 6144) f32 = 516 KB per token at
+    /// 1000 tok/s = 0.5 GB/s of PCIe for data that never changes.
+    ///
+    /// Keyed on (host pointer, byte length), see `devConst`: the same page can
+    /// legitimately be asked for at two different lengths by two layers
+    /// sharing a weight buffer, and a longer request over an existing shorter
+    /// region must not be satisfied with the short copy.
+    ///
+    /// LIFETIME: allocated on first use, freed in `dFreeScratch` along with the
+    /// other scratch.  NOT freed per layer and not evicted under pressure --
+    /// the set is tiny (one entry per distinct weight buffer, ~20 for a 27B
+    /// model) and the alternative (an LRU) would cost more than it saves.
+    /// P2c: entries kept; the key changes from "host ptr" to "device ptr of
+    /// the already-resident tensor", i.e. `devConst` collapses to a lookup.
+    dev_const: std.ArrayList(DevConst) = .empty,
+
 
     // ==== construction ======================================================
 
@@ -431,6 +560,7 @@ pub const CudaBackend = struct {
             return self;
         };
         self.cu = cand;
+        self.sync_debug = cudart.getenv("QWEN35_SYNC") != null;
 
         // The launchers themselves need no setup: they are link-time symbols, so
         // "the kernels are there" is enforced by the build.  The one run-time
@@ -452,15 +582,14 @@ pub const CudaBackend = struct {
             if (self.d_xq) |p| _ = cu.lib.Free(p);
             if (self.d_out) |p| _ = cu.lib.Free(p);
             if (self.d_deq) |p| _ = cu.lib.Free(p);
-            for (self.d_stage) |s| {
-                if (s) |p| _ = cu.lib.Free(p);
-            }
+            for (self.dev_bufs.items) |p| _ = cu.lib.Free(p);
+            self.dev_bufs.clearRetainingCapacity();
+            for (self.dev_const.items) |e| _ = cu.lib.Free(e.dev);
+            self.dev_const.clearRetainingCapacity();
             self.d_act = null;
             self.d_xq = null;
             self.d_out = null;
             self.d_deq = null;
-            self.d_stage = @splat(null);
-            self.d_stage_bytes = @splat(0);
             // The codebook buffer is process-wide (it lives in the linked-in
             // iq_tables.cu, not in this struct), so release it here and reset the
             // flag: that re-arms the one-shot upload for any backend created
@@ -473,6 +602,7 @@ pub const CudaBackend = struct {
             self.cu = null;
         }
         self.dev_rows.deinit(self.alloc);
+        self.dev_bufs.deinit(self.alloc);
         self.cpu.deinit();
     }
 
@@ -551,6 +681,8 @@ pub const CudaBackend = struct {
             return;
         };
         const rc = cu.lib.Memcpy(self.d_act, x.ptr, bytes, cudart.MemcpyHostToDevice);
+        self.stat_h2d_bytes += bytes;
+        self.stat_host_act_uploads += 1;
         if (rc != cudart.cudaSuccess) {
             std.debug.print("cuda backend: activation upload failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
         }
@@ -560,6 +692,8 @@ pub const CudaBackend = struct {
         const cu = &self.cu.?;
         const bytes = out.len * @sizeOf(f32);
         const rc = cu.lib.Memcpy(out.ptr, self.d_out, bytes, cudart.MemcpyDeviceToHost);
+        self.stat_d2h_bytes += bytes;
+        self.stat_host_out_downloads += 1;
         if (rc != cudart.cudaSuccess) {
             std.debug.print("cuda backend: result download failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
         }
@@ -568,16 +702,19 @@ pub const CudaBackend = struct {
     /// Quantize one token's activation into `self.d_xq`, in the format the weight
     /// type needs (Q8_0 for 32-element-block weights, Q8_K otherwise).  Returns the
     /// byte count written.
-    fn quantizeAct(self: *CudaBackend, ttype: gguf.TensorType, cols: usize) !usize {
+    ///
+    /// The activation is read straight from a device pointer, which after P2d is
+    /// normally the caller's own resident buffer (`xBuf`), not a `d_act` staging
+    /// area -- staging is only written when a caller hands over a host slice.
+    fn quantizeActFrom(self: *CudaBackend, d_src: [*]const f32, ttype: gguf.TensorType, cols: usize) !usize {
         const cu = &self.cu.?;
         const nb = cols / actBlockElems(ttype);
         std.debug.assert(nb * actBlockElems(ttype) == cols);
-        const d_act: [*]const f32 = @ptrCast(@alignCast(self.d_act.?));
         const kern = Launch;
         const rc = if (actBlockElems(ttype) == gguf.blockElems(.q8_0))
-            kern.quantize_q8_0(d_act, self.d_xq.?, @intCast(nb), null)
+            kern.quantize_q8_0(d_src, self.d_xq.?, @intCast(nb), null)
         else
-            kern.quantize_q8_k(d_act, self.d_xq.?, @intCast(nb), null);
+            kern.quantize_q8_k(d_src, self.d_xq.?, @intCast(nb), null);
         if (rc != cudart.cudaSuccess) {
             std.debug.print("cuda backend: quantize({s}) launch failed: {s}\n", .{
                 @tagName(ttype), std.mem.span(cu.lib.errStr(rc)),
@@ -719,18 +856,19 @@ pub const CudaBackend = struct {
     ///
     /// The source row is read *on the device*: the kernel gets `dev + row *
     /// rowBytes` (device-side pointer arithmetic, no host round trip), so a 27B
-    /// embedding table is never re-uploaded per token.  Only the `cols` f32 result
-    /// is copied back.  Buffers are the shared pair, grown by `ensureBuf`, so a
-    /// repeated call does no `cudaMalloc`.
+    /// embedding table is never re-uploaded per token.  The `cols` f32 result goes
+    /// straight into `dstBuf`'s device region -- P2d removed the `downloadOut`
+    /// that used to push every embedding row and lm_head row back through the
+    /// host.  Buffers are the shared pair, grown by `ensureBuf`, so a repeated
+    /// call does no `cudaMalloc`.
     ///
     /// The engine calls this once per row (token embedding, lm_head), so it is a
     /// latency path rather than a throughput one.
     fn vDequantRow(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
-        const dst = dstBuf.slice();
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: dequantRow: {s}\n", .{self.needHelp()});
-            @memset(dst, 0);
+            self.clearDevBuf(dstBuf);
             return;
         }
         const e = self.findDev(w.data.ptr) orelse {
@@ -738,20 +876,27 @@ pub const CudaBackend = struct {
             // so rather than compute a plausible-looking row on the CPU -- exactly
             // the class of silent divergence in AGENTS.md §5.2.
             std.debug.print("cuda backend: dequantRow: a '{s}' weight is not resident on the device\n", .{@tagName(w.ttype)});
-            @memset(dst, 0);
+            self.clearDevBuf(dstBuf);
             return;
         };
         const cu = &self.cu.?;
         const cols = w.cols();
         const row_bytes = w.rowBytes();
-        std.debug.assert(dst.len >= cols);
+        std.debug.assert(dstBuf.len >= cols);
         std.debug.assert(row < w.rows);
 
         const out_bytes = cols * @sizeOf(f32);
-        ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, out_bytes) catch {
-            std.debug.print("cuda backend: dequantRow: cannot allocate {d} B of device output\n", .{out_bytes});
-            @memset(dst, 0);
-            return;
+        // Destination: the caller's own device region when it has one (the normal
+        // case), otherwise the shared `d_out` plus the one download that a host
+        // caller still needs.
+        const dst_dev: ?[*]f32 = dBufPtr(dstBuf);
+        const d_out: [*]f32 = dst_dev orelse blk: {
+            ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, out_bytes) catch {
+                std.debug.print("cuda backend: dequantRow: cannot allocate {d} B of device output\n", .{out_bytes});
+                self.clearDevBuf(dstBuf);
+                return;
+            };
+            break :blk @ptrCast(@alignCast(self.d_out));
         };
 
         const t0 = Io.Clock.Timestamp.now(self.io, .awake);
@@ -760,7 +905,6 @@ pub const CudaBackend = struct {
         const kern = Launch;
         const src: [*]const u8 = @ptrCast(e.dev);
         const d_row = src + row * row_bytes;
-        const d_out: [*]f32 = @ptrCast(@alignCast(self.d_out));
         const rc = kern.dequantize_row(
             @intCast(@backingInt(w.ttype)),
             d_row,
@@ -772,14 +916,21 @@ pub const CudaBackend = struct {
             std.debug.print("cuda backend: dequantize_row({s}) launch failed: {s}\n", .{
                 @tagName(w.ttype), std.mem.span(cu.lib.errStr(rc)),
             });
-            @memset(dst, 0);
+            self.clearDevBuf(dstBuf);
             return;
         }
-        const rc2 = cu.lib.Memcpy(dst.ptr, self.d_out, out_bytes, cudart.MemcpyDeviceToHost);
-        if (rc2 != cudart.cudaSuccess) {
-            std.debug.print("cuda backend: dequantRow download failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc2))});
-            @memset(dst, 0);
-            return;
+        if (dst_dev == null) {
+            const rc2 = cu.lib.Memcpy(dstBuf.slice().ptr, d_out, out_bytes, cudart.MemcpyDeviceToHost);
+            if (rc2 != cudart.cudaSuccess) {
+                std.debug.print("cuda backend: dequantRow download failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc2))});
+                @memset(dstBuf.slice(), 0);
+                return;
+            }
+            // Only a caller that handed us host memory gets a D2H here; the
+            // engine's embedding / lm_head buffers are device regions, so this
+            // counter staying at 0 is the proof the rows never came back.
+            self.stat_d2h_bytes += out_bytes;
+            self.stat_host_out_downloads += 1;
         }
         self.stat_ns_dequant += durNs(t0, self.io);
         self.stat_n_dequant += 1;
@@ -787,54 +938,82 @@ pub const CudaBackend = struct {
 
     // ==== slot: matvec ======================================================
 
-    /// `out = W * x` entirely on the device: upload x into `d_act`, quantize to the
-    /// activation format matching the weight type, table-driven matvec, then
-    /// download `rows` floats.  `ttype` only chooses the activation format and
-    /// quantizer -- never a backend, and never a CPU branch.
+    /// `out = W * x` entirely on the device: quantize x in place (or, for the
+    /// one legitimate host caller, upload it once), table-driven matvec, result
+    /// written straight into `outBuf`'s device region.
+    ///
+    /// P2d: no `slice()` and no `downloadOut` on either leg.  `xBuf` / `outBuf`
+    /// are backend regions (`dAllocBuf`), so the kernel reads and writes them
+    /// directly; the only host->device copy left is `uploadAct`, reached solely
+    /// when a caller genuinely hands over a host slice (`dBufPtr` null).
+    /// `ttype` only chooses the activation format and quantizer -- never a
+    /// backend, and never a CPU branch.
     fn vMatvec(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
-        const out = outBuf.slice();
-        const x = xBuf.slice();
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvec: {s}\n", .{self.needHelp()});
-            @memset(out, 0);
+            self.clearDevBuf(outBuf);
             return;
         }
         const cu = &self.cu.?;
         const t0 = Io.Clock.Timestamp.now(self.io, .awake);
 
+        // Device activation pointer: the resident buffer when the call site is
+        // already device-side (the whole per-token path), otherwise a one-shot
+        // upload into `d_act` (first use of a host-only tensor).
+        const d_x: [*]const f32 = blk: {
+            if (dBufPtr(xBuf)) |p| break :blk @ptrCast(p);
+            if (xBuf.len != 0) self.uploadAct(xBuf.slice());
+            break :blk @ptrCast(@alignCast(self.d_act.?));
+        };
+
         switch (w) {
             .f32 => |m| {
                 const e = self.findDev(mem.sliceAsBytes(m).ptr) orelse {
                     std.debug.print("cuda backend: matvec: f32 weight is not resident on the device\n", .{});
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 };
                 const rows = e.rows;
                 const cols = e.cols;
-                std.debug.assert(x.len >= cols and out.len >= rows);
-                self.uploadAct(x);
-                ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, rows * @sizeOf(f32)) catch {
-                    std.debug.print("cuda backend: matvec: device output allocation failed\n", .{});
-                    @memset(out, 0);
-                    return;
-                };
-                const kern = Launch;
-                const rc = kern.mul_mat_vec_f32(
-                    @ptrCast(@alignCast(e.dev)),
-                    @ptrCast(@alignCast(self.d_act)),
-                    @ptrCast(@alignCast(self.d_out)),
-                    @intCast(rows),
-                    @intCast(cols),
-                    1,
-                    null,
-                );
-                if (rc != cudart.cudaSuccess) {
-                    std.debug.print("cuda backend: mul_mat_vec_f32 launch failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
-                    @memset(out, 0);
-                    return;
+                std.debug.assert(xBuf.len >= cols and outBuf.len >= rows);
+                if (dBufPtr(outBuf)) |pd| {
+                    const rc = Launch.mul_mat_vec_f32(
+                        @ptrCast(@alignCast(e.dev)),
+                        d_x,
+                        pd,
+                        @intCast(rows),
+                        @intCast(cols),
+                        1,
+                        null,
+                    );
+                    if (rc != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: mul_mat_vec_f32 launch failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                } else {
+                    ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, rows * @sizeOf(f32)) catch {
+                        std.debug.print("cuda backend: matvec: device output allocation failed\n", .{});
+                        self.clearDevBuf(outBuf);
+                        return;
+                    };
+                    const rc = Launch.mul_mat_vec_f32(
+                        @ptrCast(@alignCast(e.dev)),
+                        d_x,
+                        @ptrCast(@alignCast(self.d_out)),
+                        @intCast(rows),
+                        @intCast(cols),
+                        1,
+                        null,
+                    );
+                    if (rc != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: mul_mat_vec_f32 launch failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc))});
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                    self.downloadOut(outBuf.slice()[0..rows]);
                 }
-                self.downloadOut(out[0..rows]);
                 self.stat_ns_matvec += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(gguf.TensorType.f32)] += 1;
                 self.stat_n_matvec += 1;
@@ -843,49 +1022,67 @@ pub const CudaBackend = struct {
             .quant => |q| {
                 const e = self.findDev(q.data.ptr) orelse {
                     std.debug.print("cuda backend: matvec: a '{s}' weight is not resident on the device\n", .{@tagName(q.ttype)});
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 };
                 const cols = q.cols();
                 const rows = q.rows;
                 const xq_bytes = actBytes(q.ttype, cols);
-                std.debug.assert(x.len >= cols and out.len >= rows);
+                std.debug.assert(xBuf.len >= cols and outBuf.len >= rows);
 
-                self.uploadAct(x);
                 ensureBuf(&cu.lib, &self.d_xq, &self.d_xq_bytes, xq_bytes) catch {
                     std.debug.print("cuda backend: matvec: device activation allocation failed ({d} B)\n", .{xq_bytes});
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 };
-                ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, rows * @sizeOf(f32)) catch {
-                    std.debug.print("cuda backend: matvec: device output allocation failed\n", .{});
-                    @memset(out, 0);
+                _ = self.quantizeActFrom(d_x, q.ttype, cols) catch {
+                    self.clearDevBuf(outBuf);
                     return;
                 };
-                _ = self.quantizeAct(q.ttype, cols) catch {
-                    @memset(out, 0);
-                    return;
-                };
-                const kern = Launch;
-                // api.h order: (d_w, d_xq, d_out, rows, cols, tokens, ttype, stream).
-                const rc = kern.mul_mat_vec(
-                    e.dev,
-                    self.d_xq,
-                    @ptrCast(@alignCast(self.d_out)),
-                    @intCast(rows),
-                    @intCast(cols),
-                    1,
-                    @intCast(@backingInt(q.ttype)),
-                    null,
-                );
-                if (rc != cudart.cudaSuccess) {
-                    std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
-                        @tagName(q.ttype), std.mem.span(cu.lib.errStr(rc)),
-                    });
-                    @memset(out, 0);
-                    return;
+                if (dBufPtr(outBuf)) |pd| {
+                    // api.h order: (d_w, d_xq, d_out, rows, cols, tokens, ttype, stream).
+                    const rc = Launch.mul_mat_vec(
+                        e.dev,
+                        self.d_xq,
+                        pd,
+                        @intCast(rows),
+                        @intCast(cols),
+                        1,
+                        @intCast(@backingInt(q.ttype)),
+                        null,
+                    );
+                    if (rc != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
+                            @tagName(q.ttype), std.mem.span(cu.lib.errStr(rc)),
+                        });
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                } else {
+                    ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, rows * @sizeOf(f32)) catch {
+                        std.debug.print("cuda backend: matvec: device output allocation failed\n", .{});
+                        self.clearDevBuf(outBuf);
+                        return;
+                    };
+                    const rc = Launch.mul_mat_vec(
+                        e.dev,
+                        self.d_xq,
+                        @ptrCast(@alignCast(self.d_out)),
+                        @intCast(rows),
+                        @intCast(cols),
+                        1,
+                        @intCast(@backingInt(q.ttype)),
+                        null,
+                    );
+                    if (rc != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
+                            @tagName(q.ttype), std.mem.span(cu.lib.errStr(rc)),
+                        });
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                    self.downloadOut(outBuf.slice()[0..rows]);
                 }
-                self.downloadOut(out[0..rows]);
                 self.stat_ns_matvec += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
                 self.stat_ns_by_type[@backingInt(q.ttype)] += durNs(t0, self.io);
@@ -900,9 +1097,17 @@ pub const CudaBackend = struct {
                     // ran instead of a host fallback.
                     self.reportStats("first gpu matvec");
                 }
-                self.mvCheck(out, q, x);
+                self.mvCheck(outBuf, q, xBuf);
             },
         }
+        // `$QWEN35_SYNC`: strictly serialize after every matvec.  Purely a
+        // diagnostic for the coherency question -- if a result ever depended on
+        // an unsynchronized producer, inserting this barrier makes the bug
+        // appear/disappear deterministically.  Not needed for correctness:
+        // every launch and every copy in this file is on the default stream,
+        // which orders them, and each `cudaMemcpy` is the synchronous form, so
+        // it blocks until all prior work finished.
+        if (self.sync_debug) _ = self.cu.?.lib.DeviceSynchronize();
     }
 
     /// `$QWEN35_MVCHECK`: **debug-only cross-check, not a computation path**.
@@ -910,17 +1115,17 @@ pub const CudaBackend = struct {
     /// This is the only place in the file that calls the CPU matvec.  It is
     /// limited to the first matvec of a run, behind an env var, purely to compare
     /// device and host results (the class of bug in AGENTS.md §5.2: a kernel that
-    /// is silently wrong for one quant type).  `out` already holds the device
-    /// result and is never overwritten; the CPU value goes to a scratch slice that
-    /// is freed here.
-    fn mvCheck(self: *CudaBackend, out: []const f32, q: gguf.QuantRow, x: []const f32) void {
-        self.mvCheckVariant(out, q, x, false, 1);
+    /// is silently wrong for one quant type).  `outBuf` already holds the device
+    /// result and is never overwritten; pulling it down for the comparison is
+    /// the diagnostic's own cost (only with `QWEN35_MVCHECK` set).
+    fn mvCheck(self: *CudaBackend, outBuf: backend.Buf, q: gguf.QuantRow, xBuf: backend.Buf) void {
+        self.mvCheckVariant(outBuf, q, xBuf, false, 1);
     }
 
     /// `$QWEN35_MVCHECK` for the batch-K path: same comparison, CPU reference is
     /// `matvecBatchK` with the same K, so a per-token mismatch inside the chunk is
     /// visible instead of hidden behind token 0.
-    fn mvCheckVariant(self: *CudaBackend, out: []const f32, q: gguf.QuantRow, x: []const f32, batchk: bool, k: usize) void {
+    fn mvCheckVariant(self: *CudaBackend, outBuf: backend.Buf, q: gguf.QuantRow, xBuf: backend.Buf, batchk: bool, k: usize) void {
         if (cudart.getenv("QWEN35_MVCHECK") == null) return;
         // `$QWEN35_MVCHECK_ONLY=iq1_s` restricts the check to one type: the
         // batch-K reference needs the CPU scratch shaped for `matvecBatchK`, and
@@ -947,21 +1152,54 @@ pub const CudaBackend = struct {
             self.cpu.q8K = self.alloc.alloc(u8, k * cpu_mod.q8ScratchBytes(cols)) catch return;
             self.cpu.q8kK = self.alloc.alloc(u8, k * cpu_mod.q8kScratchBytes(cols)) catch return;
         }
-        const tmp = self.alloc.alloc(f32, out.len) catch return;
-        defer self.alloc.free(tmp);
-        if (batchk) cpu.matvecBatchK(backend.Buf.wrap(tmp), .{ .quant = q }, backend.Buf.wrap(x), k) else cpu.matvec(backend.Buf.wrap(tmp), .{ .quant = q }, backend.Buf.wrap(x));
+        // `dev` holds the device result, `cput` the CPU reference.
+        const dev = self.alloc.alloc(f32, outBuf.len) catch return;
+        defer self.alloc.free(dev);
+        // The device result is pulled down for the comparison only: MVCHECK is a
+        // debug switch, never part of the compute path (and it is what remains of
+        // this file's D2H traffic when it is set).
+        if (dBufPtr(outBuf)) |pd| {
+            const rc = self.cu.?.lib.Memcpy(
+                @ptrCast(dev.ptr),
+                @ptrCast(pd),
+                dev.len * @sizeOf(f32),
+                cudart.MemcpyDeviceToHost,
+            );
+            if (rc != cudart.cudaSuccess) return;
+            self.stat_d2h_bytes += dev.len * @sizeOf(f32);
+        } else @memcpy(dev, outBuf.slice());
+
+        // Reference activations: device-resident in the normal case, so they have
+        // to come down too -- the CPU matvec can only read host memory.
+        const x_dev = dBufPtr(xBuf) != null;
+        const x = self.alloc.alloc(f32, xBuf.len) catch return;
+        defer self.alloc.free(x);
+        if (x_dev) {
+            const rc = self.cu.?.lib.Memcpy(
+                @ptrCast(x.ptr),
+                @ptrCast(xBuf.ptr),
+                x.len * @sizeOf(f32),
+                cudart.MemcpyDeviceToHost,
+            );
+            if (rc != cudart.cudaSuccess) return;
+            self.stat_d2h_bytes += x.len * @sizeOf(f32);
+        } else @memcpy(x, xBuf.slice());
+
+        const cput = self.alloc.alloc(f32, outBuf.len) catch return;
+        defer self.alloc.free(cput);
+        if (batchk) cpu.matvecBatchK(backend.Buf.wrap(cput), .{ .quant = q }, backend.Buf.wrap(x), k) else cpu.matvec(backend.Buf.wrap(cput), .{ .quant = q }, backend.Buf.wrap(x));
         // NOT `cpu.exec()` above: that is the diagnostic's OWN backend, whose
         // scratch is sized here, one token wide -- `matvecBatchK` wants K slots.
         // Those CPUs are never fully initialised (`setThreads` etc.), so this runs
         // serially (`pool = null`) instead.
         var bad: usize = 0;
-        for (out, tmp) |a, b| {
+        for (dev, 0..) |a, i| {
             // Relative tolerance, not bit equality: the device kernel may reorder
             // the accumulation, so an exact match is not expected even when
             // correct.
-            const denom = @max(@abs(b), 1e-3);
-            if (@abs(a - b) / denom > 2e-2) {
-                if (bad < 3) std.debug.print("  MVCHECK row: dev={d} cpu={d}\n", .{ a, b });
+            const denom = @max(@abs(cput[i]), 1e-3);
+            if (@abs(a - cput[i]) / denom > 2e-2) {
+                if (bad < 3) std.debug.print("  MVCHECK row: dev={d} cpu={d}\n", .{ a, cput[i] });
                 bad += 1;
             }
         }
@@ -980,41 +1218,53 @@ pub const CudaBackend = struct {
     /// (`d_xq`, group `j` at `j * actBytes(ttype, cols)`), then a single launch
     /// computes `K*rows` outputs and one download returns them.
     fn vMatvecBatchK(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
-        const out = outBuf.slice();
-        const xK = xKBuf.slice();
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvecBatchK: {s}\n", .{self.needHelp()});
-            @memset(out, 0);
+            self.clearDevBuf(outBuf);
             return;
         }
         const cu = &self.cu.?;
         const t0 = Io.Clock.Timestamp.now(self.io, .awake);
 
+        // Which device output to write: the caller's own region (normal) or the
+        // shared `d_out` when the caller handed us host memory.
+        const out_dev: ?[*]f32 = dBufPtr(outBuf);
+
         switch (w) {
             .f32 => |m| {
                 const e = self.findDev(mem.sliceAsBytes(m).ptr) orelse {
                     std.debug.print("cuda backend: matvecBatchK: f32 weight is not resident on the device\n", .{});
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 };
                 const rows = e.rows;
                 const cols = e.cols;
-                std.debug.assert(xK.len >= k * cols and out.len >= k * rows);
+                std.debug.assert(xKBuf.len >= k * cols and outBuf.len >= k * rows);
                 const act_bytes = k * cols * @sizeOf(f32);
-                ensureBuf(&cu.lib, &self.d_act, &self.d_act_bytes, act_bytes) catch return oomMsg("batchK activation");
-                const rc0 = cu.lib.Memcpy(self.d_act, xK.ptr, act_bytes, cudart.MemcpyHostToDevice);
-                if (rc0 != cudart.cudaSuccess) {
-                    std.debug.print("cuda backend: batchK f32 activation upload failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc0))});
-                    @memset(out, 0);
-                    return;
+                const d_x: [*]const f32 = blk: {
+                    if (dBufPtr(xKBuf)) |p| break :blk @ptrCast(p);
+                    ensureBuf(&cu.lib, &self.d_act, &self.d_act_bytes, act_bytes) catch return oomMsg("batchK activation");
+                    const rc0 = cu.lib.Memcpy(self.d_act, xKBuf.slice().ptr, act_bytes, cudart.MemcpyHostToDevice);
+                    if (rc0 != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: batchK f32 activation upload failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc0))});
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                    self.stat_h2d_bytes += act_bytes;
+                    break :blk @ptrCast(@alignCast(self.d_act.?));
+                };
+                var d_out: [*]f32 = undefined;
+                if (out_dev) |p| {
+                    d_out = p;
+                } else {
+                    ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
+                    d_out = @ptrCast(@alignCast(self.d_out.?));
                 }
-                ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
-                const kern = Launch;
-                const rc = kern.mul_mat_vec_f32(
+                const rc = Launch.mul_mat_vec_f32(
                     @ptrCast(@alignCast(e.dev)),
-                    @ptrCast(@alignCast(self.d_act)),
-                    @ptrCast(@alignCast(self.d_out)),
+                    d_x,
+                    d_out,
                     @intCast(rows),
                     @intCast(cols),
                     @intCast(k),
@@ -1024,10 +1274,10 @@ pub const CudaBackend = struct {
                     std.debug.print("cuda backend: mul_mat_vec_f32(K={d}) launch failed: {s}\n", .{
                         k, std.mem.span(cu.lib.errStr(rc)),
                     });
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 }
-                self.downloadOut(out[0 .. k * rows]);
+                if (out_dev == null) self.downloadOut(outBuf.slice()[0 .. k * rows]);
                 self.stat_ns_batchk += durNs(t0, self.io);
                 self.stat_n_batchk += 1;
                 return;
@@ -1035,31 +1285,43 @@ pub const CudaBackend = struct {
             .quant => |q| {
                 const e = self.findDev(q.data.ptr) orelse {
                     std.debug.print("cuda backend: matvecBatchK: a '{s}' weight is not resident on the device\n", .{@tagName(q.ttype)});
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 };
                 const cols = q.cols();
                 const rows = q.rows;
                 const per_tok = actBytes(q.ttype, cols);
                 const nb_tok = cols / actBlockElems(q.ttype);
-                std.debug.assert(xK.len >= k * cols and out.len >= k * rows);
+                std.debug.assert(xKBuf.len >= k * cols and outBuf.len >= k * rows);
 
-                // One H2D for all K activations.
-                const act_bytes = k * cols * @sizeOf(f32);
-                ensureBuf(&cu.lib, &self.d_act, &self.d_act_bytes, act_bytes) catch return oomMsg("batchK activation");
-                const rc0 = cu.lib.Memcpy(self.d_act, xK.ptr, act_bytes, cudart.MemcpyHostToDevice);
-                if (rc0 != cudart.cudaSuccess) {
-                    std.debug.print("cuda backend: batchK activation upload failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc0))});
-                    @memset(out, 0);
-                    return;
-                }
+                // Activation source: the resident K-row buffer when the engine
+                // already keeps it on the device (the normal case after P2d),
+                // otherwise one H2D for all K rows.
+                const base_act: [*]const f32 = blk: {
+                    if (dBufPtr(xKBuf)) |p| break :blk @ptrCast(p);
+                    const act_bytes = k * cols * @sizeOf(f32);
+                    ensureBuf(&cu.lib, &self.d_act, &self.d_act_bytes, act_bytes) catch return oomMsg("batchK activation");
+                    const rc0 = cu.lib.Memcpy(self.d_act, xKBuf.slice().ptr, act_bytes, cudart.MemcpyHostToDevice);
+                    if (rc0 != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: batchK activation upload failed: {s}\n", .{std.mem.span(cu.lib.errStr(rc0))});
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                    self.stat_h2d_bytes += act_bytes;
+                    break :blk @ptrCast(@alignCast(self.d_act.?));
+                };
                 ensureBuf(&cu.lib, &self.d_xq, &self.d_xq_bytes, per_tok * k) catch return oomMsg("batchK quantized activation");
-                ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
+                var d_out: [*]f32 = undefined;
+                if (out_dev) |p| {
+                    d_out = p;
+                } else {
+                    ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
+                    d_out = @ptrCast(@alignCast(self.d_out.?));
+                }
 
                 // Quantize token j into block group j.  The quantizers take a
                 // contiguous f32 span plus a block count, so pointing them at
-                // `d_act + j*cols` and `d_xq + j*per_tok` produces exactly that.
-                const base_act: [*]const f32 = @ptrCast(@alignCast(self.d_act.?));
+                // `base_act + j*cols` and `d_xq + j*per_tok` produces exactly that.
                 const base_xq: [*]u8 = @ptrCast(self.d_xq.?);
                 const q8_0_act = actBlockElems(q.ttype) == gguf.blockElems(.q8_0);
                 const kern = Launch;
@@ -1073,7 +1335,7 @@ pub const CudaBackend = struct {
                         std.debug.print("cuda backend: batchK quantize({s}) tok {d} failed: {s}\n", .{
                             @tagName(q.ttype), j, std.mem.span(cu.lib.errStr(rc)),
                         });
-                        @memset(out, 0);
+                        self.clearDevBuf(outBuf);
                         return;
                     }
                 }
@@ -1082,7 +1344,7 @@ pub const CudaBackend = struct {
                 const rc = kern_mm.mul_mat_vec(
                     e.dev,
                     self.d_xq,
-                    @ptrCast(@alignCast(self.d_out)),
+                    d_out,
                     @intCast(rows),
                     @intCast(cols),
                     @intCast(k),
@@ -1093,10 +1355,10 @@ pub const CudaBackend = struct {
                     std.debug.print("cuda backend: mul_mat_vec({s}, K={d}) launch failed: {s}\n", .{
                         @tagName(q.ttype), k, std.mem.span(cu.lib.errStr(rc)),
                     });
-                    @memset(out, 0);
+                    self.clearDevBuf(outBuf);
                     return;
                 }
-                self.downloadOut(out[0 .. k * rows]);
+                if (out_dev == null) self.downloadOut(outBuf.slice()[0 .. k * rows]);
                 self.stat_ns_batchk += durNs(t0, self.io);
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
                 self.stat_ns_by_type[@backingInt(q.ttype)] += durNs(t0, self.io);
@@ -1110,7 +1372,7 @@ pub const CudaBackend = struct {
                 }
                 // Token 0 of the chunk is enough: all K rows run through the same
                 // kernel, so a per-type mismatch shows up on the first one.
-                self.mvCheckVariant(out[0..rows], q, xK[0..cols], true, k);
+                self.mvCheckVariant(outBuf, q, xKBuf, true, k);
             },
         }
     }
@@ -1192,31 +1454,63 @@ pub const CudaBackend = struct {
         self.iq_tables_state = .done;
     }
 
-    /// `allocBuf` for the device backend: the trampoline stage keeps regions in
-    /// the *embedded* CPU backend (host memory + its `bufs` list, released by
-    /// `dFreeScratch`), so unlike the elementwise slots above this entry CANNOT
-    /// reuse `cpu.vtable.allocBuf` directly -- that would `@ptrCast` a
-    /// `*CudaBackend` to a `*CpuBackend` and read a garbage allocator
-    /// (measured: SIGSEGV inside `mem.Allocator.rawAlloc` on the first scratch
-    /// allocation).  Forward to `&self.cpu` instead.
+    /// `allocBuf` for the device backend: a `cudaMalloc` region, so every
+    /// `backend.Buf` the engine holds (activations, KV cache, GDN state) is
+    /// DEVICE memory and the slots can hand `buf.ptr` straight to a kernel.
+    ///
+    /// This is the P2c change: P2b forwarded to the embedded CPU backend, which
+    /// returned host memory and forced every slot to bounce its operands
+    /// through staging.  The list of handed-out regions lives here (`dev_bufs`)
+    /// because `freeScratch` must release them all at once and `backend.Buf`
+    /// carries no ownership flag.
+    ///
+    /// Failure is a hard error, not a fallback: the engine's caller has no
+    /// hybrid path any more (device memory is where the data must live), so a
+    /// failed `cudaMalloc` has to surface as a load/allocation failure.
     fn dAllocBuf(ctx: *anyopaque, len: usize) anyerror!backend.Buf {
         const self = self_(ctx);
-        return cpu_mod.CpuBackend.vtable.allocBuf(@ptrCast(&self.cpu), len);
+        if (len == 0) return backend.Buf.empty;
+        const cu = if (self.cu) |*c| c else {
+            std.debug.print("cuda backend: allocBuf({d}): {s}\n", .{ len, self.needHelp() });
+            return error.DeviceUnavailable;
+        };
+        const bytes = len * @sizeOf(f32);
+        var p: ?*anyopaque = null;
+        const rc = cu.lib.Malloc(&p, bytes);
+        if (rc != cudart.cudaSuccess or p == null) {
+            std.debug.print("cuda backend: allocBuf({d} floats = {d} B) failed: {s}\n", .{
+                len, bytes, std.mem.span(cu.lib.errStr(rc)),
+            });
+            return error.OutOfMemory;
+        }
+        // A `Buf` is a `[]f32`-shaped view; the pointer is reused as-is, which
+        // is what every slot then casts back to a device pointer.
+        const slice: []f32 = @as([*]f32, @ptrCast(@alignCast(p.?)))[0..len];
+        self.dev_bufs.append(self.alloc, p.?) catch {
+            _ = cu.lib.Free(p.?);
+            return error.OutOfMemory;
+        };
+        return backend.Buf.wrap(slice);
     }
 
+    /// Release every region `dAllocBuf` handed out, plus the reusable scratch
+    /// (`d_act`/`d_xq`/`d_out`/`d_deq`) and the resident constant copies.
+    ///
+    /// Called once, by the engine at teardown (`exec.freeScratch()`), never per
+    /// token.  `dev_bufs` is sorted-free because the order does not matter; the
+    /// `Buf` values the engine still holds become dangling here, which is why
+    /// the engine must not touch them afterwards (it does not: teardown follows).
     fn dFreeScratch(ctx: *anyopaque) void {
         const self = self_(ctx);
-        // Regions handed out by `dAllocBuf` live in the embedded CPU backend
-        // (trampoline stage); release them regardless of device state.
-        cpu_mod.CpuBackend.vtable.freeScratch(@ptrCast(&self.cpu));
         const cu = if (self.cu) |*c| c else return;
+        for (self.dev_bufs.items) |p| _ = cu.lib.Free(p);
+        self.dev_bufs.clearRetainingCapacity();
         if (self.d_act) |p| _ = cu.lib.Free(p);
         if (self.d_xq) |p| _ = cu.lib.Free(p);
         if (self.d_out) |p| _ = cu.lib.Free(p);
         if (self.d_deq) |p| _ = cu.lib.Free(p);
-        for (self.d_stage) |s| {
-            if (s) |p| _ = cu.lib.Free(p);
-        }
+        for (self.dev_const.items) |e| _ = cu.lib.Free(e.dev);
+        self.dev_const.clearRetainingCapacity();
         self.d_act = null;
         self.d_act_bytes = 0;
         self.d_xq = null;
@@ -1225,8 +1519,6 @@ pub const CudaBackend = struct {
         self.d_out_bytes = 0;
         self.d_deq = null;
         self.d_deq_bytes = 0;
-        self.d_stage = @splat(null);
-        self.d_stage_bytes = @splat(0);
     }
 
     // ==== slots: pure elementwise (P2b) =====================================
@@ -1237,87 +1529,48 @@ pub const CudaBackend = struct {
     // what keeps the token stream identical); see
     // src/kernels/cuda/elementwise.cu.
     //
-    // At this stage (P2b) activations still live in HOST memory, so every call
-    // carries its operands over the link: one H2D before the launch, one D2H
-    // after.  That is a wall-time pessimisation taken deliberately
-    // (docs/cuda-backend-brief.md §5 P2b: functionally correct,
-    // performance-neutral).  P2c moves `allocBuf` to device memory and the
-    // copies disappear.
+    // P2c: ACTIVATIONS ARE DEVICE MEMORY NOW.  `dAllocBuf` hands out
+    // `cudaMalloc` regions, so a `backend.Buf` is already a device pointer and
+    // every slot below passes `buf.ptr` straight to the launcher.  The P2b
+    // staging triple and its `d_stage` slots are gone: there is exactly one
+    // legal host->device path left in this file,
+    // `devConst` (read-only weights, uploaded once), and no device->host path on
+    // the per-token execution at all -- the only D2H left is `downloadOut` for
+    // matvec results, which is the values the sampler needs.
     //
-    // THE REASON THE COPY LOGIC SITS IN THESE THREE HELPERS AND NOWHERE ELSE:
-    // the four slot bodies below are `stageIn -> launch -> stageOut` and contain
-    // no `cu.lib.Memcpy` at all, so P2c rewrites two function bodies (and the
-    // comment blocks) rather than four slots -- see `stageIn`/`stageOut`.
+    // `dBufPtr` below is the whole replacement: it is `ensureGpu` + a pointer
+    // cast, kept as one helper so the "is the device up, is this buffer empty"
+    // check cannot drift between slots.
 
-    /// Reserve staging slot `slot` for `buf` and return its device pointer,
-    /// WITHOUT uploading.
+    /// Device pointer for a resident `backend.Buf`, or null for an empty buffer.
     ///
-    /// Split out from `stageIn` for the write-only operand: `copyRange`'s
-    /// destination is fully overwritten, so uploading its old contents would be
-    /// a wasted copy (`zeroBuf` likewise writes before reading).
+    /// No copy, no allocation, no ownership: after P2c the `Buf` IS the device
+    /// region.  Null means "nothing to do" -- `Buf.empty()` is a legal value
+    /// (`engine.zig` uses it for absent optional state) and the launchers all
+    /// treat `n <= 0` as a no-op, so the null return simply skips the launch.
     ///
-    /// Grown through `ensureBuf` like every other device buffer here -- a
-    /// `cudaMalloc` per call would cost more than the kernel itself.
-    ///
-    /// P2C: this whole function collapses to `return @ptrCast(buf.ptr);` -- the
-    /// operand is already device memory, so there is nothing to reserve.  The
-    /// `d_stage`/`d_stage_bytes` fields and the `Free` calls for them go away
-    /// with it.
-    fn stageClaim(self: *CudaBackend, buf: backend.Buf, slot: StageSlot) !?[*]f32 {
-        // A zero-length Buf is a legal, common value (`Buf.empty`): there is no
-        // pointer to hand out and `ensureBuf` must not be asked for 0 bytes
-        // (it would leave the slot null and the `.?` below would panic).
+    /// The CPU fallback in the slots that call this is now a *correctness
+    /// net*, not a hybrid path: if the runtime is down the buffers handed out by
+    /// `dAllocBuf` would not exist either, so reaching it means something is
+    /// already broken and the CPU path is the honest answer.
+    fn dBufPtr(buf: backend.Buf) ?[*]f32 {
         if (buf.len == 0) return null;
-        const cu = if (self.cu) |*c| c else return error.DeviceUnavailable;
-        const i = @intFromEnum(slot);
-        const bytes = buf.len * @sizeOf(f32);
-        ensureBuf(&cu.lib, &self.d_stage[i], &self.d_stage_bytes[i], bytes) catch {
-            std.debug.print("cuda backend: elementwise staging allocation failed ({d} B)\n", .{bytes});
-            return error.OutOfMemory;
-        };
-        return @ptrCast(@alignCast(self.d_stage[i].?));
+        return @ptrCast(@alignCast(buf.ptr));
     }
 
-    /// Make `buf`'s CURRENT contents visible in staging slot `slot`; returns the
-    /// device pointer the kernel should read (null for an empty buffer).
-    ///
-    /// P2C: body becomes `return @ptrCast(buf.ptr);` (or just `buf.ptr`), with no
-    /// copy and no allocation.
-    fn stageIn(self: *CudaBackend, buf: backend.Buf, slot: StageSlot) !?[*]f32 {
-        const p = (try self.stageClaim(buf, slot)) orelse return null;
-        const cu = &self.cu.?;
-        const bytes = buf.len * @sizeOf(f32);
-        const rc = cu.lib.Memcpy(p, buf.ptr, bytes, cudart.MemcpyHostToDevice);
-        if (rc != cudart.cudaSuccess) {
-            std.debug.print("cuda backend: elementwise upload failed ({d} B): {s}\n", .{
-                bytes, std.mem.span(cu.lib.errStr(rc)),
-            });
-            return error.MemcpyFailed;
-        }
-        return p;
-    }
-
-    /// Copy staging slot `slot` back into `buf`.
-    ///
-    /// No explicit synchronisation: the kernels launch on the legacy default
-    /// stream (that is the `null` stream argument every launcher here gets), and
-    /// a blocking `cudaMemcpy` to host has device-wide ordering against it.
-    /// **P2c caveat**: the moment a non-default stream is introduced, this must
-    /// `cudaStreamSynchronize` first, or the download races the launch -- and in
-    /// P2c the download is exactly what disappears, so do not "fix" it by
-    /// dropping the sync and keeping the copy.
-    ///
-    /// P2C: body becomes empty.
-    fn stageOut(self: *CudaBackend, buf: backend.Buf, slot: StageSlot) void {
+    /// Zero a device `Buf` without a host round trip (the error path of every
+    /// numeric slot: an empty result is the honest failure signal, and the CPU
+    /// fallback of `elementwise` cannot be used because the buffer is device
+    /// memory).  Falls back to the CPU memset only when the pointer is not a
+    /// device region at all, i.e. the caller really handed us host memory.
+    fn clearDevBuf(self: *CudaBackend, buf: backend.Buf) void {
         if (buf.len == 0) return;
-        const cu = &self.cu.?;
-        const bytes = buf.len * @sizeOf(f32);
-        const rc = cu.lib.Memcpy(buf.ptr, self.d_stage[@intFromEnum(slot)].?, bytes, cudart.MemcpyDeviceToHost);
-        if (rc != cudart.cudaSuccess) {
-            std.debug.print("cuda backend: elementwise download failed ({d} B): {s}\n", .{
-                bytes, std.mem.span(cu.lib.errStr(rc)),
-            });
+        if (self.cu) |*c| {
+            if (dBufPtr(buf)) |p| {
+                if (c.lib.Memset(@ptrCast(p), 0, buf.len * @sizeOf(f32)) == cudart.cudaSuccess) return;
+            }
         }
+        @memset(buf.slice(), 0);
     }
 
     /// Failure text for a launch that returned a cudaError_t.
@@ -1326,6 +1579,42 @@ pub const CudaBackend = struct {
         std.debug.print("cuda backend: {s} launch failed: {s}\n", .{
             what, std.mem.span(cu.lib.errStr(rc)),
         });
+    }
+
+    /// Device copy of a read-only weight slice, uploaded at most once per
+    /// (pointer, length).  Returns null when the device is unavailable or the
+    /// upload fails -- the caller then takes the CPU path, exactly like a
+    /// failed launch does.
+    ///
+    /// This is THE only host->device copy left on the per-token path, and it is
+    /// a cache rather than a transfer: a hit returns the resident pointer with
+    /// no `cudaMemcpy` at all, which is what makes re-passing a per-layer
+    /// weight every token free.  `bytes` is the identity's second half for the
+    /// reason in `dev_const`.
+    fn devConst(self: *CudaBackend, host: []const f32) !?[*]f32 {
+        if (host.len == 0) return null;
+        const cu = if (self.cu) |*c| c else return error.DeviceUnavailable;
+        const bytes = host.len * @sizeOf(f32);
+        for (self.dev_const.items) |e| {
+            if (e.host == host.ptr and e.bytes == bytes) return @ptrCast(@alignCast(e.dev));
+        }
+        var p: ?*anyopaque = null;
+        var cap: usize = 0;
+        try ensureBuf(&cu.lib, &p, &cap, bytes);
+        const rc = cu.lib.Memcpy(p.?, host.ptr, bytes, cudart.MemcpyHostToDevice);
+        if (rc != cudart.cudaSuccess) {
+            _ = cu.lib.Free(p.?);
+            std.debug.print("cuda backend: constant upload failed ({d} B): {s}\n", .{
+                bytes, std.mem.span(cu.lib.errStr(rc)),
+            });
+            return error.MemcpyFailed;
+        }
+        try self.dev_const.append(self.alloc, .{
+            .host = host.ptr,
+            .bytes = bytes,
+            .dev = p.?,
+        });
+        return @ptrCast(@alignCast(p.?));
     }
 
     // The four slots.  Each is a FORWARDER rather than an alias to
@@ -1339,15 +1628,12 @@ pub const CudaBackend = struct {
 
     fn dScaleVec(ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
-        if (x.len != 0 and self.cu != null) {
-            if (self.stageIn(x, .a)) |p| {
-                const rc = Launch.scale_vec(p, s, @intCast(x.len), null);
-                if (rc == cudart.cudaSuccess) {
-                    self.stageOut(x, .a);
-                    return;
-                }
+        if (self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                const rc = Launch.scale_vec(px, s, @intCast(x.len), null);
+                if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("scale_vec", rc);
-            } else |_| {}
+            } else return;
         }
         cpu_mod.CpuBackend.vtable.scaleVec(@ptrCast(&self.cpu), x, s);
     }
@@ -1355,29 +1641,46 @@ pub const CudaBackend = struct {
     fn dAddResid(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
-        // zips the two slices).  A mismatch is an engine bug, so refuse to guess:
-        // hand it to the CPU target -- whose behaviour (assert in Debug) is the
-        // pre-existing one -- rather than silently truncating to the shorter.
+        // zips the two slices).  A mismatch is an engine bug, so refuse to guess
+        // rather than silently truncating to the shorter.
         if (src.len != dst.len) {
             std.debug.print("cuda backend: addResid length mismatch (dst={d} src={d}); using the CPU path\n", .{ dst.len, src.len });
             cpu_mod.CpuBackend.vtable.addResid(@ptrCast(&self.cpu), dst, src);
             return;
         }
-        // `dst[i] += src[i]` needs both operands: `.a` holds dst (read AND
-        // written), `.b` holds src.  Two slots, never one -- see `StageSlot`.
-        if (dst.len != 0 and self.cu != null) {
-            if (self.stageIn(dst, .a)) |pd| {
-                if (self.stageIn(src, .b)) |ps| {
+        if (self.cu != null) {
+            if (dBufPtr(dst)) |pd| {
+                if (dBufPtr(src)) |ps| {
                     const rc = Launch.add_resid(pd, ps, @intCast(dst.len), null);
-                    if (rc == cudart.cudaSuccess) {
-                        self.stageOut(dst, .a);
-                        return;
-                    }
+                    if (rc == cudart.cudaSuccess) return;
                     self.ewLaunchFail("add_resid", rc);
-                } else |_| {}
-            } else |_| {}
+                } else return;
+            } else return;
         }
         cpu_mod.CpuBackend.vtable.addResid(@ptrCast(&self.cpu), dst, src);
+    }
+
+    /// True when this `Buf` is NOT one of ours, i.e. it wraps ordinary host
+    /// memory (`Buf.wrap` of a `[]f32`, which the engine still does for f32
+    /// token embeddings and for anything it owns itself).  The test is whether
+    /// the pointer is in the `dev_bufs` list -- the only way a device region
+    /// comes into existence, since `dAllocBuf` is the sole allocator.
+    ///
+    /// This exists because `Buf` cannot tell host from device by looking at
+    /// it, and two slots legitimately receive host memory:
+    ///   * `copyRange(device, Buf.wrap(host_embedding_row))` -- the f32
+    ///     embedding lookup (engine.zig `embedToken`),
+    ///   * `dCopyFromHost`'s callers.
+    /// Treating such a `src` as a device pointer is an immediate illegal
+    /// access -- caught in the P2c acceptance run on the Q8_K_XL model, whose
+    /// embedding table is f32 (the Q6_K one is quantized and goes through
+    /// `dequantRow`, which is why it passed first).
+    fn isDevBuf(self: *CudaBackend, b: backend.Buf) bool {
+        const p: *const anyopaque = @ptrCast(b.ptr);
+        for (self.dev_bufs.items) |d| {
+            if (d == p) return true;
+        }
+        return false;
     }
 
     fn dCopyRange(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
@@ -1390,43 +1693,505 @@ pub const CudaBackend = struct {
             cpu_mod.CpuBackend.vtable.copyRange(@ptrCast(&self.cpu), dst, src);
             return;
         }
-        if (dst.len != 0 and self.cu != null) {
-            // dst is `stageClaim`ed rather than `stageIn`ed: its old contents are
-            // dead (fully overwritten), so uploading them is pure waste.
-            if (self.stageClaim(dst, .a)) |pd| {
-                if (self.stageIn(src, .b)) |ps| {
-                    const rc = Launch.copy_range(pd, ps, @intCast(dst.len), null);
-                    if (rc == cudart.cudaSuccess) {
-                        self.stageOut(dst, .a);
-                        return;
-                    }
-                    self.ewLaunchFail("copy_range", rc);
-                } else |_| {}
-            } else |_| {}
+        if (self.cu != null) {
+            if (dBufPtr(dst)) |pd| {
+                if (self.isDevBuf(src)) {
+                    if (dBufPtr(src)) |ps| {
+                        // Both device-resident: a pure device-to-device move.
+                        const rc = Launch.copy_range(pd, ps, @intCast(dst.len), null);
+                        if (rc == cudart.cudaSuccess) return;
+                        self.ewLaunchFail("copy_range", rc);
+                    } else return;
+                } else {
+                    // `src` is host memory (an f32 embedding row).  Same kernel,
+                    // opposite direction: this is the documented H2D path.
+                    CudaBackend.dCopyFromHost(@ptrCast(self), dst, src.slice()[0..dst.len]);
+                    return;
+                }
+            } else return;
         }
         cpu_mod.CpuBackend.vtable.copyRange(@ptrCast(&self.cpu), dst, src);
     }
 
     fn dZeroBuf(ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
-        if (buf.len != 0 and self.cu != null) {
-            // Write-only: no upload, and the slot does not even need to have held
-            // anything (the kernel writes every element before it is read).
-            if (self.stageClaim(buf, .a)) |p| {
+        if (self.cu != null) {
+            if (dBufPtr(buf)) |p| {
                 const rc = Launch.zero_buf(p, @intCast(buf.len), null);
-                if (rc == cudart.cudaSuccess) {
-                    self.stageOut(buf, .a);
-                    return;
-                }
+                if (rc == cudart.cudaSuccess) return;
                 self.ewLaunchFail("zero_buf", rc);
-            } else |_| {}
-            // Device path failed: still give dst the zero semantics it was
-            // promised, whatever happened above (the staging copy is the only
-            // route back, so do it explicitly rather than trusting the slot).
-            @memset(buf.slice(), 0);
+            } else return;
+        }
+        // Device path unavailable: still give dst the zero semantics it was
+        // promised.  This touches host memory only when the buffer IS host
+        // memory (i.e. the CPU fallback path), which is the honest reading.
+        @memset(buf.slice(), 0);
+    }
+
+    // ==== slots: the two host<->device bridges ==============================
+    //
+    // These are the only two slots that intentionally cross PCIe, and both are
+    // bounded by something other than "one copy per operator":
+    //
+    //   copyFromHost -- a token's f32 embedding row (unquantized token_embd
+    //                   only), once per token, `hidden` floats.
+    //   copyToHost   -- see backend.zig: `nv` (64) scalars per layer per token,
+    //                   because `gdnStep` takes beta/gamma as `f32` arguments.
+    //
+    // Everything else in this file is device-to-device.
+
+    fn dCopyFromHost(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+        const self = self_(ctx);
+        if (self.cu != null and src.len != 0 and src.len <= dst.len) {
+            if (dBufPtr(dst)) |pd| {
+                const cu = &self.cu.?;
+                const rc = cu.lib.Memcpy(
+                    @ptrCast(pd),
+                    @ptrCast(src.ptr),
+                    src.len * @sizeOf(f32),
+                    cudart.MemcpyHostToDevice,
+                );
+                self.stat_h2d_bytes += src.len * @sizeOf(f32);
+                // `$QWEN35_STAT_TALKY`: breakdown of who still hands this backend
+                // host memory.  Grouped by element count, which identifies the
+                // caller (hidden=1024 vs head_dim=256).
+                if (cudart.getenv("QWEN35_STAT_TALKY") != null) {
+                    if (self.debug_h2d_len == src.len) {
+                        self.debug_h2d_same += 1;
+                    } else {
+                        std.debug.print("H2DCOPY len={d} count={d}\n", .{ self.debug_h2d_len, self.debug_h2d_same });
+                        self.debug_h2d_len = src.len;
+                        self.debug_h2d_same = 1;
+                    }
+                }
+                if (rc == cudart.cudaSuccess) return;
+                self.ewLaunchFail("copyFromHost", rc);
+            } else return;
+        }
+        // A length mismatch is an engine bug; let the CPU reference report it.
+        cpu_mod.CpuBackend.vtable.copyFromHost(@ptrCast(&self.cpu), dst, src);
+    }
+
+    fn dCopyToHost(ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+        const self = self_(ctx);
+        std.debug.assert(dst.len <= src.len);
+        if (self.cu != null) {
+            if (dBufPtr(src)) |ps| {
+                // Blocking on purpose: it is `nv` floats per layer, and a
+                // blocking copy into pageable host memory is both simpler and
+                // (at this size) indistinguishable in cost from an async one.
+                const cu = &self.cu.?;
+                const rc = cu.lib.Memcpy(
+                    @ptrCast(dst.ptr),
+                    @ptrCast(ps),
+                    dst.len * @sizeOf(f32),
+                    cudart.MemcpyDeviceToHost,
+                );
+                self.stat_d2h_bytes += dst.len * @sizeOf(f32);
+                if (rc == cudart.cudaSuccess) return;
+                self.ewLaunchFail("copyToHost", rc);
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.copyToHost(@ptrCast(&self.cpu), dst, src);
+    }
+
+    // ==== slots: norms / activations (P2b, second batch) ====================
+    //
+    // `dBufPtr -> launch`, with the CPU slot as the fallback on ANY failure.
+    //
+    // Two properties worth stating:
+    //
+    //   * These are NOT bit-exact with the CPU.  rmsnorm/l2norm/softmax reduce
+    //     in a different order (a block tree vs the CPU's serial loop), and
+    //     every transcendental here (`expf`, `powf`, `cosf`, `sinf`) is a
+    //     different implementation in the device runtime than in glibc.  The
+    //     measured figures are in the .cu headers.
+    //   * The read-only weight operand (`w` in rmsnorm, `wconv` in convStep) is
+    //     a per-layer constant re-passed on every token, so it is NOT a device
+    //     `Buf` -- `devConst` keeps it resident, and a cache hit costs nothing.
+
+    fn dRmsnorm(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+        const self = self_(ctx);
+        // The CPU reference asserts out.len == x.len == w.len (one row).  The
+        // kernel supports several rows (w reused per row) for the shape the
+        // engine does not currently produce, so the only mismatch worth
+        // refusing is a partial row.
+        if (x.len != 0 and w.len != 0 and x.len % w.len == 0 and x.len == out.len and self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                if (dBufPtr(out)) |po| {
+                    if (self.devConst(w.slice())) |pw_unwrapped| {
+                        if (pw_unwrapped) |pw| {
+                            const rows: c_int = @intCast(x.len / w.len);
+                            const rc = Launch.rmsnorm(po, px, pw, rows, @intCast(w.len), eps, null);
+                            if (rc == cudart.cudaSuccess) return;
+                            self.ewLaunchFail("rmsnorm", rc);
+                        }
+                    } else |_| {}
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.rmsnorm(@ptrCast(&self.cpu), out, x, w, eps);
+    }
+
+    fn dL2norm(ctx: *anyopaque, x: backend.Buf) void {
+        const self = self_(ctx);
+        if (self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                // eps 1e-6 is elementwise.zig `l2norm`'s constant; it is passed
+                // explicitly so the CPU reference stays the single definition.
+                const rc = Launch.l2norm(px, 1, @intCast(x.len), 1e-6, null);
+                if (rc == cudart.cudaSuccess) return;
+                self.ewLaunchFail("l2norm", rc);
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.l2norm(@ptrCast(&self.cpu), x);
+    }
+
+    fn dSiluInPlace(ctx: *anyopaque, x: backend.Buf) void {
+        const self = self_(ctx);
+        if (self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                const rc = Launch.silu(px, @intCast(x.len), null);
+                if (rc == cudart.cudaSuccess) return;
+                self.ewLaunchFail("silu", rc);
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.siluInPlace(@ptrCast(&self.cpu), x);
+    }
+
+    fn dMulSilu(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+        const self = self_(ctx);
+        if (gate.len != out.len) {
+            std.debug.print("cuda backend: mulSilu length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
+            cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
             return;
         }
-        @memset(buf.slice(), 0);
+        if (self.cu != null) {
+            if (dBufPtr(out)) |po| {
+                if (dBufPtr(gate)) |pg| {
+                    const rc = Launch.mul_silu(po, pg, @intCast(out.len), null);
+                    if (rc == cudart.cudaSuccess) return;
+                    self.ewLaunchFail("mul_silu", rc);
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
+    }
+
+    fn dMulSigmoid(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+        const self = self_(ctx);
+        if (gate.len != out.len) {
+            std.debug.print("cuda backend: mulSigmoid length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
+            cpu_mod.CpuBackend.vtable.mulSigmoid(@ptrCast(&self.cpu), out, gate);
+            return;
+        }
+        if (self.cu != null) {
+            if (dBufPtr(out)) |po| {
+                if (dBufPtr(gate)) |pg| {
+                    const rc = Launch.mul_sigmoid(po, pg, @intCast(out.len), null);
+                    if (rc == cudart.cudaSuccess) return;
+                    self.ewLaunchFail("mul_sigmoid", rc);
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.mulSigmoid(@ptrCast(&self.cpu), out, gate);
+    }
+
+    fn dSwiglu(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+        const self = self_(ctx);
+        if (up.len != gate.len) {
+            std.debug.print("cuda backend: swiglu length mismatch (gate={d} up={d}); using the CPU path\n", .{ gate.len, up.len });
+            cpu_mod.CpuBackend.vtable.swiglu(@ptrCast(&self.cpu), gate, up);
+            return;
+        }
+        if (self.cu != null) {
+            if (dBufPtr(gate)) |pg| {
+                if (dBufPtr(up)) |pu| {
+                    const rc = Launch.swiglu(pg, pu, @intCast(gate.len), null);
+                    if (rc == cudart.cudaSuccess) return;
+                    self.ewLaunchFail("swiglu", rc);
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.swiglu(@ptrCast(&self.cpu), gate, up);
+    }
+
+    fn dSoftmax(ctx: *anyopaque, x: backend.Buf) void {
+        const self = self_(ctx);
+        if (self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                const rc = Launch.softmax(px, @intCast(x.len), null);
+                if (rc == cudart.cudaSuccess) return;
+                self.ewLaunchFail("softmax", rc);
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.softmax(@ptrCast(&self.cpu), x);
+    }
+
+    // ==== sampling (P2c: logits are device memory) ==========================
+    //
+    // The engine keeps `logits` in a backend region, so both of these used to
+    // dereference a device pointer through the CPU implementation.  argmax is
+    // a pure max and therefore goes to the device exactly (see the kernel);
+    // `sample` stays on the CPU because the sampler is a sampling POLICY
+    // (temperature, top-k/p, RNG) whose reference implementation must not be
+    // duplicated, and it needs the whole distribution.
+
+    fn dArgmax(ctx: *anyopaque, logits: backend.Buf) u32 {
+        const self = self_(ctx);
+        if (self.cu != null and logits.len != 0) {
+            if (dBufPtr(logits)) |px| {
+                // The launcher writes through `d_out`, so it MUST be device
+                // memory: the previous build passed the address of a stack
+                // `c_int`, which the kernel dereferenced as a GPU pointer.  A
+                // dedicated 4-byte device cell is reused (grown once) and only
+                // the final index -- 4 bytes -- comes back per token.
+                const cu = &self.cu.?;
+                ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, @sizeOf(c_int)) catch return 0;
+                const rc = Launch.argmax(px, @intCast(logits.len), @ptrCast(@alignCast(self.d_idx)), null);
+                if (rc != cudart.cudaSuccess) {
+                    self.ewLaunchFail("argmax", rc);
+                    return 0;
+                }
+                var host_idx: c_int = 0;
+                const rc2 = cu.lib.Memcpy(&host_idx, self.d_idx, @sizeOf(c_int), cudart.MemcpyDeviceToHost);
+                if (rc2 != cudart.cudaSuccess) {
+                    self.ewLaunchFail("argmax index download", rc2);
+                    return 0;
+                }
+                self.stat_d2h_bytes += @sizeOf(c_int);
+                return @intCast(host_idx);
+            } else return 0;
+        }
+        return cpu_mod.CpuBackend.vtable.argmax(@ptrCast(&self.cpu), logits);
+    }
+
+    /// Host staging for `dSample`: pull the row down, run the reference
+    /// sampler on it -- the one place the sampler's own `[]f32` contract has to
+    /// be fed, and it is fed with a copy the caller cannot observe later.
+    ///
+    /// The scratch buffer handed in is a device region too, so its contents are
+    /// not needed by the caller (`bufSample` treats it as write-only scratch);
+    /// the sampler gets a temporary host array instead.
+    fn sampleViaHost(self: *CudaBackend, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+        const alloc = self.alloc;
+        const host_logits = alloc.alloc(f32, logits.len) catch return 0;
+        defer alloc.free(host_logits);
+        const host_scratch = alloc.alloc(f32, @max(scratch.len, logits.len)) catch return 0;
+        defer alloc.free(host_scratch);
+        CudaBackend.dCopyToHost(@ptrCast(self), host_logits, logits);
+        return sp.sample(host_logits, host_scratch);
+    }
+
+    fn dSample(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+        const self = self_(ctx);
+        // Greedy fast path: `Sampler.sample` with temperature <= 0 is a pure
+        // argmax (sampler.zig:73), so it needs no distribution -- run it on the
+        // device and bring back 4 bytes instead of the whole vocabulary.  This
+        // is the default decode path, so it is what keeps the per-token
+        // cross-boundary traffic at a single int.
+        if (sp.temperature <= 0) return CudaBackend.dArgmax(ctx, logits);
+        // True sampling: one D2H per generated token, of the vocabulary-length
+        // logits row, and it is unavoidable while the sampler is the CPU
+        // reference.  It is also the only reason `scratch` has to be host
+        // memory: the sampler writes its normalised distribution there.  Sized
+        // by the engine.
+        if (self.cu != null and logits.len != 0) {
+            if (dBufPtr(logits) != null) {
+                return self.sampleViaHost(logits, scratch, sp);
+            }
+        }
+        return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+    }
+
+    // ==== slots: the two state machines (P2c) ===============================
+    //
+    // These are the two slots that P2c exists for.  Until KV and the GDN state
+    // became backend regions they COULD NOT be device slots at all: their
+    // arguments are large slices of state (a 64 KB GDN state per head, up to
+    // `slot+1` KV rows per layer), so a staging backend would have had to move
+    // megabytes per launch -- orders of magnitude worse than leaving them on
+    // the CPU.  With both resident, the launches are free of traffic.
+    //
+    // The numeric contract is in the kernel headers (src/kernels/cuda/gdn.cu,
+    // attn.cu): accumulation order follows the CPU reference element by
+    // element, and neither is bit-exact (FMA contraction on the device side).
+
+    fn dGdnStep(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                gamma: f32, beta: f32, vd: usize) void {
+        const self = self_(ctx);
+        // vd != 128 is the CPU `gdnFused`'s slow path (four separate kernels);
+        // the device kernel is written for the fast path only, so route the odd
+        // shape to the CPU rather than launching a kernel that would refuse.
+        if (vd == 128 and self.cu != null and
+            state.len >= vd * vd and k.len >= vd and q.len >= vd and
+            v.len >= vd and km.len >= vd and delta.len >= vd and out.len >= vd)
+        {
+            if (dBufPtr(state)) |pstate| {
+                if (dBufPtr(k)) |pk| {
+                    if (dBufPtr(v)) |pv| {
+                        if (dBufPtr(q)) |pq| {
+                            if (dBufPtr(km)) |pkm| {
+                                if (dBufPtr(delta)) |pdelta| {
+                                    if (dBufPtr(out)) |pout| {
+                                        const rc = Launch.gdn_step(pstate, pk, pv, pq, pkm, pdelta, pout, gamma, beta, @intCast(vd), null);
+                                        if (rc == cudart.cudaSuccess) return;
+                                        self.ewLaunchFail("gdn_step", rc);
+                                    } else return;
+                                } else return;
+                            } else return;
+                        } else return;
+                    } else return;
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.gdnStep(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, vd);
+    }
+
+    fn dGdnGamma(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+                 dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
+        const self = self_(ctx);
+        // Every operand here except `ssm_a`/`dt_bias` is a live backend region.
+        // The two weight rows are per-layer constants, so they go through the
+        // `devConst` cache exactly like the norm weights do.
+        if (self.cu != null and nv != 0 and
+            a_raw.len >= nv and b_raw.len >= nv and ssm_a.len >= nv and
+            dt_bias.len >= nv and gamma.len >= nv)
+        {
+            if (dBufPtr(a_raw)) |pa| {
+                if (dBufPtr(b_raw)) |pb| {
+                    if (dBufPtr(gamma)) |pg| {
+                        if (self.devConst(ssm_a.slice())) |sa_unwrapped| {
+                            if (sa_unwrapped) |sa| {
+                                if (self.devConst(dt_bias.slice())) |db_unwrapped| {
+                                    if (db_unwrapped) |db| {
+                                        const rc = Launch.gdn_gamma(pa, pb, sa, db, pg, @intCast(nv), null);
+                                        if (rc == cudart.cudaSuccess) return;
+                                        self.ewLaunchFail("gdn_gamma", rc);
+                                    }
+                                } else |_| {}
+                            }
+                        } else |_| {}
+                    } else return;
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.gdnGamma(@ptrCast(&self.cpu), a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
+    }
+
+    fn dAttnDecode(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+                   vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
+                   heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
+        const self = self_(ctx);
+        // `kcache`/`vcache` are the first `slot+1` rows of the layer's cache, so
+        // they are sized (slot+1)*kv_dim, not max_seq*kv_dim (the engine passes
+        // exactly that span).  `att` needs slot+1 floats.
+        //
+        // `heads * hd <= gout.len` and `q.len >= heads*hd` are the engine's
+        // contract; a violation is a bug, and the CPU reference's slicing would
+        // trap on it, so fall through to it rather than launch on bad sizes.
+        const nrows = slot + 1;
+        if (self.cu != null and heads != 0 and hd != 0 and
+            q.len >= heads * hd and gout.len >= heads * hd and
+            att.len >= nrows and kcache.len >= nrows * kv_dim and vcache.len >= nrows * kv_dim)
+        {
+            if (dBufPtr(q)) |pq| {
+                if (dBufPtr(gate)) |pgate| {
+                    if (dBufPtr(kcache)) |pk| {
+                        if (dBufPtr(vcache)) |pv| {
+                            if (dBufPtr(att)) |patt| {
+                                if (dBufPtr(gout)) |pgout| {
+                                    const rc = Launch.attn_decode(pq, pgate, pk, pv, patt, pgout, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, null);
+                                    if (rc == cudart.cudaSuccess) return;
+                                    self.ewLaunchFail("attn_decode", rc);
+                                } else return;
+                            } else return;
+                        } else return;
+                    } else return;
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.attnDecode(@ptrCast(&self.cpu), q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+    }
+
+    // rope64 STAYS ON THE CPU, deliberately.  A device kernel was written,
+    // measured and withdrawn; the numbers are worth recording so nobody
+    // re-does it:
+    //
+    //   The phase is `theta = pos * base^(-2j/64)`, an ABSOLUTE angle of order
+    //   `pos`.  glibc's `powf` and the device runtime's differ by up to 1 ULP
+    //   *relative to theta*, which at pos = 1e6 is ~1e-2 radians of phase --
+    //   and `cos(theta)` then differs by up to 1e-2 outright, i.e. 5e-4
+    //   relative on the rotated value (measured: max relative error 5.2e-4,
+    //   max abs 2.5e-5 over 200 positions x 256-element heads).  Recomputing
+    //   theta in double precision on the device does NOT fix it (measured:
+    //   still 5.2e-4) because the host's f32 `powf` is itself the lower-
+    //   precision side and cannot be matched, only approximated.
+    //
+    //   A 5e-4 perturbation of every q/k rotation for every layer is far past
+    //   what the token stream tolerates, while the CPU cost it would save is
+    //   negligible: 32 pow/cos/sin per head, 64 elements written, per token.
+    //
+    // So the ARITHMETIC stays on the CPU -- but after P2c `x` is a DEVICE
+    // region, and the CPU implementation would dereference a device pointer.
+    // This slot therefore owns the one remaining D2H+H2D pair on the per-token
+    // path, and it is deliberately the only one: a head's 64 floats, twice, per
+    // q/k tensor per layer.  That is ~64 KB per token for the 0.8B (48 rotations
+    // x 64 x 4 B x 2 directions), against the ~15 MiB the old staging path
+    // moved per token -- and it buys bit-identical rotation instead of 5e-4
+    // drift on every q and k.
+    //
+    // If this ever needs to go zero-copy, the fix is a device kernel plus
+    // accepting the 5e-4, NOT a rewrite of the reference.
+    fn dRope64(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+        const self = self_(ctx);
+        const max_head: usize = 256;
+        var host: [max_head]f32 = undefined;
+        const n = @min(x.len, max_head);
+        if (self.cu == null or n == 0 or n != x.len) {
+            // Same length guard as the rest: rope is a per-head call (hd = 128
+            // or 64 in every Qwen3.5 variant), so anything larger means the
+            // engine's shape changed and the CPU reference must own it.
+            cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), x, pos, base);
+            return;
+        }
+        CudaBackend.dCopyToHost(@ptrCast(self), host[0..n], x);
+        cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), backend.Buf.wrap(host[0..n]), pos, base);
+        CudaBackend.dCopyFromHost(@ptrCast(self), x, host[0..n]);
+        // One H2D + one D2H per rotated head, per position.  Counted so the
+        // report can state this remainder's exact share instead of guessing.
+        self.stat_rope_trips += 1;
+    }
+
+    fn dConvStep(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+        const self = self_(ctx);
+        // `conv` is the GDN sliding window and is BOTH read and written (the
+        // kernel shifts it in place); `y` likewise (read as the 4th tap, then
+        // overwritten).  Both are device-resident, so both are passed directly.
+        //
+        // `k` is the conv width and the kernel hardcodes 4 taps (as does
+        // elementwise.zig `convStepKernel`, which asserts it).  A model with a
+        // different window must reach the CPU rather than get a wrong answer.
+        if (k != 4) {
+            std.debug.print("cuda backend: convStep kernel width {d} != 4; using the CPU path\n", .{k});
+            cpu_mod.CpuBackend.vtable.convStep(@ptrCast(&self.cpu), conv, y, wconv, k);
+            return;
+        }
+        if (conv.len == 3 * y.len and wconv.len == 4 * y.len and self.cu != null) {
+            if (dBufPtr(conv)) |pc| {
+                if (dBufPtr(y)) |py| {
+                    if (self.devConst(wconv.slice())) |pw_unwrapped| {
+                        if (pw_unwrapped) |pw| {
+                            const rc = Launch.conv_step(pc, py, pw, @intCast(y.len), null);
+                            if (rc == cudart.cudaSuccess) return;
+                            self.ewLaunchFail("conv_step", rc);
+                        }
+                    } else |_| {}
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.convStep(@ptrCast(&self.cpu), conv, y, wconv, k);
     }
 
     // ==== profiling / introspection =========================================
@@ -1447,19 +2212,27 @@ pub const CudaBackend = struct {
         if (self.cu == null) return;
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
                 self.stat_n_batchk,
                 self.stat_n_dequant,
                 self.stat_uploaded_bytes >> 20,
+                self.stat_h2d_bytes >> 10,
+                self.stat_d2h_bytes >> 10,
                 self.dev_rows.items.len,
                 buf_bytes >> 20,
                 self.iqTablesBytes() >> 10,
                 self.stat_ns_matvec / 1_000_000,
                 self.stat_ns_batchk / 1_000_000,
                 self.stat_ns_dequant / 1_000_000,
+                // Non-zero here means a numeric slot was handed host memory.  On
+                // the per-token path all three must be 0 except `rope`, which is
+                // the documented remainder.
+                self.stat_host_act_uploads,
+                self.stat_host_out_downloads,
+                self.stat_rope_trips,
             },
         );
         // Per-type breakdown, only for types that actually ran.  Assembled with
@@ -1553,6 +2326,11 @@ pub const CudaBackend = struct {
         self.stat_n_matvec = 0;
         self.stat_n_batchk = 0;
         self.stat_n_dequant = 0;
+        self.stat_h2d_bytes = 0;
+        self.stat_d2h_bytes = 0;
+        self.stat_host_act_uploads = 0;
+        self.stat_host_out_downloads = 0;
+        self.stat_rope_trips = 0;
         self.stat_by_type = @splat(0);
         self.stat_ns_by_type = @splat(0);
         self.cpu.exec().profReset();
@@ -1586,39 +2364,46 @@ pub const vtable = backend.Exec.VTable{
     .reportProfile = CudaBackend.dReportProfile,
     .name = CudaBackend.vName,
     .describe = CudaBackend.vDescribe,
-    // Elementwise / state slots: the trampoline stage reuses the CPU targets
-    // verbatim (`cpu.vtable` is exported for exactly this).  They ignore `ctx`,
-    // so handing them out with a `*CudaBackend` ctx is safe, and the numbers
-    // stay byte-identical to `--backend cpu` until device kernels exist.
-    .rmsnorm = cpu_mod.CpuBackend.vtable.rmsnorm,
-    .rope64 = cpu_mod.CpuBackend.vtable.rope64,
-    .l2norm = cpu_mod.CpuBackend.vtable.l2norm,
-    .siluInPlace = cpu_mod.CpuBackend.vtable.siluInPlace,
-    .mulSilu = cpu_mod.CpuBackend.vtable.mulSilu,
-    .mulSigmoid = cpu_mod.CpuBackend.vtable.mulSigmoid,
-    .softmax = cpu_mod.CpuBackend.vtable.softmax,
-    .swiglu = cpu_mod.CpuBackend.vtable.swiglu,
-    .convStep = cpu_mod.CpuBackend.vtable.convStep,
-    .gdnStep = cpu_mod.CpuBackend.vtable.gdnStep,
+    // Elementwise / state slots: ALL on the device.
+    //
+    // P2b left seven of these on the CPU because every call was an H2D + D2H
+    // round trip of a few KB, and for the small hot buffers that round trip cost
+    // more than the CPU work it replaced (measured: binding all nine sank
+    // Generate from 38.7 to 22.1 tok/s).  P2c removed the round trip -- both
+    // sides are device memory now -- so the bindings below cost a launch and
+    // nothing else, and the measurement inverts (see the report).
+    //
+    // rope64 stays on the CPU on purpose: it is the one slot whose device
+    // implementation cannot match the CPU bit-for-bit (sin/cos of a different
+    // libm), and a per-head 64-element call is not worth any divergence in the
+    // token stream.  See `dRope64`'s comment.
+    .rmsnorm = CudaBackend.dRmsnorm,
+    .rope64 = CudaBackend.dRope64,
+    .l2norm = CudaBackend.dL2norm,
+    .siluInPlace = CudaBackend.dSiluInPlace,
+    .mulSilu = CudaBackend.dMulSilu,
+    .mulSigmoid = CudaBackend.dMulSigmoid,
+    .softmax = CudaBackend.dSoftmax,
+    .swiglu = CudaBackend.dSwiglu,
+    .convStep = CudaBackend.dConvStep,
+    .gdnStep = CudaBackend.dGdnStep,
     .constBuf = cpu_mod.CpuBackend.vtable.constBuf,
-    .attnDecode = cpu_mod.CpuBackend.vtable.attnDecode,
-    .gdnGamma = cpu_mod.CpuBackend.vtable.gdnGamma,
-    .copyFromHost = cpu_mod.CpuBackend.vtable.copyFromHost,
-    .argmax = cpu_mod.CpuBackend.vtable.argmax,
-    .sample = cpu_mod.CpuBackend.vtable.sample,
-    // Device (P2b): the four pure elementwise slots.  Forwarders, NOT aliases --
-    // they need `ctx` to reach the device staging buffers, and the ctx here is a
-    // `*CudaBackend` (aliasing `cpu.vtable.scaleVec` would be harmless only
-    // because the CPU bodies ignore ctx; that is not a property to rely on).
+    .attnDecode = CudaBackend.dAttnDecode,
+    .gdnGamma = CudaBackend.dGdnGamma,
+    .copyFromHost = CudaBackend.dCopyFromHost,
+    .copyToHost = CudaBackend.dCopyToHost,
+    .argmax = CudaBackend.dArgmax,
+    .sample = CudaBackend.dSample,
+    // The four pure elementwise slots.  Forwarders, NOT aliases: they need
+    // `ctx` to reach the device, and the ctx here is a `*CudaBackend`
+    // (aliasing a CPU body would work only because those bodies ignore ctx).
     // Each still falls back to the CPU path on a device-side failure.
     .scaleVec = CudaBackend.dScaleVec,
     .addResid = CudaBackend.dAddResid,
     .copyRange = CudaBackend.dCopyRange,
     .zeroBuf = CudaBackend.dZeroBuf,
-    // Trampoline stage: regions come from the embedded CPU backend's allocator,
-    // and `dFreeScratch` releases them (`CpuBackend.vtable.freeScratch`).
-    // The trampoline is needed because the ctx is a `*CudaBackend`, not a
-    // `*CpuBackend`: `dAllocBuf` forwards to `&self.cpu`.
+    // Activations are PROPER device regions after P2c, so `allocBuf` is a real
+    // `cudaMalloc` and `freeScratch` releases them (`dAllocBuf`/`dFreeScratch`).
     .allocBuf = CudaBackend.dAllocBuf,
 
 };
