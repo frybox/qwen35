@@ -116,6 +116,10 @@ const cuda_sources = [_][]const u8{
     // contract, because GDN state error carries across tokens; see both files.
     "attn.cu",
     "gdn.cu",
+    // q35_launch_rope64 -- rotary embedding.  NOT bit-exact (the device powf
+    // is not glibc's, and the phase error grows with `pos`), so dRope64 keeps
+    // it behind $QWEN35_CUDA_ROPE; see rope.cu's header for why.
+    "rope.cu",
 };
 
 /// Every regular file under src/kernels/cuda/.  These become explicit inputs of

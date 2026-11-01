@@ -136,6 +136,8 @@ const Kernels = struct {
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
+    extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
 };
 
 // ==== link-time vs. CPU-only build =========================================
@@ -206,6 +208,7 @@ const Launch = if (cuda_linked) struct {
     const attn_decode = Kernels.q35_launch_attn_decode;
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
+    const rope64 = Kernels.q35_launch_rope64;
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, stream };
@@ -305,6 +308,10 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
+    fn rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, heads, hd, pos, base, stream };
+        return stubNoCudaKernels();
+    }
 };
 
 // ==== activation geometry ====================================================
@@ -397,6 +404,9 @@ const DevConst = struct {
 /// (never-written) device pointers.
 const IqTablesState = enum { pending, done, failed };
 
+/// The two `dRope64` implementations, only for the startup log line.
+const RopePath = enum { host, device };
+
 
 // Buffers for formatted error/description strings.  Static because
 // `describe`/`name` return slices with no allocator in scope (same pattern as
@@ -445,8 +455,13 @@ pub const CudaBackend = struct {
     stat_host_out_downloads: usize = 0,
     /// `dRope64` round trips (one H2D + one D2H per rotated head, per token).
     /// The deliberate remainder described at that function: it buys bit-exact
-    /// rotation, and the report quantifies it instead of hiding it.
+    /// rotation, and the report quantifies it instead of hiding it.  Always 0
+    /// under `$QWEN35_CUDA_ROPE=device`.
     stat_rope_trips: usize = 0,
+    /// `dRope64` heads rotated by the device kernel.  Its complement to the
+    /// total rotation count is `stat_rope_trips`, so the `CUDA-M` line says
+    /// which of the two paths actually ran rather than which one was asked for.
+    stat_rope_devices: usize = 0,
     /// `$QWEN35_STAT_TALKY` grouping state: last uploaded element count and how
     /// many consecutive uploads had that size.
     debug_h2d_len: usize = 0,
@@ -670,6 +685,55 @@ pub const CudaBackend = struct {
         const v = cudart.getenv("QWEN35_CUDA_MAX_DEV_MIB") orelse return false;
         const mib = std.fmt.parseInt(usize, mem.trim(u8, v, " "), 10) catch return false;
         return self.stat_uploaded_bytes >= (mib << 20);
+    }
+
+    /// `$QWEN35_CUDA_ROPE=host|device`: which implementation `dRope64` uses.
+    /// Default `device` (zero-copy `q35_launch_rope64`); `host` is the escape
+    /// hatch back to the CPU body, which is bit-exact against the reference but
+    /// pays one D2H+H2D pair per head per layer per token.
+    ///
+    /// Measured on Qwen3.8-27B IQ3_XXS / 4090, 354-token prompt, 3 runs each
+    /// (`scripts/bench.sh` style A/B, `$QWEN35_CUDA_ROPE` the only variable):
+    /// prefill 10.20-10.54 -> 11.35-11.41 tok/s (+10.6%), generate 7.15-7.35 ->
+    /// 7.48-7.50 tok/s (+4.4%).  The gain is smaller on generate because the
+    /// per-head staging is amortised differently there, and it is NOT a scaling
+    /// claim: as the matvec kernels improve, rope's share grows and so will this.
+    ///
+    /// This does NOT preserve host/device token identity, and is not meant to.
+    /// The device libm's `powf` differs from glibc's by ~1 ULP, which is an
+    /// absolute phase error of order `pos * 1.2e-7` rad; 65 layers of q/k
+    /// rotation amplify it past the argmax margin well before pos 1000 (measured:
+    /// first divergence at generated token 34 with a 17-token prompt, pos ~50;
+    /// from token 1 with a 354-token prompt).  Each path is still deterministic
+    /// on its own (3 runs, identical md5), so A/B debugging stays possible --
+    /// what is lost is cross-path comparability, the same thing llama.cpp's own
+    /// CPU-vs-CUDA backends do not offer either.
+    ///
+    /// Read once and cached: this is on the per-token path, and `getenv` per
+    /// head per layer per token is exactly the kind of syscall this backend
+    /// exists to avoid.  Any other value (including unset) keeps the default.
+    fn ropeOnDevice() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |v| return v;
+        var on = true;
+        if (cudart.getenv("QWEN35_CUDA_ROPE")) |raw| {
+            const v = mem.trim(u8, raw, " \t\r\n");
+            if (mem.eql(u8, v, "host")) {
+                on = false;
+            } else if (!mem.eql(u8, v, "device")) {
+                std.debug.print(
+                    "cuda backend: QWEN35_CUDA_ROPE='{s}' is neither 'host' nor 'device'; using device\n",
+                    .{v},
+                );
+            }
+            std.debug.print("cuda backend: rope64 = {s} ({s})\n", .{
+                @tagName(if (on) RopePath.device else RopePath.host), "QWEN35_CUDA_ROPE",
+            });
+        }
+        S.cached = on;
+        return on;
     }
 
     /// Copy one activation vector to `d_act`, growing the buffer as needed.
@@ -2115,35 +2179,42 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.attnDecode(@ptrCast(&self.cpu), q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
-    // rope64 STAYS ON THE CPU, deliberately.  A device kernel was written,
-    // measured and withdrawn; the numbers are worth recording so nobody
-    // re-does it:
+    // rope64: TWO paths, selected at runtime by `$QWEN35_CUDA_ROPE`.
+    //
+    //   host   (DEFAULT, unchanged from before) -- D2H, `elementwise.zig`
+    //          `applyRope64` on the CPU, H2D.  The one remaining D2H+H2D pair on
+    //          the per-token path: a head's 64 floats, twice, per q/k tensor per
+    //          layer (~64 KB per token for the 0.8B: 48 rotations x 64 x 4 B x
+    //          2 directions).  Bit-identical to the CPU backend *by
+    //          construction*, because it IS the CPU backend.  These trips are
+    //          counted in `stat_rope_trips` so `CUDA-M` shows the A/B really
+    //          switched.
+    //   device -- `q35_launch_rope64` (`src/kernels/cuda/rope.cu`), zero copy,
+    //          `stat_rope_trips` stays 0.  NOT bit-exact; by how much is the
+    //          number this section used to guess at.
+    //
+    // HISTORY (the reason `host` is the default): a device kernel was written,
+    // measured and withdrawn.  What that measurement established:
     //
     //   The phase is `theta = pos * base^(-2j/64)`, an ABSOLUTE angle of order
     //   `pos`.  glibc's `powf` and the device runtime's differ by up to 1 ULP
     //   *relative to theta*, which at pos = 1e6 is ~1e-2 radians of phase --
     //   and `cos(theta)` then differs by up to 1e-2 outright, i.e. 5e-4
-    //   relative on the rotated value (measured: max relative error 5.2e-4,
-    //   max abs 2.5e-5 over 200 positions x 256-element heads).  Recomputing
-    //   theta in double precision on the device does NOT fix it (measured:
-    //   still 5.2e-4) because the host's f32 `powf` is itself the lower-
-    //   precision side and cannot be matched, only approximated.
+    //   relative on the rotated value (measured then: max relative error
+    //   5.2e-4, max abs 2.5e-5 over 200 positions x 256-element heads).
+    //   Recomputing theta in double precision on the device does NOT fix it
+    //   (measured: still 5.2e-4) because the host's f32 `powf` is itself the
+    //   lower-precision side and cannot be matched, only approximated.
     //
-    //   A 5e-4 perturbation of every q/k rotation for every layer is far past
-    //   what the token stream tolerates, while the CPU cost it would save is
-    //   negligible: 32 pow/cos/sin per head, 64 elements written, per token.
+    // What that measurement did NOT establish is the sentence that followed it
+    // ("far past what the token stream tolerates"): that was an inference, not
+    // a test, and `pos` in that sweep went far past anything `Engine.max_seq`
+    // (= 4096) can reach.  The switch exists so the claim can be measured on
+    // the real token stream instead of argued about: run the same prompt with
+    // `QWEN35_CUDA_ROPE=host` and `=device` and diff the token ids.
     //
-    // So the ARITHMETIC stays on the CPU -- but after P2c `x` is a DEVICE
-    // region, and the CPU implementation would dereference a device pointer.
-    // This slot therefore owns the one remaining D2H+H2D pair on the per-token
-    // path, and it is deliberately the only one: a head's 64 floats, twice, per
-    // q/k tensor per layer.  That is ~64 KB per token for the 0.8B (48 rotations
-    // x 64 x 4 B x 2 directions), against the ~15 MiB the old staging path
-    // moved per token -- and it buys bit-identical rotation instead of 5e-4
-    // drift on every q and k.
-    //
-    // If this ever needs to go zero-copy, the fix is a device kernel plus
-    // accepting the 5e-4, NOT a rewrite of the reference.
+    // If this ever goes zero-copy by default, the fix is to accept the drift
+    // deliberately (with the measured number), NOT to rewrite the reference.
     fn dRope64(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         const max_head: usize = 256;
@@ -2155,6 +2226,22 @@ pub const CudaBackend = struct {
             // engine's shape changed and the CPU reference must own it.
             cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), x, pos, base);
             return;
+        }
+        if (ropeOnDevice()) {
+            // The launcher works on `heads * hd`; `x` is exactly one head, so
+            // heads = 1 and hd = n.  The engine calls this once per head.
+            if (dBufPtr(x)) |px| {
+                const rc = Launch.rope64(px, 1, @intCast(n), @bitCast(pos), base, null);
+                if (rc == cudart.cudaSuccess) {
+                    self.stat_rope_devices += 1;
+                    return;
+                }
+                self.ewLaunchFail("rope64", rc);
+            }
+            // No device pointer (or the launch failed): the CPU path below is
+            // still correct, so fall through to it rather than leave `x`
+            // unrotated.  `stat_rope_trips` then counts this head as the host
+            // trip it actually was.
         }
         CudaBackend.dCopyToHost(@ptrCast(self), host[0..n], x);
         cpu_mod.CpuBackend.vtable.rope64(@ptrCast(&self.cpu), backend.Buf.wrap(host[0..n]), pos, base);
@@ -2212,7 +2299,7 @@ pub const CudaBackend = struct {
         if (self.cu == null) return;
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
@@ -2229,10 +2316,14 @@ pub const CudaBackend = struct {
                 self.stat_ns_dequant / 1_000_000,
                 // Non-zero here means a numeric slot was handed host memory.  On
                 // the per-token path all three must be 0 except `rope`, which is
-                // the documented remainder.
+                // the documented remainder.  `rope` / `rope_dev` partition the
+                // same rotations between the two `$QWEN35_CUDA_ROPE` paths, so
+                // the line itself proves which one ran (device: rope=0,
+                // rope_dev>0; host: the reverse).
                 self.stat_host_act_uploads,
                 self.stat_host_out_downloads,
                 self.stat_rope_trips,
+                self.stat_rope_devices,
             },
         );
         // Per-type breakdown, only for types that actually ran.  Assembled with

@@ -157,6 +157,22 @@ int q35_launch_conv_step(float *d_conv, float *d_y, const float *d_wconv,
 // elementwise.argmaxKernel).  Input is device logits, output a single int.
 int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream);
 
+// --- rotary embedding (src/kernels/cuda/rope.cu) ---------------------------
+//
+// `d_x` is `heads * hd` contiguous f32; the FIRST 64 floats of every `hd`-wide
+// head are rotated with cross-half pairing (j, j+32), dims 64..hd-1 pass
+// through.  `pos` is the absolute position, `base` the model's rope freq base.
+//
+// NOT bit-exact with the CPU, and cannot be: the device `powf` differs from
+// glibc's by ~1 ULP relative, which is an absolute phase error growing with
+// `pos` (see rope.cu's header).  On by default on the Zig side anyway: the
+// drift costs cross-path token identity, which was judged worth +10.6% prefill
+// / +4.4% generate, and is documented with the measured divergence in
+// rope.cu's header and backend_cuda.zig `ropeOnDevice`.  $QWEN35_CUDA_ROPE=host
+// reverts to the bit-exact CPU body.
+int q35_launch_rope64(float *d_x, int heads, int hd, int pos, float base,
+                      void *stream);
+
 // --- Gated Delta Net state machine -----------------------------------------
 // One token of the delta-rule state update, one launch per value head.
 // d_state is the [kd, vd] slice for THIS head (row-major S[k][v], kd*vd floats),
