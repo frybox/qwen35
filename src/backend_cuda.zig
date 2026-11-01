@@ -495,6 +495,77 @@ pub const CudaBackend = struct {
     /// only read when `$QWEN35_PROF` output is wanted.
     io: Io = undefined,
 
+    // ---- GPU-side timing ($QWEN35_PROF only) --------------------------------
+    //
+    // `durNs()` above is host wall clock wrapped around an *asynchronous*
+    // launch, so `t_mv_ms` / `t_bk_ms` measure submission, not execution.  The
+    // fields here come from CUDA events, which timestamp a point in the stream;
+    // `ev_end - ev_begin` is what the device actually ran.
+    //
+    // Cost model, and why this is PROF-gated: a record is ~1 us, but the
+    // *synchronize* needed to read an elapsed time drains the queue.  Measuring
+    // every batchk call therefore serializes the whole prefill; the fields below
+    // are only maintained when `ev_on` is set, and `ev_on` is only set when
+    // `$QWEN35_PROF` was in the environment.  With PROF off, `gpuTimingOn()`
+    // returns false before any event is created or touched.
+    /// Same condition as every other `$QWEN35_PROF` check in this file.
+    ev_on: bool = false,
+    /// Created once (`ensureEvents`) and reused, never per token: an
+    /// `cudaEventCreateWithFlags` in the hot path would cost more than the
+    /// kernels being measured.
+    ev_created: bool = false,
+    /// Around one `matvecBatchK` call (one weight, one chunk of K tokens).
+    ev_bk_a: ?*anyopaque = null,
+    ev_bk_b: ?*anyopaque = null,
+    /// Around the whole prefill window: `profReset` -> first `matvecBatchK` of
+    /// the decode phase.  The wall clock version of the same window is
+    /// `stat_ns_prefill_wall`, so the difference is the *host* gap that no
+    /// kernel covers.
+    ev_pre_a: ?*anyopaque = null,
+    ev_pre_b: ?*anyopaque = null,
+    /// True between `profReset` and the event read that closes the prefill
+    /// window; decides whether a `matvecBatchK` call is prefill or decode.
+    prefill_open: bool = false,
+    /// `ev_pre_a` has been recorded (the window's first device position).
+    ev_pre_started: bool = false,
+    /// Host clock origin of the prefill window (`openPrefillWindow`).
+    prefill_t0: Io.Clock.Timestamp = undefined,
+    /// Host clock origin of the batchk span inside the prefill window.
+    bk_wall_started: bool = false,
+    bk_wall_t0: Io.Clock.Timestamp = undefined,
+    /// GPU kernel time summed over every timed `matvecBatchK` call, in ns.  The
+    /// span recorded is the call's first recorded point to its last, so it
+    /// covers the activation quantize kernels *and* `mul_mat_vec` -- i.e. all
+    /// the device work that call issued (not just the matmul).
+    stat_ns_batchk_gpu: u64 = 0,
+    /// Number of batchk calls that contributed to `stat_ns_batchk_gpu`.
+    stat_n_batchk_gpu: usize = 0,
+    /// Device event span of the whole prefill window (first prefill record to
+    /// the event that closes it), in ns.  This is a *span*, not busy time: it
+    /// includes device idle while the host is submitting, so it should match
+    /// `stat_ns_prefill_wall` and is reported as a consistency check.
+    stat_ns_prefill_span: u64 = 0,
+    /// Host wall clock of that same prefill window, in ns.
+    stat_ns_prefill_wall: u64 = 0,
+    /// Host wall clock from the first to the last `matvecBatchK` of prefill:
+    /// `wall - batchk_gpu` is then the host-side slack (launch gaps, the
+    /// quantize launches' submission, the synchronous memcpys).
+    stat_ns_prefill_bk_wall: u64 = 0,
+    /// `cudaEventElapsedTime` resolution guard: number of reads that returned a
+    /// cudart error (normally 0).
+    stat_n_ev_err: usize = 0,
+    /// Kernel launches issued by the batchk path during prefill (K quantizes +
+    /// one mul_mat_vec per call).  A single `+= 1` per launch, so counting it
+    /// costs nothing measurable and works with or without events -- which is
+    /// what makes the launch *rate* comparable between a PROF run and a plain
+    /// one.
+    stat_n_launch_bk: usize = 0,
+    /// Host time spent inside `cudaEventSynchronize` while measuring.  This IS
+    /// the interference the events add, so it is reported rather than assumed
+    /// small: an event read drains the queue, so every timed call waits for its
+    /// own kernels before returning.
+    stat_ns_ev_sync: u64 = 0,
+
     // ---- reusable device buffers -------------------------------------------
     //
     // One set, grown on demand, never shrunk: matvec is the decode hot path and a
@@ -592,6 +663,10 @@ pub const CudaBackend = struct {
     pub fn deinit(self: *CudaBackend) void {
         self.reportStats("deinit");
         if (self.cu) |*cu| {
+            // Events first: they belong to the context that is about to be
+            // released, and each one was created exactly once in
+            // `ensureEvents`, so this is the matching destroy.
+            self.freeEvents();
             for (self.dev_rows.items) |e| _ = cu.lib.Free(e.dev);
             if (self.d_act) |p| _ = cu.lib.Free(p);
             if (self.d_xq) |p| _ = cu.lib.Free(p);
@@ -1305,6 +1380,10 @@ pub const CudaBackend = struct {
                 const rows = e.rows;
                 const cols = e.cols;
                 std.debug.assert(xKBuf.len >= k * cols and outBuf.len >= k * rows);
+                // `$QWEN35_PROF`: same device-side clock as the quant path.  The
+                // f32 expansion is only used for f16/bf16 weights, so on a
+                // quantized model this branch never runs.
+                if (self.gpuTimingOn()) self.batchKTimingBegin();
                 const act_bytes = k * cols * @sizeOf(f32);
                 const d_x: [*]const f32 = blk: {
                     if (dBufPtr(xKBuf)) |p| break :blk @ptrCast(p);
@@ -1344,6 +1423,7 @@ pub const CudaBackend = struct {
                 if (out_dev == null) self.downloadOut(outBuf.slice()[0 .. k * rows]);
                 self.stat_ns_batchk += durNs(t0, self.io);
                 self.stat_n_batchk += 1;
+                if (self.gpuTimingOn()) self.batchKTimingEnd();
                 return;
             },
             .quant => |q| {
@@ -1357,6 +1437,11 @@ pub const CudaBackend = struct {
                 const per_tok = actBytes(q.ttype, cols);
                 const nb_tok = cols / actBlockElems(q.ttype);
                 std.debug.assert(xKBuf.len >= k * cols and outBuf.len >= k * rows);
+                // `$QWEN35_PROF`: start the device-side clock for this call.
+                // Must run before the H2D below, so a synchronous upload is
+                // counted as host slack rather than as GPU work; the recorded
+                // point is ordered after any earlier queued kernel anyway.
+                if (self.gpuTimingOn()) self.batchKTimingBegin();
 
                 // Activation source: the resident K-row buffer when the engine
                 // already keeps it on the device (the normal case after P2d),
@@ -1402,6 +1487,10 @@ pub const CudaBackend = struct {
                         self.clearDevBuf(outBuf);
                         return;
                     }
+                    // Diagnostics only: one launch per token, so this loop is
+                    // the reason a K-token call costs K+1 launches (see the
+                    // `bk_launch` field on the `CUDA-M` line).
+                    self.stat_n_launch_bk += 1;
                 }
 
                 const kern_mm = Launch;
@@ -1427,6 +1516,11 @@ pub const CudaBackend = struct {
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
                 self.stat_ns_by_type[@backingInt(q.ttype)] += durNs(t0, self.io);
                 self.stat_n_batchk += 1;
+                // The matmul itself: makes the per-call launch count k+1.
+                self.stat_n_launch_bk += 1;
+                // `$QWEN35_PROF`: GPU-side time of what this call just issued
+                // (quantize TK + mul_mat_vec).  The drain is inside `evElapsedNs`.
+                if (self.gpuTimingOn()) self.batchKTimingEnd();
                 // Interim dump: the CLI path never runs `deinit` (the engine is
                 // arena-allocated), so without a periodic report the only profile
                 // line is the one printed on the first matvec.  Every 200th chunk
@@ -2291,6 +2385,188 @@ pub const CudaBackend = struct {
         return @intCast(Launch.tables_bytes());
     }
 
+    // ---- GPU-side timing helpers ($QWEN35_PROF only) -----------------------
+    //
+    // Every entry point is a no-op unless `ev_on` is set, and `ev_on` is only
+    // set from `dProfReset`, which the engine calls once before prefill.  So the
+    // default path checks a bool and returns: no event is created, recorded or
+    // waited on, and no stream is drained.
+
+    /// Create the four events once.  Idempotent; a failure disables the whole
+    /// facility rather than silently reporting zeros, because a zero GPU time
+    /// would look like "the GPU is idle" -- the opposite of the truth.
+    fn ensureEvents(self: *CudaBackend) bool {
+        if (self.ev_created) return true;
+        const lib = if (self.cu) |*cu| &cu.lib else return false;
+        var made: [4]?*anyopaque = .{ null, null, null, null };
+        const names = [_][:0]const u8{ "ev_bk_a", "ev_bk_b", "ev_pre_a", "ev_pre_b" };
+        for (&made, names) |*slot, nm| {
+            var h: ?*anyopaque = null;
+            // `cudaEventDefault` (flags 0): the default deliberately keeps host
+            // sync enabled, which `EventSynchronize`/`ElapsedTime` need.
+            if (lib.EventCreate(&h, 0) != cudart.cudaSuccess or h == null) {
+                // Bounded cleanup: destroy whatever was already made so a
+                // partial setup cannot leak into the next attempt.
+                for (made) |m| {
+                    if (m) |p| _ = lib.EventDestroy(p);
+                }
+                std.debug.print("cuda backend: $QWEN35_PROF event timing disabled ({s} create failed)\n", .{nm});
+                return false;
+            }
+            slot.* = h;
+        }
+        self.ev_bk_a = made[0];
+        self.ev_bk_b = made[1];
+        self.ev_pre_a = made[2];
+        self.ev_pre_b = made[3];
+        self.ev_created = true;
+        return true;
+    }
+
+    fn freeEvents(self: *CudaBackend) void {
+        if (!self.ev_created) return;
+        const lib = if (self.cu) |*cu| &cu.lib else null;
+        if (lib) |l| {
+            for ([_]?*anyopaque{ self.ev_bk_a, self.ev_bk_b, self.ev_pre_a, self.ev_pre_b }) |p| {
+                if (p) |q| _ = l.EventDestroy(q);
+            }
+        }
+        self.ev_bk_a = null;
+        self.ev_bk_b = null;
+        self.ev_pre_a = null;
+        self.ev_pre_b = null;
+        self.ev_created = false;
+    }
+
+    /// True when the caller should record events at all.  Deliberately reads
+    /// the env var as well: `profReset` is the only intended setter, but a
+    /// second line of defence keeps a stray `ev_on = true` from turning into a
+    /// default-path sync on a build where PROF is off.
+    fn gpuTimingOn(self: *const CudaBackend) bool {
+        return self.ev_on and self.cu != null;
+    }
+
+    /// Milliseconds between two recorded events, waiting for the second.  The
+    /// wait is what makes the queue drain, so this is the expensive call; it is
+    /// made once per timed `matvecBatchK`, which is once per weight per chunk.
+    /// Returns null on error (and counts it) so the caller leaves the totals
+    /// alone instead of adding a bogus 0.
+    fn evElapsedNs(self: *CudaBackend, a: ?*anyopaque, b: ?*anyopaque) ?u64 {
+        const lib = if (self.cu) |*cu| &cu.lib else return null;
+        const t_sync = Io.Clock.Timestamp.now(self.io, .awake);
+        defer self.stat_ns_ev_sync += durNs(t_sync, self.io);
+        if (lib.EventSynchronize(b) != cudart.cudaSuccess) {
+            self.stat_n_ev_err += 1;
+            return null;
+        }
+        var ms: f32 = 0;
+        if (lib.EventElapsedTime(&ms, a, b) != cudart.cudaSuccess) {
+            self.stat_n_ev_err += 1;
+            return null;
+        }
+        if (!(ms >= 0)) {
+            self.stat_n_ev_err += 1;
+            return null;
+        }
+        return @intFromFloat(@as(f64, ms) * 1_000_000.0);
+    }
+
+    /// Begin the device-side clock for one `matvecBatchK` call.  Records into the
+    /// default stream, so the timestamp is taken *after* every kernel already
+    /// queued by earlier calls -- the gap between two calls is therefore
+    /// attributed to whoever issues work next, never smeared into the kernel
+    /// timings.
+    ///
+    /// The prefill window's start event (`ev_pre_a`) is recorded here, on the
+    /// first call issued while the window is open: that is the first device
+    /// position that belongs to prefill.
+    fn batchKTimingBegin(self: *CudaBackend) void {
+        if (!self.ensureEvents()) {
+            self.ev_on = false;
+            return;
+        }
+        const lib = if (self.cu) |*cu| &cu.lib else return;
+        if (self.prefill_open and !self.ev_pre_started) {
+            if (lib.EventRecord(self.ev_pre_a, null) != cudart.cudaSuccess) {
+                self.stat_n_ev_err += 1;
+            }
+            self.ev_pre_started = true;
+        }
+        if (lib.EventRecord(self.ev_bk_a, null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
+    }
+
+    /// Close the device-side clock for one `matvecBatchK` call.
+    ///
+    /// `ev_bk_b - ev_bk_a` is everything that call issued to the device.
+    fn batchKTimingEnd(self: *CudaBackend) void {
+        const lib = if (self.cu) |*cu| &cu.lib else return;
+        if (lib.EventRecord(self.ev_bk_b, null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
+        if (self.evElapsedNs(self.ev_bk_a, self.ev_bk_b)) |ns| {
+            self.stat_ns_batchk_gpu += ns;
+            self.stat_n_batchk_gpu += 1;
+        }
+        // Host wall clock spanned by the batchk calls of the prefill window.  A
+        // monotonic host clock, incremented under the same `prefill_open` gate,
+        // so this measures "first timed batchk entry -> last timed batchk exit"
+        // and its complement (`pre_wall - pre_bkwall`) is the part of prefill
+        // that issued no matvec.
+        if (self.prefill_open) {
+            const now = Io.Clock.Timestamp.now(self.io, .awake);
+            if (!self.bk_wall_started) {
+                self.bk_wall_t0 = now;
+                self.bk_wall_started = true;
+            }
+            const d = self.bk_wall_t0.durationTo(now).raw.nanoseconds;
+            self.stat_ns_prefill_bk_wall = if (d > 0) @intCast(@min(d, std.math.maxInt(u64))) else 0;
+        }
+    }
+
+    /// Open the prefill window.  The engine calls `profReset` immediately before
+    /// prefill, so the host wall clock starts here too.
+    fn openPrefillWindow(self: *CudaBackend) void {
+        if (!self.ensureEvents()) {
+            self.ev_on = false;
+            return;
+        }
+        self.prefill_open = true;
+        self.ev_pre_started = false;
+        self.bk_wall_started = false;
+        self.prefill_t0 = Io.Clock.Timestamp.now(self.io, .awake);
+    }
+
+    /// Close the prefill window: record the end event, wait for it, and read out
+    /// both the device span and the host wall clock of the same window.
+    ///
+    /// Called from the first single-token `matvec` after prefill (the decode
+    /// path), and again, harmlessly, from `dProfPhase(false)` -- the second call
+    /// finds the window already shut.  Waiting for the end event here is what
+    /// the measurement costs: it drains the queue, so the following decode
+    /// launch cannot overlap the read.  That cost lands *after* the number it
+    /// measures, and the report quantifies the interference by comparing a
+    /// PROF run against a plain one.
+    fn closePrefillWindow(self: *CudaBackend) void {
+        if (!self.prefill_open) return;
+        self.prefill_open = false;
+        const now = Io.Clock.Timestamp.now(self.io, .awake);
+        const wall = self.prefill_t0.durationTo(now).raw.nanoseconds;
+        self.stat_ns_prefill_wall = if (wall > 0) @intCast(@min(wall, std.math.maxInt(u64))) else 0;
+        if (!self.ev_created or !self.ev_pre_started) {
+            self.reportStats("prefill done");
+            return;
+        }
+        if (self.cu) |*cu| {
+            if (cu.lib.EventRecord(self.ev_pre_b, null) != cudart.cudaSuccess) {
+                self.stat_n_ev_err += 1;
+            } else if (self.evElapsedNs(self.ev_pre_a, self.ev_pre_b)) |ns| {
+                self.stat_ns_prefill_span = ns;
+            }
+        }
+        // `reportProfile` has no call site on the CLI path (the engine is
+        // arena-allocated, so `deinit` never runs), so this is the only place the
+        // fully-formed decomposition is ever printed.
+        self.reportStats("prefill done");
+    }
+
     /// `$QWEN35_PROF`: one `CUDA-M [...]` line with what actually ran on the device,
     /// plus a per-type breakdown, so "did this model mix backends?" is answerable
     /// from the log.  Uploaded MiB is the resident weight footprint; bufs_MiB is the
@@ -2299,7 +2575,7 @@ pub const CudaBackend = struct {
         if (self.cu == null) return;
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} gpu_ev_err={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
@@ -2324,6 +2600,33 @@ pub const CudaBackend = struct {
                 self.stat_host_out_downloads,
                 self.stat_rope_trips,
                 self.stat_rope_devices,
+                // GPU-side numbers from CUDA events ($QWEN35_PROF only; 0
+                // without it, because no event is ever recorded then).
+                //   bk_gpu_ms     device time summed over timed batchk calls --
+                //                 the actual GPU execution of the matmuls +
+                //                 their activation quantize kernels
+                //   bk_n          how many calls that sum covers
+                //   pre_wall_ms   host wall clock of the prefill window
+                //   pre_bkwall_ms host wall spanned by the batchk calls
+                //   pre_gpu_span_ms
+                //                 device event span of the whole window; equals
+                //                 pre_wall_ms up to the drain, so it is a
+                //                 sanity check (they must agree), not the busy
+                //                 number
+                // Decomposition of pre_wall:
+                //   bk_gpu        GPU busy in matvecBatchK
+                //   bk_host       pre_bkwall - bk_gpu  (host slack between
+                //                 batchk calls: quantize/upload/download/launch)
+                //   non_bk        pre_wall - pre_bkwall (attention, GDN, rmsnorm,
+                //                 sampling -- issued outside matvecBatchK)
+                self.stat_ns_batchk_gpu / 1_000_000,
+                self.stat_n_batchk_gpu,
+                self.stat_ns_prefill_wall / 1_000_000,
+                self.stat_ns_prefill_bk_wall / 1_000_000,
+                self.stat_ns_prefill_span / 1_000_000,
+                self.stat_n_launch_bk,
+                self.stat_ns_ev_sync / 1_000_000,
+                self.stat_n_ev_err,
             },
         );
         // Per-type breakdown, only for types that actually ran.  Assembled with
@@ -2405,8 +2708,22 @@ pub const CudaBackend = struct {
         self.cpu.exec().setThreads(io, nt);
     }
 
+    /// End of the prefill loop: the one point where "prefill" is known to have
+    /// finished on the host side.  Events recorded here are still ordered after
+    /// every prefill kernel in the default stream, so waiting for the end event
+    /// cannot truncate the span.
+    fn dProfPrefillEnd(ctx: *anyopaque) void {
+        self_(ctx).closePrefillWindow();
+    }
+
     fn dProfPhase(ctx: *anyopaque, on: bool) void {
-        self_(ctx).cpu.exec().profPhase(on);
+        const self = self_(ctx);
+        self.cpu.exec().profPhase(on);
+        // Safety net only: the prefill window is normally already shut by the
+        // first decode `matvec` (`closePrefillWindow` is idempotent).  This
+        // catches the degenerate run where prefill issued no decode matvec at
+        // all (e.g. `-n 0`), so the `CUDA-M [prefill done]` line still appears.
+        if (!on) self.closePrefillWindow();
     }
 
     fn dProfReset(ctx: *anyopaque) void {
@@ -2424,6 +2741,25 @@ pub const CudaBackend = struct {
         self.stat_rope_trips = 0;
         self.stat_by_type = @splat(0);
         self.stat_ns_by_type = @splat(0);
+        // GPU-side counters and the prefill window.  `ev_on` is set here and
+        // nowhere else, and `profReset` is only reached from
+        // `Engine.generate`, which runs it unconditionally -- so the gate is the
+        // environment variable, checked once, and the default path never
+        // creates an event.
+        self.stat_ns_batchk_gpu = 0;
+        self.stat_n_batchk_gpu = 0;
+        self.stat_ns_prefill_span = 0;
+        self.stat_ns_prefill_wall = 0;
+        self.stat_ns_prefill_bk_wall = 0;
+        self.stat_n_ev_err = 0;
+        self.stat_n_launch_bk = 0;
+        self.stat_ns_ev_sync = 0;
+        if (cudart.getenv("QWEN35_PROF") != null) {
+            self.ev_on = self.cu != null;
+            if (self.ev_on) self.openPrefillWindow();
+        } else {
+            self.ev_on = false;
+        }
         self.cpu.exec().profReset();
     }
 
@@ -2451,6 +2787,7 @@ pub const vtable = backend.Exec.VTable{
     .setThreads = CudaBackend.dSetThreads,
     .profPhase = CudaBackend.dProfPhase,
     .profReset = CudaBackend.dProfReset,
+    .profPrefillEnd = CudaBackend.dProfPrefillEnd,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
     .name = CudaBackend.vName,

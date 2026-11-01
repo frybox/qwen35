@@ -1767,6 +1767,11 @@ pub const Engine = struct {
         }
         const t_after = Io.Clock.Timestamp.now(io, .awake);
         self.prefill_ms = @as(f64, @floatFromInt(t_start.durationTo(t_after).raw.nanoseconds)) / 1e6;
+        // Same boundary for the backend's own accounting.  A CPU backend ignores
+        // it; the CUDA backend closes its GPU-side prefill window here instead of
+        // at `profPhase(false)`, which only fires after the decode loop and would
+        // fold decode into the prefill numbers.
+        self.exec.profPrefillEnd();
 
         var out: std.ArrayList(u32) = .empty;
         errdefer out.deinit(alloc);

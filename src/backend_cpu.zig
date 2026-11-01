@@ -729,6 +729,13 @@ pub const CpuBackend = struct {
         pool_mod.profReset();
     }
 
+    /// End of the prefill loop.  The pool profiler already separates prefill
+    /// from decode through `prof_phase` sampling, so nothing to do -- this hook
+    /// exists for the CUDA backend's GPU-side window.
+    fn vProfPrefillEnd(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+
     fn vName(ctx: *anyopaque) []const u8 {
         _ = ctx;
         return "cpu";
@@ -905,6 +912,7 @@ pub const CpuBackend = struct {
         .setThreads = vSetThreads,
         .profPhase = vProfPhase,
         .profReset = vProfReset,
+        .profPrefillEnd = vProfPrefillEnd,
         .name = vName,
         .describe = vDescribe,
         .setTier = vSetTier,

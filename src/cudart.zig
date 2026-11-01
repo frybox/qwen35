@@ -173,6 +173,23 @@ pub const Lib = struct {
     StreamCreate: *const fn (*?*anyopaque) callconv(.c) c_int,
     StreamDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
 
+    // --- events --------------------------------------------------------------
+    /// `$QWEN35_PROF`-only GPU-side timing.  An event timestamps a point in a
+    /// stream, so `ElapsedTime(begin, end)` measures what the device actually
+    /// executed between two records -- the number `durNs()` cannot give, because
+    /// that one is host wall clock wrapped around an *asynchronous* launch.
+    ///
+    /// Bound unconditionally (a missing symbol is a load error, and every CUDA
+    /// runtime since 2.0 has these); nothing calls them unless `$QWEN35_PROF`
+    /// is set, so the default path creates no event and synchronizes nothing.
+    EventCreate: *const fn (*?*anyopaque, u32) callconv(.c) c_int,
+    EventDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
+    EventRecord: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int,
+    EventSynchronize: *const fn (?*anyopaque) callconv(.c) c_int,
+    /// `ms` is `float` in the C API; `cudaEventDefault` timing is the default so
+    /// elapsed time has ~0.5 microsecond resolution.
+    EventElapsedTime: *const fn (*f32, ?*anyopaque, ?*anyopaque) callconv(.c) c_int,
+
     /// Close the library handle (process exit would do it too; explicit is
     /// better for leak checkers).
     pub fn close(self: *Lib) void {
@@ -264,6 +281,11 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
     L.DeviceSynchronize = bind(&out.lib, *const fn () callconv(.c) c_int, "cudaDeviceSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamCreate = bind(&out.lib, *const fn (*?*anyopaque) callconv(.c) c_int, "cudaStreamCreate", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaStreamDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.EventCreate = bind(&out.lib, *const fn (*?*anyopaque, u32) callconv(.c) c_int, "cudaEventCreateWithFlags", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.EventDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.EventRecord = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaEventRecord", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.EventSynchronize = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.EventElapsedTime = bind(&out.lib, *const fn (*f32, ?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaEventElapsedTime", mbuf, &miss_len) orelse return error.MissingSymbol;
     out.missing_len = miss_len;
 
     // --- device validation ---------------------------------------------------

@@ -234,6 +234,11 @@ pub const Exec = struct {
         /// device backend, which reports its own timings).
         profPhase: *const fn (ctx: *anyopaque, on: bool) void,
         profReset: *const fn (ctx: *anyopaque) void,
+        /// End of the prefill loop.  A CPU backend ignores it (its pool
+        /// profiler already separates the phases); the CUDA backend uses it to
+        /// close its GPU-side prefill window, because `profPhase(false)` only
+        /// fires after the decode loop and would fold decode into prefill.
+        profPrefillEnd: *const fn (ctx: *anyopaque) void,
 
         // ---- introspection --------------------------------------------------
         name: *const fn (ctx: *anyopaque) []const u8,
@@ -352,6 +357,9 @@ pub const Exec = struct {
     }
     pub fn profReset(self: Exec) void {
         self.vtable.profReset(self.ptr);
+    }
+    pub fn profPrefillEnd(self: Exec) void {
+        self.vtable.profPrefillEnd(self.ptr);
     }
     pub fn setThreads(self: Exec, io: std.Io, nt: usize) void {
         self.vtable.setThreads(self.ptr, io, nt);
