@@ -99,6 +99,11 @@ const cuda_sources = [_][]const u8{
     "iq_tables.cu",
     // mat-vec launchers (q35_launch_mul_mat_vec_q8_0, q35_launch_mul_mat_vec_f32)
     "mmvq.cu",
+    // prefill (tokens > 1) mat-mul with K-dimension reuse + coalesced loads:
+    // q35_launch_mul_mat_vec_tile, dispatched from mmvq.cu behind
+    // $QWEN35_CUDA_MMQ; see that file's header for the tile and why the
+    // reduction order is still b = 0..nblk-1 left to right.
+    "mmq.cu",
     // pure elementwise activation launchers (q35_launch_scale_vec,
     // _add_resid, _copy_range, _zero_buf) -- P2b, first batch
     "elementwise.cu",

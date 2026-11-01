@@ -40,103 +40,10 @@
 #include "vecdotq.cuh"
 #include "api.h"
 
-// ---------------------------------------------------------------------------
-// per-type geometry.  MUST agree with src/gguf.zig blockElems/blockBytes for
-// the *native* block (not the 256-element GGUF row-block framing).
-// ---------------------------------------------------------------------------
-struct Q35QuantInfo {
-    int block_elems;    // elements per native block (32 or 256)
-    int block_bytes;    // bytes per native WEIGHT block (18 for q4_0 ...)
-    int act_bytes;      // bytes per ACTIVATION block: 34 (Q8_0) or 292 (Q8_K)
-    int wants_q8k;      // 1 -> Q8_K activation, 0 -> Q8_0 activation
-};
-
-// __host__ __device__ on purpose: the host launchers validate `ttype` and
-// `cols` with the same table the kernel uses, so a mismatch between the two
-// cannot happen.
-__host__ __device__ __forceinline__ Q35QuantInfo q35_quant_info(int ttype) {
-    Q35QuantInfo info;
-    info.block_elems = 0;
-    info.block_bytes = 0;
-    // The activation block is a SEPARATE layout from the weight block and has
-    // its own stride.  For the 32-element family the weight block is 18-24 B
-    // but the activation is always a 34 B block_q8_0; for the 256-element
-    // family it is always a 292 B block_q8_K.  Walking both with the weight
-    // stride (the obvious bug) silently desynchronises the activation after
-    // the first block -- and q8_0 is the one type where the two strides
-    // coincide, so it passes while every other type is wrong.
-    info.act_bytes = Q35_Q8_0_BLOCK_BYTES;
-    info.wants_q8k = 0;
-    switch (ttype) {
-        case Q35_TT_Q8_0:    info.block_elems = 32;  info.block_bytes = Q35_BYTES_Q8_0;    break;
-        case Q35_TT_Q4_0:    info.block_elems = 32;  info.block_bytes = Q35_BYTES_Q4_0;    break;
-        case Q35_TT_Q4_1:    info.block_elems = 32;  info.block_bytes = Q35_BYTES_Q4_1;    break;
-        case Q35_TT_Q5_0:    info.block_elems = 32;  info.block_bytes = Q35_BYTES_Q5_0;    break;
-        case Q35_TT_Q5_1:    info.block_elems = 32;  info.block_bytes = Q35_BYTES_Q5_1;    break;
-        case Q35_TT_IQ4_NL:  info.block_elems = 32;  info.block_bytes = Q35_BYTES_IQ4_NL;  break;
-        case Q35_TT_Q2_K:    info.block_elems = 256; info.block_bytes = Q35_BYTES_Q2_K;    info.wants_q8k = 1; break;
-        case Q35_TT_Q3_K:    info.block_elems = 256; info.block_bytes = Q35_BYTES_Q3_K;    info.wants_q8k = 1; break;
-        case Q35_TT_Q4_K:    info.block_elems = 256; info.block_bytes = Q35_BYTES_Q4_K;    info.wants_q8k = 1; break;
-        case Q35_TT_Q5_K:    info.block_elems = 256; info.block_bytes = Q35_BYTES_Q5_K;    info.wants_q8k = 1; break;
-        case Q35_TT_Q6_K:    info.block_elems = 256; info.block_bytes = Q35_BYTES_Q6_K;    info.wants_q8k = 1; break;
-        case Q35_TT_IQ1_S:   info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ1_S;   info.wants_q8k = 1; break;
-        case Q35_TT_IQ1_M:   info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ1_M;   info.wants_q8k = 1; break;
-        case Q35_TT_IQ2_XXS: info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ2_XXS; info.wants_q8k = 1; break;
-        case Q35_TT_IQ2_XS:  info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ2_XS;  info.wants_q8k = 1; break;
-        case Q35_TT_IQ2_S:   info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ2_S;   info.wants_q8k = 1; break;
-        case Q35_TT_IQ3_XXS: info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ3_XXS; info.wants_q8k = 1; break;
-        case Q35_TT_IQ3_S:   info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ3_S;   info.wants_q8k = 1; break;
-        case Q35_TT_IQ4_XS:  info.block_elems = 256; info.block_bytes = Q35_BYTES_IQ4_XS;  info.wants_q8k = 1; break;
-        default:                                                                          break;
-    }
-    if (info.block_elems != 0 && info.wants_q8k) info.act_bytes = Q35_BYTES_Q8_K;
-    return info;
-}
-
-// One activation block, folded into `acc` for weight type `ttype`.
-// `a` points at ONE activation block (34 B for Q8_0, 292 B for Q8_K); the
-// per-type reference is named in vecdotq.cuh next to each function.
-__device__ __forceinline__ float q35_dot_1blk(int ttype, const unsigned char *w,
-                                              const unsigned char *a, float acc) {
-    switch (ttype) {
-        case Q35_TT_Q8_0:    return q35_vec_dot_q8_0_q8_0_acc(w, a, acc);
-        case Q35_TT_Q4_0:    return q35_vec_dot_q4_0_q8_0_acc(w, a, acc);
-        case Q35_TT_Q4_1:    return q35_vec_dot_q4_1_q8_0_acc(w, a, acc);
-        case Q35_TT_Q5_0:    return q35_vec_dot_q5_0_q8_0_acc(w, a, acc);
-        case Q35_TT_Q5_1:    return q35_vec_dot_q5_1_q8_0_acc(w, a, acc);
-        case Q35_TT_IQ4_NL:  return q35_vec_dot_iq4_nl_q8_0_acc(w, a, acc);
-        case Q35_TT_Q2_K:    return q35_vec_dot_q2_k_q8_k_acc(w, a, acc);
-        case Q35_TT_Q3_K:    return q35_vec_dot_q3_k_q8_k_acc(w, a, acc);
-        case Q35_TT_Q4_K:    return q35_vec_dot_q4_k_q8_k_acc(w, a, acc);
-        case Q35_TT_Q5_K:    return q35_vec_dot_q5_k_q8_k_acc(w, a, acc);
-        case Q35_TT_Q6_K:    return q35_vec_dot_q6_k_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ1_S:   return q35_vec_dot_iq1_s_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ1_M:   return q35_vec_dot_iq1_m_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ2_XXS: return q35_vec_dot_iq2_xxs_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ2_XS:  return q35_vec_dot_iq2_xs_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ2_S:   return q35_vec_dot_iq2_s_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ3_XXS: return q35_vec_dot_iq3_xxs_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ3_S:   return q35_vec_dot_iq3_s_q8_k_acc(w, a, acc);
-        case Q35_TT_IQ4_XS:  return q35_vec_dot_iq4_xs_q8_k_acc(w, a, acc);
-        default:             return acc;  // unreachable: host validates ttype
-    }
-}
-
-// Whole-row dot: walk `nblk` native blocks of one weight row against one
-// activation row, strictly left to right (see the header on reduction order).
-//   float dot_row(ttype, wrow, arow, row_block_elems)
-__device__ __forceinline__ float q35_dot_row(int ttype, const unsigned char *wrow,
-                                             const unsigned char *arow,
-                                             int weight_bytes, int act_bytes, int nblk) {
-    // Two independent strides on purpose: weight block != activation block.
-    float acc = 0.0f;
-    for (int b = 0; b < nblk; ++b) {
-        acc = q35_dot_1blk(ttype, wrow + (size_t)b * (size_t)weight_bytes,
-                           arow + (size_t)b * (size_t)act_bytes, acc);
-    }
-    return acc;
-}
-
+// The per-type geometry table and the block/row dot helpers moved to
+// dotq.cuh so that mmq.cu (the prefill tile kernel) can use the exact same
+// definitions instead of a second copy (AGENTS.md: one source for one fact).
+#include "dotq.cuh"
 // ---------------------------------------------------------------------------
 // matvec kernel: out[t*rows + r] = W[r] . x[t]
 // ---------------------------------------------------------------------------
@@ -175,8 +82,6 @@ __global__ void q35_k_mul_mat_vec_q(const unsigned char *__restrict__ w,
 // right order `q35_dot_row` uses, so the result is bit-identical (the file
 // header forbids reordering; this respects it).
 // ---------------------------------------------------------------------------
-#define Q35_WARP 32
-
 __global__ void q35_k_mul_mat_vec_q_coop(const unsigned char *__restrict__ w,
                                          const unsigned char *__restrict__ xq,
                                          float *__restrict__ out,
@@ -298,6 +203,68 @@ __global__ void q35_k_quantize_q8_K(const float *__restrict__ x,
 // surface cudaGetErrorString().
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// `$QWEN35_CUDA_MMQ=0|1`: which kernel serves a prefill (tokens > 1) matvec.
+//
+//   1 (default)  the tile kernel in mmq.cu -- K-dimension reuse (a weight block
+//                is dotted into every token of the chunk) plus coalesced loads
+//                (a warp reads 32 consecutive blocks of ONE row), which is
+//                what the thread-per-row kernel below cannot do, and what the
+//                warp-per-row kernel can only do per token, serially.
+//   0            the thread-per-row kernel, kept as the A/B reference (and as
+//                the fallback, see below).
+//
+// Any other value (including unset) keeps the default.  Read once and cached:
+// this is per launch and `getenv` per launch is the kind of syscall this
+// backend exists to avoid.  A launch failure is NOT fatal and is NOT silent
+// either: the message names the kernel and the tile, and the old kernel runs.
+static bool q35_mmq_enabled() {
+    static int cached = -1;
+    if (cached < 0) {
+        // Default OFF.  The tile kernel is correct (bit-exact against the CPU
+        // reference for all 13 quant types on the 27B model, and it keeps the
+        // b-ascending reduction order) but it is not FASTER, so it must not be
+        // the default: measured on 354-token prefill, Qwen3.8-27B IQ3_XXS,
+        // 4090D -- thread-per-row 30.4-30.9 s vs tile 30.4 s at TPERPASS=8
+        // (parity) and 38.7 s at TPERPASS=16 (22% slower).
+        //
+        // The reuse it buys is real (a weight block is dotted into 8 tokens
+        // instead of re-read for each), but keeping the reduction order means
+        // some lane must fold 32 partials serially per (row, token) while the
+        // other 31 wait; that, plus the occupancy lost to the 16 accumulators,
+        // cancels the gain.  Kept in tree, off by default, because the K-reuse
+        // is the right shape for the next attempt (see the TODO in mmq.cu).
+        cached = 0;
+        const char *raw = getenv("QWEN35_CUDA_MMQ");
+        if (raw != NULL) {
+            const char *v = raw;
+            while (*v == ' ' || *v == '\t') ++v;
+            if (!(v[0] == '0' && (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' || v[1] == '\r' || v[1] == '\n'))) {
+                if (v[0] == '1' && (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' || v[1] == '\r' || v[1] == '\n')) {
+                    cached = 1;
+                } else {
+                    // Not 0/1: keep the default and say so, exactly like
+                    // $QWEN35_CUDA_ROPE does for a bad value in backend_cuda.zig.
+                    fprintf(stderr, "cuda kernels: QWEN35_CUDA_MMQ='%s' is neither '0' nor '1'; using 0\n", v);
+                }
+            }
+        }
+        if (cached == 0) fprintf(stderr, "cuda kernels: prefill matvec = thread-per-row ($QWEN35_CUDA_MMQ=1 for the tile kernel)\n");
+        else fprintf(stderr, "cuda kernels: prefill matvec = mmq tile ($QWEN35_CUDA_MMQ)\n");
+    }
+    return cached == 1;
+}
+
+// Defined in mmq.cu.  Return value contract (different from cudaError_t, which
+// is >= 0): cudaSuccess (0) == handled, every output element written; -1 ==
+// "not my shape, use the fallback"; anything else == a real launch failure.
+// Declared weak so a build without mmq.cu still links; nvcc rejects the GNU
+// attribute on a bare declaration, so it goes through a pointer.
+extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w, const void *d_xq,
+                                           float *d_out, int rows, int cols,
+                                           int tokens, int ttype, void *stream)
+    __attribute__((weak));
+
 extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                                       float *d_out, int rows, int cols,
                                       int tokens, int ttype, void *stream_v) {
@@ -311,6 +278,24 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     if (info.block_elems == 0) return (int)cudaErrorInvalidValue;
     if (cols % info.block_elems != 0) return (int)cudaErrorInvalidValue;
     const int threads = 128;
+
+    // Prefill only: a single token has nothing to reuse, and the warp-per-row
+    // kernel already coalesces it (below).
+    if (tokens > 1 && q35_mmq_enabled() && q35_launch_mul_mat_vec_tile != 0) {
+        const int rc = q35_launch_mul_mat_vec_tile(d_w, d_xq, d_out, rows, cols,
+                                                   tokens, ttype, stream_v);
+        if (rc == (int)cudaSuccess) return rc;   // the tile kernel owns the output
+        if (rc != -1) {
+            // A real launch failure: nothing was written, so report it and run
+            // the old kernel below, which is correct for every shape.
+            fprintf(stderr,
+                    "cuda kernels: mmq tile launch failed (%d: %s) for rows=%d cols=%d "
+                    "tokens=%d ttype=%d; falling back to the thread-per-row kernel\n",
+                    rc, cudaGetErrorString((cudaError_t)rc), rows, cols, tokens, ttype);
+            (void)cudaGetLastError();   // clear so the fallback's check is clean
+        }
+        // rc == -1: shape the tile was not sized for -> silent, intended fallback.
+    }
     const int total = rows * tokens;
     const int nblk = cols / info.block_elems;
     // The warp-per-row mapping wins only for single-token decoding: with a
