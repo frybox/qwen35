@@ -453,14 +453,17 @@ pub fn dequantRowFnFor(ttype: gguf.TensorType) ?dequantRowFn {
 }
 
 /// Row-major [rows, cols] f32 matvec: out[r] = sum_c mat[r*cols+c] * x[c].
-/// Plain auto-vectorized Zig -- identical on every x86 tier -- so it is not
-/// something the backend can usefully accelerate; it only needs the same
-/// thread pool as the quantized kernels.
-fn matvecF32(out: []f32, mat: []const f32, x: []const f32) void {
+///
+/// `pool` is the caller's thread pool and MUST be forwarded: the f32 path used
+/// to call `parallel(null, ...)`, so every bf16/f16/f32 tensor (the whole BF16
+/// model!) was decoded single-threaded -- ~1.5 tok/s at `--threads 1` AND at
+/// `--threads 32`, because the argument was dropped here, not because the work
+/// was small.
+fn matvecF32(out: []f32, mat: []const f32, x: []const f32, pool: ?*pool_mod.Pool) void {
     const rows = out.len;
     const cols = x.len;
     std.debug.assert(mat.len == rows * cols);
-    pool_mod.parallel(null, .{ .f32 = .{
+    pool_mod.parallel(pool, .{ .f32 = .{
         .out = out.ptr,
         .mat = mat,
         .x = x.ptr,
@@ -692,7 +695,7 @@ pub const CpuBackend = struct {
     fn vMatvec(ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void {
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
         switch (w) {
-            .f32 => |m| matvecF32(out.slice(), m, x.slice()),
+            .f32 => |m| matvecF32(out.slice(), m, x.slice(), self.pool),
             .quant => |q| matvecQuant(out.slice(), q, x.slice(), self.q8k, self.q8, self.pool),
         }
     }
@@ -857,9 +860,14 @@ pub const CpuBackend = struct {
     /// `l2norm`, which the engine must apply once per repeat because it is not
     /// idempotent.)
     fn vGdnStepRows(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
-                    gamma: []const f32, beta: []const f32, heads: usize, nk: usize, kd: usize, vd: usize) void {
+                    gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
         _ = ctx;
         if (heads == 0 or vd == 0 or nk == 0) return;
+        // Both are per-head coefficient regions (`gdnGamma`'s output and its
+        // in-place sigmoid(b)); the vtable contract is "at least `heads` long".
+        std.debug.assert(gamma.len >= heads and beta.len >= heads);
+        const g = gamma.slice();
+        const b = beta.slice();
         for (0..heads) |h| {
             const kh = h % nk;
             ew.bufGdnStep(
@@ -870,8 +878,8 @@ pub const CpuBackend = struct {
                 km.span(h * vd, vd),
                 delta.span(h * vd, vd),
                 out.span(h * vd, vd),
-                gamma[h],
-                beta[h],
+                g[h],
+                b[h],
                 vd,
             );
         }
@@ -892,6 +900,14 @@ pub const CpuBackend = struct {
     fn vCopyRange(ctx: *anyopaque, dst: Buf, src: Buf) void {
         _ = ctx;
         ew.bufCopyRange(dst, src);
+    }
+
+    /// Host regions on this backend, so the split is the plain per-head copy
+    /// (`ew.bufDeinterleaveQG`); it exists as a slot only so a device backend
+    /// can replace `2*heads` launches with one.
+    fn vDeinterleaveQG(ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
+        _ = ctx;
+        ew.bufDeinterleaveQG(dst_q, dst_gate, src, heads, hd);
     }
 
     fn vCopyFromHost(ctx: *anyopaque, dst: Buf, src: []const f32) void {
@@ -961,6 +977,7 @@ pub const CpuBackend = struct {
         .attnDecode = vAttnDecode,
         .gdnGamma = vGdnGamma,
         .copyRange = vCopyRange,
+        .deinterleaveQG = vDeinterleaveQG,
         .copyFromHost = vCopyFromHost,
         .copyToHost = vCopyToHost,
         .zeroBuf = vZeroBuf,
@@ -1036,7 +1053,7 @@ test "matvecQuant Q8_0 matches f32 matvec on dequantized weights" {
         try quant.dequantizeQ8_0(q8scratch[blk * q8_0_block_bytes ..][0..q8_0_block_bytes], xq[blk * q8_0_block_elems ..][0..q8_0_block_elems]);
     }
     var out_f32: [rows]f32 = undefined;
-    matvecF32(&out_f32, &wf, &xq);
+    matvecF32(&out_f32, &wf, &xq, null);
 
     for (out_q8, out_f32) |a, b| {
         // same math (i32 exact per block vs f32 accumulate): tiny rounding only
@@ -1086,7 +1103,7 @@ test "matvecF32 2x3 hand computed" {
     const m = [_]f32{ 1, 2, 3, 4, 5, 6 };
     const x = [_]f32{ 7, 8, 9 };
     var out: [2]f32 = undefined;
-    matvecF32(&out, &m, &x);
+    matvecF32(&out, &m, &x, null);
     try std.testing.expectEqual(@as(f32, 50), out[0]);
     try std.testing.expectEqual(@as(f32, 122), out[1]);
 }

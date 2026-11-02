@@ -334,16 +334,27 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
             }
         },
         .f32 => |q| {
+            // One C call per row over the whole width.  The scalar `for (rowv,
+            // xs)` loop this replaces was the entire cost of BF16/f16/f32
+            // models (BF16 decode measured 1.5 tok/s single-thread with the
+            // pool idle at 16 threads): 3.4e9 scalar FMAs per token that the
+            // compiler cannot vectorise because it must preserve the exact
+            // summation order.  `dotF32` accumulates in 4 independent YMM
+            // lanes (AVX2+FMA) and folds them at the end -- see
+            // src/kernels/x86/kernels_f32.c.  `dotBf16F32` expands bf16
+            // weights on the fly instead of reading a pre-widened f32 copy, so
+            // a bf16 row costs half the memory traffic.
             var r = lo;
             while (r < hi) : (r += 1) {
                 const tok = r / q.rows;
                 const rr = r % q.rows;
-                const rowv = q.mat[rr * q.cols ..][0..q.cols];
-                if (stat_on) _ = statf32.fetchAdd(@intCast(q.cols * 4), .monotonic);
                 const xs = q.x[tok * q.x_len ..];
-                var acc: f32 = 0;
-                for (rowv, xs) |mv, vv| acc += mv * vv;
-                q.out[tok * q.rows + rr] = acc;
+                if (stat_on) _ = statf32.fetchAdd(@intCast(q.cols * 4), .monotonic);
+                q.out[tok * q.rows + rr] = simd_api.dotF32(
+                    @intCast(q.cols),
+                    @ptrCast(q.mat.ptr + rr * q.cols),
+                    @ptrCast(xs),
+                );
             }
         },
     }

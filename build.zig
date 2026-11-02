@@ -269,6 +269,10 @@ pub fn build(b: *std.Build) void {
         .{ .name = "qwen35_kernels_avx2", .file = "src/kernels/x86/kernels32.c", .isa = .avx2 },
         .{ .name = "qwen35_kernels256_avx2", .file = "src/kernels/x86/kernels256.c", .isa = .avx2 },
         .{ .name = "qwen35_iq_kernels_avx2", .file = "src/kernels/x86/iq_kernels.c", .isa = .avx2 },
+        // f32/bf16 dot products (the .f32 matvec path: every bf16/f16/f32
+        // tensor). Its own unit so it gets AVX2+FMA without touching the
+        // quantized kernels' codegen.
+        .{ .name = "qwen35_kernels_f32", .file = "src/kernels/x86/kernels_f32.c", .isa = .avx2 },
         // AVX-512 VNNI kernels are a SEPARATE compile unit so the AVX2 units
         // above keep their own codegen (adding -mavx512vnni to them would
         // change the AVX2 kernels' output). Dispatch is runtime
