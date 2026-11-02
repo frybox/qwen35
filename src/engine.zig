@@ -1477,13 +1477,11 @@ pub const Engine = struct {
         //
         // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
         // shared `ssm_norm` row, so this is the three-condition batch.
-        // `mulSilu` stays per head: merging it is a separate (elementwise) merge.
         self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), Buf.wrap(lw.ssm_norm.?), nv, c.rms_eps);
-        for (0..nv) |h| {
-            const out_h = gout.span(h * vd, vd);
-            const zh = z.span(h * vd, vd);
-            self.exec.mulSilu(out_h, zh);
-        }
+        // `mulSilu` is elementwise with no reduction and no per-row state, so the
+        // `nv` heads collapse into this one call over the same `nv * vd` run --
+        // unlike the norm merges above, there is no repeat-count subtlety here.
+        self.exec.mulSilu(gout.span(0, value_dim), z.span(0, value_dim));
 
         // out projection [2048 -> 1024]
         self.exec.matvec(self.x2.span(0, hidden), lw.ssm_out.?, gout);
@@ -1662,14 +1660,10 @@ pub const Engine = struct {
         //
         // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
         // shared `ssm_norm` row, so the rmsnorm batch is the three-condition
-        // case.  `mulSilu` is left per head: it is elementwise over arbitrary
-        // `n`, so its batching is a separate (safe) merge, not this one.
+        // case.  `mulSilu` then collapses the same run in one call: it is
+        // elementwise over arbitrary `n`, with no per-row state to preserve.
         self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), Buf.wrap(lw.ssm_norm.?), nv, c.rms_eps);
-        for (0..nv) |h| {
-            const out_h = gout.span(h * vd, vd);
-            const zh = z.span(h * vd, vd);
-            self.exec.mulSilu(out_h, zh);
-        }
+        self.exec.mulSilu(gout.span(0, value_dim), z.span(0, value_dim));
     }
 
     fn forwardFull(self: *Engine, lw: *LayerWeights, li: usize, pos: u32) void {
