@@ -677,6 +677,29 @@ pub const CudaBackend = struct {
     /// kernel covers.
     ev_pre_a: ?*anyopaque = null,
     ev_pre_b: ?*anyopaque = null,
+    /// Around one `argmax` launch + its sync D2H copy.  `ev_arg_a` is recorded
+    /// on the device *before* the argmax kernel, `ev_arg_b` *after* it, so
+    /// `ev_arg_b - ev_arg_a` is the tail of the queue as the device saw it.
+    /// Measured only under `$QWEN35_PROF`; see `dArgmax_body`.
+    ev_arg_a: ?*anyopaque = null,
+    ev_arg_b: ?*anyopaque = null,
+    /// Marks the device position at the END of the previous token (recorded right
+    /// after that token's argmax copy).  `tok_end - prev_tok_end` is one whole
+    /// decode token as the device saw it: every kernel of that token.  The gap
+    /// between that and the host's wall clock for the same token is the host's
+    /// own share (submission + the blocking copy).
+    ev_tok_end: ?*anyopaque = null,
+    ev_prev_tok_end: ?*anyopaque = null,
+    tok_end_valid: bool = false,
+    stat_ns_token_dev: u64 = 0,
+    stat_n_token_dev: u64 = 0,
+    /// Device time of the argmax kernel's own launch window, summed (`$QWEN35_PROF`).
+    stat_ns_argmax_gpu: u64 = 0,
+    /// Host wall clock spent inside `dArgmax_body`, summed (`$QWEN35_PROF`).  The
+    /// difference against `stat_ns_argmax_gpu` is the host's share of the drain:
+    /// driver submission + the blocking copy, rather than device execution.
+    stat_ns_argmax_host: u64 = 0,
+    stat_n_argmax_timed: u64 = 0,
     /// True between `profReset` and the event read that closes the prefill
     /// window; decides whether a `matvecBatchK` call is prefill or decode.
     prefill_open: bool = false,
@@ -878,6 +901,26 @@ pub const CudaBackend = struct {
 
     pub fn exec(self: *CudaBackend) backend.Exec {
         return .{ .ptr = self, .vtable = &vtable };
+    }
+
+    /// One-shot *complete* profile report: `CUDA-M [...]` + `CUDA-M  types:`
+    /// + `CUDA-M  time:` + the `PROF-SLOT` and `PROF-COPY` tables.
+    ///
+    /// The reason this entry exists instead of relying on the existing
+    /// `reportStats` call sites: those fire at internal trigger points
+    /// (`% 500` matvecs, the first matvec, the closing of the prefill window)
+    /// and in `deinit`, but the engine is arena-allocated so `deinit` never
+    /// runs on the CLI path.  A long decode that stops before the next `% 500`
+    /// boundary -- or any BF16/f32 run, whose `matvec` branch never calls
+    /// `reportStats` at all -- therefore ended with a single header line and no
+    /// tables.  This is called once, by `Engine.profBackendReport`, right after
+    /// `generate` returns (the CLI gates it on `$QWEN35_PROF`).
+    ///
+    /// Unconditional by design: the *caller* owns the debug switch, so the
+    /// semantics here are "print the whole thing now" and nothing else.  Purely
+    /// diagnostic -- it reads counters and prints, touching no device state.
+    pub fn profReport(self: *CudaBackend) void {
+        self.reportStats("final");
     }
 
     pub fn deinit(self: *CudaBackend) void {
@@ -2399,16 +2442,73 @@ pub const CudaBackend = struct {
                 // the final index -- 4 bytes -- comes back per token.
                 const cu = &self.cu.?;
                 ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, @sizeOf(c_int)) catch return 0;
+                // $QWEN35_PROF: split the per-token drain into "device was busy"
+                // and "host was waiting".  `ev_arg_a` is recorded before the
+                // argmax launch and `ev_arg_b` right after it; both are queue
+                // positions, so `b - a` is what the device spent finishing that
+                // tail.  The host wall clock around the blocking copy is what
+                // the CPU actually paid.  Both are only touched when
+                // gpuTimingOn(), so the default path is one predictable branch.
+                const timed = self.gpuTimingOn();
+                var host_t0: ?Io.Clock.Timestamp = null;
+                if (timed) {
+                    if (!self.ensureEvents()) {
+                        self.ev_on = false;
+                    } else {
+                        host_t0 = Io.Clock.Timestamp.now(self.io, .awake);
+                        if (cu.lib.EventRecord(self.ev_arg_a, null) != cudart.cudaSuccess) {
+                            self.stat_n_ev_err += 1;
+                        }
+                    }
+                }
                 const rc = Launch.argmax(px, @intCast(logits.len), @ptrCast(@alignCast(self.d_idx)), null);
                 if (rc != cudart.cudaSuccess) {
                     self.ewLaunchFail("argmax", rc);
                     return 0;
                 }
+                if (timed and host_t0 != null) {
+                    if (cu.lib.EventRecord(self.ev_arg_b, null) != cudart.cudaSuccess) {
+                        self.stat_n_ev_err += 1;
+                    }
+                }
                 var host_idx: c_int = 0;
+                // Measured 2026-11: a pinned `MemcpyAsync` + stream sync is
+                // 5191us -> 5100us per token, i.e. noise.  The wait here is the
+                // device finishing the 240 kernels this token already queued
+                // (8.25 ms of real device work against an 8.20 ms host token),
+                // not copy overhead, so the plain blocking copy stays.
                 const rc2 = cu.lib.Memcpy(&host_idx, self.d_idx, @sizeOf(c_int), cudart.MemcpyDeviceToHost);
                 if (rc2 != cudart.cudaSuccess) {
                     self.ewLaunchFail("argmax index download", rc2);
                     return 0;
+                }
+                if (timed) {
+                    if (host_t0) |t0| {
+                        self.stat_ns_argmax_host += durNs(t0, self.io);
+                        self.stat_n_argmax_timed += 1;
+                    }
+                    // The events are now complete (the copy above waited on the
+                    // whole queue), so reading the interval synchronizes nothing
+                    // extra.  Guarded: `evElapsedNs` returns null on error.
+                    if (self.evElapsedNs(self.ev_arg_a, self.ev_arg_b)) |ns| {
+                        self.stat_ns_argmax_gpu += ns;
+                    }
+                    // Record the device position that closes THIS token, then
+                    // compare it against the previous token's close.  That spans
+                    // every kernel of the token, which is the number that has to
+                    // be compared with the host wall clock.
+                    if (cu.lib.EventRecord(self.ev_tok_end, null) == cudart.cudaSuccess) {
+                        if (self.tok_end_valid) {
+                            if (self.evElapsedNs(self.ev_prev_tok_end, self.ev_tok_end)) |ns| {
+                                self.stat_ns_token_dev += ns;
+                                self.stat_n_token_dev += 1;
+                            }
+                        }
+                        if (cu.lib.EventRecord(self.ev_prev_tok_end, null) != cudart.cudaSuccess) {
+                            self.stat_n_ev_err += 1;
+                        }
+                        self.tok_end_valid = true;
+                    } else self.stat_n_ev_err += 1;
                 }
                 self.stat_d2h_bytes += @sizeOf(c_int);
                 return @intCast(host_idx);
@@ -2757,8 +2857,8 @@ pub const CudaBackend = struct {
     fn ensureEvents(self: *CudaBackend) bool {
         if (self.ev_created) return true;
         const lib = if (self.cu) |*cu| &cu.lib else return false;
-        var made: [4]?*anyopaque = .{ null, null, null, null };
-        const names = [_][:0]const u8{ "ev_bk_a", "ev_bk_b", "ev_pre_a", "ev_pre_b" };
+        var made: [8]?*anyopaque = .{ null, null, null, null, null, null, null, null };
+        const names = [_][:0]const u8{ "ev_bk_a", "ev_bk_b", "ev_pre_a", "ev_pre_b", "ev_arg_a", "ev_arg_b", "ev_tok_end", "ev_prev_tok_end" };
         for (&made, names) |*slot, nm| {
             var h: ?*anyopaque = null;
             // `cudaEventDefault` (flags 0): the default deliberately keeps host
@@ -2778,6 +2878,10 @@ pub const CudaBackend = struct {
         self.ev_bk_b = made[1];
         self.ev_pre_a = made[2];
         self.ev_pre_b = made[3];
+        self.ev_arg_a = made[4];
+        self.ev_arg_b = made[5];
+        self.ev_tok_end = made[6];
+        self.ev_prev_tok_end = made[7];
         self.ev_created = true;
         return true;
     }
@@ -2786,7 +2890,7 @@ pub const CudaBackend = struct {
         if (!self.ev_created) return;
         const lib = if (self.cu) |*cu| &cu.lib else null;
         if (lib) |l| {
-            for ([_]?*anyopaque{ self.ev_bk_a, self.ev_bk_b, self.ev_pre_a, self.ev_pre_b }) |p| {
+            for ([_]?*anyopaque{ self.ev_bk_a, self.ev_bk_b, self.ev_pre_a, self.ev_pre_b, self.ev_arg_a, self.ev_arg_b, self.ev_tok_end, self.ev_prev_tok_end }) |p| {
                 if (p) |q| _ = l.EventDestroy(q);
             }
         }
@@ -2794,6 +2898,10 @@ pub const CudaBackend = struct {
         self.ev_bk_b = null;
         self.ev_pre_a = null;
         self.ev_pre_b = null;
+        self.ev_arg_a = null;
+        self.ev_arg_b = null;
+        self.ev_tok_end = null;
+        self.ev_prev_tok_end = null;
         self.ev_created = false;
     }
 
@@ -3135,6 +3243,40 @@ pub const CudaBackend = struct {
             );
         }
         self.reportCopyStats();
+        self.reportArgmaxDrain();
+    }
+
+    /// `PROF-DRAIN`: the per-token argmax drain split into the device's share and
+    /// the host's share.
+    ///
+    /// `PROF-SLOT argmax` gives one number for the whole slot, but that number
+    /// mixes two very different costs: the device finishing the queue the token
+    /// already issued (unavoidable compute that would happen anyway) and the
+    /// host sitting in a blocking D2H copy (pure lost overlap).  This line
+    /// separates them, because a plan that shrinks one does nothing for the
+    /// other -- e.g. a CUDA graph attacks submission overhead, which shows up
+    /// here as device-side tail, not as the copy.
+    fn reportArgmaxDrain(self: *CudaBackend) void {
+        if (self.stat_n_argmax_timed == 0) return;
+        const n = self.stat_n_argmax_timed;
+        const host_ns = self.stat_ns_argmax_host;
+        const dev_ns = self.stat_ns_argmax_gpu;
+        // Per call, in microseconds, so the numbers are comparable across runs
+        // with different token counts.
+        const host_us = host_ns / n / 1000;
+        const dev_us = dev_ns / n / 1000;
+        // Device share of what the host waited for.  <100% means the host paid
+        // for more than the device was actually executing (submission, driver,
+        // copy latency); that gap is what a graph replay can reclaim.
+        const dev_pct: u64 = if (host_ns == 0) 0 else (dev_ns * 100) / host_ns;
+        // Whole-token device time: `ev_prev_tok_end .. ev_tok_end` spans every
+        // kernel of one decode token.  Compared against the per-token host wall
+        // clock this says whether the host or the device is the ceiling.
+        const tok_dev_us = if (self.stat_n_token_dev == 0) 0 else self.stat_ns_token_dev / self.stat_n_token_dev / 1000;
+        std.debug.print(
+            "PROF-DRAIN argmax calls={d} host_us={d} dev_us={d} host_ms={d} dev_ms={d} dev_pct={d}% tok_dev_us={d} note=\"host_us is the blocking copy wait; dev_us is the argmax kernel alone; tok_dev_us is ALL device work for one token\"\n",
+            .{ n, host_us, dev_us, host_ns / 1_000_000, dev_ns / 1_000_000, dev_pct, tok_dev_us },
+        );
     }
 
     /// `PROF-COPY`: `copyRange` narrowed down by element count.
@@ -3272,6 +3414,15 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         self.cpu.exec().reportProfile();
         self.reportStats("report");
+    }
+
+    /// `Exec.profReport`: the CUDA backend's complete one-shot dump.  Reaches
+    /// the same `reportStats("final")` as the public `CudaBackend.profReport`;
+    /// the engine only ever sees the `Exec`, so the vtable path is the one the
+    /// CLI uses.
+    fn dProfReport(ctx: *anyopaque) void {
+        const self = self_(ctx);
+        self.profReport();
     }
 // ==== slot timing wrappers ($QWEN35_PROF only) ==============================
 //
@@ -3603,6 +3754,7 @@ pub const vtable = backend.Exec.VTable{
     .profPrefillEnd = CudaBackend.dProfPrefillEnd,
     .setTier = CudaBackend.dSetTier,
     .reportProfile = CudaBackend.dReportProfile,
+    .profReport = CudaBackend.dProfReport,
     .name = CudaBackend.vName,
     .describe = CudaBackend.vDescribe,
     // Elementwise / state slots: ALL on the device.

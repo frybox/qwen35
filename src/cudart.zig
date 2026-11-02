@@ -159,6 +159,16 @@ pub const Lib = struct {
     Malloc: *const fn (*?*anyopaque, usize) callconv(.c) c_int,
     Free: *const fn (?*anyopaque) callconv(.c) c_int,
     Memcpy: *const fn (?*anyopaque, ?*const anyopaque, usize, c_int) callconv(.c) c_int,
+    /// `cudaMemcpyAsync` with a `null` stream: same stream as every kernel the
+    /// backend launches (the default one), so ordering is unchanged -- but for a
+    /// *pinned* host buffer the runtime enqueues a DMA and returns instead of
+    /// copying through a staging buffer.  See the argmax path for what that buys.
+    /// Pinned (page-locked) host memory.  A DMA can only target pinned memory;
+    /// without it even `cudaMemcpyAsync` silently takes the staged path, which is
+    /// why the two are always used together here.
+    HostAlloc: *const fn (*?*anyopaque, usize, u32) callconv(.c) c_int,
+    FreeHost: *const fn (?*anyopaque) callconv(.c) c_int,
+    MemcpyAsync: *const fn (?*anyopaque, ?*const anyopaque, usize, c_int, ?*anyopaque) callconv(.c) c_int,
     /// Device-side `memset`.  Needed so the error paths of the numeric slots can
     /// zero a device result without staging it through the host.
     Memset: *const fn (?*anyopaque, c_int, usize) callconv(.c) c_int,
@@ -172,6 +182,7 @@ pub const Lib = struct {
     /// only needs the type to pass `null` through the launcher ABI.
     StreamCreate: *const fn (*?*anyopaque) callconv(.c) c_int,
     StreamDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
+    StreamSynchronize: *const fn (?*anyopaque) callconv(.c) c_int,
 
     // --- events --------------------------------------------------------------
     /// `$QWEN35_PROF`-only GPU-side timing.  An event timestamps a point in a
@@ -275,10 +286,14 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
     L.GetErrorName = bind(&out.lib, *const fn (c_int) callconv(.c) [*:0]const u8, "cudaGetErrorName", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.Malloc = bind(&out.lib, *const fn (*?*anyopaque, usize) callconv(.c) c_int, "cudaMalloc", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.Free = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaFree", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.HostAlloc = bind(&out.lib, *const fn (*?*anyopaque, usize, u32) callconv(.c) c_int, "cudaHostAlloc", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.FreeHost = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaFreeHost", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.MemcpyAsync = bind(&out.lib, *const fn (?*anyopaque, ?*const anyopaque, usize, c_int, ?*anyopaque) callconv(.c) c_int, "cudaMemcpyAsync", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.Memcpy = bind(&out.lib, *const fn (?*anyopaque, ?*const anyopaque, usize, c_int) callconv(.c) c_int, "cudaMemcpy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.MemGetInfo = bind(&out.lib, *const fn (*usize, *usize) callconv(.c) c_int, "cudaMemGetInfo", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.Memset = bind(&out.lib, *const fn (?*anyopaque, c_int, usize) callconv(.c) c_int, "cudaMemset", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.DeviceSynchronize = bind(&out.lib, *const fn () callconv(.c) c_int, "cudaDeviceSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.StreamSynchronize = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaStreamSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamCreate = bind(&out.lib, *const fn (*?*anyopaque) callconv(.c) c_int, "cudaStreamCreate", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaStreamDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventCreate = bind(&out.lib, *const fn (*?*anyopaque, u32) callconv(.c) c_int, "cudaEventCreateWithFlags", mbuf, &miss_len) orelse return error.MissingSymbol;
