@@ -117,6 +117,7 @@ int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x, float *d_out,
 int q35_launch_scale_vec(float *d_x, float s, int n, void *stream);
 int q35_launch_add_resid(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream);
+int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float *d_src, int heads, int hd, void *stream);
 int q35_launch_zero_buf(float *d_buf, int n, void *stream);
 
 // --- normalisation slots (src/kernels/cuda/norm.cu) ------------------------

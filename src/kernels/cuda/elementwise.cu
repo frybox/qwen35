@@ -62,6 +62,27 @@ __global__ void k_copy_range(float *__restrict__ dst, const float *__restrict__ 
     if (i < n) dst[i] = src[i];
 }
 
+// Split `[h][q_head | gate_head]` into two dense head-major arrays.
+//
+// One block per head, `hd` elements in, `2*hd` out: the source block for head
+// `h` is contiguous (two `hd` runs), so a block copy is the natural shape and
+// the whole thing is one launch for the entire projection instead of `2*heads`
+// launches of one head each.  That is the entire point -- the bytes are the
+// same, the launch count is not (`PROF-COPY` put the per-head form at 768
+// calls/token and 99% of the `copy_range` slot).
+//
+// EXACTNESS: a pure move, no arithmetic, so it is bit-identical to
+// `elementwise.bufDeinterleaveQG` by construction.
+__global__ void k_deinterleave_qg(float *__restrict__ q, float *__restrict__ gate,
+                                 const float *__restrict__ src, int hd) {
+    const int h = blockIdx.x;
+    const float *s = src + (size_t)h * 2 * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        q[(size_t)h * hd + i] = s[i];
+        gate[(size_t)h * hd + i] = s[hd + i];
+    }
+}
+
 __global__ void k_zero_buf(float *__restrict__ buf, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) buf[i] = 0.0f;
@@ -94,6 +115,17 @@ extern "C" int q35_launch_copy_range(float *d_dst, const float *d_src, int n, vo
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;
     k_copy_range<<<gridFor(n), kThreads, 0, stream>>>(d_dst, d_src, n);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float *d_src,
+                                          int heads, int hd, void *stream_v) {
+    if (heads <= 0 || hd <= 0) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    // `hd` threads per block is 256 for every model in this family (head_dim is
+    // 128 or 256), i.e. the same as `kThreads`; the loop in the kernel handles
+    // a larger `hd` without changing the launch config.
+    k_deinterleave_qg<<<heads, hd < kThreads ? hd : kThreads, 0, stream>>>(d_q, d_gate, d_src, hd);
     return (int)cudaGetLastError();
 }
 

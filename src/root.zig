@@ -63,3 +63,12 @@ test {
     _ = @import("backend_cuda.zig");
 }
 
+test {
+    // `elementwise.zig` is the slot body of the elementwise kernels; import it
+    // here so its tests (notably the `bufDeinterleaveQG` oracle comparison,
+    // which pins the batched q/gate split to the per-head `copyRange` sequence
+    // it replaced) actually run.  Without this line the file's `test` blocks
+    // are dead code: nothing else imports it as a module.
+    _ = @import("elementwise.zig");
+}
+

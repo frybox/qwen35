@@ -602,8 +602,8 @@ pub const Engine = struct {
     kv_mem: backend.Buf, // gdn_n_heads * 128: per-head, same reason
     /// Per-layer GDN decay scalars (`gdnGamma`'s output), `gdn_n_heads` long.
     /// A backend region because `gdnGamma` runs on the backend under a device
-    /// backend; the forward path reads it back with `Exec.copyToHost` because
-    /// `gdnStep` takes gamma as an `f32` argument.
+    /// backend, and `gdnStepRows` consumes it there as a `Buf` -- nothing reads
+    /// it back to the host.
     gamma_scratch: backend.Buf,
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
@@ -1406,20 +1406,19 @@ pub const Engine = struct {
         // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
         //
         // `beta` is written IN PLACE into the b half of `ab`, and `gamma` is
-        // this layer's `nv` decay scalars.  Both are backend regions under a
-        // device backend, while `gdnStep`'s vtable contract takes them as
-        // `f32` arguments, so the two `nv`-long host arrays below are the one
-        // and only place a per-token forward pass reads back from the device
-        // (`Exec.copyToHost`: 2 * nv * 4 B per layer, ~16 KiB per token for the
-        // 0.8B's 24 GDN layers -- against the ~15 MiB/token the old staging
-        // path moved).
-        var beta_host: [64]f32 = undefined;
-        var gamma_host: [64]f32 = undefined;
+        // this layer's `nv` decay scalars.  Both are backend regions, and they
+        // STAY there: `gdnStepRows` takes them as `Buf`s and a device backend
+        // reads its own memory, so a token makes no gamma/beta PCIe trip at all
+        // (it used to be 2 * nv * 4 B down and 2 * nv * 4 B back up per GDN
+        // layer -- `Exec.copyToHost` per layer, which is now off this path
+        // entirely).
+        //
+        // The two regions change contents every layer every token, so they must
+        // never be handed to a pointer-keyed "upload once" cache; see
+        // `VTable.gdnStepRows`.
         const beta = self.ab.span(nv, nv); // b half, overwritten with sigmoid(b)
         const gamma = self.gamma_scratch.span(0, nv);
         self.exec.gdnGamma(ab.span(0, nv), beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), gamma, nv);
-        self.exec.copyToHost(gamma_host[0..nv], gamma);
-        self.exec.copyToHost(beta_host[0..nv], beta);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out.span(0, value_dim);
@@ -1488,8 +1487,8 @@ pub const Engine = struct {
             self.kv_mem,
             self.delta,
             gout,
-            gamma_host[0..nv],
-            beta_host[0..nv],
+            gamma,
+            beta,
             nv,
             nk,
             kd,
@@ -1572,10 +1571,11 @@ pub const Engine = struct {
         const qg = self.qkvK.span(t * 2 * q_dim, 2 * q_dim);
         const q = self.qK.span(t * q_dim, q_dim);
         const gate = self.gateK.span(t * q_dim, q_dim);
-        for (0..heads) |h| {
-            self.exec.copyRange(q.span(h * hd, hd), qg.span(h * 2 * hd, hd));
-            self.exec.copyRange(gate.span(h * hd, hd), qg.span(h * 2 * hd + hd, hd));
-        }
+        // One slot for the whole split: the per-head form was `2*heads`
+        // launches of 1 KB each every token, which `PROF-COPY` put at 99% of
+        // the `copy_range` slot (the `attn_q` rows themselves are interleaved
+        // in the GGUF, so this move cannot be avoided -- only batched).
+        self.exec.deinterleaveQG(q, gate, qg, heads, hd);
         const k = self.kK.span(t * kv_dim, kv_dim);
         const v = self.vK.span(t * kv_dim, kv_dim);
 
@@ -1634,15 +1634,12 @@ pub const Engine = struct {
         const beta = self.abK.span(k * nv + t * nv, nv);
         const st = &self.gdn[li];
         self.exec.convStep(st.conv, qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
-        // Same device->host scalars as the serial path above: gamma is the
-        // backend's `nv` decay values, beta has been overwritten in place by
-        // `gdnGamma` with sigmoid(b), and `gdnStep` wants both as `f32`s.
-        var beta_host: [64]f32 = undefined;
-        var gamma_host: [64]f32 = undefined;
+        // Same regions as the serial path above: gamma is the backend's `nv`
+        // decay values, beta has been overwritten in place by `gdnGamma` with
+        // sigmoid(b), and both are consumed by `gdnStepRows` straight from
+        // device memory -- no `copyToHost`, no re-upload.
         const gamma = self.gamma_scratch.span(0, nv);
         self.exec.gdnGamma(ab_a, beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), gamma, nv);
-        self.exec.copyToHost(gamma_host[0..nv], gamma);
-        self.exec.copyToHost(beta_host[0..nv], beta);
 
         const state = st.state;
         const gout = self.goutK.span(t * value_dim, value_dim);
@@ -1687,8 +1684,8 @@ pub const Engine = struct {
             self.kv_mem,
             self.delta,
             gout,
-            gamma_host[0..nv],
-            beta_host[0..nv],
+            gamma,
+            beta,
             nv,
             nk,
             kd,
@@ -1722,11 +1719,11 @@ pub const Engine = struct {
         self.exec.matvec(qg, lw.attn_q.?, self.x1);
         const q = self.q.span(0, q_dim);
         const gate = self.z.span(0, q_dim);
-        for (0..heads) |h| {
-            // interleave: q(256) = qg[h*512 .. h*512+256], gate = next 256
-            self.exec.copyRange(q.span(h * hd, hd), qg.span(h * 2 * hd, hd));
-            self.exec.copyRange(gate.span(h * hd, hd), qg.span(h * 2 * hd + hd, hd));
-        }
+        // Batched split (see `forwardFullCore`): the GGUF `attn_q` rows are
+        // `[h][q_head | gate_head]`, and `q`/`gate` are both consumed per head,
+        // so this is a layout change no single memcpy can express -- the slot
+        // just does it in one launch instead of `2*heads`.
+        self.exec.deinterleaveQG(q, gate, qg, heads, hd);
         self.exec.matvec(self.k.span(0, kv_dim), lw.attn_k.?, self.x1);
         self.exec.matvec(self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
 

@@ -418,6 +418,20 @@ pub fn bufCopyRange(dst: Buf, src: Buf) void {
     @memcpy(dst.slice(), src.slice());
 }
 
+/// Scalar reference for the q/gate split.  This is the definition both
+/// backends must agree with: per head `h`, `q[h*hd..][hd]` is `src[h*2*hd..]`
+/// and `gate[h*hd..][hd]` is the `hd` block right after it.
+///
+/// Deliberately written as the plain per-head loop -- it is the oracle the
+/// SIMD/device versions are checked against, so it must stay obviously correct
+/// rather than fast.
+pub fn bufDeinterleaveQG(q: Buf, gate: Buf, src: Buf, heads: usize, hd: usize) void {
+    for (0..heads) |h| {
+        @memcpy(q.slice()[h * hd ..][0..hd], src.slice()[h * 2 * hd ..][0..hd]);
+        @memcpy(gate.slice()[h * hd ..][0..hd], src.slice()[h * 2 * hd + hd ..][0..hd]);
+    }
+}
+
 pub fn bufCopyFromHost(dst: Buf, src: []const f32) void {
     @memcpy(dst.slice(), src);
 }
@@ -428,4 +442,50 @@ pub fn bufArgmax(logits: Buf) u32 {
 
 pub fn bufSample(logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
     return sp.sample(logits.slice(), scratch.slice());
+}
+
+test "bufDeinterleaveQG matches the per-head copyRange form it replaced" {
+    // The rewrite that introduced `deinterleaveQG` replaced, per head,
+    //   q[h*hd..]    <- qg[h*2*hd..]
+    //   gate[h*hd..] <- qg[h*2*hd + hd..]
+    // with one batched call.  This test pins the two to each other: the naive
+    // loop below is literally the old sequence of `@memcpy`s, so a change to
+    // the batched kernel (or to a backend slot above it) that reorders heads,
+    // swaps the halves, or drops the gate block fails here.
+    const alloc = std.testing.allocator;
+    const heads = 6;
+    const hd = 5; // deliberately not a power of two
+    const n = heads * hd;
+
+    var qg = try alloc.alloc(f32, 2 * n);
+    defer alloc.free(qg);
+    const q = try alloc.alloc(f32, n);
+    defer alloc.free(q);
+    const gate = try alloc.alloc(f32, n);
+    defer alloc.free(gate);
+    // Distinct value per element so any misplaced element is detectable.
+    for (qg, 0..) |*v, i| v.* = @floatFromInt(i * 3 + 1);
+
+    // `var`: the slices themselves are never rebound, but they are the copy
+    // *destinations* below -- `@memcpy` needs a mutable target.
+    const want_q = try alloc.alloc(f32, n);
+    defer alloc.free(want_q);
+    const want_gate = try alloc.alloc(f32, n);
+    defer alloc.free(want_gate);
+
+    for (0..heads) |h| {
+        @memcpy(want_q[h * hd ..][0..hd], qg[h * 2 * hd ..][0..hd]);
+        @memcpy(want_gate[h * hd ..][0..hd], qg[h * 2 * hd + hd ..][0..hd]);
+    }
+
+    bufDeinterleaveQG(
+        Buf.wrap(q),
+        Buf.wrap(gate),
+        Buf.wrap(qg),
+        heads,
+        hd,
+    );
+
+    try std.testing.expectEqualSlices(f32, want_q, q);
+    try std.testing.expectEqualSlices(f32, want_gate, gate);
 }

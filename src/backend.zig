@@ -222,13 +222,25 @@ pub const Exec = struct {
         ///   out   [h*vd  .. +vd]
         ///   km    [h*vd  .. +vd]   PER-HEAD scratch, `heads*vd` long
         ///   delta [h*vd  .. +vd]   PER-HEAD scratch, `heads*vd` long
-        ///   gamma [h], beta [h]    per-head scalars
+        ///   gamma [h], beta [h]    per-head scalars, in backend regions
         ///
         /// `km`/`delta` must be per-head (stride vd): with a single shared `vd`
         /// buffer the `heads` blocks would race, and the wrong answer would be
         /// silent.  The caller sizes them.
+        ///
+        /// `gamma`/`beta` are `Buf`s, i.e. backend regions (device memory on a
+        /// device backend) of at least `heads` floats -- `gdnGamma`'s output
+        /// and its in-place sigmoid(b) write-back respectively.  Passing them
+        /// as regions is what keeps a token from making `2 * heads` floats of
+        /// PCIe round trip per GDN layer (read back for an `f32` argument,
+        /// then re-uploaded): a device backend just reads its own memory.
+        ///
+        /// Their CONTENTS change every token (per-layer, per-position), so they
+        /// must NEVER be routed through a `devConst`-style cache: those key on
+        /// pointer identity and never re-upload, which would silently serve the
+        /// first layer's coefficients forever.
         gdnStepRows: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
-            gamma: []const f32, beta: []const f32, heads: usize, nk: usize, kd: usize, vd: usize) void,
+            gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void,
 
         /// Full-attention decode for one token: scores against the KV rows,
         /// softmax, PV accumulation into `gout`, then the sigmoid gate.  `kcache`
@@ -242,18 +254,32 @@ pub const Exec = struct {
         /// Region-to-region copy (KV writes, MTP state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
         copyRange: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
+        /// Split the interleaved `attn_q` projection into `q` and `gate`.
+        ///
+        /// The GGUF `attn_q` rows are ordered `[h][q_head | gate_head]` -- one
+        /// `hd`-wide q block then one `hd`-wide gate block per head -- because
+        /// upstream packs them that way; nothing in the engine wants that
+        /// layout, both `q` and `gate` are consumed per head.  Doing it as
+        /// `2*heads` `copyRange` calls costs one launch per 1 KB on a device
+        /// backend (`PROF-COPY`: 768 calls/token, 99% of the `copy_range`
+        /// slot), so it gets its own slot and moves the whole `2*q_dim` in one
+        /// go.
+        ///
+        /// `dst_q.len == dst_gate.len == heads*hd`, `src.len == 2*heads*hd`.
+        deinterleaveQG: *const fn (ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void,
         /// Copy a host tensor row into a backend region (the f32 embedding row
         /// when token_embd is unquantized).
         copyFromHost: *const fn (ctx: *anyopaque, dst: Buf, src: []const f32) void,
         /// Copy a small backend region back into a host slice.
         ///
-        /// This is the ONLY device->host path on the per-token execution and
-        /// exists for exactly one thing: the per-layer `nv` scalars
-        /// (`beta`/`gamma`) that `gdnGamma` produces on the backend but that
-        /// `gdnStep` takes as `f32` arguments per the vtable contract.  It is
-        /// `nv` (64) floats ONCE PER LAYER PER TOKEN, against the megabyte
-        /// traffic the old staging path moved per operator.  Never use it to
-        /// bring activations back -- that is what P2c removed.
+        /// NOT on the per-token path any more: its one historical user was the
+        /// per-layer `nv` scalars (`beta`/`gamma`) that `gdnGamma` produces on
+        /// the backend, which `gdnStepRows` now takes as `Buf`s and reads on
+        /// the device.  It survives for diagnostics and for callers that
+        /// genuinely need a host copy of a small region (tests, `QWEN35_DUMP_*`
+        /// style tooling, MTP debug paths).  Never use it to bring activations
+        /// back -- that is what P2c removed, and a device->host copy also
+        /// serialises the stream.
         copyToHost: *const fn (ctx: *anyopaque, dst: []f32, src: Buf) void,
         /// Zero a region (reset of the conv history / GDN state).
         zeroBuf: *const fn (ctx: *anyopaque, buf: Buf) void,
@@ -377,7 +403,7 @@ pub const Exec = struct {
     /// Byte-for-byte the `heads` single calls it replaces; the engine uses this
     /// one (the single-row slot is kept for fallback and for A/B).
     pub fn gdnStepRows(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
-                       gamma: []const f32, beta: []const f32, heads: usize, nk: usize, kd: usize, vd: usize) void {
+                       gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
         self.vtable.gdnStepRows(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
     pub fn attnDecode(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
@@ -395,6 +421,9 @@ pub const Exec = struct {
     }
     pub fn copyRange(self: Exec, dst: Buf, src: Buf) void {
         self.vtable.copyRange(self.ptr, dst, src);
+    }
+    pub fn deinterleaveQG(self: Exec, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
+        self.vtable.deinterleaveQG(self.ptr, dst_q, dst_gate, src, heads, hd);
     }
     pub fn copyFromHost(self: Exec, dst: Buf, src: []const f32) void {
         self.vtable.copyFromHost(self.ptr, dst, src);
