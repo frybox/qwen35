@@ -1420,6 +1420,33 @@ pub const Engine = struct {
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out.span(0, value_dim);
+        // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128), for a
+        // whole head-run at a time instead of one head at a time.  Conditions:
+        //   * the q heads are `qkv[0..kq_dim]`, the k heads `qkv[kq_dim .. 2*kq_dim]`
+        //     and the v heads `qkv[2*kq_dim .. 3*kq_dim]` -- contiguous runs of
+        //     `kd`-wide rows;
+        //   * every row gets the same eps / the same `qscale`;
+        //   * each row's normalisation is independent (own sum of squares).
+        // `l2normRows` is `n` consecutive single-row `k_l2norm` blocks and
+        // `scaleVec` is elementwise, so both are the same arithmetic per row.
+        //
+        // ACTIVE ON THIS MODEL: nv (48) > nk (16), so head `h` maps to k head
+        // `h % nk` and each q/k row is visited `nv / nk` = 3 times, in the order
+        // 0..nk-1 repeated.  `l2norm` is NOT idempotent (a second pass divides by
+        // sqrt(1 + eps) again), so the repetitions are part of the semantics and
+        // must be kept: one `l2normRows` over the `nk` rows, `nk_reps` times,
+        // reproduces exactly the sequence of per-row calls the loop made.
+        const nk_reps = nv / nk;
+        if (gdnHeadsTiled(nv, nk)) {
+            const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+            var rep: usize = 0;
+            while (rep < nk_reps) : (rep += 1) {
+                self.exec.l2normRows(qkv.span(0, kq_dim), kd);
+                self.exec.l2normRows(qkv.span(kq_dim, kq_dim), kd);
+                // q is scaled once per v head, in the same interleaved order.
+                self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
+            }
+        }
         for (0..nv) |h| {
             // GGUF v slots are in "tiled" order (converter _reorder_v_heads):
             // slot h <-> HF v head (h%nk)*nvp + h/nk, whose k head is h%nk.
@@ -1429,11 +1456,15 @@ pub const Engine = struct {
             const v_h = qkv.span(2 * kq_dim + h * kd, kd);
             const sh = state.span(h * kd * vd, kd * vd);
 
-            // L2 normalize q,k (eps inside), then scale q by 1/sqrt(128)
-            self.exec.l2norm(q_h);
-            self.exec.l2norm(k_h);
-            const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            self.exec.scaleVec(q_h, qscale);
+            // Fallback for a layout the batched pass above cannot express
+            // (`nv` not a multiple of `nk`): the per-head form this function has
+            // always used.
+            if (!gdnHeadsTiled(nv, nk)) {
+                self.exec.l2norm(q_h);
+                self.exec.l2norm(k_h);
+                const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+                self.exec.scaleVec(q_h, qscale);
+            }
 
             // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q
             // in a second pass (see gdnFused).
@@ -1442,17 +1473,35 @@ pub const Engine = struct {
             self.exec.gdnStep(sh, k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma_host[h], beta_host[h], vd);
         }
 
-        // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6)
+        // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6).
+        //
+        // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
+        // shared `ssm_norm` row, so this is the three-condition batch.
+        // `mulSilu` stays per head: merging it is a separate (elementwise) merge.
+        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), Buf.wrap(lw.ssm_norm.?), nv, c.rms_eps);
         for (0..nv) |h| {
             const out_h = gout.span(h * vd, vd);
             const zh = z.span(h * vd, vd);
-            self.exec.rmsnorm(out_h, out_h, Buf.wrap(lw.ssm_norm.?), c.rms_eps);
             self.exec.mulSilu(out_h, zh);
         }
 
         // out projection [2048 -> 1024]
         self.exec.matvec(self.x2.span(0, hidden), lw.ssm_out.?, gout);
         self.exec.addResid(self.x.span(0, hidden), self.x2.span(0, hidden));
+    }
+
+    /// Whether the GDN per-head loop visits the q/k runs as `nk` contiguous
+    /// rows repeated `nv / nk` times, in that order -- the shape the batched
+    /// normalisation reproduces.
+    ///
+    /// The per-head loop maps v head `h` to k head `h % nk` and walks
+    /// `h = 0 .. nv-1`, so the rows it touches are `0,1,..,nk-1` repeated
+    /// `nv / nk` times.  That is expressible as `nv / nk` batched passes over
+    /// the `nk`-row run -- exactly what `forwardGdn` / `forwardGdnCore` do --
+    /// whenever `nv` is a whole multiple of `nk`.  Anything else (a partial
+    /// final group) falls back to the per-head calls.
+    inline fn gdnHeadsTiled(nv: usize, nk: usize) bool {
+        return nk != 0 and nv % nk == 0;
     }
 
     /// Causal conv step, HOST-slice form: the unit test of this file drives it
@@ -1510,14 +1559,15 @@ pub const Engine = struct {
         const v = self.vK.span(t * kv_dim, kv_dim);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
-        for (0..heads) |h| {
-            const qs = q.span(h * hd, hd);
-            self.exec.rmsnorm(qs, qs, Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
-        }
-        for (0..kv_heads) |h| {
-            const ks = k.span(h * hd, hd);
-            self.exec.rmsnorm(ks, ks, Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
-        }
+        //
+        // One call per tensor instead of one per head: the `heads` rows of `q`
+        // are CONSECUTIVE (`q` is `qK[t*q_dim..]`, each head a `hd`-wide slice
+        // of it), the weight is the SAME `attn_q_norm` row for every head and
+        // each row's normalisation is independent (own sum of squares), so this
+        // is the three-condition batch.  `rmsnormRows` launches `heads` blocks
+        // of `k_rmsnorm`, i.e. the identical per-row arithmetic.
+        self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), Buf.wrap(lw.attn_q_norm.?), heads, c.rms_eps);
+        self.exec.rmsnormRows(k.span(0, kv_dim), k.span(0, kv_dim), Buf.wrap(lw.attn_k_norm.?), kv_heads, c.rms_eps);
         for (0..heads) |h| self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);
         for (0..kv_heads) |h| self.exec.rope64(k.span(h * hd, hd), pos, c.rope_freq_base);
 
@@ -1575,6 +1625,20 @@ pub const Engine = struct {
 
         const state = st.state;
         const gout = self.goutK.span(t * value_dim, value_dim);
+        // Same per-head calls as `forwardGdn`, batched the same way (see the
+        // long comment there, including why `l2norm` must be applied
+        // `nv / nk` times to each row); `qkv` here is this slot's `conv_dim`
+        // row, so the q run starts at 0 and the k run at `kq_dim`.
+        const nk_reps = nv / nk;
+        if (gdnHeadsTiled(nv, nk)) {
+            const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+            var rep: usize = 0;
+            while (rep < nk_reps) : (rep += 1) {
+                self.exec.l2normRows(qkv.span(0, kq_dim), kd);
+                self.exec.l2normRows(qkv.span(kq_dim, kq_dim), kd);
+                self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
+            }
+        }
         for (0..nv) |h| {
             const kh = h % nk;
             const q_h = qkv.span(kh * kd, kd);
@@ -1582,20 +1646,28 @@ pub const Engine = struct {
             const v_h = qkv.span(2 * kq_dim + h * kd, kd);
             const sh = state.span(h * kd * vd, kd * vd);
 
-            self.exec.l2norm(q_h);
-            self.exec.l2norm(k_h);
-            const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            self.exec.scaleVec(q_h, qscale);
+            if (!gdnHeadsTiled(nv, nk)) {
+                self.exec.l2norm(q_h);
+                self.exec.l2norm(k_h);
+                const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+                self.exec.scaleVec(q_h, qscale);
+            }
 
             const km = self.kv_mem.span(0, vd);
             const out_h = gout.span(h * vd, vd);
             self.exec.gdnStep(sh, k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma_host[h], beta_host[h], vd);
         }
 
+        // Gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6).
+        //
+        // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
+        // shared `ssm_norm` row, so the rmsnorm batch is the three-condition
+        // case.  `mulSilu` is left per head: it is elementwise over arbitrary
+        // `n`, so its batching is a separate (safe) merge, not this one.
+        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), Buf.wrap(lw.ssm_norm.?), nv, c.rms_eps);
         for (0..nv) |h| {
             const out_h = gout.span(h * vd, vd);
             const zh = z.span(h * vd, vd);
-            self.exec.rmsnorm(out_h, out_h, Buf.wrap(lw.ssm_norm.?), c.rms_eps);
             self.exec.mulSilu(out_h, zh);
         }
     }

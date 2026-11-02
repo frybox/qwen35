@@ -768,6 +768,17 @@ pub const CpuBackend = struct {
         ew.bufRmsnorm(out, x, w, eps);
     }
 
+    /// Row-batched rmsnorm: `rows` independent rows of `w.len`.  Spelled as the
+    /// loop over consecutive spans, i.e. literally the per-row calls the engine
+    /// used to make, so the CPU path stays bit-identical to it and this slot
+    /// cannot diverge from `vRmsnorm` on any single row.
+    fn vRmsnormRows(ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+        _ = ctx;
+        const n = w.len;
+        std.debug.assert(out.len == rows * n and x.len == rows * n);
+        for (0..rows) |r| ew.bufRmsnorm(out.span(r * n, n), x.span(r * n, n), w, eps);
+    }
+
     fn vRope64(ctx: *anyopaque, x: Buf, pos: u32, base: f32) void {
         _ = ctx;
         ew.bufRope64(x, pos, base);
@@ -776,6 +787,16 @@ pub const CpuBackend = struct {
     fn vL2norm(ctx: *anyopaque, x: Buf) void {
         _ = ctx;
         ew.bufL2norm(x);
+    }
+
+    /// Row-batched l2norm: `rows` independent rows of `n`.  Loop over the same
+    /// per-row calls as `vL2norm` (see `vRmsnormRows` for why the loop shape of
+    /// this slot is load-bearing on the CPU path).
+    fn vL2normRows(ctx: *anyopaque, x: Buf, n: usize) void {
+        _ = ctx;
+        std.debug.assert(n != 0 and x.len % n == 0);
+        var r: usize = 0;
+        while (r < x.len) : (r += n) ew.bufL2norm(x.span(r, n));
     }
 
     fn vScaleVec(ctx: *anyopaque, x: Buf, s: f32) void {
@@ -888,8 +909,10 @@ pub const CpuBackend = struct {
         .matvec = vMatvec,
         .matvecBatchK = vMatvecBatchK,
         .rmsnorm = vRmsnorm,
+        .rmsnormRows = vRmsnormRows,
         .rope64 = vRope64,
         .l2norm = vL2norm,
+        .l2normRows = vL2normRows,
         .scaleVec = vScaleVec,
         .siluInPlace = vSiluInPlace,
         .mulSilu = vMulSilu,

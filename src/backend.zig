@@ -159,6 +159,24 @@ pub const Exec = struct {
 
         /// out = x * rsqrt(mean(x^2) + eps) * w, all `n` wide.
         rmsnorm: *const fn (ctx: *anyopaque, out: Buf, x: Buf, w: Buf, eps: f32) void,
+        /// `rows` consecutive `rmsnorm` calls on `out.span(r*h, h)` / `x.span(r*h, h)`.
+        ///
+        /// The ROW-BATCHED form: `out` and `x` are `rows * w.len` long and pack
+        /// `rows` consecutive rows of `w.len` floats; `w` stays ONE row and is
+        /// reused for every row.  Every row is normalised independently (its own
+        /// sum of squares), so this is exactly `rows` consecutive `rmsnorm`
+        /// calls on `out.span(r*h, h)` -- one host launch instead of `rows`.
+        ///
+        /// It is a SEPARATE slot rather than "infer rows from the lengths" (which
+        /// `out.len == rows * w.len` would allow) because `copyRange` feeds host
+        /// embedding rows through this vtable: a host-only `Buf` of length
+        /// `rows * n` must NOT silently become a device launch.  A batch caller
+        /// has to ask for the batch reading explicitly.
+        rmsnormRows: *const fn (ctx: *anyopaque, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void,
+        /// `rows` consecutive `l2norm` calls on `x.span(r*n, n)`.  Same
+        /// "explicit, never inferred" rule as `rmsnormRows`; each row's eps is
+        /// inside its own sum, so the rows are fully independent.
+        l2normRows: *const fn (ctx: *anyopaque, x: Buf, n: usize) void,
         /// Rotate the 64-dim rotary block of a row in place (cross-half pairing).
         rope64: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
         /// x *= rsqrt(sum(x^2) + 1e-6)
@@ -285,11 +303,21 @@ pub const Exec = struct {
     pub fn rmsnorm(self: Exec, out: Buf, x: Buf, w: Buf, eps: f32) void {
         self.vtable.rmsnorm(self.ptr, out, x, w, eps);
     }
+    /// See `VTable.rmsnormRows`: `out` / `x` are `rows * w.len` long, `w` is one
+    /// row.  Equivalent to `rows` calls of `rmsnorm` on consecutive sub-rows.
+    pub fn rmsnormRows(self: Exec, out: Buf, x: Buf, w: Buf, rows: usize, eps: f32) void {
+        self.vtable.rmsnormRows(self.ptr, out, x, w, rows, eps);
+    }
     pub fn rope64(self: Exec, x: Buf, pos: u32, base: f32) void {
         self.vtable.rope64(self.ptr, x, pos, base);
     }
     pub fn l2norm(self: Exec, x: Buf) void {
         self.vtable.l2norm(self.ptr, x);
+    }
+    /// See `VTable.l2normRows`: `x` is `rows * n` long.  Equivalent to `rows`
+    /// calls of `l2norm` on `x.span(r*n, n)`.
+    pub fn l2normRows(self: Exec, x: Buf, n: usize) void {
+        self.vtable.l2normRows(self.ptr, x, n);
     }
     pub fn scaleVec(self: Exec, x: Buf, s: f32) void {
         self.vtable.scaleVec(self.ptr, x, s);

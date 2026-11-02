@@ -2141,6 +2141,33 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.rmsnorm(@ptrCast(&self.cpu), out, x, w, eps);
     }
 
+    /// Row-batched `rmsnorm`: one launch, `rows` blocks, `w` reused per row.
+    /// `norm.cu` `k_rmsnorm` already indexes `x`/`out` by `blockIdx.x * n`, so
+    /// nothing in the kernel changes -- each block reduces its own row exactly
+    /// as it did when it was the only block.  Rows are therefore bit-identical
+    /// to the per-row launches (the reduction order within a row is untouched).
+    ///
+    /// Falls back to the per-row loop (`rmsnormRows` semantics) whenever the
+    /// geometry does not hold, which is what the CPU side does anyway.
+    fn dRmsnormRows_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
+        const self = self_(ctx);
+        const n = w.len;
+        if (rows_in != 0 and n != 0 and x.len == rows_in * n and out.len == rows_in * n and self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                if (dBufPtr(out)) |po| {
+                    if (self.devConst(w.slice())) |pw_unwrapped| {
+                        if (pw_unwrapped) |pw| {
+                            const rc = Launch.rmsnorm(po, px, pw, @intCast(rows_in), @intCast(n), eps, null);
+                            if (rc == cudart.cudaSuccess) return;
+                            self.ewLaunchFail("rmsnorm_rows", rc);
+                        }
+                    } else |_| {}
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.rmsnormRows(@ptrCast(&self.cpu), out, x, w, rows_in, eps);
+    }
+
     fn dL2norm_body(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
@@ -2153,6 +2180,26 @@ pub const CudaBackend = struct {
             } else return;
         }
         cpu_mod.CpuBackend.vtable.l2norm(@ptrCast(&self.cpu), x);
+    }
+
+    /// Row-batched `l2norm`: one launch, `rows = x.len / n` blocks, each
+    /// normalising its own `n`-element row with its own eps-inside-the-sum
+    /// reduction.  `k_l2norm` already strides by `blockIdx.x * n`, so this is
+    /// the same arithmetic as `x.len / n` single-row launches.
+    fn dL2normRows_body(ctx: *anyopaque, x: backend.Buf, n_in: usize) void {
+        const self = self_(ctx);
+        const n = n_in;
+        if (n != 0 and x.len % n == 0 and self.cu != null) {
+            if (dBufPtr(x)) |px| {
+                const rows: c_int = @intCast(x.len / n);
+                const rc = Launch.l2norm(px, rows, @intCast(n), 1e-6, null);
+                if (rc == cudart.cudaSuccess) return;
+                self.ewLaunchFail("l2norm_rows", rc);
+            } else return;
+        }
+        // No batching possible (unknown row width): the whole-slice reading is
+        // the single-row one, which is what `dL2norm_body` means.
+        cpu_mod.CpuBackend.vtable.l2normRows(@ptrCast(&self.cpu), x, n);
     }
 
     fn dSiluInPlace_body(ctx: *anyopaque, x: backend.Buf) void {
@@ -3153,12 +3200,30 @@ pub const CudaBackend = struct {
         dRmsnorm_body(ctx, out, x, w, eps);
     }
 
+    /// Row-batched twin of `dRmsnorm`.  Charged to the `rmsnorm` slot so the
+    /// `PROF-SLOT` total for rmsnorm stays comparable across the change (only
+    /// its `calls` count moves, which is the point of the merge).
+    fn dRmsnormRows(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, rows_in: usize, eps: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.rmsnorm, t0);
+        dRmsnormRows_body(ctx, out, x, w, rows_in, eps);
+    }
+
     /// `l2norm(slot)`, timed (`$QWEN35_PROF`).
     fn dL2norm(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.l2norm, t0);
         dL2norm_body(ctx, x);
+    }
+
+    /// Row-batched twin of `dL2norm`; charged to the `l2norm` slot.
+    fn dL2normRows(ctx: *anyopaque, x: backend.Buf, n: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.l2norm, t0);
+        dL2normRows_body(ctx, x, n);
     }
 
     /// The `siluInPlace` slot, timed (`$QWEN35_PROF`).
@@ -3300,8 +3365,10 @@ pub const vtable = backend.Exec.VTable{
     // libm), and a per-head 64-element call is not worth any divergence in the
     // token stream.  See `dRope64`'s comment.
     .rmsnorm = CudaBackend.dRmsnorm,
+    .rmsnormRows = CudaBackend.dRmsnormRows,
     .rope64 = CudaBackend.dRope64,
     .l2norm = CudaBackend.dL2norm,
+    .l2normRows = CudaBackend.dL2normRows,
     .siluInPlace = CudaBackend.dSiluInPlace,
     .mulSilu = CudaBackend.dMulSilu,
     .mulSigmoid = CudaBackend.dMulSigmoid,
