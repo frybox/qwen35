@@ -213,26 +213,57 @@ static float k32_q4_1_q8_0_avx2(int n, const void* vx, const void* vy) {
 
 /* ------------------------------------------------------------------ */
 /* iq4_nl x q8_0  block: 18 bytes = f16 d @0 + 16 x u8 @2             */
-/*   nibble indices into k32_iq4nl_tab[16]                          */
+/*   nibble indices into kvalues_iq4nl[16]                            */
 /* ------------------------------------------------------------------ */
 
+/* The 16 IQ4_NL values are an IRREGULAR table (-127,-104,-83,-65,-49,-35,
+ * -22,-10,1,13,25,38,53,69,89,113), so they cannot be reconstructed
+ * arithmetically from the nibble -- a lookup is unavoidable.  The scalar loop
+ * does 16 table lookups per 32-element block and writes the result to a stack
+ * array `xv[32]` that is then loaded straight back; that store-forwarding round
+ * trip plus 16 dependent loads is why IQ4_NL measured ~2.4x slower than IQ4_XS
+ * (3.45 vs 8.33 tok/s single-thread).
+ *
+ * `_mm256_shuffle_epi8` (vpshufb) does all 16 lookups in ONE instruction, but
+ * only within each 128-bit lane.  Both lanes get the same 16-byte table
+ * (`_mm256_broadcastsi128_si256`), so a single shuffle resolves the full 32
+ * nibbles -- this is exactly llama.cpp's `bytes_from_nibbles_32` +
+ * `mul_sum_us8_pairs_float` combination (ggml-cpu/arch/x86/quants.c:90 and
+ * :197).
+ *
+ * vpshufb semantics that matter here: the index is the low 4 bits of each byte
+ * and bit 7 forces a zero result.  Our indices are already 0..15, and no entry
+ * of kvalues_iq4nl is zero, so the LUT is exact with no masking needed.
+ *
+ * Layout check: the scalar path puts the LOW nibbles at xv[0..15] and the HIGH
+ * nibbles at xv[16..31].  `bytes_from_nibbles_32` builds
+ * { qb (masked) in low lane, qb>>4 (masked) in high lane } which is the same
+ * order, so the resulting y32 lines up element-for-element. */
 static float k32_iq4_nl_q8_0_avx2(int n, const void* vx, const void* vy) {
     const uint8_t* x = (const uint8_t*)vx;
     const uint8_t* y = (const uint8_t*)vy;
     const int nb = n / 32;
     float sumf = 0.0f;
+
+    /* both 128-bit lanes get the same 16-byte value table */
+    const __m256i lut = _mm256_broadcastsi128_si256(
+        _mm_loadu_si128((const __m128i*)kvalues_iq4nl));
+    const __m256i lowMask = _mm256_set1_epi8(0x0F);
+
     for (int ib = 0; ib < nb; ib++) {
         const uint8_t* xb = x + ib * 18;
         const uint8_t* yb = y + ib * 34;
         const float dx = k32_f16_to_f32((uint16_t)(xb[0] | ((uint32_t)xb[1] << 8)));
         const float dy = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
-        const uint8_t* qb = xb + 2;
-        int8_t xv[32];
-        for (int j = 0; j < 16; j++) {
-            xv[j] = (int8_t)k32_iq4nl_tab[qb[j] & 0x0F];
-            xv[16 + j] = (int8_t)k32_iq4nl_tab[qb[j] >> 4];
-        }
-        const __m256i x32 = _mm256_loadu_si256((const __m256i*)xv);
+
+        /* 16 packed nibble pairs -> 32 byte indices, low lane = low nibbles,
+         * high lane = high nibbles (no stack round trip). */
+        const __m128i tmp = _mm_loadu_si128((const __m128i*)(xb + 2));
+        const __m256i bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);
+        const __m256i idx = _mm256_and_si256(lowMask, bytes);
+
+        /* one vpshufb resolves all 32 weights */
+        const __m256i x32 = _mm256_shuffle_epi8(lut, idx);
         const __m256i y32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
         const int sumi = k32_dot32_i8_i8(x32, y32);
         sumf += dx * dy * (float)sumi;

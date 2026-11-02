@@ -39,7 +39,7 @@
 | UD-IQ2_XXS | 7.45 | **10.25** | **1.38×** | — | — | 48.56 | — |
 | UD-IQ3_XXS | 6.51 | **7.99** | 1.23× | — | — | 44.57 | — |
 | Q8_0 | 5.51 | 5.40 | 1.00× | 10.4 | **0.52** | 32.79 | 65.4 |
-| IQ4_NL | 3.45 | 3.67 | 1.06× | 10.3 | **0.36** | 30.74 | — |
+| **IQ4_NL** | 3.45 | **6.65** | **1.93×** | 10.3 | **0.65** | **42.28** | — |
 | BF16 | 1.56 | **2.65** | **1.70×** | 4.9 | **0.54** | **22.81** | 41.5 |
 
 **K-quants 三族（Q4_K/Q5_K/Q6_K）单线程已追平或超过 llama.cpp（1.01–1.22×）。**
@@ -48,8 +48,7 @@
 - **Q8_0 0.52** — kernel 已确认到带宽极限（§2.1 实测：把 every-block reduce 提出循环只有
   1% 差异），单线程 5.4 tok/s × 0.86 GB/token ≈ 4.6 GB/s 就是这颗核的单核带宽。
   要再快只能像 llama 那样换掉 VNNI 那套 per-block f16 scale 的写法，收益上限存疑。
-- **IQ4_NL 0.36** — §4 的 `_mm256_shuffle_epi8` 查表（llama 的
-  `bytes_from_nibbles_32`），k32 里现在是每块 16 次标量表查找 + 写栈数组。
+- ~~**IQ4_NL 0.36**~~ → **已修，0.65**（`_mm256_shuffle_epi8` 查表，见 §4.1）。
 - **BF16 0.54** — 已从 0.32 提上来（f32 dot SIMD 化 + pool 传递），但要追平 llama 还需
   把 bf16 保持原布局（现在 `loadLinear` 展开成 f32 常驻，多吃一倍内存和带宽）。
   `kernels_f32.c` 里的 `bf16_dot_f32` 已经写好但**还没接进 `loadLinear`**。
@@ -300,11 +299,70 @@ llama.cpp 是 6.3×（10.4 → 65.4）——**扩展性比 llama 还好，差的
 | 项 | 证据 | 改法 | 预期 |
 |---|---|---|---|
 | ~~Q8_0 的 VNNI 每块归约~~ **（已实测推翻，见下）** | 我最初以为把 `_mm512_reduce_add_epi32` 提出循环能拿 4.4×，**那是错的**：那个原型丢掉了 per-block 的 f16 scale 乘法，数学上不等价。用正确实现重测（`base` 6.5k 行/ms vs `batched16` 6.6k 行/ms，16 块批量归约 + 批量 scale）只有 **1%** 差异。原因：每个 block 的 `dx*dy` 是独立的标量，整数和**必须逐块归约**，无法在整数域合并 | **不改**。Q8_0 单线程 5.5 tok/s 已是带宽极限（0.86 GB/token × 5.5 = 4.8 GB/s）。proto 定量：`full` 5.9k / 省 f16 转换 9.3k / 再省 reduce 21.2k 行/ms——后两者都不可得，但它们说明**剩余开销在标量簿记上，只能靠"整块行 kernel + 常量折叠"摊薄**（即下面 §3） | 单线程不变 |
-| **IQ4_NL 慢 2.4×** | 单线程 3.45 vs 同尺寸 IQ4_XS 8.33。`kernels32.c:229-235` 每块做 16 次标量表查找 + 写栈数组 `xv[32]` | 用 `_mm256_shuffle_epi8` 一次查表 32 个值（llama.cpp 的 `bytes_from_nibbles_32`，quants.c:90）。这机器还有 `avx512_vbmi` 的 `_mm256_permutexvar_epi8`，查表更直接 | 3.45 → 8+ |
+| ~~**IQ4_NL 慢 2.4×**~~ ✅ | 单线程 3.45 vs 同尺寸 IQ4_XS 8.33。`kernels32.c:229-235` 每块做 16 次标量表查找 + 写栈数组 `xv[32]` | 已用 `_mm256_shuffle_epi8` 一次查表 32 个值（见 §4.1） | **3.45 → 6.65** |
 | **`kernels512.c` 只覆盖 Q8_0** | 106 行，只有 `q8_0_q8_0` | §1 的 AVX512-VNNI 扩容应放这里，别新开文件（build.zig 的 `KernelIsa.avx512` 已经配好） | — |
 | **IQ 族没有 AVX512** | `iq_kernels.c` 只有 `__attribute__((target("avx2")))` 和 `target("avx")` | IQ2_XXS/IQ3_XXS/IQ2_XS/IQ4_XS/IQ1_S 的 grid 查表在 VNNI 下可用 `_mm256_maskz_permutexvar_epi8`（VBMI）直接做 256 项查表，省掉两次 `_mm256_shuffle_epi8` + blend | +20~40% |
 | **`elementwise` 占 2.3%** | `bufGdnStep` 2.25% + `exp_f32` 1.24%（libm 的 exp 逐元素调用） | GDN 的 gate 用多项式近似 exp（llama.cpp 有 `ggml_v_silu`/`ggml_v_softplus` 的向量版），4 路 AVX2 | 小幅但免费 |
 | **Q8_K 量化在热点里** | `quantize_q8_K` 0.76%，每 token 每层跑一遍 | 现在逐元素 `roundf`（libm 调用）。改 `_mm256_cvtps_epi32`（`_MM_FROUND_TO_NEAREST_INT`），并且 amax 用 `_mm256_max_ps` 树归约 | 0.76% → 0.2% |
+
+### 4.1 IQ4_NL 查表 SIMD 化（已完成，2026-11）
+
+`src/kernels/x86/kernels32.c` 的 `k32_iq4_nl_q8_0_avx2` 原实现：
+
+```c
+int8_t xv[32];
+for (int j = 0; j < 16; j++) {
+    xv[j]      = (int8_t)k32_iq4nl_tab[qb[j] & 0x0F];   // 16 次依赖链查表
+    xv[16 + j] = (int8_t)k32_iq4nl_tab[qb[j] >> 4];
+}
+const __m256i x32 = _mm256_loadu_si256((const __m256i*)xv);  // 刚写就 load 回来
+```
+
+**为什么不能用算术替代查表**：`kvalues_iq4nl` 是
+`{-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113}` —— 步长不规则
+（17,21,18,16,14,13,12,11,12,12,13,15,16,20,24），所以必须查表。
+
+**改法**：一次 `vpshufb` 完成全部 32 个查表。
+
+```c
+const __m256i lut = _mm256_broadcastsi128_si256(_mm_loadu_si128((const __m128i*)kvalues_iq4nl));
+const __m128i tmp   = _mm_loadu_si128((const __m128i*)(xb + 2));
+const __m256i bytes = _mm256_set_m128i(_mm_srli_epi16(tmp, 4), tmp);  // 低 lane=低 nibble, 高 lane=高 nibble
+const __m256i idx   = _mm256_and_si256(_mm256_set1_epi8(0x0F), bytes);
+const __m256i x32   = _mm256_shuffle_epi8(lut, idx);                  // 一条指令，32 个值
+```
+
+三个必须说清的成立条件：
+
+1. **`vpshufb` 只在 128-bit lane 内查表**，所以表要 `broadcastsi128_si256` 到两个 lane。
+   16 项的表正好塞得进一个 lane，因此一次 shuffle 覆盖全部 32 个 nibble。
+2. **`vpshufb` 的索引取低 4 位、bit7 置位则输出 0**。我们的索引已经是 `idx & 0x0F`，
+   且 `kvalues_iq4nl` 里**没有 0**，所以 LUT 完全精确，无需额外屏蔽。
+3. **布局对齐**：scalar 路径把低 nibble 放 `xv[0..15]`、高 nibble 放 `xv[16..31]`；
+   `_mm256_set_m128i(_mm_srli_epi16(tmp,4), tmp)` 得到的正是"低 lane = 低 nibble、
+   高 lane = 高 nibble"，与 `xv` 的顺序一致，所以 `x32` 与 `y32` 逐元素对齐。
+
+同时删掉了 `xv[32]` 栈数组（连同那次 store-forwarding 往返）。表数据仍然只有一份：
+用的是 `iq_tables.h` 里已经 `extern` 的 `kvalues_iq4nl[16]`（`src/iq_tables.zig` 的
+`pub export`，带 `align(64)`），**没有新增第二份表**。
+
+**对拍**：`make test` 里 `iq4_nl_q8_0/c = 0`（逐位精确）、`IQ4_NL: max_err = 0`、
+`kern32 testdata-vs-rowDot` 用真实 `IQ4_NL.bin` 行也算过。
+**已验证测试有敏感性**：把 shuffle 的索引 XOR 1 注入扰动后立刻报 `e = 0.747`、
+3 个用例失败（exit 1），说明上表 16 个 nibble 槽位的逐项校验真的在跑。
+
+**结果**：
+
+| | 改前 | 改后（3 次中位数） | 倍数 | llama.cpp | 比值 |
+|---|---|---|---|---|---|
+| t=1 | 3.67 | **6.65** | **1.81×** | 10.3 | 0.36 → **0.65** |
+| t=16 | 30.74 | **42.28** | **1.38×** | — | — |
+
+`--threads 1` 与 `--threads 16` 的输出逐字节一致。
+
+比 §4 预测的"3.45 → 8+"低一些：`vpshufb` 本身省下的是一大块，
+但剩下的 `k32_dot32_i8_i8`（两次 `cvtepi8_epi16` + `madd_epi16`）现在成了主项，
+要再快得走 AVX512-VNNI 的 `_mm256_dpbusd_epi32`。
 
 ---
 
@@ -319,16 +377,15 @@ llama.cpp 是 6.3×（10.4 → 65.4）——**扩展性比 llama 还好，差的
 3. ❌ **实测无收益，不做** — 线程池常驻自旋。`post` 最多值 14%，自旋要么更慢（31 个 worker
    抢核），要么与基线在噪声内。每行函数调用开销也只占 0.26%。见 §3.1。
 4. ⬜ **待做** — **AVX512-VNNI 扩容**（§1 第 2 步 + §4 的 IQ-VBMI）。
-5. ⬜ **待做** — 小项（IQ4_NL 查表、Q8_K 量化、bf16 原布局）。
+5. ✅ **IQ4_NL 查表已做**（§4.1，3.67 → 6.65）；⬜ 待做 — Q8_K 量化、bf16 原布局。
 
 ### 下一步的优先级（依据 §0.1 实测的剩余差距）
 
 按"当前对 llama.cpp 的比值"从低到高排，也就是收益最大的先做：
 
-1. **IQ4_NL（0.36）** — §4 第 1 条，`_mm256_shuffle_epi8` 查表替代 16 次标量查表。
-   改动小（~30 行），单一格式，收益明确。
+1. ✅ **已完成 — IQ4_NL**（0.36 → 0.65），见 §4.1。
 2. **BF16（0.54）** — §2 第 3 条，`loadLinear` 保留 bf16 原布局 + 接上已经写好的
-   `bf16_dot_f32`。能同时砍掉一半内存和带宽。
+   `bf16_dot_f32`。能同时砍掉一半内存和带宽。**现在这是最大的一块。**
 3. **Q8_0（0.52）** — §2.2 已证明现有 kernel 到带宽极限，要再快需要换算法
    （不再 per-block 存 f16 scale），收益上限不明，**优先级最低**。
 4. **AVX512-VNNI 版** — 若还要再进一步。注意 Q6_K 是 signed×signed，要先 `+32` 偏置，
