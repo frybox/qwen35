@@ -515,6 +515,10 @@ const RopePath = enum { host, device };
 // `describe`/`name` return slices with no allocator in scope (same pattern as
 // the CPU backend, which reports through `std.debug.print`).
 var msg_buf: [512]u8 = undefined;
+/// One `dAllocBuf` region: the cudaMalloc base and its length in f32 elements.
+/// `isDevBuf` needs both to recognise a `span()`ed view of our own memory.
+const DevRegion = struct { ptr: *anyopaque, len: usize };
+
 pub const CudaBackend = struct {
     alloc: std.mem.Allocator,
     /// Metadata/geometry authority (see the file comment).  Never used for
@@ -740,7 +744,14 @@ pub const CudaBackend = struct {
     /// GDN state).  The `Buf` values themselves are the engine's; this list is
     /// only so `freeScratch` / `deinit` can release them, since a `Buf` carries
     /// no ownership flag.
-    dev_bufs: std.ArrayList(*anyopaque) = .empty,
+    /// Allocations from `dAllocBuf`, as (base, element count).  The count is not
+    /// decoration: `isDevBuf` has to answer for Bufs the engine built with
+    /// `span()`, whose pointer is base + offset and therefore never equals the
+    /// base.  Comparing pointers alone made every strided device view look like
+    /// host memory, which silently sent device-to-device copies through the CPU
+    /// host bounce (correct answers, ~2.5 s of needless PCIe on a 355-token
+    /// prefill).
+    dev_bufs: std.ArrayList(DevRegion) = .empty,
     /// Resident copies of the read-only per-layer weights the new elementwise
     /// slots consume (`rmsnorm`'s gamma, `convStep`'s conv1d kernel).  Their
     /// host buffers (`lw.attn_norm`, `lw.ssm_conv1d`, ...) are model metadata
@@ -821,7 +832,7 @@ pub const CudaBackend = struct {
             if (self.d_out) |p| _ = cu.lib.Free(p);
             if (self.d_deq) |p| _ = cu.lib.Free(p);
             if (self.d_gdn_cb) |p| _ = cu.lib.Free(p);
-            for (self.dev_bufs.items) |p| _ = cu.lib.Free(p);
+            for (self.dev_bufs.items) |r| _ = cu.lib.Free(r.ptr);
             self.dev_bufs.clearRetainingCapacity();
             for (self.dev_const.items) |e| _ = cu.lib.Free(e.dev);
             self.dev_const.clearRetainingCapacity();
@@ -1814,7 +1825,7 @@ pub const CudaBackend = struct {
         // A `Buf` is a `[]f32`-shaped view; the pointer is reused as-is, which
         // is what every slot then casts back to a device pointer.
         const slice: []f32 = @as([*]f32, @ptrCast(@alignCast(p.?)))[0..len];
-        self.dev_bufs.append(self.alloc, p.?) catch {
+        self.dev_bufs.append(self.alloc, .{ .ptr = p.?, .len = len }) catch {
             _ = cu.lib.Free(p.?);
             return error.OutOfMemory;
         };
@@ -1831,7 +1842,7 @@ pub const CudaBackend = struct {
     fn dFreeScratch(ctx: *anyopaque) void {
         const self = self_(ctx);
         const cu = if (self.cu) |*c| c else return;
-        for (self.dev_bufs.items) |p| _ = cu.lib.Free(p);
+        for (self.dev_bufs.items) |r| _ = cu.lib.Free(r.ptr);
         self.dev_bufs.clearRetainingCapacity();
         if (self.d_act) |p| _ = cu.lib.Free(p);
         if (self.d_xq) |p| _ = cu.lib.Free(p);
@@ -2028,9 +2039,14 @@ pub const CudaBackend = struct {
     /// embedding table is f32 (the Q6_K one is quantized and goes through
     /// `dequantRow`, which is why it passed first).
     fn isDevBuf(self: *CudaBackend, b: backend.Buf) bool {
-        const p: *const anyopaque = @ptrCast(b.ptr);
-        for (self.dev_bufs.items) |d| {
-            if (d == p) return true;
+        const lo: usize = @intFromPtr(b.ptr);
+        const hi: usize = lo + b.len * @sizeOf(f32);
+        for (self.dev_bufs.items) |r| {
+            const rlo: usize = @intFromPtr(r.ptr);
+            const rhi: usize = rlo + r.len * @sizeOf(f32);
+            // Containment, not equality: `Buf.span` advances the pointer, so a
+            // strided view of our own allocation is still ours.
+            if (lo >= rlo and hi <= rhi) return true;
         }
         return false;
     }
