@@ -1468,33 +1468,51 @@ pub const CudaBackend = struct {
                     d_out = @ptrCast(@alignCast(self.d_out.?));
                 }
 
-                // Quantize token j into block group j.  The quantizers take a
-                // contiguous f32 span plus a block count, so pointing them at
-                // `base_act + j*cols` and `d_xq + j*per_tok` produces exactly that.
+                // Quantize ALL k tokens in ONE launch.
+                //
+                // The k activation rows are contiguous in `base_act` (k*cols
+                // f32) and the destination slots are contiguous in `d_xq`
+                // (k*per_tok bytes, `per_tok == nb_tok * actBlockBytes`), so
+                // the whole batch is one run of `k * nb_tok` blocks with the
+                // SAME stride the quantizers already use -- no per-token offset
+                // arithmetic on either side.  Both device quantizers
+                // (q35_k_quantize_q8_K in mmvq.cu, q35_k_quantize_q8_0 in
+                // convert.cu) are one-thread-per-block with `blockIdx`-derived
+                // indices and read nothing outside `[0, nblocks)`, so this is
+                // bit-exact vs. the old one-launch-per-token loop.
                 const base_xq: [*]u8 = @ptrCast(self.d_xq.?);
                 const q8_0_act = actBlockElems(q.ttype) == gguf.blockElems(.q8_0);
                 const kern = Launch;
-                for (0..k) |j| {
-                    const xq_slot: ?*anyopaque = @ptrCast(base_xq + j * per_tok);
-                    const rc = if (q8_0_act)
-                        kern.quantize_q8_0(base_act + j * cols, xq_slot, @intCast(nb_tok), null)
-                    else
-                        kern.quantize_q8_k(base_act + j * cols, xq_slot, @intCast(nb_tok), null);
-                    if (rc != cudart.cudaSuccess) {
-                        std.debug.print("cuda backend: batchK quantize({s}) tok {d} failed: {s}\n", .{
-                            @tagName(q.ttype), j, std.mem.span(cu.lib.errStr(rc)),
-                        });
-                        self.clearDevBuf(outBuf);
-                        return;
-                    }
-                    // Diagnostics only: one launch per token, so this loop is
-                    // the reason a K-token call costs K+1 launches (see the
-                    // `bk_launch` field on the `CUDA-M` line).
-                    self.stat_n_launch_bk += 1;
+                // `k >= 2` on this path (engine.forwardChunk routes k == 1 to
+                // the serial forward) and `cols >= 1` with cols a multiple of
+                // actBlockElems, so `total_blocks >= 2`: the merged count can
+                // never be 0 and can never be smaller than the per-token one.
+                const total_blocks = nb_tok * k;
+                std.debug.assert(k >= 2 and nb_tok >= 1);
+                const rc = if (q8_0_act)
+                    kern.quantize_q8_0(base_act, @ptrCast(base_xq), @intCast(total_blocks), null)
+                else
+                    kern.quantize_q8_k(base_act, @ptrCast(base_xq), @intCast(total_blocks), null);
+                if (rc != cudart.cudaSuccess) {
+                    // No single token index to blame any more: report the whole
+                    // quantize that failed (all k rows, nb_tok blocks each).
+                    std.debug.print("cuda backend: batchK quantize({s}) failed for k={d} tok x nblocks={d} (total {d} blocks): {s}\n", .{
+                        @tagName(q.ttype), k, nb_tok, total_blocks, std.mem.span(cu.lib.errStr(rc)),
+                    });
+                    self.clearDevBuf(outBuf);
+                    return;
                 }
+                // Diagnostics only.  This used to be +1 per token (K per call);
+                // it is now +1 for the merged quantize, so one matvecBatchK call
+                // costs 2 launches (quantize + mul_mat_vec) -- see the
+                // `bk_launch` field on the `CUDA-M` line.
+                self.stat_n_launch_bk += 1;
 
                 const kern_mm = Launch;
-                const rc = kern_mm.mul_mat_vec(
+                // New binding (shadowing the quantize's `rc` above): the old
+                // per-token loop scoped that one to the loop body, so merging
+                // it out would otherwise redeclare `rc` in this block.
+                const rc_mm = kern_mm.mul_mat_vec(
                     e.dev,
                     self.d_xq,
                     d_out,
@@ -1504,9 +1522,9 @@ pub const CudaBackend = struct {
                     @intCast(@backingInt(q.ttype)),
                     null,
                 );
-                if (rc != cudart.cudaSuccess) {
+                if (rc_mm != cudart.cudaSuccess) {
                     std.debug.print("cuda backend: mul_mat_vec({s}, K={d}) launch failed: {s}\n", .{
-                        @tagName(q.ttype), k, std.mem.span(cu.lib.errStr(rc)),
+                        @tagName(q.ttype), k, std.mem.span(cu.lib.errStr(rc_mm)),
                     });
                     self.clearDevBuf(outBuf);
                     return;
@@ -1516,7 +1534,8 @@ pub const CudaBackend = struct {
                 self.stat_by_type[@backingInt(q.ttype)] += 1;
                 self.stat_ns_by_type[@backingInt(q.ttype)] += durNs(t0, self.io);
                 self.stat_n_batchk += 1;
-                // The matmul itself: makes the per-call launch count k+1.
+                // The matmul itself: with the merged quantize above this makes
+                // the per-call launch count 2, independent of k.
                 self.stat_n_launch_bk += 1;
                 // `$QWEN35_PROF`: GPU-side time of what this call just issued
                 // (quantize TK + mul_mat_vec).  The drain is inside `evElapsedNs`.
