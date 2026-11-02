@@ -362,6 +362,103 @@ fn durNs(t0: Io.Clock.Timestamp, io: Io) u64 {
     return if (d > 0) @intCast(@min(d, std.math.maxInt(u64))) else 0;
 }
 
+// ---- per-slot profiling ($QWEN35_PROF only) --------------------------------
+
+/// The `backend.Exec` slots, one entry each, plus the two weight/scratch slots
+/// that are not part of the per-token budget but are worth seeing (they are
+/// the load-time and allocation costs).
+///
+/// Order is the report order, so keep the hot entries first when re-reading a
+/// `PROF-SLOT` dump; `reportSlotStats` sorts by total anyway.
+pub const Slot = enum(u8) {
+    matvec,
+    matvec_batchk,
+    dequant_row,
+    load_linear,
+    rmsnorm,
+    rope64,
+    l2norm,
+    attn_decode,
+    gdn_gamma,
+    gdn_step,
+    conv_step,
+    silu,
+    mul_silu,
+    mul_sigmoid,
+    softmax,
+    swiglu,
+    scale_vec,
+    add_resid,
+    copy_range,
+    zero_buf,
+    copy_from_host,
+    copy_to_host,
+    argmax,
+    sample,
+    alloc_buf,
+    alloc_scratch,
+    alloc_scratch_k,
+    const_buf,
+};
+
+/// Number of `Slot` entries; sizes `stat_ns_slot` / `stat_n_slot`.
+///
+/// Spelled out rather than derived from `@typeInfo`: Zig 0.17 reworked
+/// `@typeInfo`, and `slotName`'s exhaustive `switch` already makes a forgotten
+/// enum member a compile error, so this only has to stay in sync by being one
+/// past the last enumerator (`const_buf`).
+const slot_count = @intFromEnum(Slot.const_buf) + 1;
+
+/// Human-readable slot names for the `PROF-SLOT` line.  Indexed by
+/// `@intFromEnum`, so a `comptime`-checked length ties them to the enum.
+fn slotName(s: Slot) []const u8 {
+    return switch (s) {
+        .matvec => "matvec",
+        .matvec_batchk => "mv_batchk",
+        .dequant_row => "dequant_row",
+        .load_linear => "load_linear",
+        .rmsnorm => "rmsnorm",
+        .rope64 => "rope64",
+        .l2norm => "l2norm",
+        .attn_decode => "attn_decode",
+        .gdn_gamma => "gdn_gamma",
+        .gdn_step => "gdn_step",
+        .conv_step => "conv_step",
+        .silu => "silu",
+        .mul_silu => "mul_silu",
+        .mul_sigmoid => "mul_sigmoid",
+        .softmax => "softmax",
+        .swiglu => "swiglu",
+        .scale_vec => "scale_vec",
+        .add_resid => "add_resid",
+        .copy_range => "copy_range",
+        .zero_buf => "zero_buf",
+        .copy_from_host => "copy_from_host",
+        .copy_to_host => "copy_to_host",
+        .argmax => "argmax",
+        .sample => "sample",
+        .alloc_buf => "alloc_buf",
+        .alloc_scratch => "alloc_scratch",
+        .alloc_scratch_k => "alloc_scratch_k",
+        .const_buf => "const_buf",
+    };
+}
+
+/// True for the slots whose forwarder drains the stream, so the recorded host
+/// interval really contains device execution.  Everything else records
+/// submission cost only (see the note on `stat_ns_slot`).
+fn slotSyncs(s: Slot) bool {
+    return switch (s) {
+        // `downloadOut` after the launch: a blocking `cudaMemcpy` D2H.
+        .matvec, .matvec_batchk, .dequant_row => true,
+        // Reads an index / floats back to the host.
+        .argmax, .copy_to_host, .sample => true,
+        // Host-side bookkeeping, no device work to attribute.
+        .load_linear, .const_buf, .alloc_buf, .alloc_scratch, .alloc_scratch_k => false,
+        else => false,
+    };
+}
+
 /// One device copy of a host weight.  `ttype` is null for the f32 expansion
 /// (which has no quant type); `rows`/`cols` are stored because an f32 slice
 /// carries no geometry of its own and both matvec paths need the launch shape.
@@ -565,6 +662,40 @@ pub const CudaBackend = struct {
     /// small: an event read drains the queue, so every timed call waits for its
     /// own kernels before returning.
     stat_ns_ev_sync: u64 = 0,
+
+    // ---- per-slot host wall clock ($QWEN35_PROF only) ----------------------
+    //
+    // `t_mv_ms` / `t_bk_ms` / `t_dq_ms` only cover the three slots that had a
+    // counter.  Everything else the engine calls through `backend.Exec`
+    // (rmsnorm, rope64, attention, the GDN state updates, the elementwise
+    // kernels, lm_head, argmax) was invisible, so the prefill budget could not
+    // be closed: wall minus (matvec + batchk + dequant) left ~2/3 of the
+    // window unaccounted for.
+    //
+    // Every forwarder below now wraps its body in `slotEnter`/`slotExit`, which
+    // are `QWEN35_PROF`-gated (a bool test when off, so the plain path is
+    // unchanged).  These are HOST wall-clock intervals around the forwarder
+    // call, which is exactly what the prefill window is measured in -- so the
+    // slots and `stat_ns_prefill_wall` are directly comparable.
+    //
+    // Caveat, important when reading the table: the CUDA forwarders launch on
+    // the default stream and do NOT drain it.  For those slots the interval
+    // measures *submission* (python-side dispatch cost plus the memcpys and any
+    // implicit sync), not device execution; the GPU time they queued shows up
+    // instead inside whichever later slot drains the stream.  Slots whose
+    // forwarder does synchronize -- `argmax`, `copyToHost`, and the batchK /
+    // matvec paths that call `downloadOut` -- DO include their GPU time.  The
+    // per-slot line marks the draining slots; see `slotSyncs`.
+    stat_ns_slot: [slot_count]u64 = @splat(0),
+    stat_n_slot: [slot_count]u32 = @splat(0),
+    /// Set while a timed slot is open, so `slotExit` can be paired.  Not
+    /// re-entrant by design: the forwarders do not call each other except via
+    /// explicit `CpuBackend.vtable.*` calls, which bypass the timers.
+    slot_depth: u32 = 0,
+    /// Wall clock spent inside timed slots, all slots summed (`QWEN35_PROF`
+    /// only).  `pre_wall_ms - slot_total_ms` is what the engine itself spent
+    /// outside any `Exec` call.
+    stat_ns_slot_total: u64 = 0,
 
     // ---- reusable device buffers -------------------------------------------
     //
@@ -871,7 +1002,7 @@ pub const CudaBackend = struct {
     /// support; it already reports missing/unknown tensors with the `LoadError` the
     /// engine expects.  This function adds exactly one decision: does the tensor
     /// fit on the device, and if not, say so loudly.
-    fn vLoadLinear(ctx: *anyopaque, name: []const u8) backend.LoadError!backend.LinearW {
+    fn vLoadLinear_body(ctx: *anyopaque, name: []const u8) backend.LoadError!backend.LinearW {
         const self = self_(ctx);
         const w = try self.cpu.exec().loadLinear(name);
         errdefer self.cpu.exec().freeLinear(w);
@@ -1003,7 +1134,7 @@ pub const CudaBackend = struct {
     ///
     /// The engine calls this once per row (token embedding, lm_head), so it is a
     /// latency path rather than a throughput one.
-    fn vDequantRow(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+    fn vDequantRow_body(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: dequantRow: {s}\n", .{self.needHelp()});
@@ -1087,7 +1218,7 @@ pub const CudaBackend = struct {
     /// when a caller genuinely hands over a host slice (`dBufPtr` null).
     /// `ttype` only chooses the activation format and quantizer -- never a
     /// backend, and never a CPU branch.
-    fn vMatvec(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+    fn vMatvec_body(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvec: {s}\n", .{self.needHelp()});
@@ -1356,7 +1487,7 @@ pub const CudaBackend = struct {
     /// in one `cudaMemcpy`, quantized as `K` consecutive block groups in one buffer
     /// (`d_xq`, group `j` at `j * actBytes(ttype, cols)`), then a single launch
     /// computes `K*rows` outputs and one download returns them.
-    fn vMatvecBatchK(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+    fn vMatvecBatchK_body(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
         if (!self.gpuReady()) {
             std.debug.print("cuda backend: matvecBatchK: {s}\n", .{self.needHelp()});
@@ -1564,7 +1695,7 @@ pub const CudaBackend = struct {
     /// error: `init()` cannot report one (the factory contract is
     /// `init(alloc, g) -> Backend`), and quietly running the whole model on the CPU
     /// after `--backend cuda` would be a lie.
-    fn dAllocScratch(ctx: *anyopaque, max_cols: usize) anyerror!void {
+    fn dAllocScratch_body(ctx: *anyopaque, max_cols: usize) anyerror!void {
         const self = self_(ctx);
         if (!self.gpuReady()) return error.BackendUnavailable;
         try self.uploadIqTables();
@@ -1579,7 +1710,7 @@ pub const CudaBackend = struct {
 
     /// K-token variant: the same buffers scaled by `k`.  `d_out`/`d_xq` dominate, so
     /// a wide prefill chunk shows up in the `CUDA-M` buffer total.
-    fn dAllocScratchK(ctx: *anyopaque, max_cols: usize, k: usize) anyerror!void {
+    fn dAllocScratchK_body(ctx: *anyopaque, max_cols: usize, k: usize) anyerror!void {
         const self = self_(ctx);
         if (!self.gpuReady()) return error.BackendUnavailable;
         try self.uploadIqTables();
@@ -1644,7 +1775,7 @@ pub const CudaBackend = struct {
     /// Failure is a hard error, not a fallback: the engine's caller has no
     /// hybrid path any more (device memory is where the data must live), so a
     /// failed `cudaMalloc` has to surface as a load/allocation failure.
-    fn dAllocBuf(ctx: *anyopaque, len: usize) anyerror!backend.Buf {
+    fn dAllocBuf_body(ctx: *anyopaque, len: usize) anyerror!backend.Buf {
         const self = self_(ctx);
         if (len == 0) return backend.Buf.empty;
         const cu = if (self.cu) |*c| c else {
@@ -1803,7 +1934,7 @@ pub const CudaBackend = struct {
     // error through the `Exec` signature, and panicking the process would be a
     // worse outcome than a slow correct answer.
 
-    fn dScaleVec(ctx: *anyopaque, x: backend.Buf, s: f32) void {
+    fn dScaleVec_body(ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -1815,7 +1946,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.scaleVec(@ptrCast(&self.cpu), x, s);
     }
 
-    fn dAddResid(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dAddResid_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         // Equal lengths are the engine's contract (`elementwise.bufAddResid`
         // zips the two slices).  A mismatch is an engine bug, so refuse to guess
@@ -1860,7 +1991,7 @@ pub const CudaBackend = struct {
         return false;
     }
 
-    fn dCopyRange(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+    fn dCopyRange_body(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
         const self = self_(ctx);
         // Same contract as `addResid`: `elementwise.bufCopyRange` is a plain
         // `@memcpy`, which requires equal lengths.  Mismatch = engine bug ->
@@ -1890,7 +2021,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.copyRange(@ptrCast(&self.cpu), dst, src);
     }
 
-    fn dZeroBuf(ctx: *anyopaque, buf: backend.Buf) void {
+    fn dZeroBuf_body(ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(buf)) |p| {
@@ -1917,7 +2048,7 @@ pub const CudaBackend = struct {
     //
     // Everything else in this file is device-to-device.
 
-    fn dCopyFromHost(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+    fn dCopyFromHost_body(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
         const self = self_(ctx);
         if (self.cu != null and src.len != 0 and src.len <= dst.len) {
             if (dBufPtr(dst)) |pd| {
@@ -1949,7 +2080,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.copyFromHost(@ptrCast(&self.cpu), dst, src);
     }
 
-    fn dCopyToHost(ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+    fn dCopyToHost_body(ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
         const self = self_(ctx);
         std.debug.assert(dst.len <= src.len);
         if (self.cu != null) {
@@ -1987,7 +2118,7 @@ pub const CudaBackend = struct {
     //     a per-layer constant re-passed on every token, so it is NOT a device
     //     `Buf` -- `devConst` keeps it resident, and a cache hit costs nothing.
 
-    fn dRmsnorm(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+    fn dRmsnorm_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
         // The CPU reference asserts out.len == x.len == w.len (one row).  The
         // kernel supports several rows (w reused per row) for the shape the
@@ -2010,7 +2141,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.rmsnorm(@ptrCast(&self.cpu), out, x, w, eps);
     }
 
-    fn dL2norm(ctx: *anyopaque, x: backend.Buf) void {
+    fn dL2norm_body(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -2024,7 +2155,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.l2norm(@ptrCast(&self.cpu), x);
     }
 
-    fn dSiluInPlace(ctx: *anyopaque, x: backend.Buf) void {
+    fn dSiluInPlace_body(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -2036,7 +2167,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.siluInPlace(@ptrCast(&self.cpu), x);
     }
 
-    fn dMulSilu(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSilu_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSilu length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
@@ -2055,7 +2186,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.mulSilu(@ptrCast(&self.cpu), out, gate);
     }
 
-    fn dMulSigmoid(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+    fn dMulSigmoid_body(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
         const self = self_(ctx);
         if (gate.len != out.len) {
             std.debug.print("cuda backend: mulSigmoid length mismatch (out={d} gate={d}); using the CPU path\n", .{ out.len, gate.len });
@@ -2074,7 +2205,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.mulSigmoid(@ptrCast(&self.cpu), out, gate);
     }
 
-    fn dSwiglu(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+    fn dSwiglu_body(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
         const self = self_(ctx);
         if (up.len != gate.len) {
             std.debug.print("cuda backend: swiglu length mismatch (gate={d} up={d}); using the CPU path\n", .{ gate.len, up.len });
@@ -2093,7 +2224,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.swiglu(@ptrCast(&self.cpu), gate, up);
     }
 
-    fn dSoftmax(ctx: *anyopaque, x: backend.Buf) void {
+    fn dSoftmax_body(ctx: *anyopaque, x: backend.Buf) void {
         const self = self_(ctx);
         if (self.cu != null) {
             if (dBufPtr(x)) |px| {
@@ -2114,7 +2245,7 @@ pub const CudaBackend = struct {
     // (temperature, top-k/p, RNG) whose reference implementation must not be
     // duplicated, and it needs the whole distribution.
 
-    fn dArgmax(ctx: *anyopaque, logits: backend.Buf) u32 {
+    fn dArgmax_body(ctx: *anyopaque, logits: backend.Buf) u32 {
         const self = self_(ctx);
         if (self.cu != null and logits.len != 0) {
             if (dBufPtr(logits)) |px| {
@@ -2160,7 +2291,7 @@ pub const CudaBackend = struct {
         return sp.sample(host_logits, host_scratch);
     }
 
-    fn dSample(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+    fn dSample_body(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
         const self = self_(ctx);
         // Greedy fast path: `Sampler.sample` with temperature <= 0 is a pure
         // argmax (sampler.zig:73), so it needs no distribution -- run it on the
@@ -2194,7 +2325,7 @@ pub const CudaBackend = struct {
     // attn.cu): accumulation order follows the CPU reference element by
     // element, and neither is bit-exact (FMA contraction on the device side).
 
-    fn dGdnStep(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+    fn dGdnStep_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
                 q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
                 gamma: f32, beta: f32, vd: usize) void {
         const self = self_(ctx);
@@ -2226,7 +2357,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.gdnStep(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
-    fn dGdnGamma(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+    fn dGdnGamma_body(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
         // Every operand here except `ssm_a`/`dt_bias` is a live backend region.
@@ -2257,7 +2388,7 @@ pub const CudaBackend = struct {
         cpu_mod.CpuBackend.vtable.gdnGamma(@ptrCast(&self.cpu), a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
-    fn dAttnDecode(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+    fn dAttnDecode_body(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         const self = self_(ctx);
@@ -2328,7 +2459,7 @@ pub const CudaBackend = struct {
     //
     // If this ever goes zero-copy by default, the fix is to accept the drift
     // deliberately (with the measured number), NOT to rewrite the reference.
-    fn dRope64(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+    fn dRope64_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         const max_head: usize = 256;
         var host: [max_head]f32 = undefined;
@@ -2364,7 +2495,7 @@ pub const CudaBackend = struct {
         self.stat_rope_trips += 1;
     }
 
-    fn dConvStep(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+    fn dConvStep_body(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
         // `conv` is the GDN sliding window and is BOTH read and written (the
         // kernel shifts it in place); `y` likewise (read as the 4th tap, then
@@ -2463,6 +2594,33 @@ pub const CudaBackend = struct {
     /// default-path sync on a build where PROF is off.
     fn gpuTimingOn(self: *const CudaBackend) bool {
         return self.ev_on and self.cu != null;
+    }
+
+    /// Start timing one `backend.Exec` slot; returns the clock origin to hand
+    /// to `slotExit`, or null when profiling is off (the returned value is then
+    /// never used, so the hot path is one predictable branch and no clock read).
+    ///
+    /// Nesting is tracked by `slot_depth` only so `slot_total` does not
+    /// double-count if a forwarder ever calls another forwarder; today the
+    /// forwarders call `CpuBackend.vtable.*` directly, which bypasses these.
+    inline fn slotEnter(self: *CudaBackend) ?Io.Clock.Timestamp {
+        if (!self.ev_on) return null;
+        self.slot_depth += 1;
+        return Io.Clock.Timestamp.now(self.io, .awake);
+    }
+
+    /// Close a slot opened by `slotEnter` and add the interval to its counter.
+    /// `t0 == null` (profiling off) is a no-op.
+    inline fn slotExit(self: *CudaBackend, s: Slot, t0: ?Io.Clock.Timestamp) void {
+        const start = t0 orelse return;
+        const ns = durNs(start, self.io);
+        const i = @intFromEnum(s);
+        self.stat_ns_slot[i] += ns;
+        self.stat_n_slot[i] += 1;
+        // Only the outermost interval counts toward the window total, so the
+        // "accounted" number stays comparable with `stat_ns_prefill_wall`.
+        self.slot_depth -= 1;
+        if (self.slot_depth == 0) self.stat_ns_slot_total += ns;
     }
 
     /// Milliseconds between two recorded events, waiting for the second.  The
@@ -2686,6 +2844,82 @@ pub const CudaBackend = struct {
             }) catch break).len;
         }
         std.debug.print("{s}\n", .{tline[0..tn]});
+
+        self.reportSlotStats();
+    }
+
+    /// `PROF-SLOT`: one line per `backend.Exec` slot, largest total first, plus
+    /// the reconciliation against the prefill window.
+    ///
+    /// `slot_sum_ms` adds the host wall clock of every timed slot call,
+    /// `unaccounted_ms = pre_wall_ms - slot_sum_ms` is the prefill loop itself
+    /// (engine arithmetic, the sampler, the batchK chunk scheduler, the token
+    /// loop bookkeeping), i.e. exactly the part that never crosses the `Exec`
+    /// vtable.  A large unaccounted number means a *path*, not a slot, is still
+    /// missing from the table.
+    ///
+    /// Fields per line: `name calls total_ms pct sync`.  `sync=1` marks the
+    /// slots whose forwarder drains the stream, so their ms include device
+    /// execution; `sync=0` slots measure submission only and their queued GPU
+    /// work surfaces inside the later draining slot (or in `bk_gpu_ms` for the
+    /// batchK path).  That is the one caveat needed to read the table as
+    /// "where did the wall clock go": submission time is real host time and is
+    /// never double-counted, but it is not the same question as GPU busy time.
+    fn reportSlotStats(self: *CudaBackend) void {
+        if (self.cu == null) return;
+        // Sort indices by total, descending.  N=28, so an insertion sort into a
+        // fixed array beats anything fancier and allocates nothing.
+        var order: [slot_count]u8 = undefined;
+        var n: usize = 0;
+        for (0..slot_count) |i| {
+            if (self.stat_n_slot[i] == 0) continue;
+            order[n] = @intCast(i);
+            n += 1;
+        }
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const cur = order[i];
+            const cur_ns = self.stat_ns_slot[cur];
+            var j: usize = i;
+            while (j > 0 and self.stat_ns_slot[order[j - 1]] < cur_ns) : (j -= 1) {
+                order[j] = order[j - 1];
+            }
+            order[j] = cur;
+        }
+
+        const wall_ns = self.stat_ns_prefill_wall;
+        const sum_ns = self.stat_ns_slot_total;
+        std.debug.print(
+            "PROF-SLOT window_ms={d} slot_sum_ms={d} unaccounted_ms={d} accounted_pct={d}.{d}% slots={d} note=\"sync=0 slots are launch-only; their GPU time is counted by the draining slot\"\n",
+            .{
+                wall_ns / 1_000_000,
+                sum_ns / 1_000_000,
+                (wall_ns -| sum_ns) / 1_000_000,
+                // Fraction of the prefill window covered by timed slots.  Shown
+                // as a percentage so a reader does not have to divide two ms
+                // numbers, and so a *regression* in coverage (a new engine path
+                // that skips the vtable) shows up as a falling number here.
+                if (wall_ns == 0) 0 else (sum_ns * 1000 / wall_ns) / 10,
+                if (wall_ns == 0) 0 else (sum_ns * 1000 / wall_ns) % 10,
+                n,
+            },
+        );
+        for (order[0..n]) |idx| {
+            const s: Slot = @enumFromInt(idx);
+            const ns = self.stat_ns_slot[idx];
+            const pct: u64 = if (sum_ns == 0) 0 else ns * 1000 / sum_ns;
+            std.debug.print(
+                "PROF-SLOT {s:<15} calls={d:<7} total_ms={d:<6} pct={d}.{d}% sync={d}\n",
+                .{
+                    slotName(s),
+                    self.stat_n_slot[idx],
+                    ns / 1_000_000,
+                    pct / 10,
+                    pct % 10,
+                    @intFromBool(slotSyncs(s)),
+                },
+            );
+        }
     }
 
     fn vName(ctx: *anyopaque) []const u8 {
@@ -2773,6 +3007,11 @@ pub const CudaBackend = struct {
         self.stat_n_ev_err = 0;
         self.stat_n_launch_bk = 0;
         self.stat_ns_ev_sync = 0;
+        // Per-slot timers (QWEN35_PROF only; the counters stay zero when off).
+        self.stat_ns_slot = @splat(0);
+        self.stat_n_slot = @splat(0);
+        self.stat_ns_slot_total = 0;
+        self.slot_depth = 0;
         if (cudart.getenv("QWEN35_PROF") != null) {
             self.ev_on = self.cu != null;
             if (self.ev_on) self.openPrefillWindow();
@@ -2787,6 +3026,242 @@ pub const CudaBackend = struct {
         self.cpu.exec().reportProfile();
         self.reportStats("report");
     }
+// ==== slot timing wrappers ($QWEN35_PROF only) ==============================
+//
+// One thin forwarder per `backend.Exec` slot.  Each one opens a clock, calls
+// the unmodified `*_body` implementation, and closes the clock on the way out
+// (`defer` covers the early-return and error paths inside the bodies, which is
+// why the bodies keep their own `return` statements untouched).
+//
+// Why wrap instead of instrumenting in place: the bodies have several
+// `return`/`catch return` exits each; adding a `slotExit` at every one of them
+// is where a profiling patch starts lying.  A wrapper cannot miss an exit.
+//
+// With `$QWEN35_PROF` unset, `slotEnter` returns null after one predictable
+// branch and `slotExit` returns immediately, so the plain path costs a call
+// and a not-taken branch -- no clock read, no counter write.
+
+    /// The `loadLinear` slot, timed (`$QWEN35_PROF`).
+    fn vLoadLinear(ctx: *anyopaque, name: []const u8) backend.LoadError!backend.LinearW {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.load_linear, t0);
+        return vLoadLinear_body(ctx, name);
+    }
+
+    /// The `dequantRow` slot, timed (`$QWEN35_PROF`).
+    fn vDequantRow(ctx: *anyopaque, dstBuf: backend.Buf, w: gguf.QuantRow, row: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.dequant_row, t0);
+        vDequantRow_body(ctx, dstBuf, w, row);
+    }
+
+    /// The `matvec` slot, timed (`$QWEN35_PROF`).
+    fn vMatvec(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.matvec, t0);
+        vMatvec_body(ctx, outBuf, w, xBuf);
+    }
+
+    /// The `matvecBatchK` slot, timed (`$QWEN35_PROF`).
+    fn vMatvecBatchK(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.matvec_batchk, t0);
+        vMatvecBatchK_body(ctx, outBuf, w, xKBuf, k);
+    }
+
+    /// The `allocScratch` slot, timed (`$QWEN35_PROF`).
+    fn dAllocScratch(ctx: *anyopaque, max_cols: usize) anyerror!void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.alloc_scratch, t0);
+        return dAllocScratch_body(ctx, max_cols);
+    }
+
+    /// The `allocScratchK` slot, timed (`$QWEN35_PROF`).
+    fn dAllocScratchK(ctx: *anyopaque, max_cols: usize, k: usize) anyerror!void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.alloc_scratch_k, t0);
+        return dAllocScratchK_body(ctx, max_cols, k);
+    }
+
+    /// The `allocBuf` slot, timed (`$QWEN35_PROF`).
+    fn dAllocBuf(ctx: *anyopaque, len: usize) anyerror!backend.Buf {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.alloc_buf, t0);
+        return dAllocBuf_body(ctx, len);
+    }
+
+    /// The `scaleVec` slot, timed (`$QWEN35_PROF`).
+    fn dScaleVec(ctx: *anyopaque, x: backend.Buf, s: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.scale_vec, t0);
+        dScaleVec_body(ctx, x, s);
+    }
+
+    /// The `addResid` slot, timed (`$QWEN35_PROF`).
+    fn dAddResid(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.add_resid, t0);
+        dAddResid_body(ctx, dst, src);
+    }
+
+    /// The `copyRange` slot, timed (`$QWEN35_PROF`).
+    fn dCopyRange(ctx: *anyopaque, dst: backend.Buf, src: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.copy_range, t0);
+        dCopyRange_body(ctx, dst, src);
+    }
+
+    /// The `zeroBuf` slot, timed (`$QWEN35_PROF`).
+    fn dZeroBuf(ctx: *anyopaque, buf: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.zero_buf, t0);
+        dZeroBuf_body(ctx, buf);
+    }
+
+    /// The `copyFromHost` slot, timed (`$QWEN35_PROF`).
+    fn dCopyFromHost(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.copy_from_host, t0);
+        dCopyFromHost_body(ctx, dst, src);
+    }
+
+    /// The `copyToHost` slot, timed (`$QWEN35_PROF`).
+    fn dCopyToHost(ctx: *anyopaque, dst: []f32, src: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.copy_to_host, t0);
+        dCopyToHost_body(ctx, dst, src);
+    }
+
+    /// The `rmsnorm` slot, timed (`$QWEN35_PROF`).
+    fn dRmsnorm(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.rmsnorm, t0);
+        dRmsnorm_body(ctx, out, x, w, eps);
+    }
+
+    /// `l2norm(slot)`, timed (`$QWEN35_PROF`).
+    fn dL2norm(ctx: *anyopaque, x: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.l2norm, t0);
+        dL2norm_body(ctx, x);
+    }
+
+    /// The `siluInPlace` slot, timed (`$QWEN35_PROF`).
+    fn dSiluInPlace(ctx: *anyopaque, x: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.silu, t0);
+        dSiluInPlace_body(ctx, x);
+    }
+
+    /// The `mulSilu` slot, timed (`$QWEN35_PROF`).
+    fn dMulSilu(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.mul_silu, t0);
+        dMulSilu_body(ctx, out, gate);
+    }
+
+    /// The `mulSigmoid` slot, timed (`$QWEN35_PROF`).
+    fn dMulSigmoid(ctx: *anyopaque, out: backend.Buf, gate: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.mul_sigmoid, t0);
+        dMulSigmoid_body(ctx, out, gate);
+    }
+
+    /// The `swiglu` slot, timed (`$QWEN35_PROF`).
+    fn dSwiglu(ctx: *anyopaque, gate: backend.Buf, up: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.swiglu, t0);
+        dSwiglu_body(ctx, gate, up);
+    }
+
+    /// The `softmax` slot, timed (`$QWEN35_PROF`).
+    fn dSoftmax(ctx: *anyopaque, x: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.softmax, t0);
+        dSoftmax_body(ctx, x);
+    }
+
+    /// The `argmax` slot, timed (`$QWEN35_PROF`).
+    fn dArgmax(ctx: *anyopaque, logits: backend.Buf) u32 {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.argmax, t0);
+        return dArgmax_body(ctx, logits);
+    }
+
+    /// The `sample` slot, timed (`$QWEN35_PROF`).
+    fn dSample(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.sample, t0);
+        return dSample_body(ctx, logits, scratch, sp);
+    }
+
+    /// The `gdnStep` slot, timed (`$QWEN35_PROF`).
+    fn dGdnStep(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                gamma: f32, beta: f32, vd: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.gdn_step, t0);
+        dGdnStep_body(ctx, state, k, v, q, km, delta, out, gamma, beta, vd);
+    }
+
+    /// The `gdnGamma` slot, timed (`$QWEN35_PROF`).
+    fn dGdnGamma(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
+                 dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.gdn_gamma, t0);
+        dGdnGamma_body(ctx, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
+    }
+
+    /// The `attnDecode` slot, timed (`$QWEN35_PROF`).
+    fn dAttnDecode(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+                   vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
+                   heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.attn_decode, t0);
+        dAttnDecode_body(ctx, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
+    }
+
+    /// `rope64(slot)`, timed (`$QWEN35_PROF`).
+    fn dRope64(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.rope64, t0);
+        dRope64_body(ctx, x, pos, base);
+    }
+
+    /// The `convStep` slot, timed (`$QWEN35_PROF`).
+    fn dConvStep(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.conv_step, t0);
+        dConvStep_body(ctx, conv, y, wconv, k);
+    }
+
 };
 
 // ==== the Exec vtable ========================================================
