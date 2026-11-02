@@ -232,7 +232,20 @@ fn runInference(
         for (res.tokens) |id| try out.print(" {d}", .{id});
         try out.print("\n", .{});
     }
-    if (qwen35.engine.prof) { qwen35.engine.profReport(); qwen35.backend_cpu.profReportMatvec(); }
+    // `$QWEN35_PROF`: ask the backend for its *complete* report now that the run
+    // is over.  Before this call the CUDA backend's `CUDA-M  types:`/`time:` and
+    // its `PROF-SLOT`/`PROF-COPY` tables only appeared at internal trigger points
+    // (`% 500` matvecs, the closing of the prefill window) or in `deinit`, which
+    // the arena-allocated engine never reaches -- so a run that stopped on EOS
+    // between two trigger points, or any f32/BF16 run (whose matvec branch never
+    // calls `reportStats`), printed a header with no tables.  Goes through
+    // `Engine`, not the device module, so `engine.zig` keeps importing no
+    // hardware backend (AGENTS.md §1.1).
+    if (qwen35.engine.prof) {
+        e.profBackendReport();
+        qwen35.engine.profReport();
+        qwen35.backend_cpu.profReportMatvec();
+    }
     try out.flush();
 }
 

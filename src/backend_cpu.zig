@@ -759,6 +759,14 @@ pub const CpuBackend = struct {
         profReportMatvec();
     }
 
+    /// `Exec.profReport`: the CPU backend's complete one-shot dump is its
+    /// per-(ttype, rows) matvec table, which `reportProfile` already prints
+    /// (the pool's `PROF-P` line is emitted by the engine/pool itself).
+    fn vProfReport(ctx: *anyopaque) void {
+        _ = ctx;
+        profReportMatvec();
+    }
+
     // ---- elementwise / state slots ------------------------------------------
     //
     // The CPU `Buf` is a host slice, so each target is the engine's historical
@@ -991,6 +999,7 @@ pub const CpuBackend = struct {
         .describe = vDescribe,
         .setTier = vSetTier,
         .reportProfile = vReportProfile,
+        .profReport = vProfReport,
     };
 };
 

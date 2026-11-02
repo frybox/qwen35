@@ -321,6 +321,18 @@ pub const Exec = struct {
         // ---- profiling ------------------------------------------------------
         /// Matvec-domain counters, printed at shutdown when profiling is on.
         reportProfile: *const fn (ctx: *anyopaque) void,
+        /// One-shot *complete* profile dump, called by `Engine.profBackendReport`
+        /// at a caller-chosen point (the CLI calls it right after `generate`
+        /// returns, gated on `$QWEN35_PROF`).
+        ///
+        /// Separate from `reportProfile` because that one is the host pool's
+        /// table and is also what a device backend's `deinit` would print; the
+        /// engine is arena-allocated, so `deinit` never runs on the CLI path and
+        /// a device backend's per-type / `PROF-SLOT` / `PROF-COPY` tables would
+        /// otherwise only appear at an internal trigger point (`% 500` matvecs,
+        /// or the closing of the prefill window) -- which a long EOS-less decode
+        /// never reaches, leaving the run with a single header line.
+        profReport: *const fn (ctx: *anyopaque) void,
     };
 
     // Convenience forwarding.  Kept trivial on purpose: these are called on
@@ -466,6 +478,11 @@ pub const Exec = struct {
     }
     pub fn reportProfile(self: Exec) void {
         self.vtable.reportProfile(self.ptr);
+    }
+    /// Print the complete profile report once.  Callers gate this on their own
+    /// debug switch; the vtable slot itself is unconditional.
+    pub fn profReport(self: Exec) void {
+        self.vtable.profReport(self.ptr);
     }
 };
 

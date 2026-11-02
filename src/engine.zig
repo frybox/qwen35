@@ -1918,6 +1918,23 @@ pub const Engine = struct {
             .hit_context_limit = hit_context_limit,
         };
     }
+
+    /// Ask the backend to print its **complete** profile report once (per-type
+    /// matvec counters, `PROF-SLOT`, `PROF-COPY`; see
+    /// `backend.Exec.profReport`).
+    ///
+    /// A one-line pass-through on purpose: `engine.zig` must not know which
+    /// hardware backend is in use (AGENTS.md §1.1 -- it imports no kernel or
+    /// device module), so the caller (`main.zig`) hands the decision to the
+    /// backend through the `Exec` vtable instead.  Callers gate this on their
+    /// own debug switch; a CPU backend prints only its matvec table.
+    ///
+    /// Call it after `generate` returns: that is the only point where the run
+    /// is over and the counters are final (the engine is arena-allocated, so
+    /// `deinit` is not reached on the CLI path).
+    pub fn profBackendReport(self: *Engine) void {
+        self.exec.profReport();
+    }
 };
 
 // ---------------------------------------------------------------------------
