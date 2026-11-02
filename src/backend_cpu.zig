@@ -844,6 +844,39 @@ pub const CpuBackend = struct {
         ew.bufGdnStep(state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
+    /// Batched `gdnStep`: the `heads` single-row calls, in order, on the same
+    /// per-head views.  This IS the reference for the device kernel -- the
+    /// arithmetic is `bufGdnStep`'s unchanged, so a bit-identical result to the
+    /// engine's old `for (0..nv) exec.gdnStep(...)` loop is the acceptance test,
+    /// not a hope.
+    ///
+    /// The kv-head mapping `kh = h % nk` lives here because it is the loop's
+    /// semantics, not a batching detail: on this model nv (48) > nk (16), so
+    /// each k/q row is visited 3 times and `gdnStep` reads `q`/`k` but never
+    /// writes them, making the repetition a plain re-read.  (Contrast
+    /// `l2norm`, which the engine must apply once per repeat because it is not
+    /// idempotent.)
+    fn vGdnStepRows(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+                    gamma: []const f32, beta: []const f32, heads: usize, nk: usize, kd: usize, vd: usize) void {
+        _ = ctx;
+        if (heads == 0 or vd == 0 or nk == 0) return;
+        for (0..heads) |h| {
+            const kh = h % nk;
+            ew.bufGdnStep(
+                state.span(h * kd * vd, kd * vd),
+                k.span(kh * kd, kd),
+                v.span(h * vd, vd),
+                q.span(kh * kd, kd),
+                km.span(h * vd, vd),
+                delta.span(h * vd, vd),
+                out.span(h * vd, vd),
+                gamma[h],
+                beta[h],
+                vd,
+            );
+        }
+    }
+
     fn vAttnDecode(ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
                    gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
                    kv_dim: usize, scale: f32) void {
@@ -922,6 +955,7 @@ pub const CpuBackend = struct {
         .swiglu = vSwiglu,
         .convStep = vConvStep,
         .gdnStep = vGdnStep,
+        .gdnStepRows = vGdnStepRows,
         .constBuf = vConstBuf,
         .allocBuf = vAllocBuf,
         .attnDecode = vAttnDecode,

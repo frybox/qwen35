@@ -174,6 +174,31 @@ int q35_launch_rope64(float *d_x, int heads, int hd, int pos, float base,
                       void *stream);
 
 // --- Gated Delta Net state machine -----------------------------------------
+// All `heads` value heads of one delta-rule state update in ONE launch
+// (`heads` blocks; block h is the call above for head h).
+//
+// NOTE: q35_launch_gdn_step_rows() below is the batched form.  Both exist: the
+// engine uses the batched one, the single-row one is kept for fallback/A-B.
+//
+// Strided bases, all in elements.  Head h touches
+//   d_state + h*state_stride   (kd*vd floats, updated in place)
+//   d_k / d_q  + (h % nk)*k_stride / q_stride   (kd floats)
+//   d_v / d_out / d_km / d_delta + h*v_stride   (vd floats)
+// and scalars d_gamma[h], d_beta[h].  d_km / d_delta are PER-HEAD scratch and
+// be `heads*vd` long: the blocks run concurrently, so a shared vd-float buffer
+// would be a silent race (not a crash).  The engine sizes them.
+// Returns cudaErrorInvalidValue unless vd == kd == 128 and heads > 0.
+int q35_launch_gdn_step_rows(float *d_state, int state_stride,
+                             const float *d_k, int k_stride,
+                             const float *d_v, int v_stride,
+                             const float *d_q, int q_stride,
+                             float *d_km, float *d_delta,
+                             float *d_out,
+                             const float *d_gamma,
+                             const float *d_beta,
+                             int heads, int nk, int kd, int vd,
+                             void *stream);
+
 // One token of the delta-rule state update, one launch per value head.
 // d_state is the [kd, vd] slice for THIS head (row-major S[k][v], kd*vd floats),
 // updated in place; d_k/d_q are kd, d_v/d_km/d_delta/d_out are vd.  See

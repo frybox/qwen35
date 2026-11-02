@@ -598,8 +598,8 @@ pub const Engine = struct {
     mlp_h: backend.Buf, // n_ff
     mlp_h1: backend.Buf, // n_ff
     logits: backend.Buf,
-    delta: backend.Buf, // 128 per-head scratch
-    kv_mem: backend.Buf, // 128
+    delta: backend.Buf, // gdn_n_heads * 128: PER-HEAD scratch for gdnStepRows
+    kv_mem: backend.Buf, // gdn_n_heads * 128: per-head, same reason
     /// Per-layer GDN decay scalars (`gdnGamma`'s output), `gdn_n_heads` long.
     /// A backend region because `gdnGamma` runs on the backend under a device
     /// backend; the forward path reads it back with `Exec.copyToHost` because
@@ -1055,8 +1055,11 @@ pub const Engine = struct {
         e.mlp_h = try e.exec.allocBuf(cfg.n_ff);
         e.mlp_h1 = try e.exec.allocBuf(cfg.n_ff);
         e.logits = try e.exec.allocBuf(cfg.vocab);
-        e.delta = try e.exec.allocBuf(gdn_kd);
-        e.kv_mem = try e.exec.allocBuf(gdn_kd);
+        // `nv` slices of `vd` each, NOT one shared `vd` buffer: `gdnStepRows`
+        // gives every head its own block, and `heads` blocks writing one shared
+        // km/delta slice would be a silent race (wrong tokens, no crash).
+        e.delta = try e.exec.allocBuf(gdn_nv * gdn_kd);
+        e.kv_mem = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.gamma_scratch = try e.exec.allocBuf(@as(usize, cfg.gdn_n_heads));
         e.sample_scratch = try e.exec.allocBuf(cfg.vocab);
 
@@ -1447,31 +1450,51 @@ pub const Engine = struct {
                 self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
             }
         }
-        for (0..nv) |h| {
-            // GGUF v slots are in "tiled" order (converter _reorder_v_heads):
-            // slot h <-> HF v head (h%nk)*nvp + h/nk, whose k head is h%nk.
-            const kh = h % nk;
-            const q_h = qkv.span(kh * kd, kd);
-            const k_h = qkv.span(kq_dim + kh * kd, kd);
-            const v_h = qkv.span(2 * kq_dim + h * kd, kd);
-            const sh = state.span(h * kd * vd, kd * vd);
-
-            // Fallback for a layout the batched pass above cannot express
-            // (`nv` not a multiple of `nk`): the per-head form this function has
-            // always used.
-            if (!gdnHeadsTiled(nv, nk)) {
+        // Fallback for a layout the batched passes above/below cannot express
+        // (`nv` not a multiple of `nk`): the per-head form this function has
+        // always used.  On this model nv/nk == 3, so this is dead code kept for
+        // shapes the kernel does not model.
+        if (!gdnHeadsTiled(nv, nk)) {
+            for (0..nv) |h| {
+                const kh = h % nk;
+                const q_h = qkv.span(kh * kd, kd);
+                const k_h = qkv.span(kq_dim + kh * kd, kd);
                 self.exec.l2norm(q_h);
                 self.exec.l2norm(k_h);
                 const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
                 self.exec.scaleVec(q_h, qscale);
             }
-
-            // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q
-            // in a second pass (see gdnFused).
-            const km = self.kv_mem.span(0, vd);
-            const out_h = gout.span(h * vd, vd);
-            self.exec.gdnStep(sh, k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma_host[h], beta_host[h], vd);
         }
+
+        // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q in a
+        // second pass (see gdnFused) -- for all `nv` heads in ONE backend call.
+        //
+        // This was a per-head `exec.gdnStep` loop: 48 launches per token per GDN
+        // layer, which the PROFILE put at ~15% of slot time.  `gdnStepRows` runs
+        // the identical per-head computation with block h on the device (the
+        // CPU backend keeps the loop, as the oracle), so the tokens do not
+        // move.
+        //
+        // The kv-head mapping `kh = h % nk` (GGUF v slots are in "tiled" order,
+        // converter `_reorder_v_heads`: slot h <-> HF v head (h%nk)*nvp + h/nk)
+        // now lives in the slot -- see `VTable.gdnStepRows`.  `km`/`delta` are
+        // per-head slices of `nv*vd` scratch: with one shared `vd` buffer the
+        // 48 blocks would race silently.
+        self.exec.gdnStepRows(
+            state,
+            qkv.span(kq_dim, kq_dim),
+            qkv.span(2 * kq_dim, value_dim),
+            qkv.span(0, kq_dim),
+            self.kv_mem,
+            self.delta,
+            gout,
+            gamma_host[0..nv],
+            beta_host[0..nv],
+            nv,
+            nk,
+            kd,
+            vd,
+        );
 
         // gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6).
         //
@@ -1637,24 +1660,40 @@ pub const Engine = struct {
                 self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
             }
         }
-        for (0..nv) |h| {
-            const kh = h % nk;
-            const q_h = qkv.span(kh * kd, kd);
-            const k_h = qkv.span(kq_dim + kh * kd, kd);
-            const v_h = qkv.span(2 * kq_dim + h * kd, kd);
-            const sh = state.span(h * kd * vd, kd * vd);
-
-            if (!gdnHeadsTiled(nv, nk)) {
+        // Per-head l2norm/scale fallback for a non-tiled layout: see the same
+        // branch in `forwardGdn` (dead code for nv/nk == 3, kept for the general
+        // shape).  Keeping it as its own loop is what lets the `gdnStepRows`
+        // call below stay byte-for-byte the batched loop of `forwardGdn`.
+        if (!gdnHeadsTiled(nv, nk)) {
+            for (0..nv) |h| {
+                const kh = h % nk;
+                const q_h = qkv.span(kh * kd, kd);
+                const k_h = qkv.span(kq_dim + kh * kd, kd);
                 self.exec.l2norm(q_h);
                 self.exec.l2norm(k_h);
                 const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
                 self.exec.scaleVec(q_h, qscale);
             }
-
-            const km = self.kv_mem.span(0, vd);
-            const out_h = gout.span(h * vd, vd);
-            self.exec.gdnStep(sh, k_h, v_h, q_h, km, self.delta.span(0, vd), out_h, gamma_host[h], beta_host[h], vd);
         }
+
+        // All `nv` heads in one backend call -- this is the 355-token prefill
+        // path, so the 48 launches/token this replaces are the ones profile
+        // shows.  Same arguments and same reasoning as `forwardGdn`'s call.
+        self.exec.gdnStepRows(
+            state,
+            qkv.span(kq_dim, kq_dim),
+            qkv.span(2 * kq_dim, value_dim),
+            qkv.span(0, kq_dim),
+            self.kv_mem,
+            self.delta,
+            gout,
+            gamma_host[0..nv],
+            beta_host[0..nv],
+            nv,
+            nk,
+            kd,
+            vd,
+        );
 
         // Gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6).
         //

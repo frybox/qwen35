@@ -97,6 +97,69 @@ __global__ void q35_gdn_step_kernel(
     d_out[j] = out;
 }
 
+// Batched form: one block per value head, same one-thread-per-column mapping
+// and the SAME accumulation statements as `q35_gdn_step_kernel` above (the
+// __fmul_rn/__fadd_rn pinning is repeated verbatim, not factored behind a
+// helper, so that a diff of the two bodies stays a line-by-line read).
+//
+// Every operand is a strided base: head h reads
+//   d_state + h*state_stride, d_v/d_km/d_delta/d_out + h*vd,
+//   d_k/d_q at kv head (h % nk) * kd, and its own gamma[h] / beta[h].
+// Rows do not overlap (`state_stride` is kd*vd per head; each block only ever
+// touches its own head's state block and its own vd-wide scratch slice), so
+// `heads` blocks in parallel are race-free -- which is exactly why km/delta had
+// to stop being single shared vd-float buffers (heads blocks writing one slice
+// would be a silent wrong answer, not a crash).
+__global__ void q35_gdn_step_rows_kernel(
+    float *__restrict__ d_state, int state_stride,
+    const float *__restrict__ d_k, int k_stride,
+    const float *__restrict__ d_v, int v_stride,
+    const float *__restrict__ d_q, int q_stride,
+    float *__restrict__ d_km, float *__restrict__ d_delta,
+    float *__restrict__ d_out,
+    const float *__restrict__ d_gamma, const float *__restrict__ d_beta,
+    int nk, int kd, int vd)
+{
+    const int h = blockIdx.x;
+    const int j = threadIdx.x;
+    if (j >= vd) return;
+
+    const int kh = h % nk;
+    const float gamma = d_gamma[h];
+    const float beta = d_beta[h];
+    const float *__restrict__ k_h = d_k + (size_t)kh * k_stride;
+    const float *__restrict__ q_h = d_q + (size_t)kh * q_stride;
+    const float *__restrict__ v_h = d_v + (size_t)h * v_stride;
+    float *__restrict__ state = d_state + (size_t)h * state_stride;
+    float *__restrict__ km_p = d_km + (size_t)h * vd;
+    float *__restrict__ delta_p = d_delta + (size_t)h * vd;
+    float *__restrict__ out_p = d_out + (size_t)h * vd;
+
+    // Pass 1: read-only sweep.  Same intrinsics, same order as the single-row
+    // kernel (see the contract at the top of this file).
+    float acc = 0.0f;
+    for (int i = 0; i < kd; ++i) {
+        const float s = state[(size_t)i * vd + j];
+        acc = __fadd_rn(acc, __fmul_rn(s, k_h[i]));
+    }
+    const float km = __fmul_rn(acc, gamma);
+    km_p[j] = km;
+
+    // delta = beta * (v - km)
+    const float delta = __fmul_rn(__fsub_rn(v_h[j], km), beta);
+    delta_p[j] = delta;
+
+    // Pass 2: rewrite the column, accumulate S^T q in the same i order.
+    float out = 0.0f;
+    for (int i = 0; i < kd; ++i) {
+        const size_t idx = (size_t)i * vd + j;
+        const float r = __fadd_rn(__fmul_rn(state[idx], gamma), __fmul_rn(k_h[i], delta));
+        state[idx] = r;
+        out = __fadd_rn(out, __fmul_rn(r, q_h[i]));
+    }
+    out_p[j] = out;
+}
+
 // beta = sigmoid(b) in place; gamma = exp(A * softplus(a + dt_bias)).
 //
 // Mirrors elementwise.zig `gdnGammaKernel`, including softplus's branch:
@@ -139,6 +202,32 @@ extern "C" int q35_launch_gdn_step(float *d_state, const float *d_k,
     }
     q35_gdn_step_kernel<<<1, Q35_GDN_THREADS, 0, (cudaStream_t)stream>>>(
         d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int q35_launch_gdn_step_rows(float *d_state, int state_stride,
+                                        const float *d_k, int k_stride,
+                                        const float *d_v, int v_stride,
+                                        const float *d_q, int q_stride,
+                                        float *d_km, float *d_delta,
+                                        float *d_out,
+                                        const float *d_gamma,
+                                        const float *d_beta,
+                                        int heads, int nk, int kd, int vd,
+                                        void *stream)
+{
+    // Same shape gate as the single-row launcher: the kernel is written for the
+    // 128-wide fast path only.  A zero/negative head count launches nothing
+    // (the empty batch is not an error).
+    if (heads <= 0) return (int)cudaSuccess;
+    if (vd != 128 || kd != 128) return cudaErrorInvalidValue;
+    if (nk <= 0) return cudaErrorInvalidValue;
+    // The kv-head index the kernel computes must land inside the caller's row
+    // array; nk > heads would make `h % nk` a head the caller never addressed.
+    if (nk > heads) return cudaErrorInvalidValue;
+    q35_gdn_step_rows_kernel<<<heads, Q35_GDN_THREADS, 0, (cudaStream_t)stream>>>(
+        d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride,
+        d_km, d_delta, d_out, d_gamma, d_beta, nk, kd, vd);
     return (int)cudaGetLastError();
 }
 

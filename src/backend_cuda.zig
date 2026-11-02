@@ -134,6 +134,7 @@ const Kernels = struct {
     // P2c: the two state machines.  One launch per value head for gdn_step,
     // one launch (block per head) for attn_decode; see the kernel headers.
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
@@ -207,6 +208,7 @@ const Launch = if (cuda_linked) struct {
     const argmax = Kernels.q35_launch_argmax;
     const attn_decode = Kernels.q35_launch_attn_decode;
     const gdn_step = Kernels.q35_launch_gdn_step;
+    const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
     const rope64 = Kernels.q35_launch_rope64;
 } else struct {
@@ -302,6 +304,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream };
         return stubNoCudaKernels();
     }
     fn gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -719,6 +725,17 @@ pub const CudaBackend = struct {
     /// per-token download the greedy path makes: 4 bytes.
     d_idx: ?*anyopaque = null,
     d_idx_bytes: usize = 0,
+    /// Per-head `gamma`/`beta` for `gdnStepRows`, laid out as 2*heads floats.
+    /// These are NOT `devConst` candidates even though they arrive as host
+    /// arrays: the arrays are the engine's stack buffers (`gamma_host` /
+    /// `beta_host` in `forwardGdnCore`), so the pointer is stable across calls
+    /// while the CONTENTS change every token.  `devConst` caches by pointer
+    /// identity and never re-uploads, which would silently feed layer 0's
+    /// coefficients to all 64 layers -- exactly the failure this scratch
+    /// exists to prevent.  Re-uploading 384 B per call is the cheap, correct
+    /// thing.
+    d_gdn_cb: ?*anyopaque = null,
+    d_gdn_cb_bytes: usize = 0,
     /// Every region `dAllocBuf` handed to the engine (activations, KV cache,
     /// GDN state).  The `Buf` values themselves are the engine's; this list is
     /// only so `freeScratch` / `deinit` can release them, since a `Buf` carries
@@ -803,6 +820,7 @@ pub const CudaBackend = struct {
             if (self.d_xq) |p| _ = cu.lib.Free(p);
             if (self.d_out) |p| _ = cu.lib.Free(p);
             if (self.d_deq) |p| _ = cu.lib.Free(p);
+            if (self.d_gdn_cb) |p| _ = cu.lib.Free(p);
             for (self.dev_bufs.items) |p| _ = cu.lib.Free(p);
             self.dev_bufs.clearRetainingCapacity();
             for (self.dev_const.items) |e| _ = cu.lib.Free(e.dev);
@@ -811,6 +829,8 @@ pub const CudaBackend = struct {
             self.d_xq = null;
             self.d_out = null;
             self.d_deq = null;
+            self.d_gdn_cb = null;
+            self.d_gdn_cb_bytes = 0;
             // The codebook buffer is process-wide (it lives in the linked-in
             // iq_tables.cu, not in this struct), so release it here and reset the
             // flag: that re-arms the one-shot upload for any backend created
@@ -1881,6 +1901,30 @@ pub const CudaBackend = struct {
         @memset(buf.slice(), 0);
     }
 
+    /// Upload `gamma` and `beta` into the dedicated per-call scratch and return
+    /// the two device pointers.  Re-uploaded on EVERY call on purpose: these
+    /// arrive as the engine's stack arrays, so their address is stable while
+    /// their contents are per-token -- a `devConst` (pointer-keyed, upload-once)
+    /// buffer would serve the first call's coefficients forever.
+    ///
+    /// Returns null if the upload fails; the caller then falls through to the
+    /// CPU per-head loop, so a device hiccup costs correctness nothing.
+    fn uploadGdnGammaBeta(self: *CudaBackend, gamma: []const f32, beta: []const f32, heads: usize) ?struct { gamma: [*]const f32, beta: [*]const f32 } {
+        if (heads == 0 or gamma.len < heads or beta.len < heads) return null;
+        const cu = if (self.cu) |*c| c else return null;
+        const bytes = 2 * heads * @sizeOf(f32);
+        ensureBuf(&cu.lib, &self.d_gdn_cb, &self.d_gdn_cb_bytes, bytes) catch return null;
+        const base: [*]u8 = @ptrCast(self.d_gdn_cb.?);
+        const gb = heads * @sizeOf(f32);
+        if (cu.lib.Memcpy(base, @ptrCast(gamma.ptr), gb, cudart.MemcpyHostToDevice) != cudart.cudaSuccess) return null;
+        if (cu.lib.Memcpy(base + gb, @ptrCast(beta.ptr), gb, cudart.MemcpyHostToDevice) != cudart.cudaSuccess) return null;
+        self.stat_h2d_bytes += bytes;
+        return .{
+            .gamma = @ptrCast(@alignCast(base)),
+            .beta = @ptrCast(@alignCast(base + gb)),
+        };
+    }
+
     /// Failure text for a launch that returned a cudaError_t.
     fn ewLaunchFail(self: *CudaBackend, what: []const u8, rc: c_int) void {
         const cu = self.cu orelse return;
@@ -2402,6 +2446,72 @@ pub const CudaBackend = struct {
             } else return;
         }
         cpu_mod.CpuBackend.vtable.gdnStep(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, vd);
+    }
+
+    /// Batched `dGdnStep_body`: one launch for all `heads`, otherwise the same
+    /// per-head call.  Shaped like `dRmsnormRows_body` / `dL2normRows_body`:
+    /// check every precondition, launch, and on launch failure log once and
+    /// fall through to the CPU reference -- which for this slot is the per-head
+    /// loop, so a fallback costs `heads` host calls, never a wrong answer.
+    ///
+    /// The precondition set is the batch's geometry, not a heuristic: the
+    /// per-head views the kernel computes must lie inside the buffers the
+    /// caller handed us (a head whose slice overruns would read a neighbouring
+    /// head's state, which is silent garbage rather than a fault).
+    fn dGdnStepRows_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                         q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                         gamma: []const f32, beta: []const f32,
+                         heads: usize, nk: usize, kd: usize, vd: usize) void {
+        const self = self_(ctx);
+        if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and
+            gamma.len >= heads and beta.len >= heads and
+            state.len >= heads * kd * vd and k.len >= nk * kd and q.len >= nk * kd and
+            v.len >= heads * vd and out.len >= heads * vd and
+            km.len >= heads * vd and delta.len >= heads * vd and
+            self.cu != null)
+        {
+            if (dBufPtr(state)) |pstate| {
+                if (dBufPtr(k)) |pk| {
+                    if (dBufPtr(v)) |pv| {
+                        if (dBufPtr(q)) |pq| {
+                            if (dBufPtr(km)) |pkm| {
+                                if (dBufPtr(delta)) |pdelta| {
+                                    if (dBufPtr(out)) |pout| {
+                                        // gamma/beta are host arrays whose
+                                        // CONTENTS change every call, so they
+                                        // must NOT go through `devConst`:
+                                        // that caches by pointer identity and
+                                        // never re-uploads, so the engine's
+                                        // stable-by-address stack arrays
+                                        // (`gamma_host`/`beta_host`) would be
+                                        // uploaded once and then silently
+                                        // reused for every later layer/token.
+                                        // A plain H2D into dedicated scratch
+                                        // on every call is correct, and 384 B
+                                        // is far below the launch cost.
+                                        if (self.uploadGdnGammaBeta(gamma, beta, heads)) |cb| {
+                                            const rc = Launch.gdn_step_rows(
+                                                pstate, @intCast(kd * vd),
+                                                pk, @intCast(kd),
+                                                pv, @intCast(vd),
+                                                pq, @intCast(kd),
+                                                pkm, pdelta, pout,
+                                                cb.gamma, cb.beta,
+                                                @intCast(heads), @intCast(nk),
+                                                @intCast(kd), @intCast(vd), null,
+                                            );
+                                            if (rc == cudart.cudaSuccess) return;
+                                            self.ewLaunchFail("gdn_step_rows", rc);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cpu_mod.CpuBackend.vtable.gdnStepRows(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
 
     fn dGdnGamma_body(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
@@ -3292,6 +3402,20 @@ pub const CudaBackend = struct {
         dGdnStep_body(ctx, state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
+    /// The batched `gdnStep` slot, timed under the SAME `.gdn_step` slot as the
+    /// single-row one: it does the same work for all heads, so the `PROF-SLOT`
+    /// line stays comparable across the change (calls drops by `heads`x, which
+    /// is the check that the batching actually took effect).
+    fn dGdnStepRows(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                    q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                    gamma: []const f32, beta: []const f32,
+                    heads: usize, nk: usize, kd: usize, vd: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.gdn_step, t0);
+        dGdnStepRows_body(ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
+    }
+
     /// The `gdnGamma` slot, timed (`$QWEN35_PROF`).
     fn dGdnGamma(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
@@ -3376,6 +3500,7 @@ pub const vtable = backend.Exec.VTable{
     .swiglu = CudaBackend.dSwiglu,
     .convStep = CudaBackend.dConvStep,
     .gdnStep = CudaBackend.dGdnStep,
+    .gdnStepRows = CudaBackend.dGdnStepRows,
     .constBuf = cpu_mod.CpuBackend.vtable.constBuf,
     .attnDecode = CudaBackend.dAttnDecode,
     .gdnGamma = CudaBackend.dGdnGamma,

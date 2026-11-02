@@ -202,6 +202,33 @@ pub const Exec = struct {
         /// state is [nv, kd, vd] (kd == vd == 128), `k`/`q` are kd wide,
         /// `v`/`km`/`delta`/`out` are vd wide, per head.
         gdnStep: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void,
+        /// Batched `gdnStep`: the SAME per-head call, `heads` times, in one
+        /// launch instead of `heads` launches (48 of them per token per layer on
+        /// this model).  Semantics are defined as "for h in 0..heads-1: the
+        /// `gdnStep` call that `h` would have made", so the CPU implementation
+        /// here is literally that loop.
+        ///
+        /// Rows are *strided bases*, not a packed array: the engine's regions
+        /// interleave (a v-head run of `vd` floats inside `qkv`, a
+        /// `kd*vd` state block per head), so each operand gets an explicit
+        /// element stride.  `heads`, `nk` and `kd`/`vd` are passed for the same
+        /// "explicit, never inferred" reason as `rmsnormRows`.
+        ///
+        ///   state[*h*st_state .. +kd*vd]   the [kd, vd] matrix for head h
+        ///   k     [kh*kd .. +kd],  kh = h % nk      (kv-head mapping: a v head
+        ///   q     [kh*kd .. +kd]    reuses k head h%nk, and `q` is implicitly
+        ///                                            scaled by 1/sqrt(kd))
+        ///   v     [h*vd  .. +vd]
+        ///   out   [h*vd  .. +vd]
+        ///   km    [h*vd  .. +vd]   PER-HEAD scratch, `heads*vd` long
+        ///   delta [h*vd  .. +vd]   PER-HEAD scratch, `heads*vd` long
+        ///   gamma [h], beta [h]    per-head scalars
+        ///
+        /// `km`/`delta` must be per-head (stride vd): with a single shared `vd`
+        /// buffer the `heads` blocks would race, and the wrong answer would be
+        /// silent.  The caller sizes them.
+        gdnStepRows: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+            gamma: []const f32, beta: []const f32, heads: usize, nk: usize, kd: usize, vd: usize) void,
 
         /// Full-attention decode for one token: scores against the KV rows,
         /// softmax, PV accumulation into `gout`, then the sigmoid gate.  `kcache`
@@ -345,6 +372,13 @@ pub const Exec = struct {
     }
     pub fn gdnStep(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf, gamma: f32, beta: f32, vd: usize) void {
         self.vtable.gdnStep(self.ptr, state, k, v, q, km, delta, out, gamma, beta, vd);
+    }
+    /// Batched `gdnStep` -- see `VTable.gdnStepRows` for the per-head strides.
+    /// Byte-for-byte the `heads` single calls it replaces; the engine uses this
+    /// one (the single-row slot is kept for fallback and for A/B).
+    pub fn gdnStepRows(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+                       gamma: []const f32, beta: []const f32, heads: usize, nk: usize, kd: usize, vd: usize) void {
+        self.vtable.gdnStepRows(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
     pub fn attnDecode(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
