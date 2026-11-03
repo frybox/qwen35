@@ -186,6 +186,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析（`PROF-M` 行由 `backend_cpu` 输出） |
 | `QWEN35_MVCHECK` | **仅 CUDA 后端、仅调试用，不是计算路径**。每个量化 matvec 之后，用内嵌的 CPU 后端对同一行再算一遍并逐行比对，打印 `MVCHECK[<type>] rows= cols= mismatched= batchk= k=`。用于确认"GPU kernel 结果与 CPU 参照一致"（CUDA 逐格式验收的自动化手段）。开销极大，只在 A/B 时开 |
 | `QWEN35_MVCHECK_ONLY` | 限定只对某一种量化类型做 MVCHECK（值 = `q.ttype` 的 tagName，如 `iq1_s`）。batch-K 参照需要 CPU scratch 按 K 塑形，不是每种类型在每个 launch 顺序下都能活，所以追单一 kernel 时用这个定向跑 |
+| `QWEN35_CUDA_COOP_WARPS` | **仅 CUDA 后端**。decode（tokens==1）warp-per-row matvec 的 block 形状（1..8 个 warp/block），A/B 用。不设时由硬件探测决定：sm_89 → 4（本机实测最佳），其他 cc → 占用率公式（cudaOccupancyMaxActiveBlocksPerMultiprocessor 选驻留 warp 最多的形状），见 `mmvq.cu` 的 `q35_coop_warps()`。探测来源是 `caps.cu`（`q35_gpu_cc()`/`q35_gpu_sm_count()`/`q35_gpu_name()`，一次探测、缓存读，x86 侧 `cpu_caps.c` 的 CUDA 镜像） |
 
 调试方法论：
 1. **先定位是"哪一层"错**，不要猜。重构后只剩 `QWEN35_SIMD_TIER` 与 `QWEN35_FORCE_SCALAR`

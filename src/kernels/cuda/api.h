@@ -28,6 +28,14 @@ extern "C" {
 #define Q35_API_QK_K 256
 #define Q35_API_Q8_K_BLOCK_BYTES 292
 
+// --- device capability probe (src/kernels/cuda/caps.cu) -------------------
+// The CUDA-side mirror of src/kernels/x86/cpu_caps.c: probed once on first
+// use, every later call is a cached read.  cc is major*100 + minor (809 ==
+// sm_89); -1 / 0 when no usable device was found (caps stay at zero).
+int q35_gpu_cc(void);
+int q35_gpu_sm_count(void);
+const char *q35_gpu_name(void);
+
 // ---------------------------------------------------------------------------
 // TensorType ids.
 //

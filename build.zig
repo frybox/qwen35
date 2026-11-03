@@ -89,6 +89,10 @@ const cuda_arch = "-arch=sm_89";
 /// registration check inside `if (cuda_enabled)` compares the two so the
 /// omission fails loudly at build time instead of silently at run time.
 const cuda_sources = [_][]const u8{
+    // GPU hardware probe (q35_gpu_cc, q35_gpu_sm_count, q35_gpu_name):
+    // the CUDA-side mirror of src/kernels/x86/cpu_caps.c, host-only code,
+    // probed once on first use.
+    "caps.cu",
     // block quantize / dequantize launchers (q35_launch_quantize_q8_0,
     // q35_launch_dequantize_q8_0)
     "convert.cu",

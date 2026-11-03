@@ -40,6 +40,8 @@
 #include "vecdotq.cuh"
 #include "api.h"
 
+#include <stdlib.h>
+
 // The per-type geometry table and the block/row dot helpers moved to
 // dotq.cuh so that mmq.cu (the prefill tile kernel) can use the exact same
 // definitions instead of a second copy (AGENTS.md: one source for one fact).
@@ -81,20 +83,27 @@ __global__ void q35_k_mul_mat_vec_q(const unsigned char *__restrict__ w,
 // memory, and lane 0 folds them strictly b = 0 .. nblk-1 -- the same left-to-
 // right order `q35_dot_row` uses, so the result is bit-identical (the file
 // header forbids reordering; this respects it).
+//
+// Block shape is a template parameter (WARPS = warps per block, one row per
+// warp).  `part` must be exactly WARPS deep: it is indexed by the warp number,
+// which runs 0..WARPS-1, so the launcher's block size (WARPS*Q35_WARP threads)
+// and this dimension are ONE decision -- q35_coop_warps() below picks it and
+// the host-side table instantiates every shape in the 1..8 domain.  WARPS=4
+// (128 threads) is the measured-best shape on sm_89; see q35_coop_warps().
 // ---------------------------------------------------------------------------
-__global__ void q35_k_mul_mat_vec_q_coop(const unsigned char *__restrict__ w,
-                                         const unsigned char *__restrict__ xq,
-                                         float *__restrict__ out,
-                                         int rows, int cols, int tokens, int ttype) {
-    __shared__ float part[/*warps*/ 4][Q35_WARP];
+template <int WARPS>
+__global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
+                                           const unsigned char *__restrict__ xq,
+                                           float *__restrict__ out,
+                                           int rows, int cols, int tokens, int ttype) {
+    __shared__ float part[WARPS][Q35_WARP];
     const Q35QuantInfo info = q35_quant_info(ttype);
     const int nblk = cols / info.block_elems;
     const int lane = threadIdx.x & (Q35_WARP - 1);
     const int warp = threadIdx.x / Q35_WARP;
     if (nblk > Q35_WARP) return;  // caller picks the other kernel in that case
 
-    const int warps_per_block = blockDim.x / Q35_WARP;
-    const int row_in_block = blockIdx.x * warps_per_block + warp;
+    const int row_in_block = blockIdx.x * WARPS + warp;
     if (row_in_block >= rows) return;
 
     const unsigned char *wrow = w + (size_t)row_in_block * (size_t)nblk * (size_t)info.block_bytes;
@@ -265,6 +274,97 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w, const void *d_xq,
                                            int tokens, int ttype, void *stream)
     __attribute__((weak));
 
+// ---------------------------------------------------------------------------
+// Warp-per-row block shape: ONE decision, picked once, from the GPU.
+//
+// The decode (tokens == 1) coop kernel is launched with WARPS warps per block
+// (one row per warp, block size WARPS*Q35_WARP threads).  The shared array
+// `part` inside the kernel is exactly WARPS deep, so the launcher's block
+// size and the kernel's `part` dimension are the SAME number -- this function
+// is the single place that fixes it.
+//
+// The shape is a hardware fact, probed once via caps.cu (the CUDA-side mirror
+// of src/kernels/x86/cpu_caps.c):
+//   * sm_89:  4 warps (128 threads).  The measured-best shape on this box
+//     (4090D): decode 128-thread -> 124 tok/s vs 256-thread -> 77 tok/s.
+//   * any other compute capability: the occupancy formula -- the warp count
+//     that maximises RESIDENT warps per SM, queried from the compiled kernel
+//     via cudaOccupancyMaxActiveBlocksPerMultiprocessor.  The decode matvec is
+//     bandwidth-bound, so resident-warps-per-SM is the right proxy; the
+//     occupancy API accounts for register / shared / thread limits the way
+//     the hardware actually does.
+//
+// $QWEN35_CUDA_COOP_WARPS=<1..8> overrides the shape (A/B only, like
+// $QWEN35_CUDA_MMQ).  An empty or out-of-range value is ignored with a note.
+// A failed probe (no usable device) keeps the sm_89-measured 4, which is the
+// value every prior build used, so an unprobed device never regresses.
+// ---------------------------------------------------------------------------
+// Occupancy formula for a non-sm_89 device: the warp count that maximises
+// RESIDENT warps per SM.  A kernel function pointer may not be stored in an
+// object-pointer variable (C++ [conv.ptr] defines the pointer-to-function ->
+// pointer-to-void conversion only at a function call), so each instantiation
+// is passed as a first-class function pointer (the `auto` parameter) and the
+// `void*` conversion happens right at the occupancy call.
+static int q35_coop_occ_best_warps(void) {
+    int best_warps = 0;
+    int best_resident = -1;
+    auto occ = [&](auto kern, int warps) {
+        int active = 0;
+        if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+                &active, (const void *)kern, warps * Q35_WARP, 0) == cudaSuccess
+            && active * warps > best_resident) {
+            best_resident = active * warps;
+            best_warps = warps;
+        }
+    };
+    occ(q35_k_mul_mat_vec_q_coop_t<1>, 1);
+    occ(q35_k_mul_mat_vec_q_coop_t<2>, 2);
+    occ(q35_k_mul_mat_vec_q_coop_t<3>, 3);
+    occ(q35_k_mul_mat_vec_q_coop_t<4>, 4);
+    occ(q35_k_mul_mat_vec_q_coop_t<5>, 5);
+    occ(q35_k_mul_mat_vec_q_coop_t<6>, 6);
+    occ(q35_k_mul_mat_vec_q_coop_t<7>, 7);
+    occ(q35_k_mul_mat_vec_q_coop_t<8>, 8);
+    return best_warps;
+}
+
+static int q35_coop_warps(void) {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int warps = 0;
+    const char *raw = getenv("QWEN35_CUDA_COOP_WARPS");
+    if (raw != NULL && *raw) {
+        int v = atoi(raw);
+        if (v >= 1 && v <= 8) {
+            warps = v;
+        } else {
+            fprintf(stderr,
+                    "cuda kernels: QWEN35_CUDA_COOP_WARPS='%s' is not in 1..8; ignoring\n",
+                    raw);
+        }
+    }
+    if (warps == 0) {
+        const int cc = q35_gpu_cc();
+        if (cc == 809) {
+            // sm_89 measured best: 4 warps (128 threads).  See the header
+            // comment above for the 124 vs 77 tok/s decode measurement.
+            warps = 4;
+        } else if (cc > 0) {
+            const int best = q35_coop_occ_best_warps();
+            warps = (best >= 1 && best <= 8) ? best : 4;
+        } else {
+            // No usable device (probe failed): keep the sm_89-measured value.
+            warps = 4;
+        }
+    }
+    cached = warps;
+    fprintf(stderr,
+            "cuda kernels: decode matvec block = %d warps/block (%d threads); "
+            "device cc=%d \"%s\" %d SMs ($QWEN35_CUDA_COOP_WARPS overrides)\n",
+            cached, cached * Q35_WARP, q35_gpu_cc(), q35_gpu_name(), q35_gpu_sm_count());
+    return cached;
+}
+
 extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                                       float *d_out, int rows, int cols,
                                       int tokens, int ttype, void *stream_v) {
@@ -277,7 +377,6 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     const Q35QuantInfo info = q35_quant_info(ttype);
     if (info.block_elems == 0) return (int)cudaErrorInvalidValue;
     if (cols % info.block_elems != 0) return (int)cudaErrorInvalidValue;
-    const int threads = 128;
 
     // Prefill only: a single token has nothing to reuse, and the warp-per-row
     // kernel already coalesces it (below).
@@ -307,12 +406,21 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
         // One warp per row: coalesced because the warp's lanes read consecutive
         // blocks of a single row.  See q35_k_mul_mat_vec_q_coop for why this is
         // numerically identical to the thread-per-row mapping.
-        const int warps_per_block = threads / Q35_WARP;
-        const int blocks = (rows + warps_per_block - 1) / warps_per_block;
-        q35_k_mul_mat_vec_q_coop<<<blocks, threads, 0, stream>>>(d_w, d_xq, d_out, rows, cols,
-                                                                 tokens, ttype);
+        const int warps = q35_coop_warps();
+        const int blocks = (rows + warps - 1) / warps;
+        switch (warps) {
+        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<blocks, 1 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<blocks, 2 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<blocks, 3 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<blocks, 4 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<blocks, 5 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<blocks, 6 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<blocks, 7 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        default: q35_k_mul_mat_vec_q_coop_t<8><<<blocks, 8 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        }
         return (int)cudaGetLastError();
     }
+    const int threads = 128;
     const int blocks = (total + threads - 1) / threads;
     q35_k_mul_mat_vec_q<<<blocks, threads, 0, stream>>>(d_w, d_xq, d_out, rows, cols,
                                                         tokens, ttype);
