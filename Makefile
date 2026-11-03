@@ -106,7 +106,8 @@ run0.8bq80-llamacpp:
 	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 -dev none --single-turn
 
 run0.8bq80-llamacpp-cuda:
-	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn
+	/mnt/llm-dev/llama.cpp194/build/bin/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn -dev CUDA0
+#	/mnt/Qwen3.8-27B-GGUF/llama-server/llama-b10707/llama-cli -m /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf -p "天空为什么是蓝色的？" -n 48 -t 1 --single-turn -dev Vulkan0
 
 run0.8bbf16:
 	zig-out/bin/qwen35 run /mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-BF16.gguf 天空为什么是蓝色的？ -n 48 --threads 1
