@@ -907,6 +907,11 @@ pub const CudaBackend = struct {
     stat_gpu_n_slot: [slot_count]u32 = @splat(0),
     /// Pairs that did not fit in the pool for this token (counted, not dropped).
     stat_gpu_overflow: usize = 0,
+    /// TEMP(ablation): bitmap of `Slot`s whose launch is SKIPPED.  Driven by
+    /// `QWEN35_ABLATE=<comma-separated slot names>`.  Model output is garbage
+    /// when this is on; the ONLY thing read is the tok/s drop, which is how a
+    /// slot's real device contribution is attributed when nsys is unavailable.
+    ablate_bits: u32 = 0,
     /// `EventElapsedTime` failures while reading the pool.
     stat_gpu_ev_err: usize = 0,
     /// Whole-token device ns from the pool (sum of all pairs), for the
@@ -1226,6 +1231,7 @@ pub const CudaBackend = struct {
         };
         self.cu = cand;
         self.sync_debug = cudart.getenv("QWEN35_SYNC") != null;
+        self.ablateInit();
 
         // The launchers themselves need no setup: they are link-time symbols, so
         // "the kernels are there" is enforced by the build.  The one run-time
@@ -4798,6 +4804,29 @@ pub const CudaBackend = struct {
     /// Returns the pair index, or null when timing is off, capture is open (an
     /// event record inside a graph is not what we want to measure), the pool is
     /// exhausted (counted as overflow), or event creation failed.
+    /// TEMP(ablation): true when slot `s`'s launch is to be SKIPPED.  Model
+    /// output is garbage while any compute slot is ablated; the only consumer of
+    /// this is the tok/s delta, which attributes a slot's device cost.
+    inline fn ablated(self: *CudaBackend, s: Slot) bool {
+        return (self.ablate_bits >> @intFromEnum(s)) & 1 != 0;
+    }
+
+    /// Parse `QWEN35_ABLATE="slot,slot,..."` into `ablate_bits` (names are the
+    /// `PROF-SLOT` names).  Unknown names are counted and reported once.
+    fn ablateInit(self: *CudaBackend) void {
+        const raw = cudart.getenv("QWEN35_ABLATE") orelse return;
+        var it = std.mem.splitScalar(u8, std.mem.trim(u8, raw, " \t\r\n"), ',');
+        var n_ablated: usize = 0;
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " \t");
+            if (t.len == 0) continue;
+            const s = std.meta.stringToEnum(Slot, t) orelse continue;
+            self.ablate_bits |= @as(u32, 1) << @intCast(@intFromEnum(s));
+            n_ablated += 1;
+        }
+        if (n_ablated != 0) std.debug.print("cuda backend: $QWEN35_ABLATE skips {d} slot(s) (model output is garbage; tok/s delta is the measurement)\n", .{n_ablated});
+    }
+
     inline fn gpuEvEnter(self: *CudaBackend) ?usize {
         if (!self.gpu_ev_on) return null;
         if (self.capturing()) return null;
@@ -5513,6 +5542,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec, t0);
+        if (self.ablated(.matvec)) return ;
         vMatvec_body(ctx, outBuf, w, xBuf);
     }
 
@@ -5521,6 +5551,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.matvec_batchk, t0);
+        if (self.ablated(.matvec_batchk)) return ;
         vMatvecBatchK_body(ctx, outBuf, w, xKBuf, k);
     }
 
@@ -5553,6 +5584,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.scale_vec, t0);
+        if (self.ablated(.scale_vec)) return ;
         dScaleVec_body(ctx, x, s);
     }
 
@@ -5561,6 +5593,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.add_resid, t0);
+        if (self.ablated(.add_resid)) return ;
         dAddResid_body(ctx, dst, src);
     }
 
@@ -5616,6 +5649,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.deinterleave_qg, t0);
+        if (self.ablated(.deinterleave_qg)) return ;
         if (self.cu != null) {
             if (dBufPtr(dst_q)) |pq| {
                 if (dBufPtr(dst_gate)) |pg| {
@@ -5637,6 +5671,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.zero_buf, t0);
+        if (self.ablated(.zero_buf)) return ;
         dZeroBuf_body(ctx, buf);
     }
 
@@ -5645,6 +5680,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.copy_from_host, t0);
+        if (self.ablated(.copy_from_host)) return ;
         dCopyFromHost_body(ctx, dst, src);
     }
 
@@ -5661,6 +5697,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rmsnorm, t0);
+        if (self.ablated(.rmsnorm)) return ;
         dRmsnorm_body(ctx, out, x, w, eps);
     }
 
@@ -5671,6 +5708,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rmsnorm, t0);
+        if (self.ablated(.rmsnorm)) return ;
         dRmsnormRows_body(ctx, out, x, w, rows_in, eps);
     }
 
@@ -5679,6 +5717,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.l2norm, t0);
+        if (self.ablated(.l2norm)) return;
         dL2norm_body(ctx, x);
     }
 
@@ -5695,6 +5734,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.silu, t0);
+        if (self.ablated(.silu)) return ;
         dSiluInPlace_body(ctx, x);
     }
 
@@ -5703,6 +5743,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.mul_silu, t0);
+        if (self.ablated(.mul_silu)) return ;
         dMulSilu_body(ctx, out, gate);
     }
 
@@ -5711,6 +5752,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.mul_sigmoid, t0);
+        if (self.ablated(.mul_sigmoid)) return ;
         dMulSigmoid_body(ctx, out, gate);
     }
 
@@ -5719,6 +5761,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.swiglu, t0);
+        if (self.ablated(.swiglu)) return ;
         dSwiglu_body(ctx, gate, up);
     }
 
@@ -5727,6 +5770,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.softmax, t0);
+        if (self.ablated(.softmax)) return ;
         dSoftmax_body(ctx, x);
     }
 
@@ -5735,6 +5779,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.argmax, t0);
+        if (self.ablated(.argmax)) return 0;
         return dArgmax_body(ctx, logits);
     }
 
@@ -5743,6 +5788,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.sample, t0);
+        if (self.ablated(.sample)) return 0;
         return dSample_body(ctx, logits, scratch, sp);
     }
 
@@ -5753,6 +5799,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_step, t0);
+        if (self.ablated(.gdn_step)) return ;
         dGdnStep_body(ctx, state, k, v, q, km, delta, out, gamma, beta, vd);
     }
 
@@ -5767,6 +5814,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_step, t0);
+        if (self.ablated(.gdn_step)) return ;
         dGdnStepRows_body(ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
 
@@ -5776,6 +5824,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.gdn_gamma, t0);
+        if (self.ablated(.gdn_gamma)) return ;
         dGdnGamma_body(ctx, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
@@ -5786,6 +5835,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.attn_decode, t0);
+        if (self.ablated(.attn_decode)) return ;
         dAttnDecode_body(ctx, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
@@ -5794,6 +5844,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.rope64, t0);
+        if (self.ablated(.rope64)) return;
         dRope64_body(ctx, x, pos, base);
     }
 
@@ -5802,6 +5853,7 @@ pub const CudaBackend = struct {
         const self = self_(ctx);
         const t0 = self.slotEnter();
         defer self.slotExit(.conv_step, t0);
+        if (self.ablated(.conv_step)) return ;
         dConvStep_body(ctx, conv, y, wconv, k);
     }
 
