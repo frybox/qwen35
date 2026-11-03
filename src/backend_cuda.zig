@@ -462,6 +462,12 @@ fn copyBinOf(elems: usize) usize {
 /// past the last enumerator (`const_buf`).
 const slot_count = @intFromEnum(Slot.const_buf) + 1;
 
+/// Event pairs available for `$QWEN35_PROF_GPU` per-slot device timing.  A decode
+/// token issues ~600 timed slot calls (measured: 599 on the 0.8B), so 1024 pairs
+/// cover one token with headroom; a token that overflows is counted in
+/// `stat_gpu_overflow` rather than dropped silently.
+const gpu_ev_capacity = 1024;
+
 /// Human-readable slot names for the `PROF-SLOT` line.  Indexed by
 /// `@intFromEnum`, so a `comptime`-checked length ties them to the enum.
 fn slotName(s: Slot) []const u8 {
@@ -851,6 +857,66 @@ pub const CudaBackend = struct {
     /// only).  `pre_wall_ms - slot_total_ms` is what the engine itself spent
     /// outside any `Exec` call.
     stat_ns_slot_total: u64 = 0,
+
+    // ---- per-slot DEVICE time ($QWEN35_PROF_GPU) ---------------------------
+    //
+    // WHY THIS EXISTS: the `QWEN35_PROF` slot table is HOST wall clock, and for
+    // the 28 non-draining slots that is submission time only -- their queued GPU
+    // work surfaces in whichever later slot drains the stream.  So the table can
+    // say "matvec = 9 ms/token" without saying whether that is 187 kernel
+    // submissions (the launch-bound regime, fixable with a graph) or 187 kernels
+    // that really ran 9 ms on the device (the bandwidth-bound regime, fixable
+    // only with a faster kernel).  A/B on `QWEN35_CUDA_GRAPH` settled the
+    // question numerically (graph=1 survives CUDA_LAUNCH_BLOCKING at 122 tok/s
+    // while graph=0 drops to 78), so the device number is what is left to
+    // measure.
+    //
+    // HOW: one pair of `cudaEventCreateWithFlags(..., EventDisableTiming)` per
+    // timed slot, recorded on the slot's launch stream at enter/exit.  Reading
+    // an elapsed time REQUIRES the pair to be complete, and each pair is
+    // recorded on the stream the launch goes to, so `b - a` is the device time
+    // between the two records: the slot's own kernels plus any device work
+    // already queued ahead of them.  That is exactly why the read happens once
+    // per token, at the argmax drain, when the stream is empty -- a pair read in
+    // the middle of a token would measure the queue, not the slot.
+    //
+    // WHY A POOL AND NOT PER-TOKEN CREATION: `cudaEventCreateWithFlags` in the
+    // hot path costs as much as the launch being measured.  The pool is created
+    // once, and a pair is reused as soon as its interval has been read.
+    // HOW: one pair of `cudaEventCreateWithFlags(..., EventDisableTiming)` per
+    // timed slot, recorded on the slot's launch stream at enter/exit.  Reading
+    // an elapsed time REQUIRES the pair to be complete, and each pair is
+    // recorded on the stream the launch goes to, so `b - a` is the device time
+    // between the two records: the slot's own kernels plus any device work
+    // already queued ahead of them.  That is exactly why the read happens once
+    // per token, at the argmax drain, when the stream is empty -- a pair read in
+    // the middle of a token would measure the queue, not the slot.
+    //
+    // WHY A POOL AND NOT PER-TOKEN CREATION: `cudaEventCreateWithFlags` in the
+    // hot path costs as much as the launch being measured.  The pool is created
+    // once, and a pair is reused as soon as its interval has been read.
+    ev_pair_a: [gpu_ev_capacity]?*anyopaque = @splat(null),
+    ev_pair_b: [gpu_ev_capacity]?*anyopaque = @splat(null),
+    gpu_ev_ready: bool = false,
+    /// Pool usage for the token currently in flight.
+    gpu_ev_used: usize = 0,
+    /// Slot id per pair, so a read can be attributed.
+    gpu_ev_slot: [gpu_ev_capacity]u8 = @splat(0),
+    /// Device ns per slot, summed over all tokens read.
+    stat_gpu_ns_slot: [slot_count]u64 = @splat(0),
+    stat_gpu_n_slot: [slot_count]u32 = @splat(0),
+    /// Pairs that did not fit in the pool for this token (counted, not dropped).
+    stat_gpu_overflow: usize = 0,
+    /// `EventElapsedTime` failures while reading the pool.
+    stat_gpu_ev_err: usize = 0,
+    /// Whole-token device ns from the pool (sum of all pairs), for the
+    /// reconciliation against `stat_ns_token_dev` (the token-end event pair).
+    stat_gpu_ns_token_sum: u64 = 0,
+    stat_gpu_n_token: usize = 0,
+    /// Set when `$QWEN35_PROF_GPU` is in the environment.
+    gpu_ev_on: bool = false,
+    /// Pair index opened by the current `slotEnter`, consumed by its `slotExit`.
+    gpu_ev_open: ?usize = null,
 
     /// `copyRange` broken down by *length* and *route* (`QWEN35_PROF` only).
     ///
@@ -4185,6 +4251,7 @@ pub const CudaBackend = struct {
                     } else self.stat_n_ev_err += 1;
                 }
                 self.stat_d2h_bytes += @sizeOf(c_int);
+                if (self.gpu_ev_on) self.gpuEvReadToken();
                 return @intCast(host_idx);
             } else return 0;
         }
@@ -4630,7 +4697,16 @@ pub const CudaBackend = struct {
     /// double-count if a forwarder ever calls another forwarder; today the
     /// forwarders call `CpuBackend.vtable.*` directly, which bypasses these.
     inline fn slotEnter(self: *CudaBackend) ?Io.Clock.Timestamp {
-        if (!self.ev_on) return null;
+        // `$QWEN35_PROF_GPU` opens one device-timing pair for the outermost slot.
+        // The slot id is NOT known here -- every forwarder calls `slotEnter()`
+        // with no argument and hands the slot to `slotExit` -- so `gpuEvEnter`
+        // takes only the pair index and `slotExit` attributes it.  A field, not a
+        // returned value: the 32 forwarders pass only the host `t0` back.
+        self.gpu_ev_open = self.gpuEvEnter();
+        if (!self.ev_on) {
+            self.slot_depth += 1;
+            return null;
+        }
         self.slot_depth += 1;
         return Io.Clock.Timestamp.now(self.io, .awake);
     }
@@ -4638,6 +4714,11 @@ pub const CudaBackend = struct {
     /// Close a slot opened by `slotEnter` and add the interval to its counter.
     /// `t0 == null` (profiling off) is a no-op.
     inline fn slotExit(self: *CudaBackend, s: Slot, t0: ?Io.Clock.Timestamp) void {
+        // Close the device-timing pair first: the closing record has to land on
+        // the same stream the launch used, which `launchStream()` still reports
+        // correctly here (the capture state has not changed during the slot).
+        self.gpuEvExit(self.gpu_ev_open, s);
+        self.gpu_ev_open = null;
         const start = t0 orelse return;
         const ns = durNs(start, self.io);
         const i = @intFromEnum(s);
@@ -4647,6 +4728,122 @@ pub const CudaBackend = struct {
         // "accounted" number stays comparable with `stat_ns_prefill_wall`.
         self.slot_depth -= 1;
         if (self.slot_depth == 0) self.stat_ns_slot_total += ns;
+    }
+
+    /// Create the event pool for `$QWEN35_PROF_GPU` once.  Events are created
+    /// with timing ENABLED (flags 0): `EventElapsedTime` needs it, and
+    /// `EventDisableTiming` pairs return `cudaErrorInvalidResourceHandle`.
+    fn gpuEvEnsure(self: *CudaBackend) bool {
+        if (self.gpu_ev_ready) return true;
+        const lib = if (self.cu) |*cu| &cu.lib else return false;
+        var made: usize = 0;
+        for (0..gpu_ev_capacity) |i| {
+            var a: ?*anyopaque = null;
+            var b: ?*anyopaque = null;
+            if (lib.EventCreate(&a, 0) != cudart.cudaSuccess or a == null) break;
+            self.ev_pair_a[i] = a;
+            made += 1;
+            if (lib.EventCreate(&b, 0) != cudart.cudaSuccess or b == null) break;
+            self.ev_pair_b[i] = b;
+            made += 1;
+            self.gpu_ev_ready = true;
+        }
+        if (!self.gpu_ev_ready) {
+            // Bounded cleanup: destroy what was created so a partial pool cannot
+            // leak, and say what we got rather than silently measuring nothing.
+            for (0..gpu_ev_capacity) |i| {
+                if (self.ev_pair_a[i]) |p| { _ = lib.EventDestroy(p); self.ev_pair_a[i] = null; }
+                if (self.ev_pair_b[i]) |p| { _ = lib.EventDestroy(p); self.ev_pair_b[i] = null; }
+            }
+            std.debug.print("cuda backend: $QWEN35_PROF_GPU event pool disabled (created {d} of {d} events)\n",
+                .{ made, gpu_ev_capacity * 2 });
+            return false;
+        }
+        return true;
+    }
+
+    /// Read every complete pair of the token in flight and add each interval to
+    /// its slot.  Called at the argmax drain, where the blocking D2H has already
+    /// completed the stream, so `EventElapsedTime` on any pair of this token
+    /// returns without waiting: the read costs one host call per kernel, not one
+    /// sync per kernel.
+    fn gpuEvReadToken(self: *CudaBackend) void {
+        const lib = if (self.cu) |*cu| &cu.lib else return;
+        var sum: u64 = 0;
+        for (0..self.gpu_ev_used) |i| {
+            const a = self.ev_pair_a[i];
+            const b = self.ev_pair_b[i];
+            if (a == null or b == null) continue;
+            var ms: f32 = 0;
+            if (lib.EventElapsedTime(&ms, a, b) == cudart.cudaSuccess and ms >= 0) {
+                const ns: u64 = @intFromFloat(@as(f64, ms) * 1_000_000.0);
+                const s = self.gpu_ev_slot[i];
+                self.stat_gpu_ns_slot[s] += ns;
+                self.stat_gpu_n_slot[s] += 1;
+                sum += ns;
+            } else self.stat_gpu_ev_err += 1;
+            // Reset for reuse: events stay allocated, only their recorded
+            // position is discarded by the next token's record.
+            self.gpu_ev_slot[i] = 0;
+        }
+        self.stat_gpu_ns_token_sum += sum;
+        self.stat_gpu_n_token += 1;
+        self.gpu_ev_used = 0;
+    }
+
+    /// Open one GPU timing pair for a slot.  Only the outermost slot gets a pair
+    /// (`slot_depth == 0`), so nested slots cannot double-count device time.
+    /// The slot id is filled in by `slotExit` (which is the only place that knows
+    /// it), so this takes none.
+    /// Returns the pair index, or null when timing is off, capture is open (an
+    /// event record inside a graph is not what we want to measure), the pool is
+    /// exhausted (counted as overflow), or event creation failed.
+    inline fn gpuEvEnter(self: *CudaBackend) ?usize {
+        if (!self.gpu_ev_on) return null;
+        if (self.capturing()) return null;
+        // A live decode graph replays one graph per token and suppresses the
+        // host-side launches (`gOpGate`), so there is nothing per slot to record
+        // -- the pairs would measure empty intervals.  The graph path reports
+        // its own totals via `stat_ns_token_dev`; disable the pool instead of
+        // printing a table of zeros.
+        if (self.g_state == .live) return null;
+        if (self.slot_depth != 0) return null;
+        if (!self.gpuEvEnsure()) {
+            self.gpu_ev_on = false;
+            return null;
+        }
+        if (self.gpu_ev_used >= gpu_ev_capacity) {
+            self.stat_gpu_overflow += 1;
+            return null;
+        }
+        const i = self.gpu_ev_used;
+        self.gpu_ev_used += 1;
+        self.gpu_ev_slot[i] = 255; // set by slotExit once the slot is known
+        const lib = &self.cu.?.lib;
+        if (lib.EventRecord(self.ev_pair_a[i], self.launchStream()) != cudart.cudaSuccess) {
+            self.stat_gpu_ev_err += 1;
+            self.gpu_ev_used -= 1;
+            return null;
+        }
+        return i;
+    }
+
+    /// Close a pair opened by `gpuEvEnter`, attributing it to slot `s`; the pair
+    /// is read at the token drain.
+    inline fn gpuEvExit(self: *CudaBackend, i: ?usize, s: Slot) void {
+        const idx = i orelse return;
+        const lib = &self.cu.?.lib;
+        self.gpu_ev_slot[idx] = @intFromEnum(s);
+        if (lib.EventRecord(self.ev_pair_b[idx], self.launchStream()) != cudart.cudaSuccess) {
+            self.stat_gpu_ev_err += 1;
+            // A pair whose closing record never landed cannot be read; free the
+            // slot by moving the last live pair into it.
+            const last = self.gpu_ev_used - 1;
+            self.ev_pair_a[idx] = self.ev_pair_a[last];
+            self.ev_pair_b[idx] = self.ev_pair_b[last];
+            self.gpu_ev_slot[idx] = self.gpu_ev_slot[last];
+            self.gpu_ev_used = last;
+        }
     }
 
     /// Milliseconds between two recorded events, waiting for the second.  The
@@ -4952,7 +5149,73 @@ pub const CudaBackend = struct {
             );
         }
         self.reportCopyStats();
+        self.reportGpuSlotStats();
         self.reportArgmaxDrain();
+    }
+
+    /// `PROF-GPU`: the same slot table as `PROF-SLOT`, but measured by the device.
+    ///
+    /// `dev_us` is the interval the GPU recorded between the slot's opening and
+    /// closing event records.  Because every record sits on the stream the launch
+    /// goes to, the interval includes device work queued ahead of the slot -- so
+    /// the per-slot numbers of a token SUM to that token's device time, and the
+    /// sum is printed against `stat_ns_token_dev` (the independent token-end pair)
+    /// as the reconciliation.  The difference between the two is the device idle
+    /// the engine left between slots: the launch-bound signature.
+    fn reportGpuSlotStats(self: *CudaBackend) void {
+        const divCeil = struct {
+            fn f(a: u64, b: u64) u64 {
+                return if (b == 0) 0 else (a + b - 1) / b;
+            }
+        }.f;
+        if (!self.gpu_ev_on) return;
+        const tokens: usize = if (self.stat_gpu_n_token == 0) 1 else self.stat_gpu_n_token;
+        var order: [slot_count]u8 = undefined;
+        var n: usize = 0;
+        for (0..slot_count) |i| {
+            if (self.stat_gpu_n_slot[i] == 0) continue;
+            order[n] = @intCast(i);
+            n += 1;
+        }
+        var i: usize = 1;
+        while (i < n) : (i += 1) {
+            const cur = order[i];
+            const cur_ns = self.stat_gpu_ns_slot[cur];
+            var j: usize = i;
+            while (j > 0 and self.stat_gpu_ns_slot[order[j - 1]] < cur_ns) : (j -= 1) {
+                order[j] = order[j - 1];
+            }
+            order[j] = cur;
+        }
+        const sum_ns = self.stat_gpu_ns_token_sum;
+        const tok_ns = self.stat_ns_token_dev;
+        std.debug.print(
+            "PROF-GPU tokens={d} gpu_sum_ms={d} tok_dev_ms={d} idle_ms={d} overflow={d} ev_err={d} note=\"dev_us = device interval per slot, per token\"\n",
+            .{
+                self.stat_gpu_n_token,
+                sum_ns / 1_000_000,
+                tok_ns / 1_000_000,
+                (tok_ns -| sum_ns) / 1_000_000,
+                self.stat_gpu_overflow,
+                self.stat_gpu_ev_err,
+            },
+        );
+        for (order[0..n]) |idx| {
+            const s: Slot = @enumFromInt(idx);
+            const ns = self.stat_gpu_ns_slot[idx];
+            const calls = self.stat_gpu_n_slot[idx];
+            std.debug.print(
+                "PROF-GPU {s:<15} calls/tok={d:<5} dev_us/tok={d:<8} avg_us/call={d:<6} pct={d}.{d}%\n",
+                .{
+                    slotName(s),
+                    divCeil(calls, tokens),
+                    divCeil(ns, tokens * 1_000),
+                    divCeil(ns, calls * 1_000),
+                    if (sum_ns == 0) 0 else (ns * 1000 / sum_ns) / 10,
+                    if (sum_ns == 0) 0 else (ns * 1000 / sum_ns) % 10,
+                },
+            );
+        }
     }
 
     /// `PROF-DRAIN`: the per-token argmax drain split into the device's share and
@@ -5176,6 +5439,21 @@ pub const CudaBackend = struct {
         self.stat_n_slot = @splat(0);
         self.stat_ns_slot_total = 0;
         self.slot_depth = 0;
+        // Per-slot DEVICE time ($QWEN35_PROF_GPU).  The pool is created lazily
+        // on the first timed slot, not here, so a run without the variable never
+        // touches an event.
+        self.stat_gpu_ns_slot = @splat(0);
+        self.stat_gpu_n_slot = @splat(0);
+        self.stat_gpu_overflow = 0;
+        self.stat_gpu_ev_err = 0;
+        self.stat_gpu_ns_token_sum = 0;
+        self.stat_gpu_n_token = 0;
+        self.gpu_ev_used = 0;
+        self.gpu_ev_open = null;
+        self.gpu_ev_on = cudart.getenv("QWEN35_PROF_GPU") != null and self.cu != null;
+        if (self.gpu_ev_on) {
+            std.debug.print("cuda backend: $QWEN35_PROF_GPU per-slot device timing on ({d} event pairs)\n", .{gpu_ev_capacity});
+        }
         if (cudart.getenv("QWEN35_PROF") != null) {
             self.ev_on = self.cu != null;
             if (self.ev_on) self.openPrefillWindow();
