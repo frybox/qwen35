@@ -161,6 +161,12 @@ __global__ void q35_attn_gate_kernel(float *__restrict__ d_gout,
     d_gout[i] = d_gout[i] * (1.0f / (1.0f + expf(-g)));
 }
 
+// Host-stub address of the decode-attention kernel; see `q35_func_rope64` in
+// rope.cu for why the graph path needs it.  Only the score/softmax/PV kernel is
+// reported: its per-token variable is `slot`.  The gate kernel that follows it
+// in the same launcher has no per-token argument, so it is never retargeted.
+extern "C" void *q35_func_attn_decode(void) { return (void *)&q35_attn_decode_kernel; }
+
 extern "C" int q35_launch_attn_decode(const float *d_q, const float *d_gate,
                                       const float *d_kcache,
                                       const float *d_vcache, float *d_att,

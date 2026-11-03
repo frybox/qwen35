@@ -739,6 +739,18 @@ pub const CpuBackend = struct {
         _ = ctx;
     }
 
+    /// Decode-step boundary: nothing to do on the CPU.  The bounds exist for a
+    /// device backend that can replay a step as one graph; the CPU executes
+    /// straight-line code, so there is nothing to capture or replay.
+    fn vStepBegin(ctx: *anyopaque, pos: u32) void {
+        _ = ctx;
+        _ = pos;
+    }
+
+    fn vStepEnd(ctx: *anyopaque) void {
+        _ = ctx;
+    }
+
     fn vName(ctx: *anyopaque) []const u8 {
         _ = ctx;
         return "cpu";
@@ -910,6 +922,13 @@ pub const CpuBackend = struct {
         ew.bufCopyRange(dst, src);
     }
 
+    /// KV append.  Host memory has no captured schedule, so the slot is
+    /// irrelevant here and this is `copyRange` (see `VTable.copyRangeSlot`).
+    fn vCopyRangeSlot(ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void {
+        _ = slot;
+        CpuBackend.vCopyRange(ctx, dst, src);
+    }
+
     /// Host regions on this backend, so the split is the plain per-head copy
     /// (`ew.bufDeinterleaveQG`); it exists as a slot only so a device backend
     /// can replace `2*heads` launches with one.
@@ -985,6 +1004,7 @@ pub const CpuBackend = struct {
         .attnDecode = vAttnDecode,
         .gdnGamma = vGdnGamma,
         .copyRange = vCopyRange,
+        .copyRangeSlot = vCopyRangeSlot,
         .deinterleaveQG = vDeinterleaveQG,
         .copyFromHost = vCopyFromHost,
         .copyToHost = vCopyToHost,
@@ -995,6 +1015,8 @@ pub const CpuBackend = struct {
         .profPhase = vProfPhase,
         .profReset = vProfReset,
         .profPrefillEnd = vProfPrefillEnd,
+        .stepBegin = vStepBegin,
+        .stepEnd = vStepEnd,
         .name = vName,
         .describe = vDescribe,
         .setTier = vSetTier,

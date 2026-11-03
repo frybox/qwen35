@@ -86,6 +86,15 @@ __global__ void k_rope64(float *__restrict__ x, int heads, int hd, int pos, floa
 // rotated.  `heads * hd` must be the tensor's element count.  hd <= 0 or
 // heads <= 0 returns success without launching (same convention as the rest of
 // api.h).
+// Host-stub address of the kernel the launcher above launches, so the decode
+// CUDA graph can recognise this op's node inside a captured graph
+// (`cudaGraphKernelNodeGetParams` reports `func` as exactly this address).  A
+// graph replays a node's arguments from a snapshot, so the ones that move per
+// token have to be found and rewritten; matching on the stub is what makes that
+// identification exact instead of a guess from argument values, which cannot
+// distinguish kernels that merely happen to have a small int in a similar slot.
+extern "C" void *q35_func_rope64(void) { return (void *)&k_rope64; }
+
 extern "C" int q35_launch_rope64(float *d_x, int heads, int hd, int pos, float base, void *stream_v) {
     if (heads <= 0 || hd < 64) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;

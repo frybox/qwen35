@@ -111,6 +111,12 @@ extern "C" int q35_launch_add_resid(float *d_dst, const float *d_src, int n, voi
     return (int)cudaGetLastError();
 }
 
+// Host-stub address of the copy kernel, so a replaying decode graph can find
+// this node's captured arguments (see `q35_func_rope64` for the mechanism).
+// The KV append is why it matters: its destination is `cache + slot * kv_dim`,
+// a pointer that moves once per token.
+extern "C" void *q35_func_copy_range(void) { return (void *)&k_copy_range; }
+
 extern "C" int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;

@@ -254,6 +254,17 @@ pub const Exec = struct {
         /// Region-to-region copy (KV writes, MTP state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
         copyRange: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
+        /// `copyRange` whose destination advances once per token: the KV cache
+        /// append, `dst = cache.k/v + slot * kv_dim`.
+        ///
+        /// Identical to `copyRange` for every backend except one that replays a
+        /// captured schedule.  Such a backend snapshots a launch's arguments,
+        /// and a destination that moves per token would then be re-recorded to
+        /// the capture token's row forever -- the cache never grows and each
+        /// token attends to the prefix it saw the first time.  Wrong numbers, no
+        /// error, so the slot has to be declared rather than inferred: a bare
+        /// device pointer carries no trace of which row of which cache it is.
+        copyRangeSlot: *const fn (ctx: *anyopaque, dst: Buf, src: Buf, slot: usize) void,
         /// Split the interleaved `attn_q` projection into `q` and `gate`.
         ///
         /// The GGUF `attn_q` rows are ordered `[h][q_head | gate_head]` -- one
@@ -310,6 +321,29 @@ pub const Exec = struct {
         /// close its GPU-side prefill window, because `profPhase(false)` only
         /// fires after the decode loop and would fold decode into prefill.
         profPrefillEnd: *const fn (ctx: *anyopaque) void,
+
+        // ---- decode-step boundary -------------------------------------------
+        //
+        // WHAT THIS IS FOR: a CUDA graph can only wrap a whole sequence of
+        // launches that is known in advance, and the only such sequence in this
+        // engine is one decode step's forward pass (weights resident, shapes
+        // fixed, `pos`/`slot` the sole variables).  The engine therefore tells
+        // the backend where that sequence starts and ends; the backend decides
+        // whether to capture it, replay it, or ignore the hint entirely.
+        //
+        // WHY THE HINT IS NEEDED AT ALL: the backend never sees the model's
+        // control flow -- it is called one op at a time -- so without this it
+        // could only guess where a step begins.  Guessing wrong is what a CUDA
+        // graph punishes hardest (a graph spanning two steps replays stale
+        // state, a graph spanning half a step omits ops: both give wrong
+        // numbers with no error).
+        //
+        // `stepBegin` carries `pos`, the step's position, which is the value
+        // that (a) identifies a capturable step and (b) changes every token.
+        // `stepEnd` closes the span.  Both must be no-ops for a CPU backend,
+        // and a device backend must be free to ignore them.
+        stepBegin: *const fn (ctx: *anyopaque, pos: u32) void,
+        stepEnd: *const fn (ctx: *anyopaque) void,
 
         // ---- introspection --------------------------------------------------
         name: *const fn (ctx: *anyopaque) []const u8,
@@ -434,6 +468,13 @@ pub const Exec = struct {
     pub fn copyRange(self: Exec, dst: Buf, src: Buf) void {
         self.vtable.copyRange(self.ptr, dst, src);
     }
+
+    /// KV-cache append: `copyRange` whose destination is `base + slot * stride`.
+    /// See `VTable.copyRangeSlot` for why a replaying backend needs the slot
+    /// spelled out.
+    pub fn copyRangeSlot(self: Exec, dst: Buf, src: Buf, slot: usize) void {
+        self.vtable.copyRangeSlot(self.ptr, dst, src, slot);
+    }
     pub fn deinterleaveQG(self: Exec, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
         self.vtable.deinterleaveQG(self.ptr, dst_q, dst_gate, src, heads, hd);
     }
@@ -463,6 +504,14 @@ pub const Exec = struct {
     }
     pub fn profPrefillEnd(self: Exec) void {
         self.vtable.profPrefillEnd(self.ptr);
+    }
+    /// Open / close one decode step.  See the vtable comments: this is a
+    /// boundary hint the backend may ignore, and the CPU backend does.
+    pub fn stepBegin(self: Exec, pos: u32) void {
+        self.vtable.stepBegin(self.ptr, pos);
+    }
+    pub fn stepEnd(self: Exec) void {
+        self.vtable.stepEnd(self.ptr);
     }
     pub fn setThreads(self: Exec, io: std.Io, nt: usize) void {
         self.vtable.setThreads(self.ptr, io, nt);

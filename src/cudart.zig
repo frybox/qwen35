@@ -113,6 +113,73 @@ pub const DeviceProp = extern struct {
 pub const MemcpyHostToDevice: c_int = 1;
 pub const MemcpyDeviceToHost: c_int = 2;
 
+/// `cudaStreamCreate`'s flags.  `NonBlocking` means "does not implicitly
+/// synchronise with the legacy default stream", which is what the graph's
+/// capture/replay stream must be: a blocking stream would make every graph
+/// replay wait on the default stream's previous work (the argmax copy), and the
+/// capture itself is refused on a stream that has such a relationship.
+pub const StreamNonBlocking: c_uint = 0x1;
+/// `cudaEventDisableTiming`.  The decode graph's ordering event has no use for
+/// timestamps, and without the flag every record costs a clock read.
+pub const EventDisableTiming: c_uint = 0x2;
+
+/// `cudaStreamCaptureMode`.  `Global` is the most restrictive mode: it refuses/// *any* unsafe call (a legacy-default-stream launch, a synchronous memcpy, a
+/// stream sync) for the whole process while the capture is open, not just for
+/// the capturing thread.  That is exactly the check we want -- a single
+/// `cudaMemcpy` leaking into the capture is the failure mode that would
+/// otherwise produce a graph which silently replays a stale copy.
+pub const StreamCaptureModeGlobal: c_int = 0;
+/// Captures only work the *current thread* submits.  Stricter than `Global`,
+/// which pulls in every stream of every thread (`cudaStreamCaptureModeGlobal`)
+/// and therefore drags unrelated host work into the graph.
+pub const StreamCaptureModeThreadLocal: c_int = 1;
+
+/// `cudaGraphNodeType`.  Only the two the backend discriminates are named.
+pub const GraphNodeTypeKernel: c_int = 0;
+pub const GraphNodeTypeMemcpy: c_int = 1;
+pub const GraphNodeTypeMemset: c_int = 2;
+
+/// `cudaKernelNodeParams` (driver_types.h, `struct __device_builtin__`).
+///
+/// Declared because `cudaGraphExecKernelNodeSetParams` takes it by pointer and
+/// we must build one ourselves to retarget a captured node's arguments.  The
+/// layout is the header's exactly: `func`, `gridDim`, `blockDim`,
+/// `sharedMemBytes`, `kernelParams`, `extra`.  `dim3` is three `unsigned int`
+/// (12 bytes), so `blockDim` starts at offset 20 -- the struct is *not*
+/// naturally aligned and gets no trailing padding assumptions beyond size 40.
+///
+/// `kernelParams` is an array of `nargs` pointers, each pointing at that
+/// argument's value; `extra` is the flat "extra" buffer encoding (unused here,
+/// always null).  Which of the two the runtime stored for a captured node is
+/// not observable, so `cudaGraphKernelNodeGetParams` may hand back an `extra`
+/// blob instead of a `kernelParams` array -- see `graph.zig`-side notes in
+/// backend_cuda.zig for how that is handled (we rebuild rather than mutate).
+pub const KernelNodeParams = extern struct {
+    func: ?*anyopaque,
+    grid_dim_x: c_uint,
+    grid_dim_y: c_uint,
+    grid_dim_z: c_uint,
+    block_dim_x: c_uint,
+    block_dim_y: c_uint,
+    block_dim_z: c_uint,
+    shared_mem_bytes: c_uint,
+    kernel_params: ?*?*anyopaque,
+    extra: ?*?*anyopaque,
+
+    comptime {
+        // Field order here decides whether the runtime reads a sane grid/block
+        // or garbage; the kernel would then launch with a nonsense geometry and
+        // the only symptom would be wrong numbers.  Pin the layout.
+        std.debug.assert(@offsetOf(KernelNodeParams, "func") == 0);
+        std.debug.assert(@offsetOf(KernelNodeParams, "grid_dim_x") == 8);
+        std.debug.assert(@offsetOf(KernelNodeParams, "block_dim_x") == 20);
+        std.debug.assert(@offsetOf(KernelNodeParams, "shared_mem_bytes") == 32);
+        std.debug.assert(@offsetOf(KernelNodeParams, "kernel_params") == 40);
+        std.debug.assert(@offsetOf(KernelNodeParams, "extra") == 48);
+        std.debug.assert(@sizeOf(KernelNodeParams) == 56);
+    }
+};
+
 /// Environment, injected by `main` before the backend is created.  Zig 0.17
 /// removed `std.posix.getenv`; environment now arrives through
 /// `std.process.Init.environ_map`, which only `main` has.  Needed for
@@ -181,6 +248,9 @@ pub const Lib = struct {
     /// Kept for future overlap; today the backend uses the default stream and
     /// only needs the type to pass `null` through the launcher ABI.
     StreamCreate: *const fn (*?*anyopaque) callconv(.c) c_int,
+    /// The flags-taking variant.  Used by the decode-graph path, which needs
+    /// `StreamNonBlocking`; the plain `StreamCreate` cannot express that.
+    StreamCreateWithFlags: *const fn (*?*anyopaque, c_uint) callconv(.c) c_int,
     StreamDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
     StreamSynchronize: *const fn (?*anyopaque) callconv(.c) c_int,
 
@@ -197,9 +267,71 @@ pub const Lib = struct {
     EventDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
     EventRecord: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int,
     EventSynchronize: *const fn (?*anyopaque) callconv(.c) c_int,
+    /// Makes a stream wait for an event.  The decode-graph stream is
+    /// non-blocking, so it has NO implicit ordering against the legacy default
+    /// stream -- the graph would otherwise start before the embedding lookup
+    /// that fills its input, i.e. read last token's activations.
+    StreamWaitEvent: *const fn (?*anyopaque, ?*anyopaque, c_uint) callconv(.c) c_int,
     /// `ms` is `float` in the C API; `cudaEventDefault` timing is the default so
     /// elapsed time has ~0.5 microsecond resolution.
     EventElapsedTime: *const fn (*f32, ?*anyopaque, ?*anyopaque) callconv(.c) c_int,
+
+    // --- CUDA graphs ---------------------------------------------------------
+    //
+    // Used only by the decode-time graph path in backend_cuda.zig, and only
+    // when `$QWEN35_CUDA_GRAPH` is not 0.  All of them are CUDA-10-era symbols
+    // except `GraphExecKernelNodeSetParams` (10.0) and `GraphInstantiate`
+    // (`flags` replaced the three legacy out-params in 12.0), so a runtime
+    // older than that simply fails the load with a named symbol instead of
+    // crashing -- the backend then runs the direct-launch path.
+    StreamBeginCapture: *const fn (?*anyopaque, c_int) callconv(.c) c_int,
+    /// Hands back the captured graph *and* the error node on failure, which is
+    /// what makes "capture went wrong, tell me where" possible without a
+    /// follow-up `cudaGetLastError` that a concurrent thread could steal.
+    StreamEndCapture: *const fn (?*anyopaque, *?*anyopaque) callconv(.c) c_int,
+    /// `cudaStreamGetCaptureInfo`: (stream, *status, *id, **graph, **nodes,
+    /// *count).  Kept only as a debug hook; dyn-loading it with the wrong
+    /// prototype is a segfault, not a compile error (measured 2026-11).
+    StreamGetCaptureInfo: *const fn (?*anyopaque, *c_int, *usize, *?*anyopaque, *?*anyopaque, *usize) callconv(.c) c_int,
+    GraphInstantiate: *const fn (*?*anyopaque, ?*anyopaque, c_ulonglong) callconv(.c) c_int,
+    GraphLaunch: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int,
+    GraphDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
+    GraphExecDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
+    GraphUpload: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int,
+    /// The captured node list.  The order is documented as unspecified, so the
+    /// backend never infers a node's identity from its position -- see the
+    /// `graphRebind` machinery in backend_cuda.zig.
+    GraphGetNodes: *const fn (?*anyopaque, ?[*]?*anyopaque, *usize) callconv(.c) c_int,
+    GraphNodeGetType: *const fn (?*anyopaque, *c_int) callconv(.c) c_int,
+    /// The dependency direction that matters for ordering: `deps[i]` must finish
+    /// before the node does.  Used instead of `cudaGraphGetEdges`, which returns
+    /// `cudaErrorNotPermitted` for a graph produced by stream capture (measured
+    /// 2026-11), so the edge list of a captured graph cannot be read at all.
+    GraphNodeGetDependencies: *const fn (?*anyopaque, ?[*]?*anyopaque, *usize) callconv(.c) c_int,
+    /// Reads an edge list from a graph.  Kept for completeness only: it returns
+    /// `cudaErrorNotPermitted` on a stream-captured graph, which is why
+    /// `graphCaptureOrder` in backend_cuda.zig reconstructs the order instead.
+    GraphGetEdges: *const fn (?*anyopaque, ?[*]?*anyopaque, ?[*]?*anyopaque, [*]usize, usize) callconv(.c) c_int,
+    GraphClone: *const fn (*?*anyopaque, ?*anyopaque) callconv(.c) c_int,
+    /// An empty graph, which `graphCaptureOrder` fills with the recorded nodes in
+    /// execution order; nothing else creates one.
+    GraphCreate: *const fn (*?*anyopaque, c_uint) callconv(.c) c_int,
+    /// Copies an EXISTING node (by handle, from another graph) into `graph`,
+    /// with the given dependencies.  This is how `graphCaptureOrder` re-lays the
+    /// recorded nodes out in execution order without rebuilding their params.
+    GraphAddNode: *const fn (*?*anyopaque, ?*anyopaque, ?*const anyopaque, [*]const ?*anyopaque, usize) callconv(.c) c_int,
+    /// Adds a kernel node to an EXISTING graph (the clone of the recorded one),
+    /// which is how `graphCaptureOrder` builds its throw-away probes; nothing
+    /// else creates graph nodes by hand.
+    GraphAddKernelNode: *const fn (*?*anyopaque, ?*anyopaque, ?[*]?*anyopaque, usize, *const KernelNodeParams) callconv(.c) c_int,
+    /// Appends nodes to the set the stream is capturing into (`ADD_ONLY`), i.e.
+    /// "these depend on whatever the stream captured last".
+    /// (stream, nodes, edgeData, count, flags).  The signature grew an
+    /// `edgeData` argument in CUDA 12; passing the 11.x shape dyn-loaded against
+    /// a 13.x runtime segfaults on the first call (measured 2026-11).
+    StreamUpdateCaptureDependencies: *const fn (?*anyopaque, ?[*]?*anyopaque, ?*const anyopaque, usize, c_uint) callconv(.c) c_int,
+    GraphKernelNodeGetParams: *const fn (?*anyopaque, *KernelNodeParams) callconv(.c) c_int,
+    GraphExecKernelNodeSetParams: *const fn (?*anyopaque, ?*anyopaque, *const KernelNodeParams) callconv(.c) c_int,
 
     /// Close the library handle (process exit would do it too; explicit is
     /// better for leak checkers).
@@ -215,6 +347,16 @@ pub const Lib = struct {
         return self.GetErrorString(code);
     }
 };
+
+/// `cudaStreamCaptureModeSequential`: plain stream order IS the dependency
+/// order, which is what `graphCaptureOrder` in backend_cuda.zig relies on.
+pub const capture_mode_sequential: c_int = 1;
+/// `cudaStreamCaptureModeRelaxed`: the capture may be violated by other threads,
+/// which is what `cudaStreamUpdateCaptureDependencies` requires (a strict-mode
+/// capture rejects it with `cudaErrorStreamCaptureUnsupported`).
+pub const capture_mode_relaxed: c_int = 2;
+/// `cudaStreamAddCaptureDependencies`: ADD_ONLY instead of REPLACE.
+pub const stream_add_only: c_uint = 1;
 
 pub const OpenError = error{
     LibraryNotFound,
@@ -295,12 +437,38 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
     L.DeviceSynchronize = bind(&out.lib, *const fn () callconv(.c) c_int, "cudaDeviceSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamSynchronize = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaStreamSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamCreate = bind(&out.lib, *const fn (*?*anyopaque) callconv(.c) c_int, "cudaStreamCreate", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.StreamCreateWithFlags = bind(&out.lib, *const fn (*?*anyopaque, c_uint) callconv(.c) c_int, "cudaStreamCreateWithFlags", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaStreamDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventCreate = bind(&out.lib, *const fn (*?*anyopaque, u32) callconv(.c) c_int, "cudaEventCreateWithFlags", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventRecord = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaEventRecord", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventSynchronize = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.StreamWaitEvent = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque, c_uint) callconv(.c) c_int, "cudaStreamWaitEvent", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventElapsedTime = bind(&out.lib, *const fn (*f32, ?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaEventElapsedTime", mbuf, &miss_len) orelse return error.MissingSymbol;
+
+    // Graph entry points.  Bound unconditionally (same argument as the event
+    // ones: a missing symbol is a *named* load error, and every runtime this
+    // project supports has them).  `$QWEN35_CUDA_GRAPH=0` is what turns the
+    // feature off, not a fallback binding.
+    L.StreamBeginCapture = bind(&out.lib, *const fn (?*anyopaque, c_int) callconv(.c) c_int, "cudaStreamBeginCapture", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.StreamEndCapture = bind(&out.lib, *const fn (?*anyopaque, *?*anyopaque) callconv(.c) c_int, "cudaStreamEndCapture", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.StreamGetCaptureInfo = bind(&out.lib, *const fn (?*anyopaque, *c_int, *usize, *?*anyopaque, *?*anyopaque, *usize) callconv(.c) c_int, "cudaStreamGetCaptureInfo", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphInstantiate = bind(&out.lib, *const fn (*?*anyopaque, ?*anyopaque, c_ulonglong) callconv(.c) c_int, "cudaGraphInstantiate", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphLaunch = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaGraphLaunch", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaGraphDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphExecDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaGraphExecDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphUpload = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaGraphUpload", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphGetNodes = bind(&out.lib, *const fn (?*anyopaque, ?[*]?*anyopaque, *usize) callconv(.c) c_int, "cudaGraphGetNodes", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphNodeGetType = bind(&out.lib, *const fn (?*anyopaque, *c_int) callconv(.c) c_int, "cudaGraphNodeGetType", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphNodeGetDependencies = bind(&out.lib, *const fn (?*anyopaque, ?[*]?*anyopaque, *usize) callconv(.c) c_int, "cudaGraphNodeGetDependencies", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphGetEdges = bind(&out.lib, *const fn (?*anyopaque, ?[*]?*anyopaque, ?[*]?*anyopaque, [*]usize, usize) callconv(.c) c_int, "cudaGraphGetEdges", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphClone = bind(&out.lib, *const fn (*?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaGraphClone", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphCreate = bind(&out.lib, *const fn (*?*anyopaque, c_uint) callconv(.c) c_int, "cudaGraphCreate", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphAddNode = bind(&out.lib, *const fn (*?*anyopaque, ?*anyopaque, ?*const anyopaque, [*]const ?*anyopaque, usize) callconv(.c) c_int, "cudaGraphAddNode", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphAddKernelNode = bind(&out.lib, *const fn (*?*anyopaque, ?*anyopaque, ?[*]?*anyopaque, usize, *const KernelNodeParams) callconv(.c) c_int, "cudaGraphAddKernelNode", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.StreamUpdateCaptureDependencies = bind(&out.lib, *const fn (?*anyopaque, ?[*]?*anyopaque, ?*const anyopaque, usize, c_uint) callconv(.c) c_int, "cudaStreamUpdateCaptureDependencies", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphKernelNodeGetParams = bind(&out.lib, *const fn (?*anyopaque, *KernelNodeParams) callconv(.c) c_int, "cudaGraphKernelNodeGetParams", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.GraphExecKernelNodeSetParams = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque, *const KernelNodeParams) callconv(.c) c_int, "cudaGraphExecKernelNodeSetParams", mbuf, &miss_len) orelse return error.MissingSymbol;
     out.missing_len = miss_len;
 
     // --- device validation ---------------------------------------------------

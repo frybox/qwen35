@@ -1206,6 +1206,23 @@ pub const Engine = struct {
         self.embedTo(token, self.x.span(0, hidden));
         if (prof) prof_emb += profNs(io, te);
 
+        // One decode step, from the first layer to the logits, is the only
+        // stretch of this engine whose kernels are known before they run: the
+        // weights are resident, every shape is fixed, and `pos`/`slot` are the
+        // only arguments that move.  A device backend can therefore record it
+        // once and replay it, and it needs to be told where the stretch starts
+        // and ends -- it never sees the model's control flow, only single ops.
+        //
+        // The boundary STARTS AFTER the embedding lookup on purpose: that lookup
+        // picks its row on the HOST (`base + token * row_bytes`), so a captured
+        // dequantize node would re-read the first token's row forever.  One
+        // dequantize row is a few microseconds, so keeping it out of the graph
+        // costs nothing measurable and removes a whole class of staleness.
+        //
+        // The boundary ENDS BEFORE `sample`: its result is the next token, so it
+        // has to reach the host before the next step can exist.  A backend that
+        // ignores the hint (the CPU one does) is unaffected either way.
+        self.exec.stepBegin(pos);
         for (self.layers, 0..) |*lw, li| {
             if (c.isFullAttention(@intCast(li))) {
                 const a = Io.Clock.Timestamp.now(io, .awake);
@@ -1248,7 +1265,18 @@ pub const Engine = struct {
     /// Forward + sample one token.  Greedy (argmax) when the sampler's
     /// temperature is 0 — the historical default.
     pub fn step(self: *Engine, token: u32, pos: u32) u32 {
+        // One decode step, from the embedding lookup to the logits, is the only
+        // stretch of this engine whose kernels are known before they run: weights
+        // are resident, every shape is fixed, and `pos`/`slot` are the only
+        // arguments that move.  A device backend can therefore record it once and
+        // replay it, and it needs to be told where the stretch starts and ends --
+        // it never sees the model's control flow, only individual ops.
+        //
+        // The boundary deliberately EXCLUDES `sample`: its result is the next
+        // token, so it has to reach the host before the next step exists.  A
+        // backend that ignores the hint (the CPU one does) is unaffected.
         const logits = self.forwardLogits(token, pos);
+        self.exec.stepEnd();
         return self.exec.sample(logits, self.sample_scratch, &self.sampler);
     }
 
@@ -1282,7 +1310,21 @@ pub const Engine = struct {
     pub fn forwardChunk(self: *Engine, tokens: []const u32, pos0: u32) Buf {
         const k = tokens.len;
         std.debug.assert(k > 0 and k <= self.nbatch);
-        if (k == 1) return self.forwardLogits(tokens[0], pos0);
+        // A single-token chunk is just a serial step, but it is reached from
+        // `generate`'s PREFILL loop, which (unlike the decode loop) does not call
+        // `exec.stepEnd`.  Delegating straight to `forwardLogits` would therefore
+        // open a backend decode-graph capture (`stepBegin`) that nothing ever
+        // closes, and the capture would run on into the first real decode step --
+        // the graph would then hold two tokens' worth of nodes and replay garbage
+        // from the first replayed token.  Measured 2026-11: with a 17-token
+        // prompt the capture recorded 120 rope64 nodes (60 from pos 16 and 60 from
+        // pos 17) instead of 60.  Close the span here so prefill can never leak
+        // one into the decode boundary.
+        if (k == 1) {
+            const out = self.forwardLogits(tokens[0], pos0);
+            self.exec.stepEnd();
+            return out;
+        }
 
         const c = self.cfg;
         const hidden: usize = c.hidden;
@@ -1596,8 +1638,8 @@ pub const Engine = struct {
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRange(cache.k.span(slot * kv_dim, kv_dim), k);
-        self.exec.copyRange(cache.v.span(slot * kv_dim, kv_dim), v);
+        self.exec.copyRangeSlot(cache.k.span(slot * kv_dim, kv_dim), k, slot);
+        self.exec.copyRangeSlot(cache.v.span(slot * kv_dim, kv_dim), v, slot);
         cache.len += 1;
 
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
@@ -1748,8 +1790,8 @@ pub const Engine = struct {
         const cache = &self.kv[li];
         std.debug.assert(cache.len < max_seq);
         const slot: usize = cache.len;
-        self.exec.copyRange(cache.k.span(slot * kv_dim, kv_dim), self.k.span(0, kv_dim));
-        self.exec.copyRange(cache.v.span(slot * kv_dim, kv_dim), self.v.span(0, kv_dim));
+        self.exec.copyRangeSlot(cache.k.span(slot * kv_dim, kv_dim), self.k.span(0, kv_dim), slot);
+        self.exec.copyRangeSlot(cache.v.span(slot * kv_dim, kv_dim), self.v.span(0, kv_dim), slot);
         cache.len += 1;
 
         // attention: kv = h // gqa (B13), scale = hd^-0.5
