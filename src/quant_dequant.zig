@@ -1303,6 +1303,24 @@ fn f16BitsToF32(h: u16) f32 {
     return @floatCast(@as(f16, @bitCast(h)));
 }
 
+/// Dequantize one 256-element f16 row-block (512 bytes, no block metadata).
+/// Matches the `dequantRowFn` contract: one call consumes 8 x 32 elements and
+/// writes exactly 256 floats (`ggml-quants.c` has no f16 block scale -- every
+/// element carries its own).
+pub fn dequantF16(row: []const u8, out: []f32) void {
+    std.debug.assert(out.len == 256 and row.len >= 512);
+    const src: [*]const u16 = @ptrCast(@alignCast(row.ptr));
+    for (0..256) |i| out[i] = f16BitsToF32(src[i]);
+}
+
+/// Dequantize one 256-element bf16 row-block (512 bytes).  bf16 is the top 16
+/// bits of an f32, so widening is exact: shift into the top half.
+pub fn dequantBF16(row: []const u8, out: []f32) void {
+    std.debug.assert(out.len == 256 and row.len >= 512);
+    const src: [*]const u16 = @ptrCast(@alignCast(row.ptr));
+    for (0..256) |i| out[i] = bf16BitsToF32(src[i]);
+}
+
 fn bf16BitsToF32(h: u16) f32 {
     return @as(f32, @bitCast(@as(u32, h) << 16));
 }

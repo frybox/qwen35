@@ -29,8 +29,10 @@ pub const DotF32 = *const fn (n: c_int, a: [*]const u8, b: [*]const u8) callconv
 
 extern fn f32_dot_f32(n: c_int, a: [*]const u8, b: [*]const u8) callconv(.c) f32;
 extern fn bf16_dot_f32(n: c_int, a: [*]const u8, b: [*]const u8) callconv(.c) f32;
+extern fn f16_dot_f32(n: c_int, a: [*]const u8, b: [*]const u8) callconv(.c) f32;
 
 /// Bound directly to the C symbol: there is only one f32 implementation tier
 /// (AVX2+FMA with a complete scalar fallback inside the same unit).
 pub const dotF32: DotF32 = f32_dot_f32;
 pub const dotBf16F32: DotF32 = bf16_dot_f32;
+pub const dotF16F32: DotF32 = f16_dot_f32;

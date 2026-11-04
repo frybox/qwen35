@@ -232,6 +232,22 @@ pub const Task = union(enum) {
         rows: usize,
         k: usize,
     },
+    /// f16/bf16 weights kept in their 2-byte form, read against f32
+    /// activations.  `dot` (`dotBf16F32`/`dotF16F32`) expands each element
+    /// inside the kernel, so the summed values are the exact same f32 numbers
+    /// the materialized f32 copy held -- no activation quantization, so a row's
+    /// result matches the materialized path bit-for-bit.  Half the memory
+    /// traffic and no expanded copy.
+    w16: struct {
+        out: [*]f32,
+        data: []const u8,
+        x: [*]const f32,
+        x_len: usize,
+        cols: usize,
+        rows: usize,
+        k: usize,
+        dot: simd_api.DotF32,
+    },
 };
 
 pub const Slot = struct {
@@ -267,6 +283,7 @@ fn rowsOf(t: Task) usize {
         .quantN => |q| q.rows * q.k,
         .quant_scalar => |q| q.rows * q.k,
         .f32 => |q| q.rows * q.k,
+        .w16 => |q| q.rows * q.k,
     };
 }
 
@@ -353,6 +370,27 @@ fn runRows(t: Task, lo: usize, hi: usize) void {
                 q.out[tok * q.rows + rr] = simd_api.dotF32(
                     @intCast(q.cols),
                     @ptrCast(q.mat.ptr + rr * q.cols),
+                    @ptrCast(xs),
+                );
+            }
+        },
+        .w16 => |q| {
+            // One C call per row: bf16/f16 weights stay in 2-byte form and are
+            // expanded inside the dot (kernels_f32.c).  The activation is the
+            // engine's own f32 vector -- NOT a Q8_0/Q8_K quantization -- because
+            // bf16->f32 is exact, so this row's sum is the same set of f32
+            // products the materialized-f32 path summed, and the result matches
+            // it bit-for-bit.  Reading 2 B/elem instead of 4 is why decode is
+            // faster as well as why the expanded copy is gone.
+            var r = lo;
+            while (r < hi) : (r += 1) {
+                const tok = r / q.rows;
+                const rr = r % q.rows;
+                const xs = q.x[tok * q.x_len ..];
+                if (stat_on) _ = statf32.fetchAdd(@intCast(q.cols * 2), .monotonic);
+                q.out[tok * q.rows + rr] = q.dot(
+                    @intCast(q.cols),
+                    q.data.ptr + rr * q.cols * 2,
                     @ptrCast(xs),
                 );
             }

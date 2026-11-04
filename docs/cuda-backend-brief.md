@@ -12,8 +12,8 @@
 
 | vtable 方法 | CPU 实现 | CUDA 侧做法 |
 |---|---|---|
-| `loadLinear` | `.quant` 直接指 mmap，不拷贝（`backend_cpu.zig:525-529`）；`.f32` 分配 | `.quant`：`cudaMalloc(data.len)` + h2d 原样字节；返回的 `QuantRow.data` 换成设备指针。`.f32` 同 |
-| `freeLinear` | `vFreeLinear`（`backend_cpu.zig:735`） | 必须实现：`cudaFree` 设备指针。注意 `LinearW.deinit`（`backend.zig:35-39`）只释放 `.f32` 的宿主内存，**设备内存只能靠 `freeLinear` 释放** |
+| `loadLinear` | `.quant`/`.f32` 都是指向 mmap 的零拷贝视图，不分配（`backend_cpu.zig` 的 `loadLinear`） | `.quant`：`cudaMalloc(data.len)` + h2d 原样字节；返回的 `QuantRow.data` 换成设备指针。`.f32` 同 |
+| `freeLinear` | `vFreeLinear`（`backend_cpu.zig`）——零拷贝视图，无宿主内存可释放 | 只需 `cudaFree` 设备指针；`LinearW` 的两个臂都不持有任何宿主分配，宿主侧无 `deinit` |
 | `allocScratch(max_cols)` | 宿主 `q8` 缓冲，34 B / 32 elems（`backend_cpu.zig:98`） | `cudaMalloc` 同尺寸设备缓冲 + 复用宿主 pinned staging。**Q8_0 只需 `d`（34 B），但 mmvq 的 `vecdotq` 走 `block_q8_1`（36 B，`ggml-common.h:257-268`）——两套缓冲都备** |
 | `allocScratchK(max_cols, k)` | `q8k` / `q8kK`（292 B / 256 elems） | `cudaMalloc`；若走 mmvq，K-类型激活用 `block_q8_K`（`ggml-common.h:370-375`） |
 | `dequantRow(dst, w, row)` | `dequantRowInto`，按 `blocks_per_row` 逐 row-block（`backend_cpu.zig:577`） | **频次仅每 token 1 次**（`engine.zig:1189`，prefill 每 token 1 次），output 4 KB / 行（0.8B hidden=1024）。可先 d2h 到宿主由 CPU 算（0 成本），P2 再换 GPU kernel |

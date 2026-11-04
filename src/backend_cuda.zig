@@ -18,9 +18,12 @@
 //! Division of labour with `backend_cpu` (deliberate, see AGENTS.md §1.1):
 //!
 //!   * The embedded `CpuBackend` stays authoritative for *metadata* work:
-//!     resolving the GGUF tensor, building the `QuantRow` view, expanding
-//!     f16/bf16/f32 tensors to f32, and the geometry it validates at load time.
-//!     That is startup work over the mmap, not a forward-pass computation.
+//!     resolving the GGUF tensor, building the `QuantRow` view, and the geometry
+//!     it validates at load time.  That is startup work over the mmap, not a
+//!     forward-pass computation.  Only `.f32` tensors are widened; f16/bf16
+//!     weights stay in their native 2-byte form (see `loadLinear` in
+//!     `backend_cpu.zig`) and are uploaded 2 B/elem, widened inside the kernel
+//!     by `mmvq.cu`'s w16 family.
 //!   * Every *numeric* operation the engine asks for -- matvec, K-token batched
 //!     matvec, row dequantization, and the activation scratch those need -- is
 //!     done on the device by the kernels in `src/kernels/cuda`.  There is no CPU
@@ -28,7 +31,8 @@
 //!     impossible to attribute and every profile meaningless.
 //!
 //! Weight residency: `loadLinear` uploads *all* `LinearW.quant` types that the
-//! CPU loader accepts, plus the f32 expansion, and records the device pointer in
+//! CPU loader accepts (f16/bf16 included, at 2 B/elem) plus the `.f32` tensors,
+//! and records the device pointer in
 //! `dev_rows`.  A failed upload is a hard load error, never a silent CPU retreat
 //! -- `--backend cuda` must mean what it says.
 //!
@@ -90,6 +94,10 @@ const Kernels = struct {
     extern fn q35_launch_mul_mat_vec(d_w: ?*const anyopaque, d_xq: ?*const anyopaque, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// Same shape for an f32 weight matrix (embedding / norms).
     extern fn q35_launch_mul_mat_vec_f32(d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// f16/bf16 weights in their native 2-byte form x f32 activation.
+    /// `d_w` is rows*cols u16 (2 B/elem) -- NO f32 copy on the device; the
+    /// dequant happens inside the kernel (mmvq.cu's w16 header).
+    extern fn q35_launch_mul_mat_vec_w16(d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     /// Upload the twelve IQ codebooks to the device (src/kernels/cuda/
     /// iq_tables.cu).  MUST succeed before any kernel that touches an IQ type:
@@ -201,6 +209,7 @@ const Launch = if (cuda_linked) struct {
     const dequantize_row = Kernels.q35_launch_dequantize_row;
     const mul_mat_vec = Kernels.q35_launch_mul_mat_vec;
     const mul_mat_vec_f32 = Kernels.q35_launch_mul_mat_vec_f32;
+    const mul_mat_vec_w16 = Kernels.q35_launch_mul_mat_vec_w16;
     const init_tables = Kernels.q35_launch_init_tables;
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
@@ -246,6 +255,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn mul_mat_vec_f32(d_w: ?[*]const f32, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_w, d_x, d_out, rows, cols, tokens, stream };
+        return stubNoCudaKernels();
+    }
+    fn mul_mat_vec_w16(d_w: ?*const anyopaque, d_x: ?[*]const f32, d_out: ?[*]f32, rows: c_int, cols: c_int, tokens: c_int, ttype: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_w, d_x, d_out, rows, cols, tokens, ttype, stream };
         return stubNoCudaKernels();
     }
     fn init_tables(stream: ?*anyopaque) callconv(.c) c_int {
@@ -343,14 +356,18 @@ const Launch = if (cuda_linked) struct {
 /// Two formats, not one, because a quantized matvec is table-driven per weight
 /// type and the activation block must match the weight block:
 ///   * Q8_0 weights use 32-element blocks -> Q8_0 activations (34 B / 32).
+///   * BF16/F16 weights (one element per 2-byte block, framed into 256-element
+///     GGUF row-blocks) are dotted by the Q8_0 family too -- see
+///     `backend_cpu.actFamily`, which is the single source for this.
 ///   * Every other packed type this backend loads uses 256-element blocks
 ///     (Q4_K/Q6_K/IQ*/... all consume Q8_K) -> Q8_K (292 B / 256).
 ///
-/// Keyed on `gguf.blockElems` rather than a type list so a new 32-element type
-/// cannot silently get the 256-element activation.  Note `rowBlockElems` is NOT
-/// the right discriminator: it is 256 for q4_0/iq4_nl too (AGENTS.md §1.1).
+/// Keying on `gguf.blockElems` alone was a live bug: BF16/F16 have
+/// `blockElems == 1`, so they fell into the Q8_K family and the launcher
+/// sized their activation as 292 B / 256 elements while the weight dot reads
+/// Q8_0 blocks.
 fn actBlockElems(ttype: gguf.TensorType) usize {
-    return if (gguf.blockElems(ttype) == gguf.blockElems(.q8_0))
+    return if (cpu_mod.actFamily(ttype) == .q8_0)
         gguf.blockElems(.q8_0)
     else
         gguf.blockElems(.q8_k);
@@ -358,7 +375,7 @@ fn actBlockElems(ttype: gguf.TensorType) usize {
 
 /// Packed bytes of one activation block for `ttype`'s matvec input.
 fn actBlockBytes(ttype: gguf.TensorType) usize {
-    return if (gguf.blockElems(ttype) == gguf.blockElems(.q8_0))
+    return if (cpu_mod.actFamily(ttype) == .q8_0)
         gguf.blockBytes(.q8_0)
     else
         gguf.blockBytes(.q8_k);
@@ -528,8 +545,8 @@ fn slotSyncs(s: Slot) bool {
     };
 }
 
-/// One device copy of a host weight.  `ttype` is null for the f32 expansion
-/// (which has no quant type); `rows`/`cols` are stored because an f32 slice
+/// One device copy of a host weight.  `ttype` is null for the `.f32` tensors
+/// (which have no quant type); `rows`/`cols` are stored because an f32 slice
 /// carries no geometry of its own and both matvec paths need the launch shape.
 const DevRow = struct {
     host: [*]const u8,
@@ -654,8 +671,9 @@ pub const CudaBackend = struct {
     /// cross-check in `mvCheck`, which is diagnostics and cannot affect output.
     cpu: cpu_mod.CpuBackend,
     /// The GGUF being served.  Needed only by `vLoadLinear` to recover the
-    /// rows/cols of an f16/bf16/f32 weight: `LinearW.f32` is a flat slice with no
-    /// geometry, and the device launches need `cols`.
+    /// rows/cols of a `.f32` weight: `LinearW.f32` is a flat slice with no
+    /// geometry, and the device launches need `cols`.  Every quant row -- f16
+    /// and bf16 included -- carries its own rows/cols, so none of them uses this.
     g: *const gguf.File,
     cu: ?cudart.Open = null,
     /// Why device init failed; re-reported from `allocScratch` so `Engine.load`
@@ -2768,6 +2786,35 @@ pub const CudaBackend = struct {
         }
     }
 
+    /// Launch the f16/bf16 (w16) matvec.  `d_w` is the resident 2-byte-per-element
+    /// weights, `d_x` the f32 activation.  Writes straight into `outBuf` when that
+    /// is already device memory (the CUDA-graph decode path), otherwise into the
+    /// shared staging buffer and downloads.  Returns the launch result code so the
+    /// caller reports it; 0 (cudaSuccess) means the work is queued/done.
+    fn launchW16(self: *CudaBackend, d_w: ?*const anyopaque, d_x: ?[*]const f32,
+                 ttype: gguf.TensorType, rows: usize, cols: usize, tokens: usize,
+                 outBuf: backend.Buf) c_int {
+        const n = tokens * rows;
+        if (dBufPtr(outBuf)) |pd| {
+            return Launch.mul_mat_vec_w16(d_w, d_x, pd, @intCast(rows), @intCast(cols),
+                                          @intCast(tokens), @intCast(@backingInt(ttype)),
+                                          self.launchStream());
+        }
+        ensureBuf(&self.cu.?.lib, &self.d_out, &self.d_out_bytes, n * @sizeOf(f32)) catch {
+            std.debug.print("cuda backend: w16 matvec: device output allocation failed ({d} B)\n", .{n * @sizeOf(f32)});
+            // Negative, not a cudaSuccess value, so the caller's error path fires
+            // (the same shape `stubNoCudaKernels` uses).
+            return -1;
+        };
+        const rc = Launch.mul_mat_vec_w16(d_w, d_x, @ptrCast(@alignCast(self.d_out)),
+                                          @intCast(rows), @intCast(cols), @intCast(tokens),
+                                          @intCast(@backingInt(ttype)), self.launchStream());
+        // The staging branch must download (same contract as the f32 branch: a
+        // download abandons any open graph capture through `dCopyToHost`).
+        if (rc == cudart.cudaSuccess) self.downloadOut(outBuf.slice()[0..n]);
+        return rc;
+    }
+
     fn downloadOut(self: *CudaBackend, out: []f32) void {
         const cu = &self.cu.?;
         const bytes = out.len * @sizeOf(f32);
@@ -2836,17 +2883,19 @@ pub const CudaBackend = struct {
             .quant => |q| q.ttype,
             .f32 => null,
         };
-        // Geometry: the QuantRow view knows rows/cols for a packed weight.  The f32
-        // expansion is a flat slice, so it is registered as one row of `len`
+        // Geometry: the QuantRow view knows rows/cols for a packed weight.  A
+        // `.f32` tensor is a flat slice, so it is registered as one row of `len`
         // columns; the engine only sends f32 weights through `dequantRow` or a
         // `matvec` whose x is exactly that wide.
         const geom = switch (w) {
             .quant => |q| Geometry{ .rows = q.rows, .cols = q.cols() },
-            // A f16/bf16/f32 weight is `LinearW.f32`, a flat expansion with no
+            // A `.f32` weight is `LinearW.f32`, a flat f32 slice with no
             // geometry of its own; recover cols/rows from the tensor's GGUF dims
             // (GGML row-major: dims[0] is the row length).  Falls back to a
             // single row so a missing tensor still reports a clear shape error
             // from the matvec assert rather than silently using the wrong cols.
+            // f16/bf16 never land here: they are `QuantRow`s with the GGUF
+            // 256-element row framing, so `.quant` above already gives the shape.
             .f32 => |m| if (self.g.findTensor(name)) |t|
                 Geometry{
                     .rows = if (t.dims.len > 1) @intCast(t.nElems() / @max(t.dims[0], 1)) else 1,
@@ -2926,8 +2975,9 @@ pub const CudaBackend = struct {
                 }
             }
         }
-        // Host side: an mmap view (quant, not owned) or an arena copy (f32, owned
-        // by the CPU backend).  Let it decide.
+        // Host side: both arms are now zero-copy views into the GGUF mapping
+        // (`.quant` and `.f32` alike), so there is nothing host-side to release
+        // here -- only the device copy above.
         self.cpu.exec().freeLinear(w);
     }
 
@@ -3113,9 +3163,29 @@ pub const CudaBackend = struct {
                 };
                 const cols = q.cols();
                 const rows = q.rows;
-                const xq_bytes = actBytes(q.ttype, cols);
                 std.debug.assert(xBuf.len >= cols and outBuf.len >= rows);
 
+                // f16/bf16: no activation quantization, no f32 weight copy.  The
+                // weights are resident in their native 2-byte form and the kernel
+                // widens them element by element against the engine's f32
+                // activation (`q35_k_mul_mat_vec_w16` in mmvq.cu).
+                if (q.ttype == .f16 or q.ttype == .bf16) {
+                    const rcw = self.launchW16(e.dev, d_x, q.ttype, rows, cols, 1, outBuf);
+                    if (rcw != cudart.cudaSuccess) {
+                        if (self.capturing()) self.graphAbandon("mul_mat_vec_w16 launch failed");
+                        std.debug.print("cuda backend: mul_mat_vec({s}) launch failed: {s}\n", .{
+                            @tagName(q.ttype), std.mem.span(cu.lib.errStr(rcw)),
+                        });
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                    self.stat_ns_matvec += durNs(t0, self.io);
+                    self.stat_by_type[@backingInt(q.ttype)] += 1;
+                    self.stat_n_matvec += 1;
+                    return;
+                }
+
+                const xq_bytes = actBytes(q.ttype, cols);
                 ensureBuf(&cu.lib, &self.d_xq, &self.d_xq_bytes, xq_bytes) catch {
                     std.debug.print("cuda backend: matvec: device activation allocation failed ({d} B)\n", .{xq_bytes});
                     self.clearDevBuf(outBuf);
@@ -3330,9 +3400,10 @@ pub const CudaBackend = struct {
                 const rows = e.rows;
                 const cols = e.cols;
                 std.debug.assert(xKBuf.len >= k * cols and outBuf.len >= k * rows);
-                // `$QWEN35_PROF`: same device-side clock as the quant path.  The
-                // f32 expansion is only used for f16/bf16 weights, so on a
-                // quantized model this branch never runs.
+                // `$QWEN35_PROF`: same device-side clock as the quant path.  This
+                // branch serves `.f32` weights only; f16/bf16 take the w16 branch
+                // below, so a model whose linear weights are 2-byte (BF16/F16) or
+                // packed never reaches it.
                 if (self.gpuTimingOn()) self.batchKTimingBegin();
                 const act_bytes = k * cols * @sizeOf(f32);
                 const d_x: [*]const f32 = blk: {
@@ -3409,6 +3480,43 @@ pub const CudaBackend = struct {
                     self.stat_h2d_bytes += act_bytes;
                     break :blk @ptrCast(@alignCast(self.d_act.?));
                 };
+                // f16/bf16: no activation quantization at all.  The K f32 rows
+                // are already resident (`base_act`), the kernel widens the
+                // 2-byte weights against them, and `d_xq` is never touched --
+                // so this branch skips the quantize launch and its buffer
+                // entirely.
+                if (q.ttype == .f16 or q.ttype == .bf16) {
+                    var d_out_w: [*]f32 = undefined;
+                    if (out_dev) |p| {
+                        d_out_w = p;
+                    } else {
+                        ensureBuf(&cu.lib, &self.d_out, &self.d_out_bytes, k * rows * @sizeOf(f32)) catch return oomMsg("batchK output");
+                        d_out_w = @ptrCast(@alignCast(self.d_out.?));
+                    }
+                    const rcw = Launch.mul_mat_vec_w16(
+                        e.dev,
+                        base_act,
+                        d_out_w,
+                        @intCast(rows),
+                        @intCast(cols),
+                        @intCast(k),
+                        @intCast(@backingInt(q.ttype)),
+                        self.launchStream(),
+                    );
+                    if (rcw != cudart.cudaSuccess) {
+                        std.debug.print("cuda backend: mul_mat_vec({s}, K={d}) launch failed: {s}\n", .{
+                            @tagName(q.ttype), k, std.mem.span(cu.lib.errStr(rcw)),
+                        });
+                        self.clearDevBuf(outBuf);
+                        return;
+                    }
+                    if (out_dev == null) self.downloadOut(outBuf.slice()[0 .. k * rows]);
+                    self.stat_ns_batchk += durNs(t0, self.io);
+                    self.stat_n_batchk += 1;
+                    if (self.gpuTimingOn()) self.batchKTimingEnd();
+                    return;
+                }
+
                 ensureBuf(&cu.lib, &self.d_xq, &self.d_xq_bytes, per_tok * k) catch return oomMsg("batchK quantized activation");
                 var d_out: [*]f32 = undefined;
                 if (out_dev) |p| {

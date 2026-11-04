@@ -91,17 +91,39 @@ __global__ void q35_k_mul_mat_vec_q(const unsigned char *__restrict__ w,
 // the host-side table instantiates every shape in the 1..8 domain.  WARPS=4
 // (128 threads) is the measured-best shape on sm_89; see q35_coop_warps().
 // ---------------------------------------------------------------------------
+// A warp owns one output row and its lanes sweep the row's `nblk` blocks in
+// strides of Q35_WARP: at every step the 32 lanes read 32 *consecutive*
+// blocks, which is what makes the load coalesced (see the file header).
+//
+// The partials live in DYNAMIC shared (extern __shared__): the launcher sizes
+// it WARPS * nblk floats and passes the byte count at launch, so nblk is
+// unbounded.  Slot (warp, b) is part_dyn[warp*nblk + b] (a row per warp);
+// lane `l` writes block `l, l+32, l+64, ...` into that warp's row, so each
+// block's term lands in its own slot regardless of how many blocks a lane
+// owned.  Lane 0 then folds strictly b = 0..nblk-1 with __fadd_rn -- the
+// same left-to-right order q35_dot_row produces, so the value is
+// bit-identical to the thread-per-row mapping.  Shared-memory writes are
+// conflict-free: within a warp the lane `l` of step `k` writes slot
+// `l + 32k`, bank `(l + 32k) % 32 == l`, one per bank.
 template <int WARPS>
 __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
                                            const unsigned char *__restrict__ xq,
                                            float *__restrict__ out,
                                            int rows, int cols, int tokens, int ttype) {
-    __shared__ float part[WARPS][Q35_WARP];
     const Q35QuantInfo info = q35_quant_info(ttype);
     const int nblk = cols / info.block_elems;
     const int lane = threadIdx.x & (Q35_WARP - 1);
     const int warp = threadIdx.x / Q35_WARP;
-    if (nblk > Q35_WARP) return;  // caller picks the other kernel in that case
+
+    // Dynamic shared: the launcher sizes it WARPS * nblk floats (one slot per
+    // (warp, block) -- the exact shape the static part[WARPS][Q35_COOP_MAXNBLK]
+    // used to have, just with the 256 bound gone) and passes the byte count as
+    // the third <<<>>> argument, so nblk is unbounded.  Slot (warp, b) lives at
+    // part_dyn[warp*nblk + b]; lane `l` writes block l, l+32, ... and lane 0
+    // folds b = 0..nblk-1 strictly left to right, so the value stays
+    // bit-identical to the static shape (see the header on reduction order).
+    extern __shared__ float part_dyn[];
+    float *part_w = part_dyn + (size_t)warp * nblk;  // this warp's nblk slots
 
     const int row_in_block = blockIdx.x * WARPS + warp;
     if (row_in_block >= rows) return;
@@ -112,24 +134,61 @@ __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
     for (int t = 0; t < tokens; ++t) {
         const unsigned char *arow = xq + (size_t)t * (size_t)nblk * (size_t)info.act_bytes;
 
-        // Lane `b` owns block b: the warp reads nblk consecutive blocks, one per
-        // lane, which is what makes the load coalesced.
-        float s = 0.0f;
-        if (lane < nblk) {
-            s = q35_dot_1blk(ttype, wrow + (size_t)lane * (size_t)info.block_bytes,
-                             arow + (size_t)lane * (size_t)info.act_bytes, 0.0f);
+        // Lane `l` owns blocks l, l+32, l+64, ...; each step the warp reads
+        // 32 consecutive blocks, coalesced.  Each term is stored at its own
+        // block index so the lane-0 fold below is order-independent of strides.
+        for (int b = lane; b < nblk; b += Q35_WARP) {
+            part_w[b] = q35_dot_1blk(ttype, wrow + (size_t)b * (size_t)info.block_bytes,
+                                      arow + (size_t)b * (size_t)info.act_bytes, 0.0f);
         }
-        part[warp][lane] = s;
         __syncwarp();
 
         if (lane == 0) {
             // Strict left-to-right fold over b = 0..nblk-1: the same order
             // q35_dot_row produces, so the value is bit-identical.
             float acc = 0.0f;
-            for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, part[warp][b]);
+            for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, part_w[b]);
             out[(size_t)t * rows + row_in_block] = acc;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// f16 / bf16 weights x f32 activation (the "w16" family).
+//
+// f16 and bf16 have no block metadata, so there is nothing to quantize: the
+// weights stay in their native 2-byte form on the device (one u16 per element)
+// and are expanded INSIDE the kernel.  No f32 copy of the weights exists
+// anywhere -- resident footprint is 2 B/elem, not 4.
+//
+// The activation is the engine's own f32 vector, NOT a quantized copy:
+//   - the widening is exact for both types (bf16 is the truncated high half of
+//     an f32; f16 -> f32 is exact), so the products are the same f32 values the
+//     materialized-f32 kernel multiplied;
+//   - quantizing the activation to Q8_0 costs ~5 significant digits, and on a
+//     0.8B BF16 model that is enough to flip an argmax in a near-tie and
+//     diverge the rest of the generation.  Measured: the Q8_0-activation CPU
+//     path matched the baseline for 42 tokens, then diverged.
+//
+// Accumulation order is one thread per output row, `c = 0..cols-1` left to
+// right -- the same fold `q35_k_mul_mat_vec_f32` below uses, so a bf16 row here
+// is bit-identical to the same row run as f32, and the CUDA BF16 token stream
+// stays identical to the f32-materialization baseline.  A warp-cooperative
+// reduction would agree only to ~1 ulp; deliberately not used (see the file
+// header's reduction-order contract).
+// ---------------------------------------------------------------------------
+__global__ void q35_k_mul_mat_vec_w16(const unsigned char *__restrict__ w,
+                                      const float *__restrict__ x,
+                                      float *__restrict__ out,
+                                      int rows, int cols, int tokens, int ttype) {
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const int total = rows * tokens;
+    if (idx >= total) return;
+    const int t = idx / rows;
+    const int r = idx - t * rows;
+    const unsigned char *wrow = w + (size_t)r * (size_t)cols * (size_t)Q35_BYTES_F16;
+    const float *xrow = x + (size_t)t * (size_t)cols;
+    out[(size_t)t * rows + r] = q35_dot_row_w16(ttype, wrow, xrow, cols);
 }
 
 // f32 weights x f32 activation, same one-thread-per-element mapping.
@@ -305,13 +364,19 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w, const void *d_xq,
 // pointer-to-void conversion only at a function call), so each instantiation
 // is passed as a first-class function pointer (the `auto` parameter) and the
 // `void*` conversion happens right at the occupancy call.
-static int q35_coop_occ_best_warps(void) {
+static int q35_coop_occ_best_warps(int nblk) {
     int best_warps = 0;
     int best_resident = -1;
     auto occ = [&](auto kern, int warps) {
         int active = 0;
+        // The kernel's `part` is dynamic shared sized WARPS * nblk floats, so
+        // each candidate's per-block shared depends on that candidate's warp
+        // count: pass it so the resident-block count is what the hardware
+        // actually gives (passing 0 would over-estimate residency once nblk is
+        // large enough that shared, not threads, becomes the limit).
+        const size_t shmem = (size_t)warps * (size_t)nblk * sizeof(float);
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active, (const void *)kern, warps * Q35_WARP, 0) == cudaSuccess
+                &active, (const void *)kern, warps * Q35_WARP, shmem) == cudaSuccess
             && active * warps > best_resident) {
             best_resident = active * warps;
             best_warps = warps;
@@ -328,7 +393,7 @@ static int q35_coop_occ_best_warps(void) {
     return best_warps;
 }
 
-static int q35_coop_warps(void) {
+static int q35_coop_warps(int nblk) {
     static int cached = -1;
     if (cached >= 0) return cached;
     int warps = 0;
@@ -350,7 +415,7 @@ static int q35_coop_warps(void) {
             // comment above for the 124 vs 77 tok/s decode measurement.
             warps = 4;
         } else if (cc > 0) {
-            const int best = q35_coop_occ_best_warps();
+            const int best = q35_coop_occ_best_warps(nblk);
             warps = (best >= 1 && best <= 8) ? best : 4;
         } else {
             // No usable device (probe failed): keep the sm_89-measured value.
@@ -402,21 +467,53 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     // `__syncwarp()` plus lane-0 fold cost more than the coalescing saves
     // (measured: 27B IQ3_XXS prefill 11.3 -> 10.1 t/s).  Keep the thread-per-row
     // kernel for tokens > 1, where each token already fills the SMs.
-    if (tokens == 1 && nblk <= Q35_WARP) {
+    if (tokens == 1) {
         // One warp per row: coalesced because the warp's lanes read consecutive
         // blocks of a single row.  See q35_k_mul_mat_vec_q_coop for why this is
-        // numerically identical to the thread-per-row mapping.
-        const int warps = q35_coop_warps();
+        // numerically identical to the thread-per-row mapping (bit-identical:
+        // part[warp][b] holds block b's term, lane 0 folds b = 0..nblk-1 with
+        // __fadd_rn -- the exact order q35_dot_row uses).
+        // nblk is unbounded: `part` is dynamic shared, sized WARPS * nblk floats
+        // and passed as the third <<<>>> argument (was a static part[WARPS]
+        // [Q35_COOP_MAXNBLK] with nblk<=256; the bound is gone).
+        const int warps = q35_coop_warps(nblk);
         const int blocks = (rows + warps - 1) / warps;
+        const size_t shmem = (size_t)warps * (size_t)nblk * sizeof(float);
+        if (shmem > 48u * 1024u) {
+            // Above the default dynamic-shared ceiling (48 KiB/block).  Raise it
+            // (sticky attribute, set on every instantiation; the launch below
+            // uses the matching one) -- without this the launch fails and
+            // decode silently degrades to thread-per-row for wide rows.
+            // NOTE: the attribute can only ever GROW (a smaller set returns
+            // cudaErrorInvalidValue), so track the high water mark and skip
+            // the call when nothing grew.
+            static size_t max_set = 0;
+            if (shmem > max_set) {
+                auto opt = [&](auto kern) {
+                    cudaFuncSetAttribute(
+                        (const void *)kern,
+                        cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+                };
+                opt(q35_k_mul_mat_vec_q_coop_t<1>);
+                opt(q35_k_mul_mat_vec_q_coop_t<2>);
+                opt(q35_k_mul_mat_vec_q_coop_t<3>);
+                opt(q35_k_mul_mat_vec_q_coop_t<4>);
+                opt(q35_k_mul_mat_vec_q_coop_t<5>);
+                opt(q35_k_mul_mat_vec_q_coop_t<6>);
+                opt(q35_k_mul_mat_vec_q_coop_t<7>);
+                opt(q35_k_mul_mat_vec_q_coop_t<8>);
+                max_set = shmem;
+            }
+        }
         switch (warps) {
-        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<blocks, 1 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<blocks, 2 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<blocks, 3 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<blocks, 4 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<blocks, 5 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<blocks, 6 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<blocks, 7 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        default: q35_k_mul_mat_vec_q_coop_t<8><<<blocks, 8 * Q35_WARP, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<blocks, 1 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<blocks, 2 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<blocks, 3 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<blocks, 4 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<blocks, 5 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<blocks, 6 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<blocks, 7 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        default: q35_k_mul_mat_vec_q_coop_t<8><<<blocks, 8 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
         }
         return (int)cudaGetLastError();
     }
@@ -449,6 +546,24 @@ extern "C" int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x,
     // not a trade worth making while the quantized path is the hot one.
     q35_k_mul_mat_vec_f32<<<blocks, threads, 0, stream>>>(d_w, d_x, d_out, rows, cols,
                                                           tokens);
+    return (int)cudaGetLastError();
+}
+
+// f16/bf16 weights x f32 activation.  `d_w` is `rows*cols` u16 (2 B/elem),
+// `d_x` is `tokens*cols` f32.  Same thread mapping as the f32 kernel, so the
+// result is bit-identical to the f32-materialization path (see the w16 header
+// above).  `ttype` picks bf16 (bits << 16) vs f16 (__half2float).
+extern "C" int q35_launch_mul_mat_vec_w16(const void *d_w, const float *d_x,
+                                          float *d_out, int rows, int cols,
+                                          int tokens, int ttype, void *stream_v) {
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    if (rows <= 0 || cols <= 0 || tokens <= 0) return (int)cudaSuccess;
+    if (ttype != Q35_TT_F16 && ttype != Q35_TT_BF16) return (int)cudaErrorInvalidValue;
+    const int threads = 256;
+    const int total = rows * tokens;
+    const int blocks = (total + threads - 1) / threads;
+    q35_k_mul_mat_vec_w16<<<blocks, threads, 0, stream>>>(
+        (const unsigned char *)d_w, d_x, d_out, rows, cols, tokens, ttype);
     return (int)cudaGetLastError();
 }
 

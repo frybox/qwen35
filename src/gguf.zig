@@ -287,8 +287,19 @@ fn unreachableBlockLayout(t: TensorType) noreturn {
 /// All framed types pack 8 x 32 = 256 elements per row-block; spelled as an
 /// expression over the layout table rather than a bare 256 so the 32-element
 /// block size keeps a single source.
+///
+/// f16/bf16 are listed explicitly (256).  Their `blockLayout` is 1 element, so
+/// the generic branch would ALSO give 256 -- the row framing they actually use
+/// -- and the packed matvec path works.  It is spelled out rather than left to
+/// that arithmetic so the contract stays readable at the type it names, and so
+/// adding a type with a non-32-element native block cannot silently inherit a
+/// 256-element row-block.
 pub fn rowBlockElems(t: TensorType) usize {
-    return if (t == .q8_0) blockElems(.q8_0) else 8 * blockElems(.q4_0);
+    return switch (t) {
+        .q8_0 => blockElems(.q8_0),
+        .f16, .bf16 => 8 * blockElems(.q4_0),
+        else => 8 * blockElems(.q4_0),
+    };
 }
 
 const gguf = @This();

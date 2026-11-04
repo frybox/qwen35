@@ -16,6 +16,7 @@ const backend = @import("backend.zig");
 const quant = @import("quant_dequant.zig");
 const pool_mod = @import("pool.zig");
 const simd = @import("simd_dispatch.zig");
+const simd_api = @import("simd_api.zig");
 
 const LinearW = backend.LinearW;
 const QuantRow = backend.QuantRow;
@@ -26,6 +27,27 @@ const Io = std.Io;
 
 pub const blockElemsOf = gguf.blockElems;
 pub const blockElemBytes = gguf.blockBytes;
+
+/// Activation family of a weight type: which activation block its matvec
+/// consumes (Q8_0 = 34 B / 32 elems, Q8_K = 292 B / 256 elems).
+///
+/// This is NOT derivable from `gguf.blockElems` alone, and keying on it is a
+/// live bug: BF16/F16 weights store ONE element per 2-byte block
+/// (`blockLayout` = elems 1 / bytes 2) and are framed into 256-element GGUF
+/// row-blocks, so `blockElems == 32` is false for them -- they fell into the
+/// Q8_K branch, found no dot kernel there, and landed in `matvecQuantScalar`,
+/// which reads ONE 2-byte "row" per 256-element activation window (garbage).
+/// Their dot kernel is `bf16_q8_0` / `f16_q8_0` -- the Q8_0 family.  So the
+/// family is stated explicitly here; the single source CPU and CUDA share.
+pub const ActFamily = enum { q8_0, q8_k };
+pub fn actFamily(ttype: gguf.TensorType) ActFamily {
+    return switch (ttype) {
+        // 2-byte unquantized weights: no block scale, decoded element-by-element
+        // inside the dot, activated with Q8_0.
+        .f16, .bf16 => .q8_0,
+        else => if (blockElemsOf(ttype) == 32) .q8_0 else .q8_k,
+    };
+}
 
 pub const q8_0_block_elems = gguf.blockElems(.q8_0);
 pub const q8_0_block_bytes = gguf.blockBytes(.q8_0);
@@ -143,6 +165,13 @@ fn rowDotFor(ttype: gguf.TensorType) ?*const fn (row: []const u8, x: []const f32
 }
 
 fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, pool: ?*pool_mod.Pool) void {
+    // f16/bf16: no activation quantization.  The dequant happens inside the C
+    // dot element-by-element, so the activation stays the engine's f32 vector
+    // and the row's sum is bit-identical to the materialized-f32 path.
+    if (w.ttype == .f16 or w.ttype == .bf16) {
+        matvecPacked(out, w, x, pool);
+        return;
+    }
     var pidx: usize = undefined;
     var pt0: Io.Clock.Timestamp = undefined;
     if (prof) {
@@ -161,10 +190,9 @@ fn matvecQuant(out: []f32, w: QuantRow, x: []const f32, q8k: []u8, q8: []u8, poo
     // row-block) would give a 1/8-size row.
     const cols = w.cols();
     std.debug.assert(out.len == rows and x.len >= cols);
-    // 32-element blocks <=> the type's own block IS 32 elements.  This is
-    // the single, data-layout-derived branch; all kernel selection below
-    // follows from it.
-    const act_b32 = blockElemsOf(w.ttype) == 32;
+    // Activation family: Q8_0 (32-elem blocks) or Q8_K (256-elem blocks).
+    // Explicit list, not `blockElems() == 32` -- see `actFamily`.
+    const act_b32 = actFamily(w.ttype) == .q8_0;
     // `bpr` is always in row-blocks, and only q8_0 has 32-element row-blocks
     // (see `QuantRow.rowBlockElems`).  The framed 32-element-block types
     // (q4_0/q4_1/q5_*/iq4_nl/mxfp4...) still count 256-element row-blocks, so
@@ -304,7 +332,22 @@ fn matvecBatchK(out: []f32, w: LinearW, xK: []const f32, k: usize, q8K: []u8, q8
         .quant => |qrow| {
             const cols = qrow.cols();
             std.debug.assert(xK.len >= k * cols);
-            const act_b32 = blockElemsOf(qrow.ttype) == 32;
+            if (qrow.ttype == .f16 or qrow.ttype == .bf16) {
+                // Same as the single-token packed path: f32 activations, dequant
+                // inside the C dot.  `tok = r / rows` indexes the K tokens.
+                pool_mod.parallel(pool, .{ .w16 = .{
+                    .out = out.ptr,
+                    .data = qrow.data,
+                    .x = xK.ptr,
+                    .x_len = cols,
+                    .cols = cols,
+                    .rows = rows,
+                    .k = k,
+                    .dot = if (qrow.ttype == .bf16) simd_api.dotBf16F32 else simd_api.dotF16F32,
+                } });
+                return;
+            }
+            const act_b32 = actFamily(qrow.ttype) == .q8_0;
             if (act_b32) {
                 const dot = switch (qrow.ttype) {
                     .q8_0 => simd.d32row.q8_0_q8_0,
@@ -448,6 +491,11 @@ pub fn dequantRowFnFor(ttype: gguf.TensorType) ?dequantRowFn {
         .iq1_s => &quant.dequantIQ1S,
         .iq1_m => &quant.dequantIQ1M,
         .q2_k => &quant.dequantQ2K,
+        // 2-byte unquantized types: no block metadata, one element per 2-byte
+        // block.  Registered so `dequantRowInto` (and the embedding lookup that
+        // runs through it) can serve BF16 token rows without any f32 copy.
+        .f16 => &quant.dequantF16,
+        .bf16 => &quant.dequantBF16,
         else => null,
     };
 }
@@ -471,6 +519,32 @@ fn matvecF32(out: []f32, mat: []const f32, x: []const f32, pool: ?*pool_mod.Pool
         .cols = cols,
         .rows = rows,
         .k = 1,
+    } });
+}
+
+/// f16/bf16 matvec over the mmap weight bytes, with the activation left as the
+/// engine's own f32 vector.  The dequant happens inside the C dot, per element
+/// (`kernels_f32.c`), so:
+///   - no f32 copy of the weights exists (the .f32 materialization is gone),
+///   - the values summed are exactly the f32 values the materialized copy
+///     would have held, so the row's result matches the f32-materialized path
+///     bit-for-bit, and
+///   - decode reads 2 B/elem instead of 4.
+/// This is `ggml_vec_mad_bf16` in llama.cpp.
+fn matvecPacked(out: []f32, w: QuantRow, x: []const f32, pool: ?*pool_mod.Pool) void {
+    const rows = out.len;
+    const cols = w.cols();
+    std.debug.assert(x.len >= cols);
+    std.debug.assert(w.data.len >= rows * cols * 2);
+    pool_mod.parallel(pool, .{ .w16 = .{
+        .out = out.ptr,
+        .data = w.data,
+        .x = x.ptr,
+        .x_len = cols,
+        .cols = cols,
+        .rows = rows,
+        .k = 1,
+        .dot = if (w.ttype == .bf16) simd_api.dotBf16F32 else simd_api.dotF16F32,
     } });
 }
 
@@ -526,36 +600,33 @@ fn quantRowOf(g: *const gguf.File, t: *const gguf.Tensor) backend.LoadError!Quan
     return QuantRow.init(t.*, data);
 }
 
-/// Load a 2D linear weight: quantized types stay in their native packed
-/// layout (zero-copy view into the mmap); f32/f16/bf16 are expanded to f32.
-fn loadLinear(alloc: std.mem.Allocator, g: *const gguf.File, name: []const u8) backend.LoadError!LinearW {
+/// Load a 2D linear weight: every type stays in its native packed layout as a
+/// zero-copy view into the GGUF mapping, `.f32` included.
+///
+/// f16/bf16 used to be expanded to f32 here, which doubled the resident
+/// footprint of a BF16 model (2 B/elem on disk -> 4 B/elem in RAM) and made
+/// every BF16 matvec a pure f32 dot; the CUDA backend inherited the same
+/// waste because it uploads what `loadLinear` returns.  They are now
+/// `QuantRow`s with the GGUF row framing they actually use (256-element
+/// row-blocks, 1 element per 2-byte block -- see `gguf.rowBlockElems`), and
+/// the C kernels `f16_q8_0`/`bf16_q8_0` decode each element on the fly inside
+/// the dot.  `.f32` tensors are the same deal: the tensor bytes are a
+/// `[]const f32` view of the mapping (the GGUF format pads every tensor to a
+/// 32-byte alignment, which covers the 4-byte f32 alignment), and the f32
+/// dot kernel reads through it.  The 1-D `loadTensorF32` tensors are the
+/// exception -- they are expanded in place (softplus / -exp(A) on `ssm_a`),
+/// so they keep an owned copy.
+fn loadLinear(g: *const gguf.File, name: []const u8) backend.LoadError!LinearW {
     const t = g.findTensor(name) orelse return error.MissingTensor;
     switch (t.ttype) {
-        .q8_0, .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m => {
+        .q8_0, .q4_0, .q4_1, .q4_k, .q5_k, .q6_k, .q3_k, .iq4_xs, .iq4_nl, .iq3_s, .iq3_xxs, .iq2_s, .iq2_xxs, .q2_k, .iq2_xs, .iq1_s, .iq1_m, .f16, .bf16 => {
             return .{ .quant = try quantRowOf(g, t) };
         },
-        // f16/bf16 carry no block layout, so the packed path cannot hold them;
-        // they are expanded to f32 here (exactly, no rounding).
-        .f16, .bf16, .f32 => {
+        .f32 => {
             const n: usize = @intCast(t.nElems());
             const data = g.tensorData(t) catch return error.MissingTensor;
-            const out = alloc.alloc(f32, n) catch return error.OutOfMemory;
-            errdefer alloc.free(out);
-            switch (t.ttype) {
-                .f32 => @memcpy(out, @as([*]const f32, @ptrCast(@alignCast(data)))[0..n]),
-                .f16 => {
-                    const src: [*]const u16 = @ptrCast(@alignCast(data));
-                    for (0..n) |i| out[i] = @floatCast(@as(f16, @bitCast(src[i])));
-                },
-                .bf16 => {
-                    // BF16 is the top 16 bits of an f32: widen by shifting,
-                    // which is exact for every bf16 value.
-                    const src: [*]const u16 = @ptrCast(@alignCast(data));
-                    for (0..n) |i| out[i] = @as(f32, @bitCast(@as(u32, @intCast(src[i])) << 16));
-                },
-                else => unreachable,
-            }
-            return .{ .f32 = out };
+            // Zero-copy: the mapping is read-only and outlives this view.
+            return .{ .f32 = @as([*]const f32, @ptrCast(@alignCast(data)))[0..n] };
         },
         else => return error.UnsupportedTensorType,
     }
@@ -649,12 +720,13 @@ pub const CpuBackend = struct {
 
     fn vLoadLinear(ctx: *anyopaque, name: []const u8) backend.LoadError!LinearW {
         const self: *CpuBackend = @ptrCast(@alignCast(ctx));
-        return loadLinear(self.alloc, self.g, name);
+        return loadLinear(self.g, name);
     }
 
     fn vFreeLinear(ctx: *anyopaque, w: LinearW) void {
-        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
-        w.deinit(self.alloc);
+        _ = ctx;
+        _ = w;
+        // Zero-copy views into the mapping; nothing to release.
     }
 
     fn vAllocScratch(ctx: *anyopaque, max_cols: usize) anyerror!void {

@@ -32,6 +32,12 @@
 #define Q35_QK8_0 32
 #define Q35_Q8_0_BLOCK_BYTES 34
 
+// f16 and bf16 carry no block metadata: the element IS the value, so a "block"
+// is one element.  Both are 2 bytes, which is the resident footprint the CUDA
+// backend keeps on the device (see the w16 header in mmvq.cu -- the dequant
+// happens inside the kernel, so there is no f32 copy of the weights).
+#define Q35_BYTES_F16 2
+
 // f16 bits -> f32.  `__half2float` is the same IEEE-754 binary16 decode the
 // CPU path performs in k32_f16_to_f32 (kernels32.c:45), including subnormals.
 __device__ __forceinline__ float q35_ld_scale(const unsigned char *p) {

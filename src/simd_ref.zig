@@ -321,6 +321,46 @@ pub const dot32 = struct {
         }
         return sumf;
     }
+    /// f16 weights (2 B/elem, one 32-element block = 64 bytes, no block
+    /// metadata) x Q8_0 activation.  Mirrors `k32_f16_q8_0_scalar`
+    /// (kernels32.c) exactly: one f16 activation scale per block, then k=0..31
+    /// in order, `acc += w * (float)(int8)q`, `sumf += d * acc`.
+    pub fn f16_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+        const nb = n / 32;
+        var sumf: f32 = 0;
+        for (0..nb) |ib| {
+            const xb: [*]align(1) const u16 = @ptrCast(vx + ib * 64);
+            const yb = vy + ib * q8_bytes;
+            const d = util.f16At(yb, 0);
+            var acc: f32 = 0;
+            for (0..32) |k| acc += @as(f32, @floatCast(@as(f16, @bitCast(xb[k])))) * @as(f32, @floatFromInt(@as(i8, @bitCast(yb[2 + k]))));
+            sumf += d * acc;
+        }
+        return sumf;
+    }
+
+    /// bf16 weights x Q8_0 activation.  bf16 is the top 16 bits of an f32, so
+    /// widening is exact (shift into the exponent field); mirrors
+    /// `k32_bf16_q8_0_scalar`.  Getting the widening wrong (e.g. treating the
+    /// bits as an integer, or as f16) is exactly what this ref is meant to
+    /// catch.
+    pub fn bf16_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+        const nb = n / 32;
+        var sumf: f32 = 0;
+        for (0..nb) |ib| {
+            const xb: [*]align(1) const u16 = @ptrCast(vx + ib * 64);
+            const yb = vy + ib * q8_bytes;
+            const d = util.f16At(yb, 0);
+            var acc: f32 = 0;
+            for (0..32) |k| {
+                const w: f32 = @as(f32, @bitCast(@as(u32, @intCast(xb[k])) << 16));
+                acc += w * @as(f32, @floatFromInt(@as(i8, @bitCast(yb[2 + k]))));
+            }
+            sumf += d * acc;
+        }
+        return sumf;
+    }
+
     pub fn q4_0_q8_0_ref(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
         const nb = n / 32;
         var sumf: f32 = 0;

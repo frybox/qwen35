@@ -34,16 +34,19 @@ const sampler = @import("sampler.zig");
 pub const QuantRow = gguf.QuantRow;
 
 /// A 2-D linear weight as the engine sees it: either still packed in its
-/// quantization format (the normal case, zero-copy) or already expanded to
-/// f32 (f32/f16/bf16 tensors).
+/// quantization format (the normal case, zero-copy -- this includes f16 and
+/// bf16, which stay 2 B/elem and are widened inside the dot kernels) or, for
+/// `.f32` tensors, the native f32 slice.
+///
+/// Both forms are zero-copy views into the GGUF mapping: `.f32` is the tensor
+/// bytes reinterpreted as `[]const f32` (the mapping pads every tensor to a
+/// 32-byte alignment, so the 4-byte f32 alignment holds).  Nothing in either
+/// arm is allocated, so a `LinearW` carries no destructor of its own -- the
+/// view is valid only while the mapping is, and a device backend uploads from
+/// it without copying host-side first.
 pub const LinearW = union(enum) {
     quant: QuantRow,
-    f32: []f32,
-
-    pub fn deinit(self: LinearW, alloc: std.mem.Allocator) void {
-        // `quant` points into the GGUF mapping; only the f32 copy is owned.
-        if (self == .f32) alloc.free(self.f32);
-    }
+    f32: []const f32,
 };
 
 /// A region of activation / state memory owned by the backend.

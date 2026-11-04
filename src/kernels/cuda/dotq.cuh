@@ -102,6 +102,32 @@ __device__ __forceinline__ float q35_dot_1blk(int ttype, const unsigned char *w,
     }
 }
 
+// f16 / bf16 weights (2 bytes per element, no block metadata) against the
+// engine's f32 activation, left to right.  The widening is EXACT for both
+// types, so the products are the same f32 values the materialized-f32 kernel
+// multiplied; the loop order here is the same `c = 0..cols-1` fold that
+// `q35_k_mul_mat_vec_f32` uses, INCLUDING its `fmaf` (fused multiply-add, one
+// rounding).  A `__fmul_rn`+`__fadd_rn` pair would round twice per term and
+// drift ~1 ulp per block, enough to flip an argmax -- see the w16 header in
+// mmvq.cu for the measured consequence on the BF16 model.
+__device__ __forceinline__ float q35_dot_row_w16(int ttype, const unsigned char *wrow,
+                                                 const float *xrow, int cols) {
+    float acc = 0.0f;
+    const uint16_t *w = (const uint16_t *)wrow;
+    if (ttype == Q35_TT_BF16) {
+        // bf16 is the top half of an f32: shift the raw bits into the exponent
+        // field.  Exact, no rounding.
+        for (int c = 0; c < cols; ++c) {
+            acc = fmaf(__uint_as_float((uint32_t)w[c] << 16), xrow[c], acc);
+        }
+    } else {
+        for (int c = 0; c < cols; ++c) {
+            acc = fmaf(__half2float(__ushort_as_half(w[c])), xrow[c], acc);
+        }
+    }
+    return acc;
+}
+
 // Whole-row dot: walk `nblk` native blocks of one weight row against one
 // activation row, strictly left to right (see the header on reduction order).
 __device__ __forceinline__ float q35_dot_row(int ttype, const unsigned char *wrow,

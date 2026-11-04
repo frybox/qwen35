@@ -379,14 +379,23 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
                         }
                     }
                 } else {
+                    // Row-block framing, identical to `backend_cpu.dequantRowInto`:
+                    // one `deq` call consumes one 256-element row-block (8 x 32
+                    // sub-blocks for q4_0/iq4_nl, 8 x 32 single-element blocks for
+                    // f16/bf16) and emits `rbe` floats.  Keying on `blockElems()`
+                    // alone is wrong here: f16/bf16 have blockElems == 1 (one
+                    // element per 2-byte block), so the old per-block loop asked a
+                    // 256-wide dequantizer for a 1-wide output.
                     const bb = q.blockBytes(); // one block of this type
-                    const be = q.blockElems();
+                    const rbe = q.rowBlockElems();
+                    const per_rb = rbe / q.blockElems(); // blocks per row-block
                     const deq = backend_cpu.dequantRowFnFor(q.ttype) orelse return -2;
                     for (0..q.blocks_per_row) |b| {
                         const i = rr * q.blocks_per_row + b;
-                        if (i * bb + bb > q.data.len) return -4;
-                        deq(q.data[i * bb ..][0..bb], rowbuf[0..be]);
-                        for (0..be) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * be + j]);
+                        const span = per_rb * bb;
+                        if (i * span + span > q.data.len) return -4;
+                        deq(q.data[i * span ..][0..span], rowbuf[0..rbe]);
+                        for (0..rbe) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * rbe + j]);
                     }
                 }
             },
@@ -1091,22 +1100,17 @@ pub const Engine = struct {
 
 
     fn freeLayerWeights(alloc: std.mem.Allocator, lw: LayerWeights) void {
+        // Linear weights are zero-copy views into the GGUF mapping (both the
+        // `.quant` and `.f32` arms), so there is nothing to release for them:
+        // the views die with the mapping.
         alloc.free(lw.attn_norm);
         alloc.free(lw.post_attention_norm);
-        lw.ffn_gate.deinit(alloc);
-        lw.ffn_up.deinit(alloc);
-        lw.ffn_down.deinit(alloc);
     }
 
     fn freeLayerTyped(alloc: std.mem.Allocator, lw: *LayerWeights) void {
-        // linear weights (q8 views point into the mmap, f32 copies are ours)
-        inline for (.{
-            &lw.attn_qkv, &lw.attn_gate, &lw.ssm_alpha, &lw.ssm_beta,    &lw.ssm_out,
-            &lw.attn_q,   &lw.attn_k,    &lw.attn_v,    &lw.attn_output,
-        }) |p| {
-            if (p.*) |w| w.deinit(alloc);
-        }
-        // plain f32 scratch tensors
+        // The `?LinearW` fields (attn_qkv / ssm_alpha / ffn_gate / ...) are all
+        // zero-copy views into the mapping -- nothing to free.
+        // plain f32 scratch tensors (owned by the engine)
         inline for (.{
             &lw.ssm_conv1d,  &lw.ssm_dt_bias, &lw.ssm_a, &lw.ssm_norm,
             &lw.attn_q_norm, &lw.attn_k_norm,
@@ -1137,8 +1141,8 @@ pub const Engine = struct {
 
     fn freeAll(self: *Engine) void {
         const a = self.alloc;
-        self.token_embd.deinit(a);
-        if (self.output_weight) |w| w.deinit(a);
+        // `token_embd` / `output_weight` are zero-copy views into the mapping;
+        // the layer `LinearW`s are the same (see `freeLayerWeights`).
         if (self.output_norm.len > 0) a.free(self.output_norm);
         self.exec.freeScratch();
         if (self.layers.len > 0) {

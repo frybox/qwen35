@@ -1152,7 +1152,54 @@ static float k32_bf16_q8_0_scalar(int n, const void* vx, const void* vy) {
 }
 
 #if defined(__AVX2__)
-/* 32 f16 halves -> 32 f32, exactly (vcvtph2ps, F16C). */
+/* f16/bf16 -> f32 conversions, and the 32-element dot against Q8_0.
+ *
+ * THE LANE-WIDTH TRAP (this is what garbled the whole BF16 model):
+ * `vcvtph2ps ymm, xmm/m64` reads the LOW 64 BITS of its source -> 8 f32 from 8
+ * halves.  `vpmovzxwd ymm, xmm/m64` also reads the LOW 64 BITS -> only 4 f32
+ * from 4 bf16.  So one 128-bit register can feed 8 f16 (16 bytes) for f16, but
+ * only 4 bf16 (8 bytes) for bf16 -- the two types need DIFFERENT group widths.
+ * The first version of these kernels paired a weight group with an activation
+ * slice using the *weight* stride, so the bf16 kernel multiplied elements 0..3
+ * against activation elements 0..7, elements 4..7 against 8..15, and so on: 16
+ * of every 32 products were paired with the wrong activation element.  The
+ * synthetic row test caught it (relative error 0.77 on one block); the
+ * whole-model symptom is fluent garbage output.
+ *
+ * Element i of a Q8_0 block is at byte `2 + i` (1 byte per element); element i
+ * of an f16/bf16 block is at byte `2*i` (2 bytes per element).  Every group
+ * below pairs a weight slice with an activation slice covering the SAME element
+ * range, derived from that element index.  Group order is k = 0,4,8,...,28,
+ * matching the scalar oracle's k = 0..31. */
+
+/* 8 f16 halves (16 bytes) -> 8 f32, exactly (vcvtph2ps, F16C). */
+static inline __m256 k32_f16x8_to_f32x8(__m128i v) {
+    return _mm256_cvtph_ps(v);
+}
+
+/* 4 bf16 (8 bytes) -> 4 f32 by shifting each 16-bit lane into the f32 exponent
+ * field.  Exact: bf16 is the truncated high half of an f32. */
+static inline __m256 k32_bf16x4_to_f32x4(__m128i v) {
+    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(v), 16));
+}
+
+/* 8 int8 (8 bytes) -> 8 f32. */
+static inline __m256 k32_i8x8_to_f32x8(__m128i v) {
+    return _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v));
+}
+
+/* 4 int8 (4 bytes) -> 4 f32, in the 128-bit domain. */
+static inline __m128 k32_i8x4_to_f32x4(__m128i v) {
+    return _mm_cvtepi32_ps(_mm_cvtepi8_epi32(v));
+}
+
+static inline float k32_hsum_float_4(const __m128 x) {
+    __m128 s = _mm_add_ps(x, _mm_movehl_ps(x, x));
+    s = _mm_add_ss(s, _mm_movehdup_ps(s));
+    return _mm_cvtss_f32(s);
+}
+
+/* 32 f16 weights x 32 int8 activation: 4 groups of 8 elements. */
 static float k32_f16_q8_0_avx2(int n, const void* vx, const void* vy) {
     const uint8_t* x = (const uint8_t*)vx;
     const uint8_t* y = (const uint8_t*)vy;
@@ -1162,25 +1209,18 @@ static float k32_f16_q8_0_avx2(int n, const void* vx, const void* vy) {
         const uint8_t* xb = x + ib * 64;
         const uint8_t* yb = y + ib * 34;
         const float d = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
-        const __m256 w0 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(xb + 0)));
-        const __m256 w1 = _mm256_cvtph_ps(_mm_loadu_si128((const __m128i*)(xb + 16)));
-        const __m256i q32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
-        const __m256 q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(q32)));
-        const __m256 q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_extracti128_si256(q32, 1)));
-        __m256 acc = _mm256_mul_ps(w0, q0);
-        acc = _mm256_fmadd_ps(w1, q1, acc);
+        __m256 acc = _mm256_setzero_ps();
+        for (int k = 0; k < 32; k += 8) {
+            const __m256 w = k32_f16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(xb + 2 * k)));
+            const __m256 q = k32_i8x8_to_f32x8(_mm_loadl_epi64((const __m128i*)(yb + 2 + k)));
+            acc = _mm256_add_ps(acc, _mm256_mul_ps(w, q));
+        }
         sumf += d * k32_hsum_float_8(acc);
     }
     return sumf;
 }
 
-/* 32 bf16 -> 32 f32 by shifting each 16-bit lane into the f32 exponent
- * field (vpmovzxwd + vpslld). No rounding: bf16 is exactly the truncated
- * high half of an f32. */
-static inline __m256 k32_bf16x8_to_f32x8(__m128i v) {
-    return _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(v), 16));
-}
-
+/* 32 bf16 weights x 32 int8 activation: 8 groups of 4 elements. */
 static float k32_bf16_q8_0_avx2(int n, const void* vx, const void* vy) {
     const uint8_t* x = (const uint8_t*)vx;
     const uint8_t* y = (const uint8_t*)vy;
@@ -1190,18 +1230,18 @@ static float k32_bf16_q8_0_avx2(int n, const void* vx, const void* vy) {
         const uint8_t* xb = x + ib * 64;
         const uint8_t* yb = y + ib * 34;
         const float d = k32_f16_to_f32((uint16_t)(yb[0] | ((uint32_t)yb[1] << 8)));
-        const __m256 w0 = k32_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(xb + 0)));
-        const __m256 w1 = k32_bf16x8_to_f32x8(_mm_loadu_si128((const __m128i*)(xb + 16)));
-        const __m256i q32 = _mm256_loadu_si256((const __m256i*)(yb + 2));
-        const __m256 q0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_castsi256_si128(q32)));
-        const __m256 q1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm256_extracti128_si256(q32, 1)));
-        __m256 acc = _mm256_mul_ps(w0, q0);
-        acc = _mm256_fmadd_ps(w1, q1, acc);
-        sumf += d * k32_hsum_float_8(acc);
+        __m128 acc = _mm_setzero_ps();
+        for (int k = 0; k < 32; k += 4) {
+            const __m128 w = _mm256_castps256_ps128(k32_bf16x4_to_f32x4(_mm_loadl_epi64((const __m128i*)(xb + 2 * k))));
+            const __m128 q = k32_i8x4_to_f32x4(_mm_loadl_epi64((const __m128i*)(yb + 2 + k)));
+            acc = _mm_add_ps(acc, _mm_mul_ps(w, q));
+        }
+        sumf += d * k32_hsum_float_4(acc);
     }
     return sumf;
 }
-#else
+
+#else  /* no AVX2/F16C: use the exact scalar path */
 static float k32_f16_q8_0_avx2(int n, const void* vx, const void* vy) {
     return k32_f16_q8_0_scalar(n, vx, vy);
 }

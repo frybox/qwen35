@@ -27,6 +27,8 @@ const C = struct {
     extern fn iq4_nl_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
     extern fn mxfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
     extern fn nvfp4_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
+    extern fn f16_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
+    extern fn bf16_q8_0(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
 
     extern fn q2_k_q8_k(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
     extern fn q3_k_q8_k(n: c_int, vx: ?*const anyopaque, vy: ?*const anyopaque) f32;
@@ -79,6 +81,20 @@ pub const dot32 = struct {
     }
     pub fn nvfp4_q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
         return C.nvfp4_q8_0(@intCast(n), vx, vy);
+    }
+    /// f16 weights (2 B/elem, no block metadata) x Q8_0 activation.
+    pub fn f16_q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+        return C.f16_q8_0(@intCast(n), vx, vy);
+    }
+    /// bf16 weights (2 B/elem) x Q8_0 activation.
+    pub fn bf16_q8_0(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+        return C.bf16_q8_0(@intCast(n), vx, vy);
+    }
+    pub fn f16_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+        return f16_q8_0(n, vx, vy);
+    }
+    pub fn bf16_q8_0_row(n: usize, vx: [*]const u8, vy: [*]const u8) callconv(.c) f32 {
+        return bf16_q8_0(n, vx, vy);
     }
 
     // Row entry points: the C kernels iterate over blocks, so a row and a

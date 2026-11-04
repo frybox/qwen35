@@ -53,6 +53,7 @@ test {
 
 test {
     _ = @import("simd_tests_iq_c.zig");
+    _ = @import("simd_tests_f32.zig");
 }
 
 test {

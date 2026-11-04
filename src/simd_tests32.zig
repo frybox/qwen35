@@ -31,6 +31,15 @@ fn makeX(buf: []f32, seed: u64) void {
     for (buf) |*v| v.* = (r.float(f32) * 2.0 - 1.0) * 4.0;
 }
 
+/// Positive activations, paired with `fillRowPacked`'s positive weights: the
+/// products keep one sign, so the row sum is far from zero and `relErr` is a
+/// real signal (see the note on `fillRowPacked`).
+fn makeXPos(buf: []f32, seed: u64) void {
+    var rng = std.Random.DefaultPrng.init(seed);
+    const r = rng.random();
+    for (buf) |*v| v.* = r.float(f32) * 4.0 + 0.5;
+}
+
 /// Random packed weight bytes with the f16 scale fields forced into a small
 /// finite range, so products stay sane and no NaN/Inf enters the sums.
 fn fillWeight(alloc: std.mem.Allocator, rb: usize, seed: u64, comptime scales: []const usize) ![]u8 {
@@ -48,17 +57,60 @@ fn fillWeight(alloc: std.mem.Allocator, rb: usize, seed: u64, comptime scales: [
 }
 
 const cases = .{
-    .{ .name = "q8_0_q8_0", .elems = 32, .rb = 34, .scales = &[_]usize{0} },
-    .{ .name = "q4_0_q8_0", .elems = 32, .rb = 18, .scales = &[_]usize{0} },
-    .{ .name = "q4_1_q8_0", .elems = 32, .rb = 20, .scales = &[_]usize{ 0, 2 } },
-    .{ .name = "q5_0_q8_0", .elems = 32, .rb = 22, .scales = &[_]usize{0} },
-    .{ .name = "q5_1_q8_0", .elems = 32, .rb = 24, .scales = &[_]usize{ 0, 2 } },
-    .{ .name = "q1_0_q8_0", .elems = 128, .rb = 18, .scales = &[_]usize{0} },
-    .{ .name = "q2_0_q8_0", .elems = 64, .rb = 18, .scales = &[_]usize{0} },
-    .{ .name = "iq4_nl_q8_0", .elems = 32, .rb = 18, .scales = &[_]usize{0} },
-    .{ .name = "mxfp4_q8_0", .elems = 32, .rb = 17, .scales = &[_]usize{} },
-    .{ .name = "nvfp4_q8_0", .elems = 64, .rb = 36, .scales = &[_]usize{} },
+    .{ .name = "q8_0_q8_0", .elems = 32, .rb = 34, .scales = &[_]usize{0}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "q4_0_q8_0", .elems = 32, .rb = 18, .scales = &[_]usize{0}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "q4_1_q8_0", .elems = 32, .rb = 20, .scales = &[_]usize{ 0, 2 }, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "q5_0_q8_0", .elems = 32, .rb = 22, .scales = &[_]usize{0}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "q5_1_q8_0", .elems = 32, .rb = 24, .scales = &[_]usize{ 0, 2 }, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "q1_0_q8_0", .elems = 128, .rb = 18, .scales = &[_]usize{0}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "q2_0_q8_0", .elems = 64, .rb = 18, .scales = &[_]usize{0}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "iq4_nl_q8_0", .elems = 32, .rb = 18, .scales = &[_]usize{0}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "mxfp4_q8_0", .elems = 32, .rb = 17, .scales = &[_]usize{}, .fill_bits = false, .is_bf16 = false },
+    .{ .name = "nvfp4_q8_0", .elems = 64, .rb = 36, .scales = &[_]usize{}, .fill_bits = false, .is_bf16 = false },
+    // f16/bf16: every 16-bit lane IS a weight value (no block scale, no
+    // metadata).  `packed = true` switches the filler to `fillWeightPacked`,
+    // which constrains the exponent field -- raw random bytes put a large
+    // fraction of lanes in the NaN/Inf/large-exponent range, which poisons
+    // the comparison threshold for reasons unrelated to the kernel.
+    .{ .name = "f16_q8_0", .elems = 32, .rb = 64, .scales = &[_]usize{}, .fill_bits = true, .is_bf16 = false },
+    .{ .name = "bf16_q8_0", .elems = 32, .rb = 64, .scales = &[_]usize{}, .fill_bits = true, .is_bf16 = true },
 };
+
+/// Fill a weight row of `nblocks` x `rb` bytes with finite, moderate f16/bf16
+/// values.  `elems` is the element count per block, `rb` the block bytes, so
+/// `rb == elems * 2`.  Exponent fields are kept in a range that lands |w| in
+/// about [2^-7, 2^5], mantissa random, sign random: no NaN/Inf, no denormal
+/// extremes, and the sums stay comparable at the usual 1e-3 threshold.
+/// All-positive: the f16/bf16 dot is a sum of 32 signed products, and a random
+/// sign pattern makes the row sum land near zero, where relative error is
+/// meaningless (the cancellation noise of any float dot exceeds any fixed
+/// tolerance).  Positive weights + positive activations keep every term the
+/// same sign, so `relErr` measures the kernel, not cancellation.
+fn fillRowPacked(alloc: std.mem.Allocator, rb: usize, nblocks: usize, seed: u64, comptime is_bf16: bool) ![]u8 {
+    std.debug.assert(rb % 2 == 0);
+    const b = try alloc.alloc(u8, rb * nblocks);
+    var rng = std.Random.DefaultPrng.init(seed);
+    const r = rng.random();
+    const n = rb * nblocks / 2;
+    const v: [*]align(1) u16 = @ptrCast(b.ptr);
+    for (0..n) |i| {
+        if (comptime is_bf16) {
+            // bf16 = top 16 bits of an f32: sign(1) exp(8) mant(7), bias 127.
+            const exp: u16 = 120 + @as(u16, @intCast(r.intRangeAtMost(u8, 0, 10)));
+            v[i] = (exp << 7) | @as(u16, r.intRangeAtMost(u8, 0, 127));
+        } else {
+            // f16: sign(1) exp(5) mant(10), bias 15.
+            const exp: u16 = 10 + @as(u16, @intCast(r.intRangeAtMost(u8, 0, 10)));
+            v[i] = (exp << 10) | @as(u16, r.intRangeAtMost(u16, 0, 1023));
+        }
+    }
+    return b;
+}
+
+fn fillWeightPacked(alloc: std.mem.Allocator, rb: usize, seed: u64, comptime is_bf16: bool) ![]u8 {
+    return fillRowPacked(alloc, rb, 1, seed, is_bf16);
+}
+
 
 fn runCase(
     comptime m: type,
@@ -67,6 +119,8 @@ fn runCase(
     comptime elems: usize,
     comptime rb: usize,
     comptime scales: []const usize,
+    comptime fill_bits: bool,
+    comptime is_bf16: bool,
     q8: []const u8,
     alloc: std.mem.Allocator,
 ) !f32 {
@@ -76,7 +130,10 @@ fn runCase(
     const w = try alloc.alloc(u8, nblocks * rb);
     defer alloc.free(w);
     for (0..nblocks) |i| {
-        const blk = try fillWeight(alloc, rb, 0x1000 + i * 7, scales);
+        const blk = if (comptime fill_bits)
+            try fillWeightPacked(alloc, rb, 0x1000 + i * 7, is_bf16)
+        else
+            try fillWeight(alloc, rb, 0x1000 + i * 7, scales);
         defer alloc.free(blk);
         @memcpy(w[i * rb ..][0..rb], blk);
     }
@@ -97,12 +154,19 @@ test "simd kern32: SIMD (3 tiers) vs scalar ref" {
     defer alloc.free(q8);
     simd_c.act.quantizeQ8_0(x.len, &x, q8.ptr);
 
+    // Positive activation for the packed f16/bf16 cases (see `fillRowPacked`).
+    var xp: [256]f32 = undefined;
+    makeXPos(&xp, 0xC0FFEE);
+    const q8p = try alloc.alloc(u8, (256 / 32) * q8_bytes);
+    defer alloc.free(q8p);
+    simd_c.act.quantizeQ8_0(xp.len, &xp, q8p.ptr);
+
     var worst: f32 = 0;
     var worst_case: []const u8 = "";
     var worst_tier: []const u8 = "";
     inline for (tier_list) |t| {
         inline for (cases) |c| {
-            const e = try runCase(t.m, simd_ref, c.name, c.elems, c.rb, c.scales, q8, alloc);
+            const e = try runCase(t.m, simd_ref, c.name, c.elems, c.rb, c.scales, c.fill_bits, c.is_bf16, if (c.fill_bits) q8p else q8, alloc);
             std.debug.print("    {s}/{s} = {}\n", .{ c.name, t.name, e });
             if (e > worst) {
                 worst = e;
@@ -259,6 +323,110 @@ test "simd kern32: row kernels == sum of block kernels (3 tiers)" {
     }
     std.debug.print("  kern32 row-vs-block worst = {} ({s})\n", .{ worst, worst_case });
     try std.testing.expect(worst < 1e-3);
+}
+
+// ---------------------------------------------------------------------------
+// f16 / bf16 packed rows (the BF16 model path).
+//
+// These types are the odd ones out: every 16-bit lane IS a weight value, there
+// is no block scale, and the GGUF row framing is 8 x 32 = 256 elements.  The
+// engine feeds `bf16_q8_0` a full row (cols/256 row-blocks) with a Q8_0
+// activation, so three things must hold: the kernel matches the scalar oracle
+// per block, a whole-row call equals the sum of its block calls, and the row
+// matches the engine's own `rowDotBF16`/`rowDotF16` on a real-length row.
+//
+// The synthetic values are built by `fillRowPacked` with the exponent field
+// constrained; raw random bytes land a large share of lanes in the
+// NaN/Inf/large-exponent range, which would blow the tolerance for reasons
+// unrelated to the kernel.
+// ---------------------------------------------------------------------------
+
+const FRowCase = struct { name: []const u8, rowdot: *const fn (row: []const u8, x: []const f32) f32, is_bf16: bool };
+
+const frows = [_]FRowCase{
+    .{ .name = "f16_q8_0", .rowdot = &quant.rowDotF16, .is_bf16 = false },
+    .{ .name = "bf16_q8_0", .rowdot = &quant.rowDotBF16, .is_bf16 = true },
+};
+
+test "simd kern32: f16/bf16 row == sum of blocks, and row vs engine rowDot" {
+    const alloc = std.testing.allocator;
+    const nblocks = 8; // 256 elements: one GGUF row-block, as cols%256==0
+    var x: [nblocks * 32]f32 = undefined;
+    makeX(&x, 0xB16C0DE);
+    const q8 = try alloc.alloc(u8, nblocks * q8_bytes);
+    defer alloc.free(q8);
+    simd_c.act.quantizeQ8_0(x.len, &x, q8.ptr);
+
+    // Exact f32 view of the activation (d * q): feeding this to `rowDot*`
+    // isolates kernel error from activation-quantization error.
+    var xq: [nblocks * 32]f32 = undefined;
+    for (0..nblocks) |b| {
+        const d = f16bits(q8[b * q8_bytes ..][0..2]);
+        for (0..32) |j| xq[b * 32 + j] = d * @as(f32, @floatFromInt(@as(i8, @bitCast(q8[b * q8_bytes + 2 + j]))));
+    }
+
+    var worst_row: f32 = 0;
+    var worst_dot: f32 = 0;
+    var worst_case: []const u8 = "";
+    inline for (tier_list) |t| {
+        inline for (frows) |c| {
+            const w = try fillRowPacked(alloc, 64, nblocks, 0x3000, c.is_bf16);
+            defer alloc.free(w);
+            const row_f: DotFn = @field(t.m.dot32, c.name ++ "_row");
+            const blk_f: DotFn = @field(t.m.dot32, c.name);
+
+            // row kernel == sum of per-block kernels
+            const got = row_f(nblocks * 32, w.ptr, q8.ptr);
+            var ref: f32 = 0;
+            for (0..nblocks) |i| ref += blk_f(32, w[i * 64 ..].ptr, q8[i * q8_bytes ..].ptr);
+            const e1 = relErr(got, ref);
+            if (e1 > worst_row) {
+                worst_row = e1;
+                worst_case = c.name;
+            }
+
+            // row kernel == engine's scalar rowDot over the same row
+            const e2 = relErr(got, c.rowdot(w, &xq));
+            if (e2 > worst_dot) {
+                worst_dot = e2;
+                worst_case = c.name;
+            }
+        }
+    }
+    std.debug.print("  kern32 f16/bf16 row-vs-block worst = {} ({s})\n", .{ worst_row, worst_case });
+    std.debug.print("  kern32 f16/bf16 row-vs-rowDot worst = {} ({s})\n", .{ worst_dot, worst_case });
+    try std.testing.expect(worst_row < 1e-3);
+    try std.testing.expect(worst_dot < 5e-3);
+}
+
+test "simd kern32: f16/bf16 dequant row-block vs bit-level widening" {
+    const alloc = std.testing.allocator;
+    const rbe = 256; // row-block elements (gguf.rowBlockElems for f16/bf16)
+    var worst_f16: f32 = 0;
+    var worst_bf16: f32 = 0;
+
+    inline for ([_]bool{ false, true }) |is_bf16| {
+        const w = try fillRowPacked(alloc, rbe * 2, 1, 0x4000, is_bf16);
+        defer alloc.free(w);
+        var out: [256]f32 = undefined;
+        if (is_bf16) quant.dequantBF16(w, &out) else quant.dequantF16(w, &out);
+        const src: [*]align(1) const u16 = @ptrCast(w.ptr);
+        for (0..rbe) |i| {
+            const want = if (is_bf16)
+                @as(f32, @bitCast(@as(u32, @intCast(src[i])) << 16))
+            else
+                @as(f32, @floatCast(@as(f16, @bitCast(src[i]))));
+            const e = relErr(out[i], want);
+            if (is_bf16) {
+                if (e > worst_bf16) worst_bf16 = e;
+            } else if (e > worst_f16) worst_f16 = e;
+        }
+    }
+    std.debug.print("  kern32 dequant f16 worst = {}  bf16 worst = {}\n", .{ worst_f16, worst_bf16 });
+    // bf16 widening is exact by construction (shift into the exponent field),
+    // so it must be bit-identical; f16 widening is exact too.
+    try std.testing.expect(worst_bf16 == 0);
+    try std.testing.expect(worst_f16 == 0);
 }
 
 // ---------------------------------------------------------------------------
