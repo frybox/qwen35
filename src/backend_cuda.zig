@@ -611,12 +611,17 @@ const DevRegion = struct { ptr: *anyopaque, len: usize };
 /// check on the first real run and the feature switched itself off -- correct,
 /// but useless.
 ///
-/// Each entry costs a few hundred bytes (args + params + ptr arrays), so 256 is
-/// ~200 KiB -- acceptable for a backend that already holds the weights.
-/// 64 layers (27B) needs 128 `rope64` nodes and 64 `attn_decode` ones, so this
-/// still has room to spare.  Exceeding it is not a correctness problem: the
-/// graph path switches itself off and falls back to direct launches.
-const graph_max_layers: usize = 256;
+/// Each entry costs a few hundred bytes (args + params + ptr arrays), so 1024 is
+/// ~800 KiB -- acceptable for a backend that already holds the weights.
+///
+/// Measured on the 27B (65 layers, 24 q-heads, 4 kv-heads, interval 4): a decode
+/// token captures **448 `rope64` + 16 `attn_decode` + 32 kv-append** nodes.  The
+/// earlier claim here ("128 rope64, room to spare") was off by 3.5x and made the
+/// 256 capacity silently reject the graph on every 27B run.  Exceeding the
+/// capacity is not a correctness problem: the graph path switches itself off and
+/// falls back to direct launches, so a too-small value is invisible in the exit
+/// code and only shows up as decode throughput.  0.8B needs 48.
+const graph_max_layers: usize = 1024;
 
 /// One flag per op class the captured decode step can contain.  See
 /// `CudaBackend.g_op_seen` for why the gating exists at all.
