@@ -483,7 +483,16 @@ const slot_count = @intFromEnum(Slot.const_buf) + 1;
 /// token issues ~600 timed slot calls (measured: 599 on the 0.8B), so 1024 pairs
 /// cover one token with headroom; a token that overflows is counted in
 /// `stat_gpu_overflow` rather than dropped silently.
-const gpu_ev_capacity = 1024;
+///
+/// The 27B needs far more: a decode token issues ~2273 timed slot calls (measured
+/// from PROF-SLOT: 111k calls / 49 tokens).  With 1024 pairs the pool overflowed
+/// by 93566, so the PROF-GPU breakdown was unusable on 27B and the device-side
+/// attribution had to be inferred from QWEN35_ABLATE instead of measured.  4096
+/// pairs cover one 27B token with headroom.  This is a debug-only path
+/// (`$QWEN35_PROF_GPU` in the environment); the events are created lazily by
+/// `gpuEvEnsure` and destroyed on teardown, so raising it costs nothing at
+/// runtime outside a profiling run.
+const gpu_ev_capacity = 4096;
 
 /// Human-readable slot names for the `PROF-SLOT` line.  Indexed by
 /// `@intFromEnum`, so a `comptime`-checked length ties them to the enum.
