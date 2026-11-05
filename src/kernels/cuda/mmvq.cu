@@ -41,6 +41,7 @@
 #include "api.h"
 
 #include <stdlib.h>
+#include <string.h>
 
 // The per-type geometry table and the block/row dot helpers moved to
 // dotq.cuh so that mmq.cu (the prefill tile kernel) can use the exact same
@@ -109,7 +110,8 @@ template <int WARPS>
 __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
                                            const unsigned char *__restrict__ xq,
                                            float *__restrict__ out,
-                                           int rows, int cols, int tokens, int ttype) {
+                                           int rows, int cols, int tokens, int ttype,
+                                           int memonly, int rpb) {
     const Q35QuantInfo info = q35_quant_info(ttype);
     const int nblk = cols / info.block_elems;
     const int lane = threadIdx.x & (Q35_WARP - 1);
@@ -123,12 +125,16 @@ __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
     // folds b = 0..nblk-1 strictly left to right, so the value stays
     // bit-identical to the static shape (see the header on reduction order).
     extern __shared__ float part_dyn[];
-    float *part_w = part_dyn + (size_t)warp * nblk;  // this warp's nblk slots
+    // Each row the warp owns gets its OWN nblk-slot region, so the lane-0 fold
+    // below is the same strict b = 0..nblk-1 order for every row -- multi-row
+    // per warp must not change the reduction order (see the header contract).
+    float *part_w = part_dyn + (size_t)warp * (size_t)rpb * nblk;
 
-    const int row_in_block = blockIdx.x * WARPS + warp;
-    if (row_in_block >= rows) return;
-
-    const unsigned char *wrow = w + (size_t)row_in_block * (size_t)nblk * (size_t)info.block_bytes;
+    // A warp owns `rpb` CONSECUTIVE rows: row (warp*rpb + k).  The base is
+    // WARPS*rpb per block, so rows stay covered in order with no gaps.
+    const int row_base = blockIdx.x * WARPS * rpb + warp * rpb;
+    if (row_base >= rows) return;
+    const size_t row_stride = (size_t)nblk * (size_t)info.block_bytes;
 
     // Loop over tokens so a prefill chunk reuses the same tile mapping.
     for (int t = 0; t < tokens; ++t) {
@@ -138,17 +144,42 @@ __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
         // 32 consecutive blocks, coalesced.  Each term is stored at its own
         // block index so the lane-0 fold below is order-independent of strides.
         for (int b = lane; b < nblk; b += Q35_WARP) {
-            part_w[b] = q35_dot_1blk(ttype, wrow + (size_t)b * (size_t)info.block_bytes,
-                                      arow + (size_t)b * (size_t)info.act_bytes, 0.0f);
+            // All rpb rows in one pass: the rpb q35_dot_1blk chains are
+            // independent (different rows, different weights), so issuing them
+            // back to back gives the scheduler rpb-way ILP where the old
+            // single-row mapping had one chain per warp.
+            for (int k = 0; k < rpb; ++k) {
+                const int row = row_base + k;
+                if (row >= rows) break;
+                const unsigned char *wrow = w + (size_t)row * row_stride;
+                const unsigned char *pb = wrow + (size_t)b * (size_t)info.block_bytes;
+                float *slot = part_w + (size_t)k * nblk + b;
+                if (memonly) {
+                    // Load-only: touch every byte of the block, no IQ math.  The
+                    // address pattern, the lane->block mapping and the shared
+                    // write are identical to the real path, so the difference in
+                    // time is the IQ dot product plus its dependent loads.
+                    int s = 0;
+                    for (int i = 0; i < info.block_bytes; ++i) s += pb[i];
+                    *slot = (float)s;
+                } else {
+                    *slot = q35_dot_1blk(ttype, pb,
+                                         arow + (size_t)b * (size_t)info.act_bytes, 0.0f);
+                }
+            }
         }
         __syncwarp();
 
-        if (lane == 0) {
-            // Strict left-to-right fold over b = 0..nblk-1: the same order
-            // q35_dot_row produces, so the value is bit-identical.
+        // Fold `rpb` rows in PARALLEL: lane `k` folds row `k`.  Each row keeps
+        // the strict b = 0..nblk-1 left-to-right fold that q35_dot_row uses, so
+        // every value is bit-identical (the header's reduction-order contract).
+        // Folding everything on lane 0 would serialize rpb*nblk FADDs and make
+        // the reduction the bottleneck as rpb grows.
+        if (lane < rpb && row_base + lane < rows) {
+            const float *slot_row = part_w + (size_t)lane * nblk;
             float acc = 0.0f;
-            for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, part_w[b]);
-            out[(size_t)t * rows + row_in_block] = acc;
+            for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, slot_row[b]);
+            out[(size_t)t * rows + row_base + lane] = acc;
         }
     }
 }
@@ -393,6 +424,48 @@ static int q35_coop_occ_best_warps(int nblk) {
     return best_warps;
 }
 
+/// `$QWEN35_CUDA_MEMONLY`: load-only decode matvec (see the memonly branch in
+/// q35_k_mul_mat_vec_q_coop_t).  Diagnostic only -- it produces garbage output,
+/// so it exists to answer "how much of the decode matvec time is the IQ dot
+/// product" and must never be used for a real run.
+static int q35_memonly() {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    const char *raw = getenv("QWEN35_CUDA_MEMONLY");
+    cached = (raw != NULL && *raw && strcmp(raw, "0") != 0) ? 1 : 0;
+    if (cached) fprintf(stderr, "cuda kernels: decode matvec = LOAD ONLY (no IQ math); output is garbage\n");
+    return cached;
+}
+
+/// `$QWEN35_CUDA_RPB`: rows per warp in the decode matvec (see q35_k_mul_mat_vec_q_coop_t).
+/// 1 = the original one-row-per-warp mapping.
+///
+/// MEASURED, AND IT DOES NOT WORK: on 27B IQ3_XXS (RTX 4090 D, 4 warps, decode
+/// tok/s) rpb = 1/2/4/8/16 gives 17.82 / 17.35 / 16.84 / 15.04 / 12.62 --
+/// strictly WORSE as rpb grows.  The reasoning that motivated it (nblk = 20 < 32,
+/// so a warp's lanes each do one block per row, giving rpb independent
+/// q35_dot_1blk chains) is correct about ILP and wrong about everything else:
+/// with rpb = 1 the 1280 blocks already fill all 114 SMs, so there is no
+/// parallelism left to add, and the only thing rpb changes is the shared-memory
+/// footprint (warps * rpb * nblk floats = 20 KiB at rpb = 16), which lowers
+/// occupancy.  Rows-per-warp is NOT the lever; the chain length inside
+/// q35_dot_1blk (256 elements per lane) is.  Keep the knob as an A/B tool, do
+/// not tune it.
+static int q35_rpb() {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int v = 1;
+    const char *raw = getenv("QWEN35_CUDA_RPB");
+    if (raw != NULL && *raw) {
+        int t = atoi(raw);
+        if (t >= 1 && t <= 32) v = t;
+        else fprintf(stderr, "cuda kernels: QWEN35_CUDA_RPB='%s' is not in 1..32; using 1\n", raw);
+    }
+    cached = v;
+    fprintf(stderr, "cuda kernels: decode matvec rows-per-warp = %d ($QWEN35_CUDA_RPB overrides)\n", cached);
+    return cached;
+}
+
 static int q35_coop_warps(int nblk) {
     static int cached = -1;
     if (cached >= 0) return cached;
@@ -477,8 +550,11 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
         // and passed as the third <<<>>> argument (was a static part[WARPS]
         // [Q35_COOP_MAXNBLK] with nblk<=256; the bound is gone).
         const int warps = q35_coop_warps(nblk);
-        const int blocks = (rows + warps - 1) / warps;
-        const size_t shmem = (size_t)warps * (size_t)nblk * sizeof(float);
+        const int memonly = q35_memonly();
+        const int rpb = q35_rpb();
+        const int rows_per_block = warps * rpb;
+        const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+        const size_t shmem = (size_t)warps * (size_t)rpb * (size_t)nblk * sizeof(float);
         if (shmem > 48u * 1024u) {
             // Above the default dynamic-shared ceiling (48 KiB/block).  Raise it
             // (sticky attribute, set on every instantiation; the launch below
@@ -506,14 +582,14 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
             }
         }
         switch (warps) {
-        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<blocks, 1 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<blocks, 2 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<blocks, 3 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<blocks, 4 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<blocks, 5 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<blocks, 6 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<blocks, 7 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
-        default: q35_k_mul_mat_vec_q_coop_t<8><<<blocks, 8 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype); break;
+        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<blocks, 1 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<blocks, 2 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<blocks, 3 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<blocks, 4 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<blocks, 5 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<blocks, 6 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<blocks, 7 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        default: q35_k_mul_mat_vec_q_coop_t<8><<<blocks, 8 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
         }
         return (int)cudaGetLastError();
     }
