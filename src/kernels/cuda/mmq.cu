@@ -354,12 +354,303 @@ __global__ void q35_k_mmq_mma_q32(const unsigned char *__restrict__ w,
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core (mma.sync) prefill kernel, 256-element K-family weight
+// (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K).
+//
+// Same shape as the 32-element kernel, but the dot's scale is per 16 elements
+// (16 groups per 256-element super-block), so the k32 mma result cannot be
+// used: it mixes two scale groups.  k16 mma is used instead -- one mma per
+// group, so D.x[l] is the EXACT int32 dot of one 16-element group, folded into
+// isum[l] with that group's `scv[g]` in ascending g order.  That is precisely
+// q35_dot_scaled16's association (int-domain, exact), so the integer part is
+// bit-identical by construction.
+//
+// Dequant: the per-type aux8/unpack helpers are reused VERBATIM from
+// vecdotq.cuh (q35_q2k_aux8, q35_q3k_aux8 + q35_q3k_unpack_scales,
+// q35_q6k_aux8, q35_unpack_scale_min), so the int8 weights mma multiplies are
+// the same bytes the dp4a path multiplies.  Q5_K needs the +16 high-bit term,
+// and its `sm[]` is the low-nibble scale; Q6_K carries its scales as int8.
+//
+// Float tail: Q2_K/Q4_K/Q5_K add a `- dmin*summs` term (summs from Q8_K bsums);
+// each type's expression and rounding order mirrors its _acc function exactly.
+// ---------------------------------------------------------------------------
+
+// Dequantize a WHOLE 256-element row of the native block at `wb` into w8[256]
+// (int8), reusing the same aux8 helpers the dp4a path multiplies, so the int8
+// values mma sees are the same bytes.  Q5_K's +16 high-bit term and Q6_K's
+// -32 bias live in those helpers.
+__device__ __forceinline__ void q35_mma_k_aux8(int ttype, const unsigned char *wb,
+                                               int8_t *w8) {
+    signed char *s = (signed char *)w8;
+    switch (ttype) {
+    case Q35_TT_Q2_K:
+        q35_q2k_aux8(wb, s);
+        break;
+    case Q35_TT_Q3_K:
+        q35_q3k_aux8(wb, s);
+        break;
+    case Q35_TT_Q4_K: {
+        const unsigned char *q4 = wb + 16;
+        for (int c = 0; c < 4; ++c) {
+            for (int l = 0; l < 32; ++l) s[c * 64 + l] = (signed char)(q4[c * 32 + l] & 0x0F);
+            for (int l = 0; l < 32; ++l) s[c * 64 + 32 + l] = (signed char)(q4[c * 32 + l] >> 4);
+        }
+        break;
+    }
+    case Q35_TT_Q5_K: {
+        const unsigned char *q4 = wb + 48;
+        const unsigned char *hm = wb + 16;
+        int m = 1;
+        for (int c = 0; c < 4; ++c) {
+            for (int l = 0; l < 32; ++l)
+                s[c * 64 + l] = (signed char)((q4[c * 32 + l] & 0x0F) + ((hm[l] & m) ? 16 : 0));
+            for (int l = 0; l < 32; ++l)
+                s[c * 64 + 32 + l] =
+                    (signed char)((q4[c * 32 + l] >> 4) + ((hm[l] & (m << 1)) ? 16 : 0));
+            m <<= 2;
+        }
+        break;
+    }
+    case Q35_TT_Q6_K:
+        q35_q6k_aux8(wb, s);
+        break;
+    default:
+        break;
+    }
+}
+
+// Per-type: unpack the 16 per-16-element scales (scv[g]) and, where the type
+// has a min term, the per-32-element mins (sm[8 + j/2]).
+__device__ __forceinline__ void q35_mma_k_scales(int ttype, const unsigned char *wb,
+                                                 int *scv, unsigned char *smv) {
+    switch (ttype) {
+    case Q35_TT_Q2_K: {
+        const unsigned char *sc = wb;
+        for (int g = 0; g < 16; ++g) scv[g] = (int)(sc[g] & 0x0F);
+        break;
+    }
+    case Q35_TT_Q3_K: {
+        signed char sc[16];
+        q35_q3k_unpack_scales(wb + 96, sc);
+        for (int g = 0; g < 16; ++g) scv[g] = (int)sc[g] - 32;
+        break;
+    }
+    case Q35_TT_Q4_K:
+    case Q35_TT_Q5_K: {
+        unsigned char sm[16];
+        q35_unpack_scale_min(wb + 4, sm);
+        for (int g = 0; g < 16; ++g) scv[g] = (int)sm[g / 2];
+        for (int j = 0; j < 16; ++j) smv[j] = sm[j];
+        break;
+    }
+    case Q35_TT_Q6_K: {
+        const signed char *sc = (const signed char *)(wb + 192);
+        for (int g = 0; g < 16; ++g) scv[g] = (int)sc[g];
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+__global__ void q35_k_mmq_mma_k256(const unsigned char *__restrict__ w,
+                                   const unsigned char *__restrict__ xq,
+                                   float *__restrict__ out,
+                                   int rows, int cols, int tokens, int ttype) {
+    const Q35QuantInfo info = q35_quant_info(ttype);
+    const int block_bytes = info.block_bytes;
+    const int nblk = cols / 256;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int r0 = blockIdx.x * 128 + warp * 16;
+    const int t0 = blockIdx.y * 8;
+    // NOTE: no early return here.  This kernel uses __syncthreads() (the
+    // activation tile sB is shared by all warps of the block), so every thread
+    // must reach the barrier -- a `return` for out-of-range warps would hang
+    // the block.  Rows past `rows` are guarded at the store instead.
+    const bool row_live = (r0 < rows);
+
+    // Whole 256-element block staged once per warp (16 rows x 256 int8 = 4 KB)
+    // plus one shared 8-token activation tile (2 KB).  34 KB/block total, so
+    // the block still fits two-per-SM.  The per-16 scale makes a group
+    // self-contained but staging the whole block means ONE __syncwarp() per
+    // block instead of 16, and the per-row scales are unpacked once instead of
+    // once per group -- that was most of the cost in the first version.
+    __shared__ int8_t sA[8 * 16 * 256];
+    __shared__ int8_t sB[8 * 256];
+    int8_t *sAw = sA + warp * 16 * 256;
+    __shared__ int sScv[8 * 16 * 16];    // per-warp, per-row group scales
+    int *scv_w = sScv + warp * 16 * 16;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int b = 0; b < nblk; ++b) {
+        const unsigned char *wb0 =
+            w + (size_t)r0 * (size_t)nblk * block_bytes + (size_t)b * block_bytes;
+        // Stage the whole 256-element block for all 16 rows.  Dequantize a
+        // WHOLE row at a time through the same aux8 helper the dp4a path uses
+        // (16 lanes -> 16 rows, one call each) instead of element-by-element
+        // with a per-element type switch: the switch was the bulk of the cost
+        // in the first version (measured 27B Q4_K_XL prefill 21.7 vs 22.5 for
+        // thread-per-row; whole-row aux8 is what the dp4a path already does).
+        if (row_live && lane < 16) {
+            const unsigned char *wb = wb0 + (size_t)lane * (size_t)nblk * block_bytes;
+            q35_mma_k_aux8(ttype, wb, sAw + lane * 256);
+            int scv[16];
+            unsigned char smv[16];
+            q35_mma_k_scales(ttype, wb, scv, smv);
+            for (int g = 0; g < 16; ++g) scv_w[lane * 16 + g] = scv[g];
+        }
+        // Activation: one shared 8-token x 256 int8 tile.  Byte copies, NOT
+        // int4: a Q8_K block is 292 bytes, so 292 % 16 == 4 and neither a token
+        // row nor a block start is 16-byte aligned (an int4 walk faults with
+        // "misaligned address").  This copy is 2 KB next to the weight dequant.
+        // sB is shared by all 8 warps of the block, so the barrier here must be
+        // __syncthreads(): with __syncwarp() a warp could read a tile another
+        // warp was still writing (that was a real bug -- Q6_K had 24 718
+        // mismatched rows until this became a block-wide barrier).
+        if (warp == 0 && lane < 8) {
+            const int np = lane;
+            int8_t *dst = sB + np * 256;
+            if (t0 + np < tokens) {
+                const unsigned char *row =
+                    xq + (size_t)(t0 + np) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
+                for (int k = 0; k < 256; ++k) dst[k] = (int8_t)row[k];
+            } else {
+                for (int k = 0; k < 256; ++k) dst[k] = 0;
+            }
+        }
+        __syncthreads();
+
+        int isum[4] = {0, 0, 0, 0};
+        for (int g = 0; g < 16; ++g) {
+            q35_tile<16, 4, int> A_frag;
+            q35_tile<8, 4, int> B_frag;
+            q35_tile<16, 8, int> D;
+            q35_mma::load_ldmatrix(A_frag, (const int *)(sAw + g * 16), 64);
+            q35_mma::load_generic(B_frag, (const int *)(sB + g * 16), 64);
+            q35_mma::mma(D, A_frag, B_frag);
+            // Row of each lane's fragment register, so the scale lookup is
+            // scv_w[row][g] (per-row, per-group).
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int mp = q35_tile<16, 8, int>::get_i(l);
+                isum[l] += scv_w[mp * 16 + g] * D.x[l];
+            }
+        }
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int np = q35_tile<16, 8, int>::get_j(l);
+            const int mp = q35_tile<16, 8, int>::get_i(l);
+            if (t0 + np >= tokens || r0 + mp >= rows) continue;
+            const unsigned char *wb = wb0 + (size_t)mp * (size_t)nblk * block_bytes;
+            const unsigned char *yb =
+                xq + (size_t)(t0 + np) * (size_t)nblk * 292 + (size_t)b * 292;
+            const float dy = q35_q8k_d(yb);
+            switch (ttype) {
+            case Q35_TT_Q2_K: {
+                const unsigned char *sc = wb;
+                int sms = 0;
+                for (int j = 0; j < 16; ++j) sms += q35_q8k_bsum(yb, j) * (int)(sc[j] >> 4);
+                const float dall = __fmul_rn(dy, q35_f16_at(wb, 80));
+                const float dmin = __fmul_rn(dy, q35_f16_at(wb, 82));
+                acc[l] = __fadd_rn(acc[l], __fmul_rn(dall, (float)isum[l]));
+                acc[l] = __fadd_rn(acc[l], __fmul_rn(-dmin, (float)sms));
+                break;
+            }
+            case Q35_TT_Q3_K:
+                acc[l] = __fadd_rn(acc[l],
+                    __fmul_rn(__fmul_rn(q35_f16_at(wb, 108), dy), (float)isum[l]));
+                break;
+            case Q35_TT_Q4_K:
+            case Q35_TT_Q5_K: {
+                unsigned char sm[16];
+                q35_unpack_scale_min(wb + 4, sm);
+                int sms = 0;
+                for (int j = 0; j < 16; ++j) sms += q35_q8k_bsum(yb, j) * (int)sm[8 + j / 2];
+                const float d = __fmul_rn(dy, q35_f16_at(wb, 0));
+                const float dmin = __fmul_rn(dy, q35_f16_at(wb, 2));
+                acc[l] = __fadd_rn(acc[l], __fmul_rn(d, (float)isum[l]));
+                acc[l] = __fadd_rn(acc[l], __fmul_rn(-dmin, (float)sms));
+                break;
+            }
+            case Q35_TT_Q6_K:
+                acc[l] = __fadd_rn(acc[l],
+                    __fmul_rn(__fmul_rn(q35_f16_at(wb, 208), dy), (float)isum[l]));
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int mp = q35_tile<16, 8, int>::get_i(l);
+        const int np = q35_tile<16, 8, int>::get_j(l);
+        if (t0 + np < tokens && r0 + mp < rows)
+            out[(size_t)(t0 + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[l];
+    }
+}
+
 static cudaError_t mmq_mma_launch(const unsigned char *d_w, const unsigned char *d_xq,
                                   float *d_out, int rows, int cols, int tokens, int ttype,
                                   cudaStream_t stream) {
     const dim3 grid((unsigned)((rows + 127) / 128), (unsigned)((tokens + 7) / 8));
     q35_k_mmq_mma_q32<<<grid, Q35_MMQ_THREADS, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype);
     return cudaGetLastError();
+}
+
+static cudaError_t mmq_mma_k_launch(const unsigned char *d_w, const unsigned char *d_xq,
+                                    float *d_out, int rows, int cols, int tokens, int ttype,
+                                    cudaStream_t stream) {
+    const dim3 grid((unsigned)((rows + 127) / 128), (unsigned)((tokens + 7) / 8));
+    q35_k_mmq_mma_k256<<<grid, Q35_MMQ_THREADS, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype);
+    return cudaGetLastError();
+}
+
+// QWEN35_CUDA_MMQ_KMM: "0" disables the K-family tensor-core path entirely;
+// otherwise it is a comma list of `q.ttype` tag names to enable selectively
+// (empty/unset = all five).  Read once per launch shape; a getenv on the
+// prefill path is noise next to the kernel itself.
+static bool q35_mma_k_enabled(int ttype) {
+    static int mode = -1;   // -1 unknown, 0 all, 1 list
+    static char list[256];
+    if (mode < 0) {
+        const char *e = getenv("QWEN35_CUDA_MMQ_KMM");
+        if (e == nullptr) {
+            mode = 0;
+        } else if (e[0] == '0' && e[1] == '\0') {
+            mode = 2;  // explicit off
+        } else {
+            mode = 1;
+            size_t n = sizeof(list) - 1;
+            size_t i = 0;
+            for (; i < n && e[i] != '\0'; ++i) list[i] = e[i];
+            list[i] = '\0';
+        }
+    }
+    if (mode == 2) return false;
+    if (mode == 0) return true;
+    // Selective: match the tag name of this ttype against the list.
+    struct { int tt; const char *tag; } names[] = {
+        {Q35_TT_Q2_K, "q2_k"}, {Q35_TT_Q3_K, "q3_k"}, {Q35_TT_Q4_K, "q4_k"},
+        {Q35_TT_Q5_K, "q5_k"}, {Q35_TT_Q6_K, "q6_k"},
+    };
+    for (const auto &nm : names) {
+        if (nm.tt != ttype) continue;
+        const char *p = list;
+        const size_t ln = strlen(nm.tag);
+        while (*p) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (strncmp(p, nm.tag, ln) == 0 && (p[ln] == ',' || p[ln] == '\0')) return true;
+            while (*p && *p != ',') ++p;
+        }
+        return false;
+    }
+    return false;
 }
 
 extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v,
@@ -376,7 +667,6 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // cudaError_t range (those are >= 0), so it cannot be mistaken for a launch
     // failure that would need reporting.
     if (tokens > Q35_MMQ_MAX_TOKENS) return -1;
-    const int nblk = cols / info.block_elems;
 
     // Tensor-core path: 32-element weight family.  mma gives the SAME exact
     // int32 per-block dot as the dp4a path, so the result is bit-identical
@@ -385,13 +675,20 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     if (info.block_elems == 32) {
         return (int)mmq_mma_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
+    // K family (256 elements, per-16 scales).  Gated by QWEN35_CUDA_MMQ_KMM
+    // (a comma list of ttype tags, or "0" to disable, default on) so each type
+    // can be A/B'd against the dp4a tile kernel in isolation.
+    if (info.block_elems == 256 && q35_mma_k_enabled(ttype) &&
+        (ttype == Q35_TT_Q2_K || ttype == Q35_TT_Q3_K || ttype == Q35_TT_Q4_K ||
+         ttype == Q35_TT_Q5_K || ttype == Q35_TT_Q6_K)) {
+        return (int)mmq_mma_k_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
+    }
 
-    // BLK per lane is a runtime pick now (see the kernel's comment for why it is
-    // not a template parameter any more).  A warp covers `Q35_WARP * blk`
-    // blocks and must cover the whole row, so blk = ceil(nblk / 32).  nblk 20
-    // (attention) gives 1, nblk 68 (FFN) gives 3; every row is one pass and
-    // there is no tail loop.  All shapes share the SAME TPERPASS=16
-    // instantiation, so this file compiles exactly one kernel.
-    const int blk = (nblk + Q35_WARP - 1) / Q35_WARP;
-    return (int)mmq_launch<8>(d_w, d_xq, d_out, rows, cols, tokens, ttype, blk, stream);
+    // Types with no tensor-core kernel yet DECLINE to the caller's
+    // thread-per-row path rather than running the dp4a tile kernel: measured
+    // on 27B IQ3_XXS prefill (523 tokens), the dp4a tile is 19.3 tok/s against
+    // 36.2 for thread-per-row, so routing the IQ family there is strictly
+    // worse.  Each IQ type gets its own mma kernel and flips over here.
+    //
+    return -1;
 }
