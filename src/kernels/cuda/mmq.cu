@@ -611,6 +611,314 @@ static cudaError_t mmq_mma_k_launch(const unsigned char *d_w, const unsigned cha
     return cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core (mma.sync) prefill kernel, IQ family (256-element super-block).
+//
+// WHY THIS EXISTS
+// ---------------
+// The IQ types had no mma kernel: q35_launch_mul_mat_vec_tile returned -1 for
+// them, so prefill fell back to the caller's thread-per-row kernel -- 35.8
+// tok/s on 27B IQ3_XXS (66-token prefill, measured).  The dp4a *tile* kernel
+// was measured slower still (19.3 tok/s) because it carries a 32-lane serial
+// fold (`__shared__ float part[WARPS][TPERPASS][32]` + a lane-0 loop of 32
+// `__fadd_rn`) whose only justification was reproducing q35_dot_row's exact
+// b-ascending float association.
+//
+// That constraint is lifted (docs/cuda-elementwise-ulp.md: "bit-exact
+// reproduction of CPU token ids is NOT the acceptance criterion"; kernel-level
+// acceptance is MVCHECK's relative tolerance 2e-2).  With free association the
+// reduction folds into the mma D fragment: mma.sync already yields the int32
+// dot of a whole 32-element group in D.x[0..3] -- four int32 per lane, no
+// cross-lane step at all.  There is no serial fold here to remove.
+//
+// SHAPE / ASSOCIATION
+// -------------------
+// One block = 8 warps = 128 weight rows (16 per warp) x 8 tokens.  Each warp
+// stages 16 rows x 256 int8 of dequantized weight, the block shares one
+// 8-token x 256 int8 activation tile.  IQ3_XXS carries one scale per 32
+// elements (8 per super-block) and the k32 mma gives exactly the int32 dot of
+// one 32-element group, so `isum[row] += ls[g] * D.x[l]` accumulates the 8
+// groups in the integer domain (exact), and the float scaling is applied once
+// at the end -- the same association q35_vec_dot_iq3_xxs_q8_k_acc uses
+// (`0.25f * d * bsum`).
+//
+// DEQUANT IS THE REAL COST, SO IT IS DONE ONCE
+// --------------------------------------------
+// IQ3_XXS dequant is a grid lookup (iq3xxs_grid: uint32 -> 4 int8) plus a 7-bit
+// sign expansion per 4-lane group.  Doing that per mma (16 groups per
+// super-block, per row) would dominate.  Instead each lane unpacks a WHOLE row
+// (16 lanes = 16 rows) into shared memory using the same __vsub4(g ^ m, m)
+// byte-negation the dp4a path uses, and ldmatrix feeds mma from the staged
+// int8: one __syncthreads() per super-block.
+// ---------------------------------------------------------------------------
+
+// Unpack one 32-element IQ3_XXS group from q3[0..7] and the 28-bit sign field
+// into out[0..7], each holding 4 int8 (elements 0..3, 4..7, ... 28..31).
+// Byte-identical to the dp4a path's __vsub4(iq3xxs_grid[..] ^ s, s).
+__device__ __forceinline__ void q35_iq3xxs_group32(const unsigned char *q3,
+                                                   unsigned int aux7, int out[8]) {
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int sgn = q35_iq_signs8((aux7 >> (7 * l)) & 127u);
+        const int g1 = (int)iq3xxs_grid[q3[2 * l + 0]];
+        const int g2 = (int)iq3xxs_grid[q3[2 * l + 1]];
+        const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+        const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+        out[2 * l + 0] = __vsub4(g1 ^ s0, s0);
+        out[2 * l + 1] = __vsub4(g2 ^ s1, s1);
+    }
+}
+
+// Per-32-element scale of IQ3_XXS: ls = 2*(aux32>>28) + 1 (always positive).
+__device__ __forceinline__ int q35_iq3xxs_ls(const unsigned char *gas, int g) {
+    return 2 * (int)(q35_ld_u32(gas + 4 * g) >> 28) + 1;
+}
+
+// Trait structs for the generic IQ kernel: plain constants plus a
+// __device__-callable unpacker.  `group` is a plain (non-template) static
+// function, which keeps nvcc's template substitution happy.
+struct Q35Iq3Xxs {
+    static constexpr int block_bytes = 98;
+    static constexpr int out_scale_q = 1;
+    static constexpr int out_scale_den = 4;   // 0.25f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+};
+struct Q35Iq3S {
+    static constexpr int block_bytes = 110;
+    static constexpr int out_scale_q = 1;
+    static constexpr int out_scale_den = 1;   // 1.0f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+};
+struct Q35Iq2S {
+    static constexpr int block_bytes = 82;
+    static constexpr int out_scale_q = 1;
+    static constexpr int out_scale_den = 8;   // 0.125f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+};
+
+// Per-type unpacker for the generic IQ tensor-core kernel below: decompose one
+// 32-element group of a 256-element super-block into 8 int32 of int8 and
+// return that group's integer scale `ls`.
+__device__ void Q35Iq3Xxs::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // gas[4g] packs four 7-bit sign codes plus the 4-bit group scale.
+    // IQ3_XXS has ONE scale per 32 elements, so both halves share it.
+    const unsigned int aux32 = q35_ld_u32(wb + 66 + 4 * g);
+    q35_iq3xxs_group32(wb + 2 + 8 * g, aux32 & 0x0FFFFFFFu, p);
+    ls[0] = ls[1] = 2 * (int)(aux32 >> 28) + 1;
+}
+
+__device__ void Q35Iq3S::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // IQ3_S differs from IQ3_XXS in three ways, all handled here: the grid
+    // index needs a 9th bit from qh[g], the sign field is a plain 8-bit mask
+    // per 4-lane chunk (signs[4g+l] * 0x01010101, no 7-bit expansion), and the
+    // group scale is a nibble of scales[g>>1] rather than the top of gas.
+    const unsigned char *qs = wb + 2 + 8 * g;
+    const unsigned int qh = wb[66 + g];
+    const unsigned char *signs = wb + 74 + 4 * g;
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int i1 = (unsigned int)qs[2 * l + 0] | ((qh << (8 - 2 * l)) & 256u);
+        const unsigned int i2 = (unsigned int)qs[2 * l + 1] | ((qh << (7 - 2 * l)) & 256u);
+        const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
+        const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+        const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+        p[2 * l + 0] = __vsub4((int)iq3s_grid[i1] ^ s0, s0);
+        p[2 * l + 1] = __vsub4((int)iq3s_grid[i2] ^ s1, s1);
+    }
+    // One scale per 32 elements, so both halves share it.
+    const unsigned char sc = wb[106 + (g >> 1)];
+    const unsigned int nib = (g & 1) ? (unsigned int)(sc >> 4) : (unsigned int)(sc & 0xF);
+    ls[0] = ls[1] = 2 * (int)nib + 1;
+}
+
+// BLOCK_BYTES: weight block size of the type; GROUP(i) -> q35_iq_group_*.
+
+__device__ void Q35Iq2S::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // 82 B = d@0 | qs[32]@2 | qh[8]@66 | scales[8]@74 | signs[32]@34
+    // (`signs` is NOT a separate field: the reference reads it at qs+32, i.e.
+    // the block's byte 34, and each of its bytes packs 8 sign bits.)
+    // iq2s_grid is u64: 8 uint8 of magnitude per entry, so one 8-value chunk
+    // needs no packing tricks -- just two uint32 halves.
+    const unsigned char *qs = wb + 2 + 4 * g;
+    const unsigned int qh = wb[66 + g];
+    const unsigned char *signs = wb + 34 + 4 * g;
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int idx = (unsigned int)qs[l] | ((qh << (8 - 2 * l)) & 0x300u);
+        const unsigned long long gv = iq2s_grid[idx];
+        const int g1 = (int)(gv & 0xFFFFFFFFull);
+        const int g2 = (int)(gv >> 32);
+        const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
+        const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+        const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+        p[2 * l + 0] = __vsub4(g1 ^ s0, s0);
+        p[2 * l + 1] = __vsub4(g2 ^ s1, s1);
+    }
+    // IQ2_S is the one IQ type with 16-element scale granularity: scales[g]
+    // holds ls1 in its low nibble (elements 0..15 of the group) and ls2 in its
+    // high nibble (elements 16..31).  That is exactly why this kernel uses k16
+    // mma: a k32 D fragment would span both scales and could only apply one.
+    const unsigned char sc = wb[74 + g];
+    ls[0] = 2 * (int)(sc & 0xF) + 1;
+    ls[1] = 2 * (int)(sc >> 4) + 1;
+}
+
+template <class T>
+__global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
+                                 const unsigned char *__restrict__ xq,
+                                 float *__restrict__ out,
+                                 int rows, int cols, int tokens) {
+    constexpr int block_bytes = T::block_bytes;
+    constexpr int OUT_SCALE_Q = T::out_scale_q;
+    constexpr int OUT_SCALE_DEN = T::out_scale_den;
+    const int nblk = cols / 256;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int r0 = blockIdx.x * 128 + warp * 16;
+    const int t0 = blockIdx.y * 8;
+    // No early return: this kernel uses __syncthreads() (sB is shared by all
+    // warps), so every thread must reach the barrier.  Out-of-range rows are
+    // skipped at the dequant and at the store.
+    const bool row_live = (r0 < rows);
+
+    // 16 rows x 256 int8 = 4 KB per warp (32 KB/block) + one shared 8x256
+    // activation tile (2 KB) + per-row group scales.
+    __shared__ int8_t sA[8 * 16 * 256];
+    __shared__ int8_t sB[8 * 256];
+    int8_t *sAw = sA + warp * 16 * 256;
+    __shared__ int sLs[8 * 16 * 16];     // per-warp per-row ls[16]: one per 16-element half
+    int *ls_w = sLs + warp * 16 * 16;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    for (int b = 0; b < nblk; ++b) {
+        const unsigned char *wb0 =
+            w + (size_t)r0 * (size_t)nblk * block_bytes + (size_t)b * block_bytes;
+
+        // Weight dequant, spread over the WHOLE warp: lane = row * 2 +
+        // group-pair, so 16 rows x 4 group-pairs = 32 lanes, each unpacking 2
+        // of the block's 8 groups (64 elements).  Unpacking a whole row on one
+        // lane left 31 of 32 lanes idle here and was the kernel's real cost.
+        if (row_live) {
+            const int row = lane >> 1;              // 0..15
+            // Groups 0..7 must all be covered: 16 rows x 2 lanes leaves 2
+            // lanes per row, so each lane takes FOUR groups, not two.
+            const int gp = lane & 1;                // 0..1
+            const unsigned char *wb = wb0 + (size_t)row * (size_t)nblk * block_bytes;
+            int *dst = (int *)(sAw + row * 256);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) {
+                const int g = 4 * gp + k;
+                int p[8];
+                int ls[2];
+                T::group(wb, g, p, ls);
+                ls_w[row * 16 + g * 2 + 0] = ls[0];
+                ls_w[row * 16 + g * 2 + 1] = ls[1];
+                for (int i = 0; i < 8; ++i) dst[g * 8 + i] = p[i];
+            }
+        } else {
+            const int row = lane >> 1;
+            const int gp = lane & 1;
+            for (int k = 0; k < 4; ++k) {
+                ls_w[row * 16 + (4 * gp + k) * 2 + 0] = 1;
+                ls_w[row * 16 + (4 * gp + k) * 2 + 1] = 1;
+            }
+        }
+
+        // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).  Byte
+        // copies, not int4: 292 % 16 == 4, so neither a token row nor a block
+        // start is 16-byte aligned.
+        if (warp == 0 && lane < 8) {
+            int8_t *dst = sB + lane * 256;
+            if (t0 + lane < tokens) {
+                const unsigned char *row =
+                    xq + (size_t)(t0 + lane) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
+                for (int k = 0; k < 256; ++k) dst[k] = (int8_t)row[k];
+            } else {
+                for (int k = 0; k < 256; ++k) dst[k] = 0;
+            }
+        }
+        __syncthreads();
+
+        // k16 mma, one per 16-element HALF-group: D.x[l] is then the exact
+        // int32 dot of 16 elements, so the per-half scale is applied without
+        // mixing.  IQ3_XXS/IQ3_S carry one scale per 32 elements and simply
+        // reuse it for both halves; IQ2_* carry one per 16 (two nibbles of
+        // scales[g]), which is why k32 -- whose D would span two different
+        // scales -- is unusable for them.  k16 costs 16 mma instead of 8 per
+        // super-block; the tensor cores are nowhere near the bottleneck
+        // (dequant + shared staging is), so this is free.
+        int isum[4] = {0, 0, 0, 0};
+#pragma unroll
+        for (int h = 0; h < 16; ++h) {
+            q35_tile<16, 4, int> A_frag;
+            q35_tile<8, 4, int> B_frag;
+            q35_tile<16, 8, int> D;
+            // Shared rows are 256 int8 wide = 64 int, so the ldmatrix stride
+            // is 64 int and a 16-element half starts at int offset h*4.
+            q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, 64);
+            q35_mma::load_generic(B_frag, (const int *)sB + h * 4, 64);
+            q35_mma::mma(D, A_frag, B_frag);
+            const int g = h >> 1;               // 32-element group
+            const int half = h & 1;
+#pragma unroll
+            for (int l = 0; l < 4; ++l) {
+                const int mp = q35_tile<16, 8, int>::get_i(l);
+                // ls2 holds the second half's scale when the type has 16-element
+                // granularity; for 32-element types both entries are equal.
+                isum[l] += (half ? ls_w[mp * 16 + g * 2 + 1] : ls_w[mp * 16 + g * 2]) * D.x[l];
+            }
+        }
+        __syncthreads();   // sAw/sB are written again next iteration
+
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int mp = q35_tile<16, 8, int>::get_i(l);
+            const int np = q35_tile<16, 8, int>::get_j(l);
+            if (t0 + np >= tokens || r0 + mp >= rows) continue;
+            const unsigned char *wb = wb0 + (size_t)mp * (size_t)nblk * block_bytes;
+            const unsigned char *yb =
+                xq + (size_t)(t0 + np) * (size_t)nblk * 292 + (size_t)b * 292;
+            const float d = __fmul_rn(q35_f16_at(wb, 0), q35_q8k_d(yb));
+            // T::out_scale_q * OUT_SCALE_DEN: an integer template argument
+            // times a power-of-two denominator, because C++ forbids a
+            // floating-point template parameter.  Both factors are exact.
+            acc[l] = __fadd_rn(acc[l], __fmul_rn(
+                __fmul_rn(d, (float)isum[l]), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
+        }
+    }
+
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int mp = q35_tile<16, 8, int>::get_i(l);
+        const int np = q35_tile<16, 8, int>::get_j(l);
+        if (t0 + np < tokens && r0 + mp < rows)
+            out[(size_t)(t0 + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[l];
+    }
+}
+
+static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned char *d_xq,
+                                     float *d_out, int rows, int cols, int tokens, int ttype,
+                                     cudaStream_t stream) {
+    const dim3 grid((unsigned)((rows + 127) / 128), (unsigned)((tokens + 7) / 8));
+    switch (ttype) {
+        case Q35_TT_IQ3_XXS:
+            q35_k_mmq_mma_iq<Q35Iq3Xxs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
+                d_w, d_xq, d_out, rows, cols, tokens);
+            break;
+        case Q35_TT_IQ3_S:
+            q35_k_mmq_mma_iq<Q35Iq3S><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
+                d_w, d_xq, d_out, rows, cols, tokens);
+            break;
+        case Q35_TT_IQ2_S:
+            q35_k_mmq_mma_iq<Q35Iq2S><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
+                d_w, d_xq, d_out, rows, cols, tokens);
+            break;
+        default:
+            return (cudaError_t)-1;
+    }
+    return cudaGetLastError();
+}
+
 // QWEN35_CUDA_MMQ_KMM: "0" disables the K-family tensor-core path entirely;
 // otherwise it is a comma list of `q.ttype` tag names to enable selectively
 // (empty/unset = all five).  Read once per launch shape; a getenv on the
@@ -653,6 +961,49 @@ static bool q35_mma_k_enabled(int ttype) {
     return false;
 }
 
+// QWEN35_CUDA_MMQ_IQM: "0" disables the IQ-family tensor-core path entirely;
+// otherwise it is a comma list of `q.ttype` tag names to enable selectively
+// (empty/unset = all implemented).  Same shape as QWEN35_CUDA_MMQ_KMM so the
+// two families A/B the same way.
+static bool q35_mma_iq_enabled(int ttype) {
+    static int mode = -1;   // -1 unknown, 0 all, 1 list, 2 off
+    static char list[256];
+    if (mode < 0) {
+        const char *e = getenv("QWEN35_CUDA_MMQ_IQM");
+        if (e == nullptr) {
+            mode = 0;
+        } else if (e[0] == '0' && e[1] == '\0') {
+            mode = 2;
+        } else {
+            mode = 1;
+            size_t n = sizeof(list) - 1;
+            size_t i = 0;
+            for (; i < n && e[i] != '\0'; ++i) list[i] = e[i];
+            list[i] = '\0';
+        }
+    }
+    if (mode == 2) return false;
+    if (mode == 0) return true;
+    struct { int tt; const char *tag; } names[] = {
+        {Q35_TT_IQ3_XXS, "iq3_xxs"},
+        {Q35_TT_IQ3_S,   "iq3_s"},
+        {Q35_TT_IQ2_S,   "iq2_s"},
+    };
+    for (const auto &nm : names) {
+        if (nm.tt != ttype) continue;
+        const char *p = list;
+        const size_t ln = strlen(nm.tag);
+        while (*p) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (strncmp(p, nm.tag, ln) == 0 && (p[ln] == ',' || p[ln] == '\0')) return true;
+            while (*p && *p != ',') ++p;
+        }
+        return false;
+    }
+    return false;
+}
+
+
 extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v,
                                            float *d_out, int rows, int cols,
                                            int tokens, int ttype, void *stream_v) {
@@ -684,11 +1035,21 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
         return (int)mmq_mma_k_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
 
+    // IQ family (256 elements, tensor-core path).  The mma D fragment IS the
+    // 32-element integer reduction (see the block comment above
+    // q35_k_mmq_mma_iq3xxs).  Gated by QWEN35_CUDA_MMQ_IQM ("0" to disable, or
+    // a comma list of ttype tags, default on) so each type can be A/B'd
+    // against the caller's thread-per-row kernel.
+    if (info.block_elems == 256 && q35_mma_iq_enabled(ttype) &&
+        (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S)) {
+        return (int)mmq_mma_iq_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
+    }
+
     // Types with no tensor-core kernel yet DECLINE to the caller's
     // thread-per-row path rather than running the dp4a tile kernel: measured
     // on 27B IQ3_XXS prefill (523 tokens), the dp4a tile is 19.3 tok/s against
     // 36.2 for thread-per-row, so routing the IQ family there is strictly
-    // worse.  Each IQ type gets its own mma kernel and flips over here.
-    //
+    // worse.  Each remaining IQ type gets its own mma kernel and flips over
+    // here.
     return -1;
 }

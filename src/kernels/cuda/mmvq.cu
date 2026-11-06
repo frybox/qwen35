@@ -320,32 +320,30 @@ __global__ void q35_k_quantize_q8_K(const float *__restrict__ x,
 static bool q35_mmq_enabled() {
     static int cached = -1;
     if (cached < 0) {
-        // Default OFF.  The tile kernel is correct (bit-exact against the CPU
-        // reference for all 13 quant types on the 27B model, and it keeps the
-        // b-ascending reduction order) but it is not FASTER, so it must not be
-        // the default: measured on 354-token prefill, Qwen3.8-27B IQ3_XXS,
-        // 4090D -- thread-per-row 30.4-30.9 s vs tile 30.4 s at TPERPASS=8
-        // (parity) and 38.7 s at TPERPASS=16 (22% slower).
-        //
-        // The reuse it buys is real (a weight block is dotted into 8 tokens
-        // instead of re-read for each), but keeping the reduction order means
-        // some lane must fold 32 partials serially per (row, token) while the
-        // other 31 wait; that, plus the occupancy lost to the 16 accumulators,
-        // cancels the gain.  Kept in tree, off by default, because the K-reuse
-        // is the right shape for the next attempt (see the TODO in mmq.cu).
-        cached = 0;
+        // Default ON.  This switch now gates the whole mmq.cu tensor-core
+        // prefill path, and `q35_launch_mul_mat_vec_tile` decides per TYPE
+        // whether the tensor-core kernel serves it: it returns 0 (handled) for
+        // the 32-element family, the K family and IQ3_XXS, and -1 ("use the
+        // fallback") for everything still without an mma kernel -- so enabling
+        // this cannot route a type to the old dp4a tile kernel, which was the
+        // reason the default used to be OFF (dp4a tile 19.3 tok/s vs 36.2
+        // thread-per-row on 27B IQ3_XXS).  `=0` stays the A/B reference: it
+        // forces the thread-per-row kernel for every type.
+        cached = 1;
         const char *raw = getenv("QWEN35_CUDA_MMQ");
         if (raw != NULL) {
             const char *v = raw;
             while (*v == ' ' || *v == '\t') ++v;
-            if (!(v[0] == '0' && (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' || v[1] == '\r' || v[1] == '\n'))) {
-                if (v[0] == '1' && (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' || v[1] == '\r' || v[1] == '\n')) {
-                    cached = 1;
-                } else {
-                    // Not 0/1: keep the default and say so, exactly like
-                    // $QWEN35_CUDA_ROPE does for a bad value in backend_cuda.zig.
-                    fprintf(stderr, "cuda kernels: QWEN35_CUDA_MMQ='%s' is neither '0' nor '1'; using 0\n", v);
-                }
+            const bool tail_ok = (v[1] == '\0' || v[1] == ' ' || v[1] == '\t' ||
+                                  v[1] == '\r' || v[1] == '\n');
+            if (v[0] == '0' && tail_ok) {
+                cached = 0;
+            } else if (v[0] == '1' && tail_ok) {
+                cached = 1;
+            } else {
+                // Not 0/1: keep the default and say so, exactly like
+                // $QWEN35_CUDA_ROPE does for a bad value in backend_cuda.zig.
+                fprintf(stderr, "cuda kernels: QWEN35_CUDA_MMQ='%s' is neither '0' nor '1'; using 1\n", v);
             }
         }
         if (cached == 0) fprintf(stderr, "cuda kernels: prefill matvec = thread-per-row ($QWEN35_CUDA_MMQ=1 for the tile kernel)\n");
