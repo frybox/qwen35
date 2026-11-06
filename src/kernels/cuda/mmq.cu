@@ -90,6 +90,7 @@
 // thread-per-row kernel".  A half-idle tile would be slower than the fallback,
 // and a silently wrong tile is worse than either.
 #include "dotq.cuh"
+#include "mma.cuh"
 
 #define Q35_MMQ_THREADS 256
 #define Q35_MMQ_WARPS (Q35_MMQ_THREADS / Q35_WARP)
@@ -220,6 +221,147 @@ static cudaError_t mmq_launch(const unsigned char *d_w, const unsigned char *d_x
     return cudaGetLastError();
 }
 
+// ---------------------------------------------------------------------------
+// Tensor-core (mma.sync) prefill kernel, 32-element weight family
+// (Q8_0, Q4_0, Q4_1, Q5_0, Q5_1, IQ4_NL).
+//
+// Replaces the dp4a inner dot with mma.sync m16n8k32 s32.s8.s8.s32.  Every
+// type in this family is: dequant the weight block to int8 w8[32] (every value
+// lands in the int8 range -- IQ4_NL table spans -127..113, the widest), let
+// mma give the EXACT int32 dot sumi = sum_k w8[k]*a8[k], then apply the SAME
+// per-block float scale in the SAME ascending block order as the dp4a path
+// (dotq.cuh q35_vec_dot_*_q8_0_acc): Q4_1/Q5_1 add a sumy = sum a8 term.
+// The integer dot is exact (no overflow: |sumi| <= 127*127*32 = 517760 <<
+// 2^31) and the float ops are the same expressions in the same order, so the
+// result is BIT-IDENTICAL to the dp4a tile kernel and the CPU reference.
+// Verified standalone for Q8_0 (/tmp/mma_q8_0_test.cu): 0/2048 mismatched.
+//
+// All six use Q8_0 activation (act_bytes 34, f16 d @0 + int8 a8 @2..33), so
+// the activation staging is shared; only the weight dequant (q35_mma_w8) and
+// the optional sumy term differ.
+//
+// Tiling: one block = 8 warps = 128 weight rows (16/warp) x 8 tokens.  Each
+// warp covers 16 consecutive rows for the same 8-token tile, so the mma A
+// fragment is 16 rows x 32 k and B is 8 tokens x 32 k (one k32 mma per
+// block b).  grid.x over 128-row groups, grid.y over 8-token tiles.
+// ---------------------------------------------------------------------------
+
+// Dequantize weight element `k` of native block at `wb` to its int8 form
+// (the value mma multiplies by the activation int8).  Mirrors the per-type
+// nibble layouts in vecdotq.cuh q35_vec_dot_*_q8_0_acc:
+//   Q4_0/Q4_1/IQ4_NL: byte j -> element j (low nibble) and j+16 (high nibble);
+//   Q5_0/Q5_1:        byte j/2 -> elements 2j, 2j+1 (q4 | high qh bit).
+__device__ __forceinline__ int q35_mma_w8(int ttype, const unsigned char *wb, int k) {
+    switch (ttype) {
+    case Q35_TT_Q8_0:
+        return (int)(int8_t)wb[2 + k];
+    case Q35_TT_Q4_0:
+        return (k < 16) ? (wb[2 + k] & 0x0F) - 8 : (int)(wb[2 + (k - 16)] >> 4) - 8;
+    case Q35_TT_Q4_1:
+        return (k < 16) ? (wb[4 + k] & 0x0F) : (int)(wb[4 + (k - 16)] >> 4);
+    case Q35_TT_Q5_0: {
+        const unsigned int qh = q35_ld_u32(wb + 2);
+        const int q4 = (wb[6 + k / 2] >> (4 * (k & 1))) & 0x0F;
+        return (q4 | (int)((qh >> k) & 1u) << 4) - 16;
+    }
+    case Q35_TT_Q5_1: {
+        const unsigned int qh = q35_ld_u32(wb + 4);
+        const int q4 = (wb[8 + k / 2] >> (4 * (k & 1))) & 0x0F;
+        return q4 | (int)((qh >> k) & 1u) << 4;
+    }
+    case Q35_TT_IQ4_NL:
+        return (k < 16) ? (int)kvalues_iq4nl[wb[2 + k] & 0x0F]
+                        : (int)kvalues_iq4nl[wb[2 + (k - 16)] >> 4];
+    default:
+        return 0;  // unreachable: host validates ttype
+    }
+}
+
+__global__ void q35_k_mmq_mma_q32(const unsigned char *__restrict__ w,
+                                  const unsigned char *__restrict__ xq,
+                                  float *__restrict__ out,
+                                  int rows, int cols, int tokens, int ttype) {
+    const Q35QuantInfo info = q35_quant_info(ttype);
+    const int block_bytes = info.block_bytes;
+    const int nblk = cols / 32;
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int r0 = blockIdx.x * 128 + warp * 16;
+    const int t0 = blockIdx.y * 8;
+    if (r0 >= rows) return;
+
+    const bool need_sumy = (ttype == Q35_TT_Q4_1 || ttype == Q35_TT_Q5_1);
+
+    __shared__ int8_t sA[8 * 16 * 32];   // per-warp weight int8 (16 rows x 32 k)
+    __shared__ int8_t sB[8 * 8 * 32];    // per-warp activation int8 (8 tok x 32 k)
+    __shared__ int sSumy[8 * 8];         // per-warp per-token sum a8 (Q4_1/Q5_1 only)
+    int8_t *sAw = sA + warp * 16 * 32;
+    int8_t *sBw = sB + warp * 8 * 32;
+    int *sumy = sSumy + warp * 8;
+
+    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    for (int b = 0; b < nblk; ++b) {
+        // Weight int8: per-type dequant (q35_mma_w8), 16 rows x 32 k.
+        for (int idx = lane; idx < 16 * 32; idx += 32) {
+            int mp = idx / 32, k = idx % 32;
+            const unsigned char *wb =
+                w + (size_t)(r0 + mp) * (size_t)nblk * block_bytes + (size_t)b * block_bytes;
+            sAw[mp * 32 + k] = (int8_t)q35_mma_w8(ttype, wb, k);
+        }
+        // Activation int8 (Q8_0 layout for all six types).
+        for (int idx = lane; idx < 8 * 32; idx += 32) {
+            int np = idx / 32, k = idx % 32;
+            sBw[np * 32 + k] = (t0 + np < tokens)
+                ? (int8_t)xq[(size_t)(t0 + np) * (size_t)nblk * 34 + (size_t)b * 34 + 2 + k] : 0;
+        }
+        __syncwarp();
+        // Per-token sumy = sum a8, only for the _1 types.  Lanes 0..7 each sum
+        // one token's 32 int8; the scale loop below reads all eight.
+        if (need_sumy) {
+            if (lane < 8) {
+                int s = 0;
+                for (int k = 0; k < 32; ++k) s += (int)(int8_t)sBw[lane * 32 + k];
+                sumy[lane] = s;
+            }
+            __syncwarp();
+        }
+        q35_tile<16, 8, int> A_frag, D;
+        q35_tile<8, 8, int> B_frag;
+        q35_mma::load_ldmatrix(A_frag, (const int *)sAw, 8);
+        q35_mma::load_ldmatrix(B_frag, (const int *)sBw, 8);
+        q35_mma::mma(D, A_frag, B_frag);
+#pragma unroll
+        for (int l = 0; l < 4; ++l) {
+            const int mp = q35_tile<16, 8, int>::get_i(l);
+            const int np = q35_tile<16, 8, int>::get_j(l);
+            const unsigned char *wb =
+                w + (size_t)(r0 + mp) * (size_t)nblk * block_bytes + (size_t)b * block_bytes;
+            const float dx = q35_f16_at(wb, 0);
+            const float dy = q35_f16_at(xq + (size_t)(t0 + np) * (size_t)nblk * 34 + (size_t)b * 34, 0);
+            acc[l] = __fadd_rn(acc[l], __fmul_rn(__fmul_rn(dx, dy), (float)D.x[l]));
+            if (need_sumy) {
+                const float mx = q35_f16_at(wb, 2);
+                acc[l] = __fadd_rn(acc[l], __fmul_rn(__fmul_rn(mx, dy), (float)sumy[np]));
+            }
+        }
+    }
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const int mp = q35_tile<16, 8, int>::get_i(l);
+        const int np = q35_tile<16, 8, int>::get_j(l);
+        if (t0 + np < tokens)
+            out[(size_t)(t0 + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[l];
+    }
+}
+
+static cudaError_t mmq_mma_launch(const unsigned char *d_w, const unsigned char *d_xq,
+                                  float *d_out, int rows, int cols, int tokens, int ttype,
+                                  cudaStream_t stream) {
+    const dim3 grid((unsigned)((rows + 127) / 128), (unsigned)((tokens + 7) / 8));
+    q35_k_mmq_mma_q32<<<grid, Q35_MMQ_THREADS, 0, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype);
+    return cudaGetLastError();
+}
+
 extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v,
                                            float *d_out, int rows, int cols,
                                            int tokens, int ttype, void *stream_v) {
@@ -235,6 +377,14 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // failure that would need reporting.
     if (tokens > Q35_MMQ_MAX_TOKENS) return -1;
     const int nblk = cols / info.block_elems;
+
+    // Tensor-core path: 32-element weight family.  mma gives the SAME exact
+    // int32 per-block dot as the dp4a path, so the result is bit-identical
+    // (MVCHECK: mismatched=0).  All six 32-elem types route here; the 256-elem
+    // family (K/IQ) routes here per-type once each is implemented and verified.
+    if (info.block_elems == 32) {
+        return (int)mmq_mma_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
+    }
 
     // BLK per lane is a runtime pick now (see the kernel's comment for why it is
     // not a template parameter any more).  A warp covers `Q35_WARP * blk`
