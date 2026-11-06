@@ -97,11 +97,27 @@ Q35_DEV float q35_ld_f32(const unsigned char *p) {
     return __uint_as_float(q35_ld_u32(p));
 }
 
+// Expand a 7-bit IQ sign code (bit 7 = popcount parity; see ksigns_iq2xs)
+// into an 8-way 0x00/0xFF sign mask, one lane per element.  Same expansion as
+// the upstream unpack_ksigns (ggml-cuda/vecdotq.cuh) so the __vsub4 negation
+// in the IQ dots below is bit-identical to the scalar ksigns_iq2xs /
+// kmask_iq2xs path.  The *0x01010101 broadcast is safe because the operand is
+// < 256 (no cross-byte carry).
+Q35_DEV unsigned int q35_iq_signs8(unsigned int v7) {
+    const unsigned int p = __popc(v7) & 1u;
+    return (v7 ^ (p << 7)) * 0x01010101u;
+}
+
 // len consecutive int8 x int8 dot products.  Integer-only, so the association
-// order is irrelevant to the result.
+// order is irrelevant to the result; __dp4a folds four int8 products into one
+// (sm_61+), the tail is scalar so any len stays correct.
 Q35_DEV int q35_dot_i8(const signed char *w, const signed char *a, int len) {
     int s = 0;
-    for (int i = 0; i < len; ++i) s += (int)w[i] * (int)a[i];
+    const int n4 = len & ~3;
+    for (int i = 0; i < n4; i += 4)
+        s = q35_dp4a(q35_ld_u32((const unsigned char *)w + i),
+                    q35_ld_u32((const unsigned char *)a + i), s);
+    for (int i = n4; i < len; ++i) s += (int)w[i] * (int)a[i];
     return s;
 }
 
@@ -603,27 +619,35 @@ Q35_DEV float q35_vec_dot_iq3_xxs_q8_k_acc(const unsigned char *w,
     const unsigned char *q3  = w + 2;                 // QK_K/4 bytes
     const unsigned char *gas = w + 2 + Q35_QK_K / 4;  // 32 scale bytes
     const signed char *q8 = q35_q8k_qs(y);
+    // Integer-domain: the per-32 `sumi` and the per-block `bsum` are exact
+    // int32 product-sums (the float scaling is applied below, unchanged), so
+    // folding each 4-lane group through __dp4a is BIT-IDENTICAL to the scalar
+    // ksigns_iq2xs / kmask_iq2xs path -- the sign is applied per-byte by the
+    // __vsub4 negation exactly as unpack_ksigns does upstream.
     int bsum = 0;
     for (int ib32 = 0; ib32 < Q35_QK_K / 32; ++ib32) {
         const unsigned int aux32 = q35_ld_u32(gas);
         gas += 4;
-        const unsigned int ls = 2 * (aux32 >> 28) + 1;
+        const int ls = 2 * (int)(aux32 >> 28) + 1;
         int sumi = 0;
         for (int l = 0; l < 4; ++l) {
-            // iq3xxs_grid is uint32_t[256]: each entry packs 4 unsigned bytes.
-            const unsigned int g1 = iq3xxs_grid[q3[2 * l + 0]];
-            const unsigned int g2 = iq3xxs_grid[q3[2 * l + 1]];
-            const unsigned char signs = ksigns_iq2xs[(aux32 >> (7 * l)) & 127];
-            for (int j = 0; j < 4; ++j) {
-                const int v1 = (int)((g1 >> (8 * j)) & 0xFF);
-                const int v2 = (int)((g2 >> (8 * j)) & 0xFF);
-                sumi += v1 * (int)q8[j + 0] * ((signs & kmask_iq2xs[j + 0]) ? -1 : 1);
-                sumi += v2 * (int)q8[j + 4] * ((signs & kmask_iq2xs[j + 4]) ? -1 : 1);
-            }
+            const unsigned int sgn = q35_iq_signs8((aux32 >> (7 * l)) & 127);
+            const int g1 = (int)iq3xxs_grid[q3[2 * l + 0]];
+            const int g2 = (int)iq3xxs_grid[q3[2 * l + 1]];
+            // Per-byte sign: mask bytes 0..3 -> elements 0..3 (g1), 4..7 (g2).
+            // __vsub4(g ^ m, m) negates exactly the lanes whose sign bit is set
+            // (m byte is 0xFF there, 0x00 otherwise) -- bit-identical to the
+            // scalar `signs & kmask_iq2xs[j] ? -1 : 1`.
+            const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+            const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+            sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                           q35_ld_u32((const unsigned char *)q8), sumi);
+            sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                           q35_ld_u32((const unsigned char *)q8 + 4), sumi);
             q8 += 8;
         }
         q3 += 8;
-        bsum += sumi * (int)ls;
+        bsum += sumi * ls;
     }
     // The oracle returns `0.25f * sumf` AFTER the loop (iq_kernels.c:641), i.e.
     // one scaling of the whole row, not a per-block factor.  Folding the 0.25
@@ -658,14 +682,18 @@ Q35_DEV float q35_vec_dot_iq3_s_q8_k_acc(const unsigned char *w,
                                         (((unsigned int)qh[ib32 + half] << (8 - 2 * l)) & 256u);
                 const unsigned int i2 = (unsigned int)qs[2 * l + 1] |
                                         (((unsigned int)qh[ib32 + half] << (7 - 2 * l)) & 256u);
-                const unsigned int g1 = iq3s_grid[i1];
-                const unsigned int g2 = iq3s_grid[i2];
-                for (int j = 0; j < 4; ++j) {
-                    const int v1 = (int)((g1 >> (8 * j)) & 0xFF);
-                    const int v2 = (int)((g2 >> (8 * j)) & 0xFF);
-                    sumi += v1 * (int)q8[j + 0] * ((signs[l] & kmask_iq2xs[j + 0]) ? -1 : 1);
-                    sumi += v2 * (int)q8[j + 4] * ((signs[l] & kmask_iq2xs[j + 4]) ? -1 : 1);
-                }
+                // iq3_s signs are a full 8-bit mask (bit e = element e), so the
+                // 8-way expansion is a plain *0x01010101 broadcast (no popcount
+                // parity, unlike the 7-bit codes of iq3_xxs/iq2_xs/iq2_s).
+                const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
+                const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+                const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+                const int g1 = (int)iq3s_grid[i1];
+                const int g2 = (int)iq3s_grid[i2];
+                sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                               q35_ld_u32((const unsigned char *)q8), sumi);
+                sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                               q35_ld_u32((const unsigned char *)q8 + 4), sumi);
                 q8 += 8;
             }
             qs += 8;
