@@ -82,6 +82,12 @@ int q35_launch_quantize_q8_0(const float *d_x, void *d_out, int nblocks,
 // quantize_q8_K (src/kernels/x86/kernels256.c:392).
 int q35_launch_quantize_q8_K(const float *d_x, void *d_out, int nblocks,
                              void *stream);
+// MMQ activation layout (block_q8_1_mmq, 160 B per 128 values, D4 scales).
+// `nblocks_k` counts 128-VALUE blocks per row and `nrows` token rows, so the
+// destination holds nrows*nblocks_k blocks.  This is the layout the prefill
+// tile kernel reads; see src/kernels/cuda/mmq-smem.cuh.
+int q35_launch_quantize_q8_1_mmq(const float *d_x, void *d_y, int nblocks_k,
+                                 int nrows, void *stream);
 
 // --- dequantization (src/kernels/cuda/convert.cu) --------------------------
 // `nblocks` is a count of the type's NATIVE blocks (32 elements for

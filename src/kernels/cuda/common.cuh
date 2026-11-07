@@ -129,4 +129,15 @@ __device__ __forceinline__ int q35_get_int_b4(const signed char *p) {
     return (int)(lo | (hi << 16));
 }
 
+// Little-endian 16-bit view of 2 consecutive payload bytes (upstream
+// get_int_b2).  block_q*_K keeps qs/hmask/scales 2-byte aligned, so this is the
+// widest safe load for those arrays.
+__device__ __forceinline__ int q35_get_int_b2(const signed char *p) {
+    const unsigned char *u = (const unsigned char *)p;
+    return (int)((unsigned int)u[0] | ((unsigned int)u[1] << 8));
+}
+__device__ __forceinline__ int q35_get_int_b2_u(const unsigned char *p) {
+    return (int)((unsigned int)p[0] | ((unsigned int)p[1] << 8));
+}
+
 #endif // Q35_CUDA_COMMON_CUH

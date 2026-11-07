@@ -33,6 +33,7 @@
 //     iq_tables.cuh on why keven_signs_q2xs is not usable here).
 #include "common.cuh"
 #include "vecdotq.cuh"
+#include "mmq-smem.cuh"
 #include "api.h"
 
 // ---------------------------------------------------------------------------
@@ -817,4 +818,99 @@ extern "C" int q35_launch_dequantize_row(int ttype, const void *d_src_row,
     if (cols % block_elems != 0) return (int)cudaErrorInvalidValue;
     return q35_launch_dequantize_impl(ttype, d_src_row, d_dst, cols / block_elems,
                                       stream);
+}
+
+// ---------------------------------------------------------------------------
+// device kernel: MMQ activation quantizer (block_q8_1_mmq)
+// ---------------------------------------------------------------------------
+// PORT of ggml-cuda/quantize.cu:456 quantize_mmq_q8_1 with ds_layout = D4 and
+// scatter = false.
+//
+// The point of this kernel is that it does the TRANSPOSE, not the matvec:
+//   1. the row is cut into 128-value blocks (4 groups of 32);
+//   2. each group of 32 is quantized against ITS OWN absmax (so one scale per
+//      32 values, exactly like block_q8_1), and the 4 int8 pack into one char4
+//      written as a single 32-bit store;
+//   3. the 4 scales go into d4[0..3].
+// Because the destination is already grouped by 128 and 4-value-packed, the
+// matvec kernel can copy a whole block into smem with plain int moves -- no
+// shuffling, no per-element arithmetic.  That is what lets the tile kernel
+// bring its activation tile down to J*40 B and stop keeping a separate int8
+// staging array.
+//
+// Layout of the OUTPUT (per token row, `cols` values):
+//   for k_block in cols/128:
+//     q35_block_q8_1_mmq = { float d4[4]; int8 qs[128]; }
+//   The qs order within a block is the natural element order (group g holds
+//   values 32g..32g+31), NOT a strided sub-lane order -- the transpose
+//   upstream refers to is the 128-grouping itself.
+//
+// One thread handles 4 consecutive values; 8 threads cooperate on one group of
+// 32 (vals_per_scale/4 == 8) via __shfl_xor.  Threads are laid out so that
+// lane == (i0/4) % 32, which is what makes the shuffles land inside a group.
+__global__ void q35_k_quantize_q8_1_mmq(const float *__restrict__ x,
+                                        q35_block_q8_1_mmq *__restrict__ y,
+                                        int nblocks_k,   // 128-value blocks per row
+                                        int nrows) {
+    // i0 = 4 * global thread index; blockIdx.y is the token row.
+    const int i0 = (int)(blockDim.x * blockIdx.x + threadIdx.x) * 4;
+    const int row = blockIdx.y;
+    if (row >= nrows) return;
+    if (i0 >= nblocks_k * Q35_QK8_1_MMQ) return;
+
+    const float4 *x4 = (const float4 *)(x + (size_t)row * (size_t)nblocks_k * Q35_QK8_1_MMQ);
+    q35_block_q8_1_mmq *yr = y + (size_t)row * (size_t)nblocks_k;
+
+    const int k_block = i0 / Q35_QK8_1_MMQ;   // which 128-value block
+    const int iqs     = i0 % Q35_QK8_1_MMQ;   // element index inside the block
+
+    const float4 xi = x4[i0 / 4];
+
+    // absmax over these 4 values, then across the 8 threads of this 32-group.
+    // vals_per_scale/8 == 4 -> offsets 4,2,1 (llama.cpp quantize.cu:497).
+    float amax = fabsf(xi.x);
+    amax = fmaxf(amax, fabsf(xi.y));
+    amax = fmaxf(amax, fabsf(xi.z));
+    amax = fmaxf(amax, fabsf(xi.w));
+#pragma unroll
+    for (int offset = Q35_QK8_1 / 8; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFFu, amax, offset, 32));
+    }
+
+    // D4 layout: no partial sum is needed, so `sum` is never computed.
+    const float d_inv = 127.0f / amax;
+    char4 q;
+    q.x = (char)roundf(xi.x * d_inv);
+    q.y = (char)roundf(xi.y * d_inv);
+    q.z = (char)roundf(xi.z * d_inv);
+    q.w = (char)roundf(xi.w * d_inv);
+    const float d = 1.0f / d_inv;
+
+    // One 32-bit store for the 4 int8 (upstream: "for better memory bandwidth").
+    char4 *yqs4 = (char4 *)yr[k_block].qs;
+    yqs4[iqs / 4] = q;
+
+    // One scale per 32 values, written by the first thread of each group.
+    if (iqs % 32 == 0) {
+        yr[k_block].d4[iqs / 32] = d;
+    }
+}
+
+// Host launcher.  `nblocks_k` is the number of 128-VALUE blocks per row (so
+// `cols / 128`), and `nrows` the token count.  Both rows and blocks are
+// flattened into one 2-D grid, matching the upstream num_blocks(block_num_x,
+// ne1, ...) shape.
+extern "C" int q35_launch_quantize_q8_1_mmq(const float *d_x, void *d_y_v,
+                                            int nblocks_k, int nrows,
+                                            void *stream_v) {
+    q35_block_q8_1_mmq *d_y = (q35_block_q8_1_mmq *)d_y_v;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    if (nblocks_k <= 0 || nrows <= 0) return (int)cudaSuccess;
+    // 4 values per thread: blockDim covers whole 128-value blocks.
+    const int vals = nblocks_k * Q35_QK8_1_MMQ;
+    const int threads = 256;
+    const int blocks = (vals / 4 + threads - 1) / threads;
+    dim3 grid((unsigned)blocks, (unsigned)nrows);
+    q35_k_quantize_q8_1_mmq<<<grid, threads, 0, stream>>>(d_x, d_y, nblocks_k, nrows);
+    return (int)cudaGetLastError();
 }
