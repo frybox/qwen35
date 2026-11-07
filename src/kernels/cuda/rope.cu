@@ -80,8 +80,57 @@ __global__ void k_rope64(float *__restrict__ x, int heads, int hd, int pos, floa
     hp[j + kHalf] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
 }
 
+__global__ void k_rope64_rows(float *__restrict__ x, int rows, int heads, int hd,
+                             int pos0, float base) {
+    // Decode the flat (row, head) pair this warp handles.  `rows` is the token
+    // count and `heads` the head count PER ROW, so the full tensor is
+    // `rows * heads * hd` floats and row r starts at `r * heads * hd`.
+    const int lane = threadIdx.x & (kHalf - 1);
+    const int local_head = threadIdx.x / kHalf;
+    const int flat = blockIdx.x * kHeadsPerBlock + local_head;
+    const int rh = flat;
+    if (rh >= rows * heads) return;
+    const int r = rh / heads;
+    // `h` is implied by `rh` (the row-major (row, head) order) and is not used
+    // directly: the pointer below already accounts for it.
+    float *hp = x + ((size_t)rh) * (size_t)hd;
+    const int j = lane;
+    // Each row rotates at its own position: row r is token `pos0 + r`.  The
+    // arithmetic below is the single-row `k_rope64` body unchanged, so row r of
+    // this launch is bit-identical to a `k_rope64` launch with `pos = pos0 + r`.
+    const int pos = pos0 + r;
+    const float exponent = -2.0f * (float)j / 64.0f;
+    const float theta = __fmul_rn((float)pos, powf(base, exponent));
+    const float c = cosf(theta);
+    const float s = sinf(theta);
+    const float a = hp[j];
+    const float b = hp[j + kHalf];
+    hp[j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    hp[j + kHalf] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
+}
+
 } // namespace
 
+// Row-batched `rope64`: `d_x` is `rows * heads * hd` contiguous f32, row r
+// (token `pos0 + r`) is `heads * hd` floats of which each `hd`-wide head gets
+// its first 64 rotated.  Row r is the same arithmetic as a single
+// `q35_launch_rope64(d_x + r*heads*hd, heads, hd, pos0 + r, base)`.
+//
+// PREFILL ONLY.  The decode path must keep issuing one `k_rope64` per tensor per
+// token because the decode CUDA graph identifies and retargets those nodes by
+// host-stub address (`q35_func_rope64`); a batched node has no such identity.
+// Prefill never captures a graph (see `forwardChunk`'s `stepEnd` contract), so
+// batching there is free.
+extern "C" int q35_launch_rope64_rows(float *d_x, int rows, int heads, int hd, int pos0,
+                                     float base, void *stream_v) {
+    if (rows <= 0 || heads <= 0 || hd < 64) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    const int threads = kHalf * kHeadsPerBlock;
+    const int total = rows * heads;
+    const int blocks = (total + kHeadsPerBlock - 1) / kHeadsPerBlock;
+    k_rope64_rows<<<blocks, threads, 0, stream>>>(d_x, rows, heads, hd, pos0, base);
+    return (int)cudaGetLastError();
+}
 // `d_x` is `heads * hd` contiguous f32; only the first 64 of each `hd` are
 // rotated.  `heads * hd` must be the tensor's element count.  hd <= 0 or
 // heads <= 0 returns success without launching (same convention as the rest of

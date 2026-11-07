@@ -148,6 +148,9 @@ const Kernels = struct {
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
     extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Row-batched rope64: `rows` tokens `pos0..pos0+rows-1`, each `heads * hd`
+    /// floats wide.  PREFILL ONLY (see the note on `VTable.rope64Rows`).
+    extern fn q35_launch_rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
     /// Host-stub address of the device kernel `q35_launch_rope64` launches.  A
     /// captured graph node reports exactly this value as `KernelNodeParams.func`,
     /// so comparing against it is how the decode-graph path finds the node whose
@@ -232,6 +235,7 @@ const Launch = if (cuda_linked) struct {
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
     const rope64 = Kernels.q35_launch_rope64;
+    const rope64_rows = Kernels.q35_launch_rope64_rows;
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, stream };
@@ -347,6 +351,10 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_x, heads, hd, pos, base, stream };
         return stubNoCudaKernels();
     }
+    fn rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, rows, heads, hd, pos0, base, stream };
+        return stubNoCudaKernels();
+    }
 };
 
 // ==== activation geometry ====================================================
@@ -417,6 +425,7 @@ pub const Slot = enum(u8) {
     load_linear,
     rmsnorm,
     rope64,
+    rope64_rows,
     l2norm,
     attn_decode,
     gdn_gamma,
@@ -504,6 +513,7 @@ fn slotName(s: Slot) []const u8 {
         .load_linear => "load_linear",
         .rmsnorm => "rmsnorm",
         .rope64 => "rope64",
+        .rope64_rows => "rope64_rows",
         .l2norm => "l2norm",
         .attn_decode => "attn_decode",
         .gdn_gamma => "gdn_gamma",
@@ -652,6 +662,7 @@ const GhOpFlags = struct {
     conv_step: bool = false,
     attn_decode: bool = false,
     rope64: bool = false,
+    rope64_rows: bool = false,
     kv_append: bool = false,
 };
 
@@ -4707,6 +4718,35 @@ pub const CudaBackend = struct {
         self.stat_rope_trips += 1;
     }
 
+    /// Row-batched `rope64` for prefill: ONE launch for `rows` tokens x `heads`
+    /// heads instead of `rows * heads` launches.  The engine's prefill loop used
+    /// to issue 28 per-token calls per full-attention layer (24 q heads + 4 kv
+    /// heads); `k_rope64_rows` indexes rows and heads off a single flat block
+    /// id and rotates row r at `pos + r`, so row r is the same arithmetic as the
+    /// single-row call it replaces.
+    ///
+    /// NEVER used during a decode capture: this slot would add a node the graph
+    /// cannot retarget (it matches `q35_func_rope64` node-by-node), so it bails
+    /// out to the per-row loop when a capture is live.  Prefill does not capture.
+    fn dRope64Rows_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
+        const self = self_(ctx);
+        if (self.gOpGate(&self.g_op_seen.rope64_rows)) return;
+        const row_len = heads_in * hd_in;
+        if (!ropeOnDevice() or self.capturing() or self.g_state == .live or
+            heads_in == 0 or hd_in < 64 or rows_in == 0 or
+            row_len == 0 or x.len != rows_in * row_len or self.cu == null)
+        {
+            cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
+            return;
+        }
+        if (dBufPtr(x)) |px| {
+            const rc = Launch.rope64_rows(px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), @bitCast(pos), base, self.launchStream());
+            if (rc == cudart.cudaSuccess) return;
+            self.ewLaunchFail("rope64_rows", rc);
+        }
+        cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
+    }
+
     fn dConvStep_body(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.g_op_seen.conv_step)) return;
@@ -5970,6 +6010,15 @@ pub const CudaBackend = struct {
         dRope64_body(ctx, x, pos, base);
     }
 
+    /// The prefill row-batched `rope64` slot, timed (`$QWEN35_PROF`).
+    fn dRope64Rows(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32, rows_in: usize, heads_in: usize, hd_in: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.rope64_rows, t0);
+        if (self.ablated(.rope64_rows)) return;
+        dRope64Rows_body(ctx, x, pos, base, rows_in, heads_in, hd_in);
+    }
+
     /// The `convStep` slot, timed (`$QWEN35_PROF`).
     fn dConvStep(ctx: *anyopaque, conv: backend.Buf, y: backend.Buf, wconv: backend.Buf, k: usize) void {
         const self = self_(ctx);
@@ -6022,6 +6071,7 @@ pub const vtable = backend.Exec.VTable{
     .rmsnorm = CudaBackend.dRmsnorm,
     .rmsnormRows = CudaBackend.dRmsnormRows,
     .rope64 = CudaBackend.dRope64,
+    .rope64Rows = CudaBackend.dRope64Rows,
     .l2norm = CudaBackend.dL2norm,
     .l2normRows = CudaBackend.dL2normRows,
     .siluInPlace = CudaBackend.dSiluInPlace,

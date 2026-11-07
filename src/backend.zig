@@ -182,6 +182,16 @@ pub const Exec = struct {
         l2normRows: *const fn (ctx: *anyopaque, x: Buf, n: usize) void,
         /// Rotate the 64-dim rotary block of a row in place (cross-half pairing).
         rope64: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32) void,
+        /// `rows` consecutive `rope64` calls on `x.span(r * heads * hd, heads * hd)`
+        /// with `pos + r`, i.e. row r is prefill token `pos + r`.  `heads` is the
+        /// head count PER ROW, so `x.len == rows * heads * hd`.  Same
+        /// "explicit, never inferred" rule as `rmsnormRows`.
+        ///
+        /// PREFILL ONLY in practice: the decode path must keep issuing single-row
+        /// `rope64` calls because the decode CUDA graph identifies and retargets
+        /// those nodes by host-stub address (see `q35_func_rope64`).  Prefill
+        /// never captures a graph, so the batch reading is free there.
+        rope64Rows: *const fn (ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void,
         /// x *= rsqrt(sum(x^2) + 1e-6)
         l2norm: *const fn (ctx: *anyopaque, x: Buf) void,
         /// x *= s
@@ -412,6 +422,11 @@ pub const Exec = struct {
     }
     pub fn rope64(self: Exec, x: Buf, pos: u32, base: f32) void {
         self.vtable.rope64(self.ptr, x, pos, base);
+    }
+    /// See `VTable.rope64Rows`: `x` is `rows * heads * hd` long, row r (prefill
+    /// token `pos + r`) is `heads * hd` floats.
+    pub fn rope64Rows(self: Exec, x: Buf, pos: u32, base: f32, rows: usize, heads: usize, hd: usize) void {
+        self.vtable.rope64Rows(self.ptr, x, pos, base, rows, heads, hd);
     }
     pub fn l2norm(self: Exec, x: Buf) void {
         self.vtable.l2norm(self.ptr, x);

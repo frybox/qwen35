@@ -1346,21 +1346,41 @@ pub const Engine = struct {
         const conv_dim: usize = 2 * nk * kd + nv * kd;
         const value_dim: usize = nv * kd;
         const n_ff: usize = c.n_ff;
+        // q/k head counts and head width for the chunk-wide `rope64Rows` passes
+        // (`forwardFullCore` no longer rotates; see there).
+        const heads_q_rope: usize = c.n_heads;
+        const kv_heads_rope: usize = c.n_kv_heads;
+        const hd_q: usize = c.head_dim;
 
         var t: usize = 0;
         while (t < k) : (t += 1) self.embedTo(tokens[t], self.xK.span(t * hidden, hidden));
 
         for (self.layers, 0..) |*lw, li| {
-            // ---- per-token RMSNorm of the residual stream, then the batched
+            // ---- RMSNorm of the whole chunk in ONE launch, then the batched
             // projections (weight bytes read once for the whole chunk) ----
-            t = 0;
-            while (t < k) : (t += 1)
-                self.exec.rmsnorm(self.x1K.span(t * hidden, hidden), self.xK.span(t * hidden, hidden), Buf.wrap(lw.attn_norm), c.rms_eps);
+            // `rmsnormRows` is `k` consecutive single-row blocks of `k_rmsnorm`:
+            // each block reduces its own row with the same order, so the result
+            // is bit-identical to the per-token loop it replaces.  The
+            // per-token loop issued `k` launches of a 5 us kernel per layer per
+            // norm, which was 5.6% of prefill device time on 27B IQ3_XXS.
+            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), Buf.wrap(lw.attn_norm), k, c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
                 self.exec.matvecBatchK(self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
                 self.exec.matvecBatchK(self.kK.span(0, k * kv_dim), lw.attn_k.?, self.x1K, k);
                 self.exec.matvecBatchK(self.vK.span(0, k * kv_dim), lw.attn_v.?, self.x1K, k);
+                // ---- RoPE for the whole chunk in ONE launch ----
+                // The per-token loop below issues this tensor-by-tensor, so the
+                // per-head `rope64` calls inside it were 28 launches per token
+                // per full-attention layer (24 q heads + 4 kv heads) -- 9.8%
+                // of prefill device time on 27B IQ3_XXS.  `rope64Rows` indexes
+                // rows and heads off one flat block id and rotates row r at
+                // `pos0 + r`, so row r is the same arithmetic as the single-row
+                // call it replaces.  Row r needs row r's pos, so this MUST run
+                // after `qkvK`/`kK` are filled for every token (above) and
+                // before any consumer of q/k.
+                self.exec.rope64Rows(self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads_q_rope, hd_q);
+                self.exec.rope64Rows(self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads_rope, hd_q);
                 t = 0;
                 while (t < k) : (t += 1) self.forwardFullCore(lw, li, t, pos0 + @as(u32, @intCast(t)));
                 self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
@@ -1379,19 +1399,18 @@ pub const Engine = struct {
             while (t < k) : (t += 1)
                 self.exec.addResid(self.xK.span(t * hidden, hidden), self.x2K.span(t * hidden, hidden));
 
-            // ---- MLP: norm, batched gate/up, per-token SwiGLU, batched down, residual ----
-            t = 0;
-            while (t < k) : (t += 1)
-                self.exec.rmsnorm(self.x1K.span(t * hidden, hidden), self.xK.span(t * hidden, hidden), Buf.wrap(lw.post_attention_norm), c.rms_eps);
+            // ---- MLP: chunk-wide norm, batched gate/up, chunk-wide SwiGLU,
+            // batched down, residual ----
+            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), Buf.wrap(lw.post_attention_norm), k, c.rms_eps);
             self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
             self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
-            t = 0;
-            while (t < k) : (t += 1)
-                self.exec.swiglu(self.mlpK.span(t * n_ff, n_ff), self.mlpK1.span(t * n_ff, n_ff));
+            // SwiGLU over the whole chunk: `gate[i] = silu(gate[i]) * up[i]` is
+            // elementwise and each token's `n_ff` run is independent, so one
+            // launch over `k * n_ff` is the same arithmetic as `k` launches of
+            // an `n_ff`-long one.
+            self.exec.swiglu(self.mlpK.span(0, k * n_ff), self.mlpK1.span(0, k * n_ff));
             self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ffn_down, self.mlpK, k);
-            t = 0;
-            while (t < k) : (t += 1)
-                self.exec.addResid(self.xK.span(t * hidden, hidden), self.x2K.span(t * hidden, hidden));
+            self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
         }
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
@@ -1641,8 +1660,10 @@ pub const Engine = struct {
         // of `k_rmsnorm`, i.e. the identical per-row arithmetic.
         self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), Buf.wrap(lw.attn_q_norm.?), heads, c.rms_eps);
         self.exec.rmsnormRows(k.span(0, kv_dim), k.span(0, kv_dim), Buf.wrap(lw.attn_k_norm.?), kv_heads, c.rms_eps);
-        for (0..heads) |h| self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);
-        for (0..kv_heads) |h| self.exec.rope64(k.span(h * hd, hd), pos, c.rope_freq_base);
+        // (rope64 is NOT here: the chunk-wide `rope64Rows` pass in `forwardChunk`
+        // has already rotated every token's q and k in one launch.  `pos` is kept
+        // in the signature because the attention below still needs `slot`.)
+        _ = pos;
 
         // KV cache: slot == cache.len, exactly as the serial path
         const cache = &self.kv[li];

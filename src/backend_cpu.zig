@@ -879,6 +879,18 @@ pub const CpuBackend = struct {
         ew.bufRope64(x, pos, base);
     }
 
+    /// Row-batched rope64: `rows` tokens `pos..pos+rows-1`, each `heads * hd`
+    /// floats wide.  The CPU oracle is literally the loop of per-row calls, so
+    /// row r is bit-identical to `vRope64` on that row with `pos + r` (same
+    /// convention as `vRmsnormRows`).
+    fn vRope64Rows(ctx: *anyopaque, x: Buf, pos: u32, base: f32, rows_in: usize, heads: usize, hd: usize) void {
+        _ = ctx;
+        const row_len = heads * hd;
+        std.debug.assert(row_len != 0 and x.len % row_len == 0 and x.len / row_len == rows_in);
+        for (0..rows_in) |r|
+            ew.bufRope64(x.span(r * row_len, row_len), pos + @as(u32, @intCast(r)), base);
+    }
+
     fn vL2norm(ctx: *anyopaque, x: Buf) void {
         _ = ctx;
         ew.bufL2norm(x);
@@ -1059,6 +1071,7 @@ pub const CpuBackend = struct {
         .rmsnorm = vRmsnorm,
         .rmsnormRows = vRmsnormRows,
         .rope64 = vRope64,
+        .rope64Rows = vRope64Rows,
         .l2norm = vL2norm,
         .l2normRows = vL2normRows,
         .scaleVec = vScaleVec,
