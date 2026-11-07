@@ -889,7 +889,20 @@ __device__ void Q35Iq2Xxs::group(const unsigned char *wb, int g, int p[8], int l
     ls[0] = ls[1] = 2 * (int)(aux1 >> 28) + 1;
 }
 
-template <class T>
+// NWARPS is a template argument, not a constant, so the launch shape can be
+// shrunk to buy OCCUPANCY.  The tile is 16 rows per warp, so the row tile per
+// block is NWARPS*16: 8 warps -> 128 rows (the original shape) gives the 27B
+// ffn (rows=5120) only (5120+127)/128 = 40 blocks for 114 SMs, i.e. 35% of the
+// device idle.  Halving the warps doubles the block count and halves the shared
+// memory (`sA` is NWARPS*16*256 int8), so the small-row matrices finally fill
+// the GPU.  Crucially this needs no atomics and no extra reduction: every block
+// still owns whole rows and the whole K range, so the store path stays a plain
+// assignment and the result is deterministic.  (An earlier attempt split the K
+// range across grid.y and accumulated with atomicAdd; it measured fine but
+// reordered the float sums, so the token stream diverged from the --MMQ=0
+// reference even though MVCHECK passed.  Warp count is the lever that does not
+// touch the summation order.)
+template <class T, int NWARPS>
 __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                                  const unsigned char *__restrict__ xq,
                                  float *__restrict__ out,
@@ -900,7 +913,9 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     const int nblk = cols / 256;
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
-    const int r0 = blockIdx.x * 128 + warp * 16;
+    const int r0 = blockIdx.x * (NWARPS * 16) + warp * 16;
+    const int b_lo = 0;
+    const int b_hi = nblk;
     // No early return: this kernel uses __syncthreads() (sB is shared by all
     // warps), so every thread must reach the barrier.  Out-of-range rows are
     // skipped at the dequant and at the store.
@@ -908,10 +923,10 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
 
     // 16 rows x 256 int8 = 4 KB per warp (32 KB/block) + one shared 8x256
     // activation tile (2 KB) + per-row group scales.
-    __shared__ int8_t sA[8 * 16 * 256];
+    __shared__ int8_t sA[NWARPS * 16 * 256];
     __shared__ int8_t sB[8 * 256];
     int8_t *sAw = sA + warp * 16 * 256;
-    __shared__ int sLs[8 * 16 * 16];     // per-warp per-row ls[16]: one per 16-element half
+    __shared__ int sLs[NWARPS * 16 * 16];  // per-warp per-row ls[16]: one per 16-element half
     int *ls_w = sLs + warp * 16 * 16;
 
     // One accumulator per token-tile.  With grid.y == 1 the whole token range
@@ -927,7 +942,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     for (int t = 0; t < MAX_TILES; ++t)
         for (int l = 0; l < 4; ++l) acc[t][l] = 0.0f;
 
-    for (int b = 0; b < nblk; ++b) {
+    for (int b = b_lo; b < b_hi; ++b) {
         const unsigned char *wb0 =
             w + (size_t)r0 * (size_t)nblk * block_bytes + (size_t)b * block_bytes;
 
@@ -988,16 +1003,22 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
             // of the 8 token rows and one of the 32 byte-columns, so all 256
             // threads copy 8 bytes each and the barrier wait is one loop
             // iteration.
+            // 2048 bytes over whatever the block actually has: stride by
+            // blockDim.x so this is correct for ANY warp count (NWARPS is a
+            // template parameter, so it is 128..256 threads here).  Binding one
+            // row per warp -- `trow = threadIdx.x / 32` -- silently left rows 4..7
+            // unwritten at 4 warps, which is exactly the bug this loop had.
             {
-                const int tid = (int)threadIdx.x;          // 0..Q35_MMQ_THREADS-1
-                const int trow = tid / 32;                 // which of the 8 tokens
-                const int tcol = tid % 32;                 // byte column, 8 per step
-                if (trow < 8) {
-                    int8_t *dst = sB + trow * 256 + tcol * 8;
-                    if (tb + trow < tokens) {
+                const int tid = (int)threadIdx.x;
+                const int nt  = (int)blockDim.x;
+                for (int i = tid * 8; i < 8 * 256; i += nt * 8) {
+                    const int trow = i >> 8;               // which of the 8 tokens
+                    const int tcol = i & 255;              // byte offset in the row
+                    int8_t *dst = sB + i;
+                    if (tb + trow < tokens && tcol + 8 <= 256) {
                         const unsigned char *row =
                             xq + (size_t)(tb + trow) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
-                        const unsigned char *src = row + tcol * 8;
+                        const unsigned char *src = row + tcol;
                         for (int k = 0; k < 8; ++k) dst[k] = (int8_t)src[k];
                     } else {
                         for (int k = 0; k < 8; ++k) dst[k] = 0;
@@ -1058,44 +1079,94 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         for (int l = 0; l < 4; ++l) {
             const int mp = q35_tile<16, 8, int>::get_i(l);
             const int np = q35_tile<16, 8, int>::get_j(l);
-            if (tb + np < tokens && r0 + mp < rows)
+            if (tb + np < tokens && r0 + mp < rows) {
                 out[(size_t)(tb + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[t][l];
+            }
         }
     }
+}
+
+// How many WARPS per block the IQ prefill tile should use.
+//
+// Occupancy is what is left on the table.  The tile is 16 rows per warp, so the
+// original 8-warp shape is a 128-row block and the 27B ffn (rows=5120,
+// cols=17408) launches only (5120+127)/128 = 40 blocks for 114 SMs -- 65% of
+// the device idle on the largest matrix in the model.  Measured throughput on
+// that shape was 17.2 GB/s, against 250+ GB/s the same weights achieve in the
+// decode kernel.
+//
+// Fewer warps = more blocks AND less shared memory (`sA` is NWARPS*16*256 int8),
+// so the small-row matrices fill the device.  This is deliberately a launch-shape
+// change only: each block still owns whole rows over the whole K range, so the
+// store stays a plain assignment and the float summation order is untouched.
+//
+// (The obvious other lever, splitting the K range across grid.y, measured
+// slightly better -- 88.8 -> 105.3 tok/s -- but it needs atomicAdd, which
+// reorders the float sums.  MVCHECK passed and the token stream still diverged
+// from the --MMQ=0 reference, so it was dropped: this project's decode/prefill
+// equivalence standard is the token stream, not a tolerance.)
+//
+// $QWEN35_CUDA_MMQ_WARPS forces the warp count (1..8; 8 restores the old shape).
+static int q35_iq_warps(int rows) {
+    static int forced = -1;
+    if (forced < 0) {
+        forced = 0;
+        const char *raw = getenv("QWEN35_CUDA_MMQ_WARPS");
+        if (raw != nullptr && *raw) {
+            int v = atoi(raw);
+            if (v >= 1 && v <= 8) forced = v;
+            else fprintf(stderr, "cuda kernels: QWEN35_CUDA_MMQ_WARPS='%s' is not in 1..8; ignoring\n", raw);
+        }
+    }
+    if (forced > 0) return forced;
+    // 4 warps (64 rows/block) is the measured optimum on the 27B shapes, and the
+    // 1..8 sweep is flat enough around it that a per-shape search is not worth a
+    // getenv-free table: 79-token IQ3_XXS prefill measured 88.5 (w=8), 97.4
+    // (w=4), 96.0 (w=2), 94.6 (w=1).
+    //
+    // The reason 4 wins over 2 and 1 despite fewer blocks per SM: the block's
+    // shared-memory tile is the same 8-token activation tile whatever the warp
+    // count, and each block pays one __syncthreads() per token tile.  Halving
+    // the warps halves the rows that barrier work is amortized over, so past
+    // w=4 that cost overtakes the occupancy gain.  The 8-warp shape is the clear
+    // loser because it underfills the device (27B ffn: 40 blocks for 114 SMs).
+    (void)rows;
+    return 4;
 }
 
 static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned char *d_xq,
                                      float *d_out, int rows, int cols, int tokens, int ttype,
                                      cudaStream_t stream) {
-    // grid.y == 1: the kernel loops over the 8-token tiles itself, so the
-    // 128-row weight slice is dequantized from HBM once per super-block b
-    // instead of once per tile (tokens/8).  grid.y is the old weight-re-read
-    // factor.
-    const dim3 grid((unsigned)((rows + 127) / 128), 1);
+    const int nw = q35_iq_warps(rows);
+    const int rowtile = nw * 16;
+    // grid.x is one row tile per block; grid.y stays 1 because the kernel loops
+    // over the 8-token tiles itself, so the weight slice is dequantized from HBM
+    // once per super-block instead of once per tile.
+    const dim3 grid((unsigned)((rows + rowtile - 1) / rowtile), 1);
+    const int threads = nw * Q35_WARP;
+    #define Q35_IQ_LAUNCH(TP)                                                   \
+        do {                                                                    \
+            switch (nw) {                                                       \
+            case 1: q35_k_mmq_mma_iq<TP, 1><<<grid, threads, 0, stream>>>(      \
+                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+            case 2: q35_k_mmq_mma_iq<TP, 2><<<grid, threads, 0, stream>>>(      \
+                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+            case 4: q35_k_mmq_mma_iq<TP, 4><<<grid, threads, 0, stream>>>(      \
+                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+            default: q35_k_mmq_mma_iq<TP, 8><<<grid, threads, 0, stream>>>(     \
+                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+            }                                                                   \
+        } while (0)
     switch (ttype) {
-        case Q35_TT_IQ3_XXS:
-            q35_k_mmq_mma_iq<Q35Iq3Xxs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
-                d_w, d_xq, d_out, rows, cols, tokens);
-            break;
-        case Q35_TT_IQ3_S:
-            q35_k_mmq_mma_iq<Q35Iq3S><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
-                d_w, d_xq, d_out, rows, cols, tokens);
-            break;
-        case Q35_TT_IQ2_S:
-            q35_k_mmq_mma_iq<Q35Iq2S><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
-                d_w, d_xq, d_out, rows, cols, tokens);
-            break;
-        case Q35_TT_IQ4_XS:
-            q35_k_mmq_mma_iq<Q35Iq4Xs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
-                d_w, d_xq, d_out, rows, cols, tokens);
-            break;
-        case Q35_TT_IQ2_XXS:
-            q35_k_mmq_mma_iq<Q35Iq2Xxs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
-                d_w, d_xq, d_out, rows, cols, tokens);
-            break;
+        case Q35_TT_IQ3_XXS: Q35_IQ_LAUNCH(Q35Iq3Xxs); break;
+        case Q35_TT_IQ3_S:   Q35_IQ_LAUNCH(Q35Iq3S);   break;
+        case Q35_TT_IQ2_S:   Q35_IQ_LAUNCH(Q35Iq2S);   break;
+        case Q35_TT_IQ4_XS:  Q35_IQ_LAUNCH(Q35Iq4Xs);  break;
+        case Q35_TT_IQ2_XXS: Q35_IQ_LAUNCH(Q35Iq2Xxs); break;
         default:
             return (cudaError_t)-1;
     }
+    #undef Q35_IQ_LAUNCH
     return cudaGetLastError();
 }
 
