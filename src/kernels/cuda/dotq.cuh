@@ -73,6 +73,41 @@ __host__ __device__ __forceinline__ Q35QuantInfo q35_quant_info(int ttype) {
     return info;
 }
 
+// Sub-block count of a 256-element block for `ttype`, and whether the split-lane
+// decode kernel has a partial-dot implementation for it.  The split kernel
+// subdivides a block into `SPLIT` pieces of equal sub-block count, which is why
+// only types whose 256 elements factor evenly AND that have a `_part` body are
+// accepted.  Everything else keeps the whole-block path (`q35_dot_1blk`).
+__device__ __host__ __forceinline__ int q35_split_units(int ttype) {
+    // The unit is the native per-32 scale group, so a 256-element block is
+    // always 8 units.  IQ3_XXS is the first type with a `_part` body; add to
+    // this switch as each one is implemented and verified with MVCHECK.
+    switch (ttype) {
+        case Q35_TT_IQ3_XXS: return 8;
+        default:             return 0;   // no split path: caller uses 1blk
+    }
+}
+
+// The `i`-th slice `[lo, hi)` of the `units` sub-blocks of one 256-element block.
+__device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char *w,
+                                                  const unsigned char *a, int part, int split) {
+    const int units = q35_split_units(ttype);
+    const int per = units / split;          // units must be a multiple of split
+    const int lo = part * per;
+    const int hi = lo + per;
+    // `split > units` would make `per == 0`: an EMPTY range, i.e. the block
+    // would silently contribute nothing.  That is rejected here rather than
+    // clamped, because a silent all-zeros dot looks like a fast kernel
+    // (measured: SPLIT=16 on IQ3_XXS "ran" at 20 tok/s with mismatched=0
+    // because it computed zero blocks).  The launcher already clamps `split`
+    // down to a divisor of `units`; this is the second line of defence.
+    if (per <= 0) return 0.0f;
+    switch (ttype) {
+        case Q35_TT_IQ3_XXS: return q35_vec_dot_iq3_xxs_q8_k_part(w, a, lo, hi);
+        default:             return 0.0f;
+    }
+}
+
 // One activation block, folded into `acc` for weight type `ttype`.
 // `a` points at ONE activation block (34 B for Q8_0, 292 B for Q8_K); the
 // per-type reference is named in vecdotq.cuh next to each function.

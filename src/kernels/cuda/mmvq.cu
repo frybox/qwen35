@@ -185,6 +185,85 @@ __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
 }
 
 // ---------------------------------------------------------------------------
+// K-SPLIT decode kernel: `SPLIT` lanes cooperate on ONE 256-element weight block
+// ---------------------------------------------------------------------------
+// Why this exists.  `q35_k_mul_mat_vec_q_coop_t` above gives each lane an entire
+// 256-element block, so a lane's dot is a strict serial chain of eight
+// 32-element sub-blocks (8 x (2 grid lookups + 2 dp4a) into ONE accumulator).
+// Measured on 27B IQ3_XXS decode (5120x10240 qkv), the coop kernel moves the
+// weights at 251 GB/s while the SAME loads with the arithmetic replaced by a
+// byte checksum reach 885 GB/s: decode is not bandwidth-starved, it is bound by
+// that per-lane chain.  A microbenchmark over the identical bytes measured
+// 251 GB/s at one lane per block, 285 at 2, 453 at 4 and 694 at 8 -- the chain,
+// not the parallelism, is the limit.  llama.cpp reaches the same conclusion by
+// different means (`vdr` splits K across lanes).
+//
+// Shape here.  Lane `l` of a warp works on block `b` and sub-block slice
+// `l % SPLIT`, and the SPLIT lanes of one block are lane-consecutive so their
+// weight reads for that block are one coalesced region.  Blocks stride by
+// `Q35_WARP / SPLIT`, so the warp still covers 32 blocks per step (unchanged
+// coalescing) and every block is covered exactly once.
+//
+// REDUCTION.  Each lane holds a partial sum.  They are folded with a
+// `SPLIT`-wide butterfly (`__shfl_down_sync` by 1, 2, 4) inside each subgroup,
+// then the SPLIT-wide results are folded across the warp exactly like the coop
+// kernel does -- except that the cross-warp part still goes through
+// `part_dyn[block]` + a lane-0 strict `b = 0..nblk-1` fold, so the value stays
+// in the same reduction class as the coop kernel (checked by QWEN35_MVCHECK).
+//
+// Deliberately NO `rpb`: multi-row-per-warp was measured worse on this model
+// (17.8 -> 12.6 tok/s at rpb=4), and it multiplies the shared-memory footprint
+// which is the other thing this kernel must keep small.
+template <int WARPS, int SPLIT>
+__global__ void q35_k_mul_mat_vec_q_split_t(const unsigned char *__restrict__ w,
+                                            const unsigned char *__restrict__ xq,
+                                            float *__restrict__ out,
+                                            int rows, int cols, int tokens, int ttype) {
+    const Q35QuantInfo info = q35_quant_info(ttype);
+    const int nblk = cols / info.block_elems;
+    const int lane = threadIdx.x & (Q35_WARP - 1);
+    const int warp = threadIdx.x / Q35_WARP;
+
+    // One float per (warp, block): each block's FULL sum lands here, so the
+    // lane-0 fold below is the same strict b = 0..nblk-1 order the coop kernel
+    // uses.
+    extern __shared__ float part_dyn[];
+    float *part_w = part_dyn + (size_t)warp * (size_t)nblk;
+
+    const int row = blockIdx.x * WARPS + warp;
+    if (row >= rows) return;
+    const size_t row_stride = (size_t)nblk * (size_t)info.block_bytes;
+
+    const int part = lane & (SPLIT - 1);        // which slice of the block
+    const int lblock = lane / SPLIT;            // which lane-slot within a block
+    constexpr int kBlocksPerStep = Q35_WARP / SPLIT;
+
+    for (int t = 0; t < tokens; ++t) {
+        const unsigned char *arow = xq + (size_t)t * (size_t)nblk * (size_t)info.act_bytes;
+        for (int b = lblock; b < nblk; b += kBlocksPerStep) {
+            const unsigned char *pb = w + (size_t)row * row_stride +
+                                      (size_t)b * (size_t)info.block_bytes;
+            const unsigned char *ab = arow + (size_t)b * (size_t)info.act_bytes;
+            float v = q35_dot_blk_part(ttype, pb, ab, part, SPLIT);
+            // Butterfly within the SPLIT-lane subgroup.  Lanes 0..SPLIT-1 of
+            // each group all end up with the same value; only `part == 0` keeps
+            // it (the store below).
+            #pragma unroll
+            for (int o = 1; o < SPLIT; o <<= 1) v += __shfl_down_sync(0xffffffffu, v, o);
+            if (part == 0) part_w[b] = v;
+        }
+        __syncwarp();
+        // Strict left-to-right fold per warp, matching q35_dot_row's order.
+        if (lane == 0) {
+            float acc = 0.0f;
+            for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, part_w[b]);
+            out[(size_t)t * rows + row] = acc;
+        }
+        __syncwarp();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // f16 / bf16 weights x f32 activation (the "w16" family).
 //
 // f16 and bf16 have no block metadata, so there is nothing to quantize: the
@@ -501,6 +580,27 @@ static int q35_coop_warps(int nblk) {
     return cached;
 }
 
+// How many lanes cooperate on one 256-element weight block in the decode
+// kernel.  0 (or 1) means "use the whole-block coop kernel".
+// `$QWEN35_CUDA_SPLIT` overrides; accepted values 0/1/2/4/8/16/32.  A value the
+// type cannot support (`q35_split_units(ttype) % split != 0`) is clamped down to
+// the largest supported divisor at the call site, so the env var can never make
+// the kernel read a slice that does not exist.
+static int q35_split() {
+    static int cached = -1;
+    if (cached >= 0) return cached;
+    int v = 8;   // measured-best on sm_89 for IQ3_XXS (see the kernel header)
+    const char *raw = getenv("QWEN35_CUDA_SPLIT");
+    if (raw != NULL && *raw) {
+        int t = atoi(raw);
+        if (t == 0 || t == 1 || t == 2 || t == 4 || t == 8 || t == 16 || t == 32) v = t;
+        else fprintf(stderr, "cuda kernels: QWEN35_CUDA_SPLIT='%s' is not one of 0/1/2/4/8/16/32; using 8\n", raw);
+    }
+    cached = v;
+    fprintf(stderr, "cuda kernels: decode K-split lanes/block = %d ($QWEN35_CUDA_SPLIT overrides)\n", cached);
+    return cached;
+}
+
 extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                                       float *d_out, int rows, int cols,
                                       int tokens, int ttype, void *stream_v) {
@@ -539,6 +639,71 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
     // (measured: 27B IQ3_XXS prefill 11.3 -> 10.1 t/s).  Keep the thread-per-row
     // kernel for tokens > 1, where each token already fills the SMs.
     if (tokens == 1) {
+        // K-split kernel first: it needs a type with a `_part` body and a block
+        // whose sub-block count divides `SPLIT` evenly.  `q35_split()` returns
+        // the wanted lane count; clamp to the largest divisor of the type's unit
+        // count so an unsupported value degrades to a valid shape instead of
+        // reading a slice that does not exist.
+        {
+            const int units = q35_split_units(ttype);
+            int split = q35_split();
+            if (units > 0 && split > 1) {
+                // Clamp to the largest divisor of the unit count, capped at the
+                // unit count itself: `split > units` would give every lane an
+                // EMPTY sub-block range and the dot would contribute nothing
+                // (measured: IQ3_XXS at SPLIT=16 "ran" fine and fast on a
+                // zero-valued dot product).
+                while (split > 1 && (units % split) != 0) split >>= 1;
+                if (split > units) split = units;
+            } else {
+                split = 0;
+            }
+            if (split >= 2 && q35_memonly() == 0) {
+                const int warps_s = q35_coop_warps(nblk);
+                const size_t shmem_s = (size_t)warps_s * (size_t)nblk * sizeof(float);
+                if (shmem_s > 48u * 1024u) {
+                    static size_t max_set_s = 0;
+                    if (shmem_s > max_set_s) {
+                        auto opt = [&](auto kern) {
+                            cudaFuncSetAttribute((const void *)kern,
+                                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem_s);
+                        };
+                        opt(q35_k_mul_mat_vec_q_split_t<1, 2>);
+                        opt(q35_k_mul_mat_vec_q_split_t<1, 4>);
+                        opt(q35_k_mul_mat_vec_q_split_t<1, 8>);
+                        opt(q35_k_mul_mat_vec_q_split_t<2, 2>);
+                        opt(q35_k_mul_mat_vec_q_split_t<2, 4>);
+                        opt(q35_k_mul_mat_vec_q_split_t<2, 8>);
+                        opt(q35_k_mul_mat_vec_q_split_t<4, 2>);
+                        opt(q35_k_mul_mat_vec_q_split_t<4, 4>);
+                        opt(q35_k_mul_mat_vec_q_split_t<4, 8>);
+                        opt(q35_k_mul_mat_vec_q_split_t<8, 2>);
+                        opt(q35_k_mul_mat_vec_q_split_t<8, 4>);
+                        opt(q35_k_mul_mat_vec_q_split_t<8, 8>);
+                        max_set_s = shmem_s;
+                    }
+                }
+                const int blocks_s = (rows + warps_s - 1) / warps_s;
+                #define Q35_SPLIT_LAUNCH(W, S) \
+                    q35_k_mul_mat_vec_q_split_t<W, S><<<blocks_s, W * Q35_WARP, shmem_s, stream>>>( \
+                        d_w, d_xq, d_out, rows, cols, tokens, ttype)
+                #define Q35_SPLIT_SW(S) \
+                    switch (warps_s) { \
+                    case 1:  Q35_SPLIT_LAUNCH(1, S); break; \
+                    case 2:  Q35_SPLIT_LAUNCH(2, S); break; \
+                    case 4:  Q35_SPLIT_LAUNCH(4, S); break; \
+                    default: Q35_SPLIT_LAUNCH(8, S); break; \
+                    }
+                switch (split) {
+                case 2:  Q35_SPLIT_SW(2); break;
+                case 4:  Q35_SPLIT_SW(4); break;
+                default: Q35_SPLIT_SW(8); break;
+                }
+                #undef Q35_SPLIT_SW
+                #undef Q35_SPLIT_LAUNCH
+                return (int)cudaGetLastError();
+            }
+        }
         // One warp per row: coalesced because the warp's lanes read consecutive
         // blocks of a single row.  See q35_k_mul_mat_vec_q_coop for why this is
         // numerically identical to the thread-per-row mapping (bit-identical:

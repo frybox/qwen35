@@ -659,6 +659,53 @@ Q35_DEV float q35_vec_dot_iq3_xxs_q8_k_acc(const unsigned char *w,
     return __fadd_rn(acc, __fmul_rn(__fmul_rn(d, (float)bsum), 0.25f));
 }
 
+// --- IQ3_XXS, K-SPLIT variant (`lane_part`) --------------------------------
+// Same 98-byte block, same arithmetic, but only the `ib32` sub-blocks in
+// `[lo, hi)` are accumulated.  Used by the split-lane decode kernel: llama.cpp
+// splits the K dimension across lanes (`vdr`), so one lane owns a *sliver* of a
+// 256-element block instead of all eight 32-element sub-blocks.  On 27B IQ3_XXS
+// decode the whole-block-per-lane shape runs the dot at 251 GB/s against 885
+// GB/s for the same loads with the arithmetic removed -- the difference is this
+// per-lane serial chain (8 sub-blocks x (2 grid lookups + 2 dp4a), one
+// accumulator).  Shortening the chain while keeping the loads shared is what
+// buys the throughput back.
+//
+// REDUCTION ORDER: each lane returns the EXACT int32 partial sum of its own
+// sub-blocks, so the caller may add the partials in any order and still get the
+// same integer `bsum`.  The float scale `d` is applied per partial, so the sum
+// of partials is `d * bsum` up to *float* associativity; that is the same class
+// of reassociation the existing warp reduction already does, and it is checked
+// by `QWEN35_MVCHECK` (relative tolerance 2e-2).
+Q35_DEV float q35_vec_dot_iq3_xxs_q8_k_part(const unsigned char *w,
+                                            const unsigned char *y, int lo, int hi) {
+    const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    const unsigned char *q3  = w + 2;
+    const unsigned char *gas = w + 2 + Q35_QK_K / 4;
+    const signed char *q8 = q35_q8k_qs(y);
+    int bsum = 0;
+    for (int ib32 = lo; ib32 < hi; ++ib32) {
+        const unsigned int aux32 = q35_ld_u32(gas + 4 * ib32);
+        const int ls = 2 * (int)(aux32 >> 28) + 1;
+        int sumi = 0;
+        const unsigned char *q3b = q3 + 8 * ib32;
+        const signed char *q8b = q8 + 32 * ib32;
+        for (int l = 0; l < 4; ++l) {
+            const unsigned int sgn = q35_iq_signs8((aux32 >> (7 * l)) & 127);
+            const int g1 = (int)iq3xxs_grid[q3b[2 * l + 0]];
+            const int g2 = (int)iq3xxs_grid[q3b[2 * l + 1]];
+            const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+            const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+            sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                           q35_ld_u32((const unsigned char *)q8b), sumi);
+            sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                           q35_ld_u32((const unsigned char *)q8b + 4), sumi);
+            q8b += 8;
+        }
+        bsum += sumi * ls;
+    }
+    return __fmul_rn(__fmul_rn(d, (float)bsum), 0.25f);
+}
+
 // --- IQ3_S: 110 B = d @0 | qs[64] @2 | qh[8] @66 | signs[32] @74 | sc[4] @106
 // iq_kernels.c:1727 iq3_s_q8_k_scalar_impl.  Grid index uses bit 0x100 of qh
 // (9-bit index into iq3s_grid[512]); ls1/ls2 are 2*nibble+1; output is plain
