@@ -84,6 +84,7 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
     // this switch as each one is implemented and verified with MVCHECK.
     switch (ttype) {
         case Q35_TT_IQ3_XXS: return 8;
+        case Q35_TT_IQ2_S:   return 8;
         default:             return 0;   // no split path: caller uses 1blk
     }
 }
@@ -104,6 +105,7 @@ __device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char
     if (per <= 0) return 0.0f;
     switch (ttype) {
         case Q35_TT_IQ3_XXS: return q35_vec_dot_iq3_xxs_q8_k_part(w, a, lo, hi);
+        case Q35_TT_IQ2_S:   return q35_vec_dot_iq2_s_q8_k_part(w, a, lo, hi);
         default:             return 0.0f;
     }
 }

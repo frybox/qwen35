@@ -706,6 +706,74 @@ Q35_DEV float q35_vec_dot_iq3_xxs_q8_k_part(const unsigned char *w,
     return __fmul_rn(__fmul_rn(d, (float)bsum), 0.25f);
 }
 
+// IQ2_S partial over 32-element sub-blocks `[lo, hi)`.
+//
+// Unlike IQ3_S there is no cross-ib32 state: `qs`/`signs` advance 4 bytes and
+// `q8` 32 bytes per iteration, all driven by `ib32`, so every slice boundary is
+// valid and the only requirement is that the caller's `lo`/`hi` are in
+// [0, 8) with lo < hi.  The 0.125 output factor of the full-block body is kept,
+// and `d` is applied once per partial -- the same shape as the IQ3_XXS `_part`
+// body above, so the split reduction folds a sum of already-scaled partials.
+Q35_DEV float q35_vec_dot_iq2_s_q8_k_part(const unsigned char *w,
+                                          const unsigned char *y, int lo, int hi) {
+    const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    // Every pointer advances 4 bytes (qs, signs) or 1 byte (qh) per ib32, so all
+    // of them rebase by `lo` units -- NOT by lo/2.  (Writing lo/2 here silently
+    // halves the qs/signs offset and reads the wrong sub-blocks for lo >= 2.)
+    const unsigned char *qs = w + 2 + (size_t)lo * 4;
+    const unsigned char *qh = w + 66 + lo;
+    const unsigned char *scales = w + 74;
+    const unsigned char *signs = w + 34 + (size_t)lo * 4;
+    const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
+    int bsum = 0;
+    for (int ib32 = lo; ib32 < hi; ++ib32) {
+        const int ls1 = 1 + 2 * (scales[ib32] & 0xF);
+        const int ls2 = 1 + 2 * (scales[ib32] >> 4);
+        int sumi1 = 0, sumi2 = 0;
+        for (int l = 0; l < 4; ++l) {
+            const unsigned int idx = (unsigned int)qs[l] |
+                                     (((unsigned int)qh[0] << (8 - 2 * l)) & 0x300u);
+            const unsigned long long g = iq2s_grid[idx];
+            // __vsub4 sign trick, same shape as the IQ3_XXS `_part` body: the
+            // sign byte broadcasts to an 8-byte mask where each byte is 0xFF
+            // for "negate", so (g ^ m) - m is a branchless per-byte negation
+            // and __dp4a folds all 8 products into one instruction.  The scalar
+            // ternary loop this replaces is why IQ2_S measured 217 GB/s against
+            // IQ3_XXS's 550 on identical bytes and the same split.
+            //
+            // NOT q35_iq_signs8: that helper expands a SEVEN-bit code by
+            // appending a popcount-parity bit, which is the IQ3_XXS/IQ2_XS
+            // convention.  IQ2_S's `signs[]` bytes are eight INDEPENDENT sign
+            // bits (`signs[l] & kmask_iq2xs[j]` for j = 0..7 in the scalar body
+            // above), so the mask is a plain *0x01010101 broadcast.  Using the
+            // parity helper here silently negated the wrong elements: MVCHECK
+            // still reported mismatched=0 (the magnitudes are right) while the
+            // token stream diverged at output 5.
+            const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
+            const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+            const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+            const int g1 = (int)(unsigned int)(g & 0xFFFFFFFFull);
+            const int g2 = (int)(unsigned int)(g >> 32);
+            if (l < 2) {
+                sumi1 = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                                q35_ld_u32((const unsigned char *)q8), sumi1);
+                sumi1 = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                                q35_ld_u32((const unsigned char *)q8 + 4), sumi1);
+            } else {
+                sumi2 = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                                q35_ld_u32((const unsigned char *)q8), sumi2);
+                sumi2 = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                                q35_ld_u32((const unsigned char *)q8 + 4), sumi2);
+            }
+            q8 += 8;
+        }
+        bsum += ls1 * sumi1 + ls2 * sumi2;
+        qs += 4;
+        signs += 4;
+    }
+    return __fmul_rn(__fmul_rn(d, (float)bsum), 0.125f);
+}
+
 // --- IQ3_S: 110 B = d @0 | qs[64] @2 | qh[8] @66 | signs[32] @74 | sc[4] @106
 // iq_kernels.c:1727 iq3_s_q8_k_scalar_impl.  Grid index uses bit 0x100 of qh
 // (9-bit index into iq3s_grid[512]); ls1/ls2 are 2*nibble+1; output is plain
@@ -749,6 +817,55 @@ Q35_DEV float q35_vec_dot_iq3_s_q8_k_acc(const unsigned char *w,
         }
     }
     return __fadd_rn(acc, __fmul_rn(d, (float)bsum));
+}
+
+// IQ3_S partial over 32-element sub-blocks `[lo, hi)`.
+//
+// The full-block body above walks `ib32` in [0,8) in steps of 2 because one
+// `scales[]` byte carries BOTH halves (low nibble = ib32, high = ib32+1) and
+// `qs`/`signs` advance 8/4 bytes per PAIR.  A slice boundary that fell inside a
+// pair would need those pointers rebased mid-pair, so a split is only accepted
+// on an EVEN `lo` and an EVEN-length range; the caller's `units` is 8 and the
+// launcher only ever passes split in {2,4,8}, which makes `per` 4/2/1 -- and a
+// `per` of 1 would land on an odd boundary.  Returning 0 for that case keeps
+// the launcher honest instead of silently computing a wrong slice.
+Q35_DEV float q35_vec_dot_iq3_s_q8_k_part(const unsigned char *w,
+                                          const unsigned char *y, int lo, int hi) {
+    if ((lo & 1) != 0 || ((hi - lo) & 1) != 0) return 0.0f;
+    const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    const unsigned char *qs = w + 2 + (lo / 2) * 8;
+    const unsigned char *qh = w + 66 + lo;
+    const unsigned char *signs = w + 74 + (lo / 2) * 4;
+    const unsigned char *scales = w + 106;
+    const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
+    int bsum = 0;
+    for (int ib32 = lo; ib32 < hi; ib32 += 2) {
+        const unsigned int ls1 = 2 * (unsigned int)(scales[ib32 / 2] & 0xF) + 1;
+        const unsigned int ls2 = 2 * (unsigned int)(scales[ib32 / 2] >> 4) + 1;
+        for (int half = 0; half < 2; ++half) {
+            int sumi = 0;
+            for (int l = 0; l < 4; ++l) {
+                const unsigned int i1 = (unsigned int)qs[2 * l + 0] |
+                                        (((unsigned int)qh[half] << (8 - 2 * l)) & 256u);
+                const unsigned int i2 = (unsigned int)qs[2 * l + 1] |
+                                        (((unsigned int)qh[half] << (7 - 2 * l)) & 256u);
+                const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
+                const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+                const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+                const int g1 = (int)iq3s_grid[i1];
+                const int g2 = (int)iq3s_grid[i2];
+                sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                               q35_ld_u32((const unsigned char *)q8), sumi);
+                sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                               q35_ld_u32((const unsigned char *)q8 + 4), sumi);
+                q8 += 8;
+            }
+            qs += 8;
+            signs += 4;
+            bsum += sumi * (int)(half == 0 ? ls1 : ls2);
+        }
+    }
+    return __fmul_rn(d, (float)bsum);
 }
 
 // --- IQ4_XS: 136 B = d @0 (f16) | scales_h @2 (u16) | scales_l[4] @4 | qs[128] @8
