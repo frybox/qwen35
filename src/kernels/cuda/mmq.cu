@@ -514,15 +514,26 @@ __global__ void q35_k_mmq_mma_k256(const unsigned char *__restrict__ w,
         // __syncthreads(): with __syncwarp() a warp could read a tile another
         // warp was still writing (that was a real bug -- Q6_K had 24 718
         // mismatched rows until this became a block-wide barrier).
-        if (warp == 0 && lane < 8) {
-            const int np = lane;
-            int8_t *dst = sB + np * 256;
-            if (t0 + np < tokens) {
-                const unsigned char *row =
-                    xq + (size_t)(t0 + np) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
-                for (int k = 0; k < 256; ++k) dst[k] = (int8_t)row[k];
-            } else {
-                for (int k = 0; k < 256; ++k) dst[k] = 0;
+        // Spread over the whole block, not `warp == 0 && lane < 8`: the old
+        // shape had 8 lanes each byte-copying 256 elements while the other 248
+        // threads waited at the barrier, and it runs once per (super-block,
+        // token-tile), so its cost scaled exactly linearly with `tokens`.  Same
+        // fix and same measurement as the IQ path in
+        // `q35_k_mmq_mma_iq` (tokens 8 -> 128 was 222 us -> 1799 us before it).
+        {
+            const int tid = (int)threadIdx.x;
+            const int trow = tid / 32;      // which of the 8 tokens
+            const int tcol = tid % 32;      // byte column, 8 per step
+            if (trow < 8) {
+                int8_t *dst = sB + trow * 256 + tcol * 8;
+                if (t0 + trow < tokens) {
+                    const unsigned char *row =
+                        xq + (size_t)(t0 + trow) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
+                    const unsigned char *src = row + tcol * 8;
+                    for (int k = 0; k < 8; ++k) dst[k] = (int8_t)src[k];
+                } else {
+                    for (int k = 0; k < 8; ++k) dst[k] = 0;
+                }
             }
         }
         __syncthreads();
@@ -963,17 +974,34 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         for (int t = 0; t < MAX_TILES; ++t) {
             const int tb = t * 8;
             if (tb >= tokens) continue;
-            // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).  Byte
-            // copies, not int4: 292 % 16 == 4, so neither a token row nor a
+            // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).
+            // Byte copies, not int4: 292 % 16 == 4, so neither a token row nor a
             // block start is 16-byte aligned.
-            if (warp == 0 && lane < 8) {
-                int8_t *dst = sB + lane * 256;
-                if (tb + lane < tokens) {
-                    const unsigned char *row =
-                        xq + (size_t)(tb + lane) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
-                    for (int k = 0; k < 256; ++k) dst[k] = (int8_t)row[k];
-                } else {
-                    for (int k = 0; k < 256; ++k) dst[k] = 0;
+            //
+            // Previously `warp == 0 && lane < 8` with a 256-iteration inner
+            // loop: 8 lanes copied 256 bytes each while the other 248 threads
+            // sat at the barrier.  That serial loop runs once per (super-block,
+            // token-tile), so its cost scales EXACTLY linearly with `tokens` --
+            // which is the shape of the measured prefill cliff (tokens 8 -> 128
+            // went 222 us -> 1799 us, 8.1x for 16x tokens).  Spread the same
+            // 8x256 bytes over the whole block instead: `threadIdx.x` picks one
+            // of the 8 token rows and one of the 32 byte-columns, so all 256
+            // threads copy 8 bytes each and the barrier wait is one loop
+            // iteration.
+            {
+                const int tid = (int)threadIdx.x;          // 0..Q35_MMQ_THREADS-1
+                const int trow = tid / 32;                 // which of the 8 tokens
+                const int tcol = tid % 32;                 // byte column, 8 per step
+                if (trow < 8) {
+                    int8_t *dst = sB + trow * 256 + tcol * 8;
+                    if (tb + trow < tokens) {
+                        const unsigned char *row =
+                            xq + (size_t)(tb + trow) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
+                        const unsigned char *src = row + tcol * 8;
+                        for (int k = 0; k < 8; ++k) dst[k] = (int8_t)src[k];
+                    } else {
+                        for (int k = 0; k < 8; ++k) dst[k] = 0;
+                    }
                 }
             }
             __syncthreads();
