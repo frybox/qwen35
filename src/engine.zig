@@ -1072,8 +1072,14 @@ pub const Engine = struct {
         e.gamma_scratch = try e.exec.allocBuf(@as(usize, cfg.gdn_n_heads));
         e.sample_scratch = try e.exec.allocBuf(cfg.vocab);
 
-        // ---- K-token batched prefill scratch (K = 16) ----
-        const K: usize = 16;
+        // ---- K-token batched prefill scratch (K = 128) ----
+        // K is the number of prompt tokens folded into one batched chunk:
+        // every layer's quantized weights are read from HBM once per chunk
+        // (the mma tile kernel hoists the weight over the token loop), so
+        // 543 tokens = 5 launches at K=128 instead of 34 at K=16 -- the
+        // weight bytes pass through DRAM 13x less often.  128 == the mma tile
+        // kernel's MAX_TILES (16 token-tiles of 8), so a chunk is one launch.
+        const K: usize = 128;
         const q_dimK: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
         const kv_dimK: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
         e.nbatch = if (no_batch) 0 else K;

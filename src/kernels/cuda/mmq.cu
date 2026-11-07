@@ -85,7 +85,7 @@
 // trivially-parallel kernel -- order still ascending, but the fold leaves the
 // critical path.  Re-measure both before flipping the default.
 //
-// `tokens > Q35_MMQ_MAX_TOKENS` (the engine's prefill chunk is 16) is declined
+// `tokens > Q35_MMQ_MAX_TOKENS` (the engine's prefill chunk is 128) is declined
 // at launch time: the launcher returns -1, which mmvq.cu reads as "use the
 // thread-per-row kernel".  A half-idle tile would be slower than the fallback,
 // and a silently wrong tile is worse than either.
@@ -94,7 +94,11 @@
 
 #define Q35_MMQ_THREADS 256
 #define Q35_MMQ_WARPS (Q35_MMQ_THREADS / Q35_WARP)
-#define Q35_MMQ_MAX_TOKENS 16   // engine.zig nbatch: the register budget boundary
+// engine.zig nbatch: the register budget boundary.  The mma tile kernel now
+// handles up to 128 tokens per launch (MAX_TILES == 16 token-tiles of 8, with
+// the 128-row weight slice hoisted over the token loop), so this matches the
+// engine's K == 128.
+#define Q35_MMQ_MAX_TOKENS 128
 
 // ---------------------------------------------------------------------------
 // One warp = one (weight row, token).  Lane l folds the block run
@@ -695,6 +699,40 @@ struct Q35Iq2S {
     static constexpr int out_scale_den = 8;   // 0.125f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
 };
+// IQ4_XS: 136 B = d@0 (f16) | scales_h@2 (u16) | scales_l[4]@4 | qs[128]@8.
+// A plain 4-bit codebook lookup (kvalues_iq4nl, i.e. the iq4nl alias) with NO
+// sign table, ONE scale per 32 elements (so ls[0] == ls[1] here), and -- unlike
+// IQ3_XXS -- a NEGATIVE-capable ls (the -32 bias), which is why the integer
+// domain is the only sane place to accumulate it.
+// Source of truth: ggml-quants.c dequantize_row_iq4_xs (line 2744) and
+// ggml-common.h block_iq4_xs (line 454).  dp4a twin in this repo is
+// vecdotq.cuh:710 q35_vec_dot_iq4_xs_q8_k_acc.
+struct Q35Iq4Xs {
+    static constexpr int block_bytes = 136;
+    static constexpr int out_scale_q = 1;
+    static constexpr int out_scale_den = 1;   // 1.0f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+};
+// IQ2_XXS: 66 B = d@0 (f16) | qs[32] @2, read as 8 x { a[0..3] (4 grid indices)
+// + aux1 (u32) }.  iq2xxs_grid is u64 (8 uint8 magnitudes), the sign table is
+// ksigns_iq2xs (7-bit codes -- NOT keven_signs), and the scale is ONE per 32
+// elements from the top nibble of aux1, so -- like IQ3_XXS -- both halves of
+// the group share ls[0] == ls[1] and the kernel runs k16 mma with 0.25f.
+// Source of truth: ggml-quants.c dequantize_row_iq2_xxs (line 2500) and
+// ggml-common.h block_iq2_xxs (line 240).  dp4a twin in this repo is
+// vecdotq.cuh:498 q35_vec_dot_iq2_xxs_q8_k_acc.
+struct Q35Iq2Xxs {
+    static constexpr int block_bytes = 66;
+    static constexpr int out_scale_q = 1;
+    // 1/8, NOT IQ3_XXS's 1/4 -- see the derivation in group() below:
+    //   db = d * (0.5f + hi) * 0.25f  and  ls = 2*hi + 1
+    //   => db = d * ls * 0.125f, because 0.25*(0.5+hi) == 0.125*(2*hi+1).
+    // The `2*hi` inside ls already absorbs a factor of two, so reusing
+    // out_scale_den = 4 here doubles every output (MVCHECK: dev == 2 * cpu on
+    // every row, mismatched=163839).
+    static constexpr int out_scale_den = 8;   // 0.125f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+};
 
 // Per-type unpacker for the generic IQ tensor-core kernel below: decompose one
 // 32-element group of a 256-element super-block into 8 int32 of int8 and
@@ -762,6 +800,84 @@ __device__ void Q35Iq2S::group(const unsigned char *wb, int g, int p[8], int ls[
     ls[1] = 2 * (int)(sc >> 4) + 1;
 }
 
+__device__ void Q35Iq4Xs::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // 136 B = d@0 (f16) | scales_h@2 (u16) | scales_l[4]@4 | qs[128]@8.
+    // dequantize_row_iq4_xs (ggml-quants.c:2744) and the dp4a twin
+    // q35_vec_dot_iq4_xs_q8_k_acc (vecdotq.cuh:710):
+    //   ls = (scales_l[ib/2] nibble) | (((h >> 2*ib) & 3) << 4),  SCALE = ls-32
+    //   y[j+0] = d*(ls-32)*kvalues_iq4nl[qs[j] & 0xf]
+    //   y[j+16]= d*(ls-32)*kvalues_iq4nl[qs[j] >>  4]
+    // Two differences from IQ3_XXS/IQ3_S drive this implementation:
+    //  1. The 6-bit ls is biased by -32 and may be negative or zero -- IQ4_XS
+    //     is the only IQ type here with a signed per-group scale.  It is kept
+    //     in the INTEGER domain (`isum += ls * D.x[l]`), which is exact either
+    //     way; d is factored out to the final float scale.
+    //  2. kvalues_iq4nl is `int8_t` spanning -127..113, NOT an unsigned grid
+    //     byte.  Packing it with plain `<< 8` sign-extends each value into its
+    //     neighbours (`(int)(int8_t)-127 == 0xFFFFFF81`), so every byte must be
+    //     masked to 0x00FF before the shift.  (Measured before the mask: every
+    //     element of every row wrong, MVCHECK mismatched=161750.)
+    const unsigned short h = q35_ld_u16(wb + 2);
+    const unsigned char *sc_l = wb + 4;
+    const unsigned char *qs = wb + 8 + 16 * g;
+    const unsigned char sc = sc_l[g >> 1];
+    const unsigned int nib = (g & 1) ? (unsigned int)(sc >> 4) : (unsigned int)(sc & 0xF);
+    const int l = (int)nib | (int)(((unsigned int)h >> (2 * g)) & 3u) << 4;
+    // Low nibbles -> elements 0..15, high nibbles -> 16..31 (the two y[] rows).
+    // p[l] holds elements 4l..4l+3.
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+        const int lo = ((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 0] & 0xF]) |
+                       (((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 1] & 0xF]) << 8) |
+                       (((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 2] & 0xF]) << 16) |
+                       (((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 3] & 0xF]) << 24);
+        const int hi = ((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 0] >> 4]) |
+                       (((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 1] >> 4]) << 8) |
+                       (((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 2] >> 4]) << 16) |
+                       (((int)(unsigned char)kvalues_iq4nl[qs[4 * q + 3] >> 4]) << 24);
+        p[q] = lo;
+        p[4 + q] = hi;
+    }
+    ls[0] = ls[1] = l - 32;
+}
+
+__device__ void Q35Iq2Xxs::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // 66 B = d@0 (f16) | qs[32]@2.  Group g owns the 8 bytes at qs + 8*g:
+    //   a[0..3] = four iq2xxs_grid indices, +4 = aux1
+    //     aux1 bits 7*l+0..7*l+6 -> 7-bit sign code for the l-th chunk of 8
+    //     aux1 bits 28..31       -> (db/d factor) - 1, i.e. ls = 2*hi + 1
+    // Element order is l*8 + j (dequantize_row_iq2_xxs:2500), i.e. the grid's
+    // 8 magnitude bytes are CONSECUTIVE elements, whereas p[q] holds elements
+    // 4q..4q+3.  So each 8-byte grid straddles two p[] ints: the low uint32
+    // (bytes j=0..3) lands in p[2l], the high uint32 (j=4..7) in p[2l+1].
+    // Signs: exactly the IQ3_XXS trick -- q35_iq_signs8 expands the 7-bit code
+    // into one 0xFF/0x00 byte per element, __vcmpne4 turns the byte selection
+    // into a 0xFFFFFFFF/0 int, and __vsub4(g ^ m, m) negates the marked bytes
+    // (bit-identical to the scalar `signs & kmask_iq2xs[j] ? -1 : 1`, and free
+    // of the branch loop).  iq2xxs_grid bytes are unsigned 0..255 magnitudes,
+    // so they are taken with & 0xFF and fed to __vcmpne4/__vsub4 as unsigned
+    // byte lanes -- no int8 sign extension to pollute neighbouring bytes (the
+    // IQ4_XS bug was the opposite: a genuinely signed int8 table).
+    const unsigned int aux1 = q35_ld_u32(wb + 2 + 8 * g + 4);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int sgn = q35_iq_signs8((aux1 >> (7 * l)) & 127u);
+        const unsigned long long grid = iq2xxs_grid[wb[2 + 8 * g + l]];
+        const int g1 = (int)(unsigned int)(grid & 0xFFFFFFFFull);
+        const int g2 = (int)(unsigned int)(grid >> 32);
+        const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+        const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+        p[2 * l + 0] = __vsub4(g1 ^ s0, s0);
+        p[2 * l + 1] = __vsub4(g2 ^ s1, s1);
+    }
+    // ONE (always positive, odd) scale per 32 elements, so both halves share
+    // it.  ls = 2*(aux1>>28) + 1.  With db = d*(0.5f + hi)*0.25f that leaves
+    // a float factor of 0.125f (out_scale_den = 8), NOT IQ3_XXS's 0.25f:
+    // 0.25*(0.5+hi) == 0.125*(2*hi+1) exactly (both are powers of two times an
+    // odd integer, so the identity is bit-exact in f32).
+    ls[0] = ls[1] = 2 * (int)(aux1 >> 28) + 1;
+}
+
 template <class T>
 __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                                  const unsigned char *__restrict__ xq,
@@ -774,7 +890,6 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int r0 = blockIdx.x * 128 + warp * 16;
-    const int t0 = blockIdx.y * 8;
     // No early return: this kernel uses __syncthreads() (sB is shared by all
     // warps), so every thread must reach the barrier.  Out-of-range rows are
     // skipped at the dequant and at the store.
@@ -788,7 +903,18 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     __shared__ int sLs[8 * 16 * 16];     // per-warp per-row ls[16]: one per 16-element half
     int *ls_w = sLs + warp * 16 * 16;
 
-    float acc[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // One accumulator per token-tile.  With grid.y == 1 the whole token range
+    // is handled inside the kernel, so the 128-row weight slice is dequantized
+    // from HBM ONCE per super-block b and hoisted over the token-tile loop
+    // below.  (Previously grid.y == tokens/8 re-read the same 128-row weight
+    // once per 8-token tile -- the prefill bandwidth cliff.)  acc[t] holds the
+    // (16 rows x 8 tokens) D-fragment sum for token-tile t, accumulated across
+    // all super-blocks b.
+    constexpr int MAX_TILES = 16;   // K == 128 tokens / 8 per tile
+    const int ntiles = (tokens + 7) / 8;
+    float acc[MAX_TILES][4];
+    for (int t = 0; t < MAX_TILES; ++t)
+        for (int l = 0; l < 4; ++l) acc[t][l] = 0.0f;
 
     for (int b = 0; b < nblk; ++b) {
         const unsigned char *wb0 =
@@ -798,6 +924,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         // group-pair, so 16 rows x 4 group-pairs = 32 lanes, each unpacking 2
         // of the block's 8 groups (64 elements).  Unpacking a whole row on one
         // lane left 31 of 32 lanes idle here and was the kernel's real cost.
+        // Staged ONCE per b (hoisted over the token-tile loop below).
         if (row_live) {
             const int row = lane >> 1;              // 0..15
             // Groups 0..7 must all be covered: 16 rows x 2 lanes leaves 2
@@ -824,82 +951,99 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
             }
         }
 
-        // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).  Byte
-        // copies, not int4: 292 % 16 == 4, so neither a token row nor a block
-        // start is 16-byte aligned.
-        if (warp == 0 && lane < 8) {
-            int8_t *dst = sB + lane * 256;
-            if (t0 + lane < tokens) {
-                const unsigned char *row =
-                    xq + (size_t)(t0 + lane) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
-                for (int k = 0; k < 256; ++k) dst[k] = (int8_t)row[k];
-            } else {
-                for (int k = 0; k < 256; ++k) dst[k] = 0;
+        // Token tiles: sAw/ls_w are staged above and hoisted over this loop;
+        // only the 8-token activation tile is re-staged per tile.
+        // Constant-bounded (MAX_TILES) so the compiler keeps acc[t][l] in
+        // REGISTERS, not local memory: a runtime-bounded loop would spill the
+        // 16x4 float accumulator to local memory and the prefill matvec becomes
+        // local-memory bound (measured: that is why the grid.y==1 hoist alone
+        // gave only ~1.6x -- the weight-bandwidth win was eaten by the spill).
+        // `tb >= tokens` guards the partial last tile; tokens is launch-uniform
+        // (not thread-dependent), so the __syncthreads() below stay uniform.
+        for (int t = 0; t < MAX_TILES; ++t) {
+            const int tb = t * 8;
+            if (tb >= tokens) continue;
+            // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).  Byte
+            // copies, not int4: 292 % 16 == 4, so neither a token row nor a
+            // block start is 16-byte aligned.
+            if (warp == 0 && lane < 8) {
+                int8_t *dst = sB + lane * 256;
+                if (tb + lane < tokens) {
+                    const unsigned char *row =
+                        xq + (size_t)(tb + lane) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
+                    for (int k = 0; k < 256; ++k) dst[k] = (int8_t)row[k];
+                } else {
+                    for (int k = 0; k < 256; ++k) dst[k] = 0;
+                }
             }
-        }
-        __syncthreads();
+            __syncthreads();
 
-        // k16 mma, one per 16-element HALF-group: D.x[l] is then the exact
-        // int32 dot of 16 elements, so the per-half scale is applied without
-        // mixing.  IQ3_XXS/IQ3_S carry one scale per 32 elements and simply
-        // reuse it for both halves; IQ2_* carry one per 16 (two nibbles of
-        // scales[g]), which is why k32 -- whose D would span two different
-        // scales -- is unusable for them.  k16 costs 16 mma instead of 8 per
-        // super-block; the tensor cores are nowhere near the bottleneck
-        // (dequant + shared staging is), so this is free.
-        int isum[4] = {0, 0, 0, 0};
+            // k16 mma, one per 16-element HALF-group: D.x[l] is then the exact
+            // int32 dot of 16 elements, so the per-half scale is applied without
+            // mixing.  k16 costs 16 mma instead of 8 per super-block; the tensor
+            // cores are nowhere near the bottleneck (dequant + shared staging is),
+            // so this is free.
+            int isum[4] = {0, 0, 0, 0};
 #pragma unroll
-        for (int h = 0; h < 16; ++h) {
-            q35_tile<16, 4, int> A_frag;
-            q35_tile<8, 4, int> B_frag;
-            q35_tile<16, 8, int> D;
-            // Shared rows are 256 int8 wide = 64 int, so the ldmatrix stride
-            // is 64 int and a 16-element half starts at int offset h*4.
-            q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, 64);
-            q35_mma::load_generic(B_frag, (const int *)sB + h * 4, 64);
-            q35_mma::mma(D, A_frag, B_frag);
-            const int g = h >> 1;               // 32-element group
-            const int half = h & 1;
+            for (int h = 0; h < 16; ++h) {
+                q35_tile<16, 4, int> A_frag;
+                q35_tile<8, 4, int> B_frag;
+                q35_tile<16, 8, int> D;
+                // Shared rows are 256 int8 wide = 64 int, so the ldmatrix stride
+                // is 64 int and a 16-element half starts at int offset h*4.
+                q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, 64);
+                q35_mma::load_generic(B_frag, (const int *)sB + h * 4, 64);
+                q35_mma::mma(D, A_frag, B_frag);
+                const int g = h >> 1;               // 32-element group
+                const int half = h & 1;
+#pragma unroll
+                for (int l = 0; l < 4; ++l) {
+                    const int mp = q35_tile<16, 8, int>::get_i(l);
+                    // ls2 holds the second half's scale when the type has 16-element
+                    // granularity; for 32-element types both entries are equal.
+                    isum[l] += (half ? ls_w[mp * 16 + g * 2 + 1] : ls_w[mp * 16 + g * 2]) * D.x[l];
+                }
+            }
+            __syncthreads();   // sB is re-staged next token-tile
+
 #pragma unroll
             for (int l = 0; l < 4; ++l) {
                 const int mp = q35_tile<16, 8, int>::get_i(l);
-                // ls2 holds the second half's scale when the type has 16-element
-                // granularity; for 32-element types both entries are equal.
-                isum[l] += (half ? ls_w[mp * 16 + g * 2 + 1] : ls_w[mp * 16 + g * 2]) * D.x[l];
+                const int np = q35_tile<16, 8, int>::get_j(l);
+                if (tb + np >= tokens || r0 + mp >= rows) continue;
+                const unsigned char *wb = wb0 + (size_t)mp * (size_t)nblk * block_bytes;
+                const unsigned char *yb =
+                    xq + (size_t)(tb + np) * (size_t)nblk * 292 + (size_t)b * 292;
+                const float d = __fmul_rn(q35_f16_at(wb, 0), q35_q8k_d(yb));
+                // T::out_scale_q * OUT_SCALE_DEN: an integer template argument
+                // times a power-of-two denominator, because C++ forbids a
+                // floating-point template parameter.  Both factors are exact.
+                acc[t][l] = __fadd_rn(acc[t][l], __fmul_rn(
+                    __fmul_rn(d, (float)isum[l]), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
             }
         }
-        __syncthreads();   // sAw/sB are written again next iteration
+    }
 
+    for (int t = 0; t < ntiles; ++t) {
+        const int tb = t * 8;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const int mp = q35_tile<16, 8, int>::get_i(l);
             const int np = q35_tile<16, 8, int>::get_j(l);
-            if (t0 + np >= tokens || r0 + mp >= rows) continue;
-            const unsigned char *wb = wb0 + (size_t)mp * (size_t)nblk * block_bytes;
-            const unsigned char *yb =
-                xq + (size_t)(t0 + np) * (size_t)nblk * 292 + (size_t)b * 292;
-            const float d = __fmul_rn(q35_f16_at(wb, 0), q35_q8k_d(yb));
-            // T::out_scale_q * OUT_SCALE_DEN: an integer template argument
-            // times a power-of-two denominator, because C++ forbids a
-            // floating-point template parameter.  Both factors are exact.
-            acc[l] = __fadd_rn(acc[l], __fmul_rn(
-                __fmul_rn(d, (float)isum[l]), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
+            if (tb + np < tokens && r0 + mp < rows)
+                out[(size_t)(tb + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[t][l];
         }
-    }
-
-#pragma unroll
-    for (int l = 0; l < 4; ++l) {
-        const int mp = q35_tile<16, 8, int>::get_i(l);
-        const int np = q35_tile<16, 8, int>::get_j(l);
-        if (t0 + np < tokens && r0 + mp < rows)
-            out[(size_t)(t0 + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[l];
     }
 }
 
 static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned char *d_xq,
                                      float *d_out, int rows, int cols, int tokens, int ttype,
                                      cudaStream_t stream) {
-    const dim3 grid((unsigned)((rows + 127) / 128), (unsigned)((tokens + 7) / 8));
+    // grid.y == 1: the kernel loops over the 8-token tiles itself, so the
+    // 128-row weight slice is dequantized from HBM once per super-block b
+    // instead of once per tile (tokens/8).  grid.y is the old weight-re-read
+    // factor.
+    const dim3 grid((unsigned)((rows + 127) / 128), 1);
     switch (ttype) {
         case Q35_TT_IQ3_XXS:
             q35_k_mmq_mma_iq<Q35Iq3Xxs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
@@ -911,6 +1055,14 @@ static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned ch
             break;
         case Q35_TT_IQ2_S:
             q35_k_mmq_mma_iq<Q35Iq2S><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
+                d_w, d_xq, d_out, rows, cols, tokens);
+            break;
+        case Q35_TT_IQ4_XS:
+            q35_k_mmq_mma_iq<Q35Iq4Xs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
+                d_w, d_xq, d_out, rows, cols, tokens);
+            break;
+        case Q35_TT_IQ2_XXS:
+            q35_k_mmq_mma_iq<Q35Iq2Xxs><<<grid, Q35_MMQ_THREADS, 0, stream>>>(
                 d_w, d_xq, d_out, rows, cols, tokens);
             break;
         default:
@@ -988,6 +1140,8 @@ static bool q35_mma_iq_enabled(int ttype) {
         {Q35_TT_IQ3_XXS, "iq3_xxs"},
         {Q35_TT_IQ3_S,   "iq3_s"},
         {Q35_TT_IQ2_S,   "iq2_s"},
+        {Q35_TT_IQ4_XS,  "iq4_xs"},
+        {Q35_TT_IQ2_XXS, "iq2_xxs"},
     };
     for (const auto &nm : names) {
         if (nm.tt != ttype) continue;
@@ -1041,7 +1195,8 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // a comma list of ttype tags, default on) so each type can be A/B'd
     // against the caller's thread-per-row kernel.
     if (info.block_elems == 256 && q35_mma_iq_enabled(ttype) &&
-        (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S)) {
+        (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S ||
+         ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS)) {
         return (int)mmq_mma_iq_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
 
@@ -1050,6 +1205,12 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // on 27B IQ3_XXS prefill (523 tokens), the dp4a tile is 19.3 tok/s against
     // 36.2 for thread-per-row, so routing the IQ family there is strictly
     // worse.  Each remaining IQ type gets its own mma kernel and flips over
-    // here.
+    // around.  Each remaining IQ type gets its own mma kernel and flips over
+    // here:  IQ4_XS done (1 scale per 32 elements, signed ls, no sign table),
+    // IQ2_XXS done (u64 grid -> 8 unsigned magnitude bytes, 7-bit ksigns
+    // expansion, 1 positive odd scale per 32 elements = the IQ3_XXS shape).
+    // Still falling back: IQ1_S/IQ1_M (1 element per 8-bit grid entry, so the
+    // int8 staging this kernel does would need a different unpack), IQ2_XS
+    // (8-bit grid entries + 7-bit signs, no k32-friendly scale).
     return -1;
 }
