@@ -149,8 +149,18 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
   - 数量口径（实测）：恢复前 `zig build test` = 54；恢复后 74 = 54 + 15 个对拍用例
     + 5 个 `test { _ = @import("simd_testsX.zig"); }` 包装块（每个包装块自身算一个 test）。
     15 个用例名逐个核对确认真在跑（`grep simd_tests /tmp/…` = 15 行），不是空跑。
-- 规则：**改动前先跑一遍 `make test` 与 §6 的探针记录基线，改动后不得新增失败或让探针退化**。
+- 规则：**改动前先跑一遍 `make test`，改动后不得新增失败**。
   不要用 `skip` / 放宽阈值 / 删用例的方式"变绿"。
+- **token 流不是验收标准**（2026-11 决定：项目后续支持多模型 / 多硬件，固定 prompt
+  的 token 比对不可扩展；llama.cpp 也没有这种探针——它的跨后端验收是逐 op 的 nmse
+  容差 `tests/test-backend-ops.cpp` + 手工 perplexity）。§6 的固定 prompt 运行仅作手动调试 /
+  性能对比用，不进回归判据：
+  - CPU/CUDA 的 token 流不可能稳定逐位相同（f32 收尾 / 归约顺序 / 超越函数 1–2 ulp，
+    见 `docs/cuda-elementwise-ulp.md`；MVCHECK 全过时 token 流仍会分叉，实测见
+    `src/kernels/cuda/mmq.cu:1105`）；
+  - llama.cpp 默认采样是 temp 0.8 + 随机 seed，其参照输出本身不可复现。
+  正确性以 kernel 级对拍为准（`make test` 三路对拍 + `QWEN35_MVCHECK`），
+  端到端只作输出是否通顺的烟雾信号（完整口径见 `docs/cuda-backend-brief.md` §2bis）。
 - 现有测试入口：`src/root.zig` 的 import 列表 + `refAllDecls`；`make test` 跑两个 test artifact
   （`mod_tests` 与 `exe_tests`，见 `build.zig`），`mod_tests` 会 `linkLibrary(c_kernels)`。
   注意 `-Doptimize=ReleaseFast` 下 `exe_tests` 那条链不参与，`make test` 用默认 optimize。
@@ -202,7 +212,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    而 pool 用 `xs[b*256 .. b*256+256]` 一次吃一个 256 元素 row-block，
    对 `q4_0`/`iq4_nl` 这类"块 32、row-block 256"的类型会算错行跨与激活窗口。
    已知未修；A/B 时不要拿它当 Q4_0 的 oracle。
-4. 改动前后固定复跑同一句探针：
+4. 改动前后固定复跑同一条命令（仅 A/B 调试用，不是验收标准）：
    `zig-out/bin/qwen35 run <gguf> "天空为什么是蓝色的？" -n 48 --threads 1`
    （单线程是为了结果可比，勿随手加线程数）。
 5. **跨量化格式必须逐个验**，不能只验 Q8_0 就收工：Q8_0 通过**不代表**其它类型通过。
@@ -214,9 +224,12 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    定位手段是给 `dequantRowInto` 写 Q4_0 对拍测试，而不是读代码猜；
    新增类型时照此办：先在测试里造块字节，与 `quant.rowDotXxx` 参照对齐。
 
-## 6. 运行探针（模型与 target）
+## 6. 手动运行与性能对比（模型与 target）
 
-- 量化格式覆盖很广，`make run0.8b` 会跑全部 22 个 GGUF 变体；回归时按需单独跑
+> 固定 prompt 的"token 流探针"已移出验收标准（见 §4 规则）。以下 target 只用于手动调试与
+> 性能对比，不属于回归判据。
+
+- 量化格式覆盖很广，`make run0.8b` 会跑全部 22 个 GGUF 变体；单个变体按需跑
   （如 `make run0.8biq3xxs`、`make run27biq3xxs`、`make run0.8biq2xxs-llamacpp`）。
 - 模型位于 `/mnt/Qwen3.5-0.8B-GGUF/` 等目录；`-ud` 变体用 `make run0.8bud`。
   **文件名是大小写混合的**：`/mnt/Qwen3.5-0.8B-GGUF/Qwen3.5-0.8B-Q8_0.gguf`（大写 `Qwen3.5-0.8B-` 前缀
