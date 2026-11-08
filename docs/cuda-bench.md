@@ -94,3 +94,79 @@
 - 原始逐次数据：`bench_raw/cuda_qwen35.tsv`（列：pass/file/kind/prompt_tok/prefill_tok_s/
   prefill_s/gen_tok/gen_tok_s/gen_s；kind=capped 为 `-n 48` 的 22 量化 run，
   uncapped 为 Q8_0 长 run）、`bench_raw/cuda_llamacpp.tsv`（列：pass/file/prompt_tok_s/gen_tok_s）。
+
+---
+
+# 27B IQ3_XXS decode 追平 llama.cpp：逐类型带宽归因（2026-11）
+
+上表是 0.8B 全量化矩阵。真正的长跑基准是 **`make run27biq3xxs-cuda-long`**
+（`/mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf`，prompt 取自 `Makefile:396`），
+对手是 `make run27biq3xxs-llamacpp-cuda-long`（**54.5 tok/s**）。
+
+## 方法：先归因，再优化
+
+`QWEN35_MVLIST=1` 打出一个完整 decode token 的 489 次 matvec launch，按
+`rows * cols/256 * block_bytes` 汇总权重流量（**每 token 10.10 GB**，加 lm_head 的
+0.72 GB = 10.82 GB）；再用单进程 microbench（`/tmp/mb/mb_ok.cu`，先验算再计时）测每种
+类型的实际带宽。`MB / GB_s` 就是该类型在一 token 里的耗时占比：
+
+| 类型 | MB/token | 流量% | GB/s | ms/token | 耗时% |
+|---|---|---|---|---|---|
+| iq3_s | 2599.7 | 25.8 | 439 → **633** | 5.27 → 4.11 | 24.2 → 20.2 |
+| iq3_xxs | 2988.5 | 29.6 | 654 | 4.57 | 21.0 |
+| q4_k（含 lm_head 715 MB） | 1657.4 | 16.4 | 522 / 556 | 3.18 | 14.6 |
+| iq4_xs | 1412.1 | 14.0 | 498 | 2.84 | 13.0 |
+| iq2_s | 834.6 | 8.3 | 619 | 1.35 | 6.2 |
+| iq2_xxs | 477.1 | 4.7 | 392 | 1.22 | 5.6 |
+| iq1_s | 139.3 | 1.4 | 131 → **306** | 1.06 → 0.45 | 4.9 → 2.0 |
+| q2_k | 166.9 | 1.7 | 235 | 0.71 | 3.3 |
+| iq2_xs | 292.5 | 2.9 | 496 | 0.59 | 2.7 |
+| q3_k | 155.4 | 1.5 | 268 | 0.58 | 2.7 |
+| iq1_m | 58.5 | 0.6 | 182 | 0.32 | 1.5 |
+| q5_k | 25.2 | 0.2 | 317 | 0.08 | 0.4 |
+
+纯权重读取的理论下限是 **45.9 tok/s**（1090 cuMemcpy 的带宽上限远高于此，
+所以瓶颈是**访问模式**而非设备带宽：`QWEN35_CUDA_MEMONLY=1` 只到 27.0 tok/s）。
+
+## 已完成的四个 split（P3）
+
+decode matvec 占 decode 时间 **87%**；把 256 元素权重块按 K 维切给同一 warp 的多个 lane、
+最后 butterfly 归约，是唯一有效的杠杆（`q35_k_mul_mat_vec_q_split_t<WARPS,SPLIT>`，
+`q35_split_units()` 声明每种类型的合法切分数）。**切分边界必须让每个 lane 的权重读取连续**：
+
+| 提交 | 类型 | units | 依据 | 收益 |
+|---|---|---|---|---|
+| `3997196` | iq3_xxs | 8 | 8 个 `ib32` 组 | 17.60 → 20.08 tok/s |
+| `7deaa48` | iq2_s | 8 | 同上（dp4a body） | → 21.08 |
+| `9031a4b` | q4_k | 4 | 4 条 64 元素 q4 字节行 | 298 → 553 GB/s |
+| `c45534e` | iq4_xs | 4 | `_acc` 每步 `h >>= 4` 一次，一步=一个 64 元素 `ib` | 22.7 → 23.91 |
+| `97dbeef` | iq2_xxs / iq2_xs | 8 | 8 个 `ib32` 组 | 23.91 → 25.29 |
+| `14358dc` | iq1_s | 8 | 8 个彼此独立的 `ib`（各带 qh u16 + 2 个 bsum） | IQ1_S 131 → 306 GB/s；25.48 → 25.94 |
+| `2f9b048` | iq3_s（余下最大项） | 8 | 从绝对 `ib32` 推 nibble，允许奇数 `lo` | IQ3_S 439 → 633 GB/s；25.94 → **26.94** |
+
+## 三条血泪教训（都已写进代码注释）
+
+1. **`q35_split_units` 必须是无副作用常量表**。它标了 `__device__ __host__`，
+   split kernel 每 block 调一次；曾在此处加 `getenv()` 做 A/B 开关，host 侧正常执行，
+   设备侧结果被静默污染 —— 3579 个 token 的乱码，而 MVCHECK 全 0。
+   A/B 开关只能放在 launcher（host-only）。
+2. **切分数由 `_acc` 的循环步长推导，不能猜**。IQ4_XS 是 4 不是 8（`h >>= 4` 每步一次）；
+   三个错误的 rebase 都只影响靠后的 slice，`lo=0` 仍正确，模型看起来能跑一个 token。
+3. **让 `_part` 拒绝一个 range 就等于造假速度**。把 IQ3_S 的 `min_per` 放宽到 1 而没改 body，
+   旧的 `if (lo & 1) return 0.0f` 让一半 slice 算 0 → "27.03 tok/s"（比真的快 4%），
+   输出变成"茶，写茶，，"。切分必须能算它拿到的每一种 range。
+
+## 复现命令
+
+```bash
+make cuda                          # -Dcuda=true -Doptimize=ReleaseFast
+P=$(sed -n 396p Makefile | sed 's/.*qwen35 run [^ ]* "//; s/" --backend cuda.*//')
+# 固定 -n 400 才有可比性（不同 token 数会走不同分叉，耗时不可比）
+./zig-out/bin/qwen35 run /mnt/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ3_XXS.gguf "$P" \
+  --backend cuda -n 400
+# 诊断开关
+QWEN35_SPLITDBG=1      # 每次 split launch 打印 ttype/rows/cols/nblk/split/warps/shmem
+QWEN35_MVLIST=1        # 打印每个 matvec 形状
+QWEN35_CUDA_GRAPH=0    # 关 CUDA graph，否则 dump 读到的是 capture 期的陈旧零值
+QWEN35_MVCHECK=1       # 逐类型与 CPU 后端比对（开销极大）
+```

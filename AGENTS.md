@@ -197,8 +197,50 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_MVCHECK` | **仅 CUDA 后端、仅调试用，不是计算路径**。每个量化 matvec 之后，用内嵌的 CPU 后端对同一行再算一遍并逐行比对，打印 `MVCHECK[<type>] rows= cols= mismatched= batchk= k=`。用于确认"GPU kernel 结果与 CPU 参照一致"（CUDA 逐格式验收的自动化手段）。开销极大，只在 A/B 时开 |
 | `QWEN35_MVCHECK_ONLY` | 限定只对某一种量化类型做 MVCHECK（值 = `q.ttype` 的 tagName，如 `iq1_s`）。batch-K 参照需要 CPU scratch 按 K 塑形，不是每种类型在每个 launch 顺序下都能活，所以追单一 kernel 时用这个定向跑 |
 | `QWEN35_CUDA_COOP_WARPS` | **仅 CUDA 后端**。decode（tokens==1）warp-per-row matvec 的 block 形状（1..8 个 warp/block），A/B 用。不设时由硬件探测决定：sm_89 → 4（本机实测最佳），其他 cc → 占用率公式（cudaOccupancyMaxActiveBlocksPerMultiprocessor 选驻留 warp 最多的形状），见 `mmvq.cu` 的 `q35_coop_warps()`。探测来源是 `caps.cu`（`q35_gpu_cc()`/`q35_gpu_sm_count()`/`q35_gpu_name()`，一次探测、缓存读，x86 侧 `cpu_caps.c` 的 CUDA 镜像） |
+| `QWEN35_CUDA_SPLIT` | **仅 CUDA 后端**。decode K-split 的每 block lane 数，默认 8。合法值 0/1/2/4/8/16/32；launcher 会把它 clamp 成 `q35_split_units(ttype)` 的最大因子，并对每种类型再按 `q35_split_min_per` 收窄。`split<2` 退回 coop kernel |
+| `QWEN35_SPLITDBG` | **仅 CUDA 后端**。每次走 split 路径的 launcher 往 stderr 打一行 `[split] ttype= rows= cols= nblk= split= warps= shmem=`。确认某类型**真的**走了 split、以及 per 是多少，只需看这一行——不要凭 tok/s 反推 |
+| `QWEN35_MVLIST` | **仅 CUDA 后端**。打印每个 matvec 调用的 `[mvl] <type> rows= cols=`。用来算「一 token 里每种类型多少流量」，是决定优化优先级的唯一可靠依据（按 launch 次数或按代码直觉都会排错序） |
+| `QWEN35_CUDA_MEMONLY` | **仅 CUDA 后端**。只搬权重不做点积，测「纯访存下限」。27B IQ3_XXS 实测 27.0 tok/s → 说明瓶颈是访问模式而非设备带宽（4090D 理论 ~1000 GB/s，实测各类型 130–660） |
 
 调试方法论：
+0. **CUDA 侧的坑（2026-11 全部踩过，逐条都有代价）**：
+   - **绝对不要在 `__device__`/`__device__ __host__` 函数里 `getenv`**。
+     `q35_split_units` 是 `__device__ __host__` 且被 split kernel 每 block 调用；
+     在那里加 `getenv` 做 A/B 编译能过、host 侧正常，**设备侧结果被静默污染**：
+     输出 3579 个 token 的乱码，而 MVCHECK 全是 0。A/B 开关只放 launcher（host-only）。
+     该函数必须保持成无副作用常量表。
+   - **`_part` body 不能对任何 range `return 0.0f` 来「拒绝」**。
+     曾把 IQ3_S 的 `min_per` 放宽到 1 却没改 body，旧的 `if (lo & 1) return 0.0f`
+     让一半 slice 算 0 → "27.03 tok/s"（比真值快 4%）而输出是「茶，写茶，，」。
+     **被拒绝的 slice 返回 0 = 假加速**。切分必须能算它拿到的每一种 range；
+     `q35_split_min_per` 的 clamp 只是第一道防线。
+   - **切分数必须从 `_acc` 的循环步长推导，不能猜**。IQ4_XS 是 4 不是 8
+     （`_acc` 每步 `h >>= 4` 一次）。三个错误的 rebase 都只影响靠后的 slice，
+     `lo=0` 仍然正确，模型能正常跑一个 token——所以必须在**奇数 `lo` 与非零 `lo`
+     都覆盖**的整数 gate 下验（见 `/tmp/mb/gate_3s.cu`）。
+   - **切分边界要让每个 lane 的权重读取连续**。Q4_K 按 16 元素子块切是 298→316 GB/s
+     （每个 lane 读 16 个跨步字节），改成按 64 元素的 q4 字节**行**切是 298→**553 GB/s**。
+     同理 IQ2_XXS/IQ2_XS/IQ1_S 都用 32 元素 `ib32` 组边界。
+   - **共享数组会让 split 反向变慢**。Q5_K 与 Q4_K 行结构相同，但 `qh[32]` 是 4 个
+     row slice 都要**整块重读**的共享数组（每个 slice 用不同 bit 掩码取同一批字节），
+     4 路 split 把 qh 流量变成 4 倍：实测 25.29 → 24.09 tok/s。
+     所以 `q35_split_units(Q35_TT_Q5_K)` 返回 **0**，`_part` body 留着等共享内存 staging。
+   - **CUDA graph capture 期间 kernel 不执行**。开着 graph 去 dump 中间缓冲只会读到
+     陈旧零值，看着像「输出全是 0.0」。调试一律先 `QWEN35_CUDA_GRAPH=0`。
+   - **发散 warp 上的全掩码 `__syncwarp()` 是硬挂死**，不是崩溃：
+     表现为进程不退出（exit 124）。`nblk % kBlocksPerStep != 0` 时要把轮数向上取整，
+     并让所有 lane 每轮都对哑值做 `__shfl_down_sync` 以保持收敛。
+   - **多形状 microbench 会污染 context**：`cudaFree` + event 复用后，第一次出错之后的
+     所有行都打印垃圾 GB/s（1e12+）配 "invalid resource handle"。要么一进程一形状，
+     要么先验算再计时（`/tmp/mb/mb_ok.cu` 会先检查每行输出非零且有限，再进计时循环）。
+   - **microbench 的 ttype 编号是 `Q35_TT_*`（`api.h`），不是 GGUF 的枚举**。
+     两套编号不同：GGUF 里 IQ3_S 是 19，而 `Q35_TT_IQ1_S` 才是 19。混用会静默
+     bench 到另一种格式（曾把每个 "iq3_s" 行测成 IQ1_S 的耗时）。
+   - **`/tmp/mb/*.o` 是手编的，不会跟着 `make cuda` 更新**。改了 `.cuh` 之后
+     一定要重编 `mmvq.o` 再链接，否则 bench 跑的仍是旧 kernel（症状：新加的 split
+     完全不生效，`[split]` 一行都不打印）。
+   - **固定 `-n` 才能比 tok/s**。不同 `-n` 会走到不同长度的分叉，token 数不同时
+     耗时不可直接比（曾把 536-token 的 25.29 和 578-token 的 24.09 拿来比）。
 1. **先定位是"哪一层"错**，不要猜。重构后只剩 `QWEN35_SIMD_TIER` 与 `QWEN35_FORCE_SCALAR`
    两条 A/B 路径（4 个更强的开关已删）。如果 tier/scalar 全档一致地错，
    说明**不是 ISA 问题**，而是几何/布局/索引问题——去查 `QuantRow` 的
