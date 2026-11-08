@@ -237,21 +237,40 @@ __global__ void q35_k_mul_mat_vec_q_split_t(const unsigned char *__restrict__ w,
     const int part = lane & (SPLIT - 1);        // which slice of the block
     const int lblock = lane / SPLIT;            // which lane-slot within a block
     constexpr int kBlocksPerStep = Q35_WARP / SPLIT;
+    // Round the block count UP to a multiple of `kBlocksPerStep` so every lane
+    // executes the same number of loop rounds.  This is not cosmetic: with a
+    // ragged trip count (`nblk % kBlocksPerStep != 0`, e.g. SPLIT=4 and
+    // nblk=20 -> some lanes 3 rounds, some 2) the warp is left DIVERGENT at the
+    // loop exit, and the full-mask `__syncwarp()` that used to sit there hangs
+    // the device outright.  Measured: SPLIT=2/4 hung on the very first block,
+    // while SPLIT=8 looked fine only because 20 % 4 == 0 made every lane run 5
+    // rounds.  Keeping the `__shfl_down_sync` in the out-of-range rounds (on a
+    // dummy value) keeps the warp converged without an extra barrier.
+    const int rounds = (nblk + kBlocksPerStep - 1) / kBlocksPerStep;
+    // Fast path: when `nblk` divides evenly the padding never triggers, so the
+    // in-range test inside the loop is pure overhead on the hot path.
+    const bool even = (nblk % kBlocksPerStep) == 0;
 
     for (int t = 0; t < tokens; ++t) {
         const unsigned char *arow = xq + (size_t)t * (size_t)nblk * (size_t)info.act_bytes;
-        for (int b = lblock; b < nblk; b += kBlocksPerStep) {
-            const unsigned char *pb = w + (size_t)row * row_stride +
-                                      (size_t)b * (size_t)info.block_bytes;
-            const unsigned char *ab = arow + (size_t)b * (size_t)info.act_bytes;
-            float v = q35_dot_blk_part(ttype, pb, ab, part, SPLIT);
+        for (int r = 0; r < rounds; ++r) {
+            const int b = lblock + r * kBlocksPerStep;
+            float v = 0.0f;
+            if (even || b < nblk) {
+                const unsigned char *pb = w + (size_t)row * row_stride +
+                                          (size_t)b * (size_t)info.block_bytes;
+                const unsigned char *ab = arow + (size_t)b * (size_t)info.act_bytes;
+                v = q35_dot_blk_part(ttype, pb, ab, part, SPLIT);
+            }
             // Butterfly within the SPLIT-lane subgroup.  Lanes 0..SPLIT-1 of
             // each group all end up with the same value; only `part == 0` keeps
-            // it (the store below).
+            // it (the store below).  Executed by EVERY lane, including the ones
+            // whose `b` is out of range, to stay converged.
             #pragma unroll
             for (int o = 1; o < SPLIT; o <<= 1) v += __shfl_down_sync(0xffffffffu, v, o);
-            if (part == 0) part_w[b] = v;
+            if (part == 0 && (even || b < nblk)) part_w[b] = v;
         }
+        // Legitimate now: the padded loop above leaves the warp converged.
         __syncwarp();
         // Strict left-to-right fold per warp, matching q35_dot_row's order.
         if (lane == 0) {
@@ -655,6 +674,16 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                 // zero-valued dot product).
                 while (split > 1 && (units % split) != 0) split >>= 1;
                 if (split > units) split = units;
+                // A type whose `_part` body needs a MINIMUM slice width (IQ3_S
+                // can only start on a pair boundary, so `per` must be even and
+                // at least 2) would otherwise be handed a one-unit slice that
+                // its body rejects -- and a rejected slice returns 0.0f, i.e.
+                // the block silently contributes nothing while the run stays
+                // fast and the output looks plausible.  Clamp instead of
+                // trusting the body's own guard, so `split` can never describe
+                // a shape the body cannot compute.
+                const int min_per = q35_split_min_per(ttype);
+                while (split > 1 && (units / split) < min_per) split >>= 1;
             } else {
                 split = 0;
             }
@@ -665,8 +694,18 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                     static size_t max_set_s = 0;
                     if (shmem_s > max_set_s) {
                         auto opt = [&](auto kern) {
-                            cudaFuncSetAttribute((const void *)kern,
+                            cudaError_t e = cudaFuncSetAttribute((const void *)kern,
                                 cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem_s);
+                            if (e != cudaSuccess) {
+                                // Silently ignoring this used to leave the launch
+                                // asking for more dynamic shmem than the variant
+                                // was ever granted, i.e. an immediate crash on the
+                                // first block.  Fail the launch instead, so the
+                                // caller reports the kernel as unsupported.
+                                fprintf(stderr, "[cuda] dynshmem %zu B rejected: %s\n",
+                                        shmem_s, cudaGetErrorString(e));
+                                cudaGetLastError();
+                            }
                         };
                         opt(q35_k_mul_mat_vec_q_split_t<1, 2>);
                         opt(q35_k_mul_mat_vec_q_split_t<1, 4>);
@@ -694,6 +733,10 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                     case 4:  Q35_SPLIT_LAUNCH(4, S); break; \
                     default: Q35_SPLIT_LAUNCH(8, S); break; \
                     }
+                if (getenv("QWEN35_SPLITDBG")) {
+                    fprintf(stderr, "[split] ttype=%d rows=%d cols=%d nblk=%d split=%d warps=%d shmem=%zu\n",
+                            ttype, rows, cols, nblk, split, warps_s, shmem_s);
+                }
                 switch (split) {
                 case 2:  Q35_SPLIT_SW(2); break;
                 case 4:  Q35_SPLIT_SW(4); break;

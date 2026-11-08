@@ -85,7 +85,23 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
     switch (ttype) {
         case Q35_TT_IQ3_XXS: return 8;
         case Q35_TT_IQ2_S:   return 8;
+        // IQ3_S packs two 32-element sub-blocks per `scales[]` byte, so its
+        // `_part` body can only start on a PAIR boundary; `q35_split_min_per`
+        // reports that constraint and the launcher clamps `split` to respect it.
+        case Q35_TT_IQ3_S:   return 8;
         default:             return 0;   // no split path: caller uses 1blk
+    }
+}
+
+// Smallest valid slice width (in 32-element units) for `ttype`'s `_part` body.
+// Most bodies are fine with any width; IQ3_S packs two sub-blocks per scale byte
+// and therefore needs an even, non-zero slice.  The launcher clamps `split` down
+// until `units / split >= min_per`, so a body can never be handed a range it
+// would have to reject.
+__device__ __host__ __forceinline__ int q35_split_min_per(int ttype) {
+    switch (ttype) {
+        case Q35_TT_IQ3_S: return 2;
+        default:           return 1;
     }
 }
 
@@ -106,6 +122,7 @@ __device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char
     switch (ttype) {
         case Q35_TT_IQ3_XXS: return q35_vec_dot_iq3_xxs_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ2_S:   return q35_vec_dot_iq2_s_q8_k_part(w, a, lo, hi);
+        case Q35_TT_IQ3_S:   return q35_vec_dot_iq3_s_q8_k_part(w, a, lo, hi);
         default:             return 0.0f;
     }
 }

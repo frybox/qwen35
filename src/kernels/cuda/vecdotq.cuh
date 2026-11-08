@@ -833,9 +833,22 @@ Q35_DEV float q35_vec_dot_iq3_s_q8_k_part(const unsigned char *w,
                                           const unsigned char *y, int lo, int hi) {
     if ((lo & 1) != 0 || ((hi - lo) & 1) != 0) return 0.0f;
     const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
-    const unsigned char *qs = w + 2 + (lo / 2) * 8;
+    // Rebasing mirrors the full-block body EXACTLY: it advances `qs` by 8 for
+    // each of the two halves (16 per pair) and `signs` by 4 per half (8 per
+    // pair), so a pair-aligned rebase must use 16 and 8, not 8 and 4.  The
+    // first version of this body used the per-half amounts and quietly read
+    // the wrong bytes from the second pair onward -- the result stayed in the
+    // right ballpark, so only the token stream showed it.
+    const unsigned char *qs = w + 2 + (lo / 2) * 16;
+    // `qh` is indexed by ABSOLUTE `ib32 + half` in the full-block body, so after
+    // rebasing to `lo` the index inside the loop has to walk back off `lo`.
+    // Reading plain `qh[half]` (which is what the first version did) freezes the
+    // high-bit byte at the slice's first pair, so every pair after the first
+    // decodes its 8 high bits from the WRONG byte: the products stay plausible
+    // and only an exact integer comparison exposes it (gate: `sum of 2-unit
+    // parts == whole block` was exact, `part(0,8) == whole block` was not).
     const unsigned char *qh = w + 66 + lo;
-    const unsigned char *signs = w + 74 + (lo / 2) * 4;
+    const unsigned char *signs = w + 74 + (lo / 2) * 8;
     const unsigned char *scales = w + 106;
     const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
     int bsum = 0;
@@ -846,9 +859,9 @@ Q35_DEV float q35_vec_dot_iq3_s_q8_k_part(const unsigned char *w,
             int sumi = 0;
             for (int l = 0; l < 4; ++l) {
                 const unsigned int i1 = (unsigned int)qs[2 * l + 0] |
-                                        (((unsigned int)qh[half] << (8 - 2 * l)) & 256u);
+                                        (((unsigned int)qh[ib32 - lo + half] << (8 - 2 * l)) & 256u);
                 const unsigned int i2 = (unsigned int)qs[2 * l + 1] |
-                                        (((unsigned int)qh[half] << (7 - 2 * l)) & 256u);
+                                        (((unsigned int)qh[ib32 - lo + half] << (7 - 2 * l)) & 256u);
                 const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
                 const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
                 const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
