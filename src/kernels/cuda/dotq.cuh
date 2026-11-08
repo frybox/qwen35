@@ -113,6 +113,12 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
         // owning its own scale.  See the `_part` bodies.
         case Q35_TT_IQ2_XXS: return 8;
         case Q35_TT_IQ2_XS:  return 8;
+        // IQ1_S: eight 32-element `ib` groups, each owning 4 qs bytes, one qh
+        // u16 (its high index + its own scale/delta) and its two bsum entries.
+        // Without a split this type ran at 131 GB/s -- the slowest in the 27B
+        // IQ3_XXS mix -- because a single warp per 256-element block leaves the
+        // grid-shaped `iq1s_grid` fetches exposed.
+        case Q35_TT_IQ1_S:   return 8;
         default:             return 0;   // no split path: caller uses 1blk
     }
 }
@@ -151,6 +157,7 @@ __device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char
         case Q35_TT_IQ4_XS:  return q35_vec_dot_iq4_xs_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ2_XXS: return q35_vec_dot_iq2_xxs_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ2_XS:  return q35_vec_dot_iq2_xs_q8_k_part(w, a, lo, hi);
+        case Q35_TT_IQ1_S:   return q35_vec_dot_iq1_s_q8_k_part(w, a, lo, hi);
         default:             return 0.0f;
     }
 }

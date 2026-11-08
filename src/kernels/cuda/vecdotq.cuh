@@ -1096,6 +1096,41 @@ Q35_DEV float q35_vec_dot_iq4_xs_q8_k_acc(const unsigned char *w,
 //   delta = +-1 from qh bit 0x8000.  The delta term uses y->bsums, so it is
 //   accumulated separately as sumi1 with the same integer ls/delta weights.
 #define Q35_IQ1S_DELTA 0.125f
+// IQ1_S partial over `[lo, hi)` 32-element `ib` groups.  Each `ib` is fully
+// self-contained: 4 `qs` bytes, one `qh` u16 (its own 3-bit high index and
+// scale/delta), and the two `bsum` entries its 32 activations own.  `units` is
+// therefore 8.
+Q35_DEV float q35_vec_dot_iq1_s_q8_k_part(const unsigned char *w,
+                                          const unsigned char *y, int lo, int hi) {
+    const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
+    const unsigned char *qs = w + 2 + 4 * lo;
+    const unsigned char *qh_bytes = w + 34 + 2 * lo;
+    int sumi = 0, sumi1 = 0;
+    for (int ib = lo; ib < hi; ++ib) {
+        const unsigned short qh = q35_ld_u16(qh_bytes);
+        const int ls = 2 * (int)((qh >> 12) & 7) + 1;
+        const int delta = (qh & 0x8000) ? -1 : 1;
+        int lsum = 0;
+        for (int l = 0; l < 4; ++l) {
+            const unsigned int idx = (unsigned int)qs[l] |
+                                     (((unsigned int)((qh >> (3 * l)) & 7)) << 8);
+            const unsigned long long g = iq1s_grid[idx];
+            lsum = q35_dp4a((int)(unsigned int)g,
+                            q35_ld_u32((const unsigned char *)q8), lsum);
+            lsum = q35_dp4a((int)(unsigned int)(g >> 32),
+                            q35_ld_u32((const unsigned char *)q8 + 4), lsum);
+            q8 += 8;
+        }
+        sumi  += ls * lsum;
+        sumi1 += ls * delta * (q35_q8k_bsum(y, 2 * ib + 0) + q35_q8k_bsum(y, 2 * ib + 1));
+        qs += 4;
+        qh_bytes += 2;
+    }
+    const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    const float tot = __fadd_rn((float)sumi, __fmul_rn(Q35_IQ1S_DELTA, (float)sumi1));
+    return __fmul_rn(d, tot);
+}
+
 Q35_DEV float q35_vec_dot_iq1_s_q8_k_acc(const unsigned char *w,
                                          const unsigned char *y, float acc) {
     const signed char *q8 = q35_q8k_qs(y);
@@ -1111,10 +1146,14 @@ Q35_DEV float q35_vec_dot_iq1_s_q8_k_acc(const unsigned char *w,
             const unsigned int idx = (unsigned int)qs[l] |
                                      (((unsigned int)((qh >> (3 * l)) & 7)) << 8);
             const unsigned long long g = iq1s_grid[idx];
-            for (int j = 0; j < 8; ++j) {
-                const signed char gv = (signed char)((g >> (8 * j)) & 0xFF);
-                lsum += (int)q8[j] * (int)gv;
-            }
+            // `iq1s_grid` entries are eight SIGNED bytes and so is the activation,
+            // i.e. the 8-term scalar loop below is exactly two dp4a steps.  The
+            // scalar form was the whole reason IQ1_S ran at 131 GB/s while the
+            // structurally similar IQ3_XXS (which already used dp4a) hit 654.
+            lsum = q35_dp4a((int)(unsigned int)g,
+                            q35_ld_u32((const unsigned char *)q8), lsum);
+            lsum = q35_dp4a((int)(unsigned int)(g >> 32),
+                            q35_ld_u32((const unsigned char *)q8 + 4), lsum);
             q8 += 8;
         }
         sumi  += ls * lsum;
@@ -1163,12 +1202,16 @@ Q35_DEV float q35_vec_dot_iq1_m_q8_k_acc(const unsigned char *w,
             const unsigned int idx = (unsigned int)qs[l] |
                     (((unsigned int)qh[l / 2] << (8 - 4 * (l % 2))) & 0x700u);
             const unsigned long long g = iq1s_grid[idx];
-            int lsum1 = 0, lsum2 = 0;
-            for (int j = 0; j < 8; ++j) {
-                const signed char gv = (signed char)((g >> (8 * j)) & 0xFF);
-                lsum1 += (int)q8[j] * (int)gv;
-                lsum2 += (int)q8[j];
-            }
+            // 8 signed products and 8 raw bytes summed per grid entry -- both are
+            // two dp4a steps (the second one against a broadcast 1).  Same
+            // reasoning as IQ1_S: the scalar form cost more than the memory it
+            // was waiting on.
+            const int a0 = q35_ld_u32((const unsigned char *)q8);
+            const int a1 = q35_ld_u32((const unsigned char *)q8 + 4);
+            int lsum1 = q35_dp4a((int)(unsigned int)g, a0, 0);
+            lsum1 = q35_dp4a((int)(unsigned int)(g >> 32), a1, lsum1);
+            int lsum2 = q35_dp4a(0x01010101, a0, 0);
+            lsum2 = q35_dp4a(0x01010101, a1, lsum2);
             q8 += 8;
             sum1[l / 2] += lsum1;
             sum2[l / 2] += lsum2 * delta[l];
