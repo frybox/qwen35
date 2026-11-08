@@ -89,6 +89,13 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
         // `_part` body can only start on a PAIR boundary; `q35_split_min_per`
         // reports that constraint and the launcher clamps `split` to respect it.
         case Q35_TT_IQ3_S:   return 8;
+        // Q4_K splits on its four 64-element q4 BYTE ROWS, not on the sixteen
+        // 16-element sub-blocks `q35_dot_scaled16` uses: only the row boundary
+        // keeps each lane's 32-byte read contiguous.  Slicing on the arithmetic
+        // sub-block boundary instead measured 298 -> 316 GB/s (nothing) on
+        // 27B 17408x5120 because every lane read 16 strided bytes, while row
+        // slicing gives 298 -> 553 GB/s.  See `q35_vec_dot_q4_k_q8_k_part`.
+        case Q35_TT_Q4_K:    return 4;
         default:             return 0;   // no split path: caller uses 1blk
     }
 }
@@ -123,6 +130,7 @@ __device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char
         case Q35_TT_IQ3_XXS: return q35_vec_dot_iq3_xxs_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ2_S:   return q35_vec_dot_iq2_s_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ3_S:   return q35_vec_dot_iq3_s_q8_k_part(w, a, lo, hi);
+        case Q35_TT_Q4_K:    return q35_vec_dot_q4_k_q8_k_part(w, a, lo, hi);
         default:             return 0.0f;
     }
 }

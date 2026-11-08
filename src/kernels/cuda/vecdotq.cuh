@@ -419,6 +419,51 @@ Q35_DEV float q35_vec_dot_q4_k_q8_k_acc(const unsigned char *w,
     return __fadd_rn(acc, __fmul_rn(-dmin, (float)sumi));
 }
 
+// q4_K partial over the four 64-element q4 byte rows `[lo, hi)`.
+//
+// UNIT CHOICE IS A MEMORY-LAYOUT constraint, not an arithmetic one.  The
+// arithmetic unit is the 16-element sub-block of `q35_dot_scaled16` (16 per
+// block), but slicing on that boundary makes each lane read 16 NON-CONTIGUOUS
+// bytes: sub-block `g` lives in byte row `c = g/4`, at offset `(g&1)*16` of
+// either the low or the high nibble plane.  Measured at SPLIT=8 on
+// 27B (17408x5120): 298 -> 316 GB/s, i.e. nothing, because the lanes thrash.
+//
+// Grouping the four sub-blocks that share one q4 row gives each lane a
+// contiguous 32-byte read (the whole row) and covers 4*16 = 64 elements, so the
+// unit count is 4 and the launcher clamps `split` to <= 4.  A 4-lane split is
+// the most this layout can support without strided reads.
+Q35_DEV float q35_vec_dot_q4_k_q8_k_part(const unsigned char *w,
+                                         const unsigned char *y, int lo, int hi) {
+    const unsigned char *q4 = w + 16;
+    unsigned char sm[16];
+    q35_unpack_scale_min(w + 4, sm);
+
+    const signed char *aq = q35_q8k_qs(y);
+    signed char w8[16];
+    int isum = 0;
+    int sumi = 0;
+    for (int c = lo; c < hi; ++c) {
+        // Row `c` feeds sub-blocks 4c+0, 4c+1 (low nibble) and 4c+2, 4c+3 (high
+        // nibble) -- the same w8[c*64 + {0,16,32,48}] slots `_acc` fills.
+        for (int g = 4 * c; g < 4 * c + 4; ++g) {
+            const int hi_nib = (g & 2) != 0;
+            const int half = (g & 1) * 16;
+            for (int l = 0; l < 16; ++l) {
+                const unsigned char b = q4[c * 32 + half + l];
+                w8[l] = (signed char)(hi_nib ? (b >> 4) : (b & 0x0F));
+            }
+            isum += q35_dot_i8(w8, aq + g * 16, 16) * (int)sm[g / 2];
+            sumi += q35_q8k_bsum(y, g) * (int)sm[8 + g / 2];
+        }
+    }
+
+    const float dy = q35_q8k_d(y);
+    const float d = __fmul_rn(dy, q35_f16_at(w, 0));
+    const float dmin = __fmul_rn(dy, q35_f16_at(w, 2));
+    float acc = __fmul_rn(d, (float)isum);
+    return __fadd_rn(acc, __fmul_rn(-dmin, (float)sumi));
+}
+
 // q5_K: 176 B = d @0 | dmin @2 | scales[12] @4 | qh[32] @16 | qs[128] @48
 // kernels256.c:325, aux8 at kernels256.c:185 (m walks 1,4,16,64).
 Q35_DEV float q35_vec_dot_q5_k_q8_k_acc(const unsigned char *w,

@@ -3210,6 +3210,9 @@ pub const CudaBackend = struct {
                     return;
                 }
 
+                if (cudart.getenv("QWEN35_MVLIST") != null) {
+                    std.debug.print("[mvl] {s} rows={d} cols={d}\n", .{ @tagName(q.ttype), rows, cols });
+                }
                 const xq_bytes = actBytes(q.ttype, cols);
                 ensureBuf(&cu.lib, &self.d_xq, &self.d_xq_bytes, xq_bytes) catch {
                     std.debug.print("cuda backend: matvec: device activation allocation failed ({d} B)\n", .{xq_bytes});
