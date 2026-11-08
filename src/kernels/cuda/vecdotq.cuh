@@ -926,6 +926,57 @@ Q35_DEV float q35_vec_dot_iq3_s_q8_k_part(const unsigned char *w,
     return __fmul_rn(d, (float)bsum);
 }
 
+// IQ4_XS partial over the four 64-element `ib` steps `[lo, hi)`.
+//
+// `_acc` above loops `ib = 0,2,4,6` (Q35_QK_K/32 = 8 sub-blocks of 32, taken two
+// at a time) and does `h >>= 4` ONCE per step, so one step consumes exactly one
+// nibble of `scales_h` and one byte of `scales_l`:
+//   scales_l -> +lo        (one byte per step: `scales_l[ib/2]`)
+//   scales_h -> >> 4*lo    (ONE nibble per step)
+//   qs       -> +32*lo     (two 16-byte halves)
+//   q8       -> +64*lo     (two 32-element sub-blocks)
+//
+// `units` is therefore 4, not 8.  Every one of these four strides was wrong on
+// the first attempt (units 8, scales_l/2, h >> 8*lo, and a missing nibble
+// shift), and the ONLY symptom was the model collapsing to 3579 copies of
+// token 0: MVCHECK reported mismatched=0 throughout because it only exercises
+// the batchk path.  The float-vs-float microbench is not enough either -- check
+// `units` against the `_acc` loop step first, then verify against real weights.
+Q35_DEV float q35_vec_dot_iq4_xs_q8_k_part(const unsigned char *w,
+                                           const unsigned char *y, int lo, int hi) {
+    const float d4d8 = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    unsigned short h = (unsigned short)(q35_ld_u16(w + 2) >> (4 * lo));
+    const unsigned char *scales_l = w + 4 + lo;
+    const unsigned char *qs = w + 8 + 32 * (size_t)lo;
+    const signed char *q8 = q35_q8k_qs(y) + 64 * lo;
+    float acc = 0.0f;
+    for (int it = lo; it < hi; ++it) {
+        const unsigned char ls1 = (unsigned char)((scales_l[0] & 0xF) | ((h << 4) & 0x30));
+        const unsigned char ls2 = (unsigned char)((scales_l[0] >> 4)  | ((h << 2) & 0x30));
+        h >>= 4;
+        const float d1 = __fmul_rn(d4d8, (float)((int)ls1 - 32));
+        const float d2 = __fmul_rn(d4d8, (float)((int)ls2 - 32));
+        int sumi1 = 0, sumi2 = 0;
+        for (int j = 0; j < 16; ++j) {
+            sumi1 += (int)q8[j + 0]  * (int)kvalues_iq4nl[qs[j] & 0xF];
+            sumi2 += (int)q8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
+        }
+        acc = __fadd_rn(acc, __fmul_rn(d1, (float)(sumi1 + sumi2)));
+        qs += 16;
+        q8 += 32;
+        sumi1 = sumi2 = 0;
+        for (int j = 0; j < 16; ++j) {
+            sumi1 += (int)q8[j + 0]  * (int)kvalues_iq4nl[qs[j] & 0xF];
+            sumi2 += (int)q8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
+        }
+        acc = __fadd_rn(acc, __fmul_rn(d2, (float)(sumi1 + sumi2)));
+        qs += 16;
+        q8 += 32;
+        scales_l += 1;
+    }
+    return acc;
+}
+
 // --- IQ4_XS: 136 B = d @0 (f16) | scales_h @2 (u16) | scales_l[4] @4 | qs[128] @8
 // iq_kernels.c:966 iq4_xs_q8_k_scalar_impl.  Plain kvalues_iq4nl lookup (no
 // sign table); `ls` HAS the -32 bias; no 0.125 output factor.

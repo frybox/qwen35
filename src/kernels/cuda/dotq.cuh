@@ -78,6 +78,14 @@ __host__ __device__ __forceinline__ Q35QuantInfo q35_quant_info(int ttype) {
 // subdivides a block into `SPLIT` pieces of equal sub-block count, which is why
 // only types whose 256 elements factor evenly AND that have a `_part` body are
 // accepted.  Everything else keeps the whole-block path (`q35_dot_1blk`).
+//
+// MUST stay a pure constant table: this is `__device__ __host__` and the device
+// side (`q35_dot_blk_part` inside the split kernel) calls it too.  Putting a
+// `getenv` debug switch in here compiles fine, runs on the host, and silently
+// corrupts the device-side answer -- the model output turned into 3579 tokens of
+// gibberish with `mismatched=0` everywhere, and both `_part` bodies matched
+// `_acc` in a standalone gate.  A/B switches belong in the launcher, which is
+// host-only; this table must not read the environment.
 __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
     // The unit is the native per-32 scale group, so a 256-element block is
     // always 8 units.  IQ3_XXS is the first type with a `_part` body; add to
@@ -96,6 +104,10 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
         // 27B 17408x5120 because every lane read 16 strided bytes, while row
         // slicing gives 298 -> 553 GB/s.  See `q35_vec_dot_q4_k_q8_k_part`.
         case Q35_TT_Q4_K:    return 4;
+        // IQ4_XS above walks four 64-element `ib` steps (`h >>= 4` once per
+        // step), each touching 32 contiguous qs bytes, so all four boundaries
+        // are valid.  See `q35_vec_dot_iq4_xs_q8_k_part`.
+        case Q35_TT_IQ4_XS:  return 4;
         default:             return 0;   // no split path: caller uses 1blk
     }
 }
@@ -131,6 +143,7 @@ __device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char
         case Q35_TT_IQ2_S:   return q35_vec_dot_iq2_s_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ3_S:   return q35_vec_dot_iq3_s_q8_k_part(w, a, lo, hi);
         case Q35_TT_Q4_K:    return q35_vec_dot_q4_k_q8_k_part(w, a, lo, hi);
+        case Q35_TT_IQ4_XS:  return q35_vec_dot_iq4_xs_q8_k_part(w, a, lo, hi);
         default:             return 0.0f;
     }
 }
