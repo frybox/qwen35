@@ -945,60 +945,63 @@ Q35_DEV float q35_vec_dot_iq3_s_q8_k_acc(const unsigned char *w,
 //
 // The full-block body above walks `ib32` in [0,8) in steps of 2 because one
 // `scales[]` byte carries BOTH halves (low nibble = ib32, high = ib32+1) and
-// `qs`/`signs` advance 8/4 bytes per PAIR.  A slice boundary that fell inside a
-// pair would need those pointers rebased mid-pair, so a split is only accepted
-// on an EVEN `lo` and an EVEN-length range; the caller's `units` is 8 and the
-// launcher only ever passes split in {2,4,8}, which makes `per` 4/2/1 -- and a
-// `per` of 1 would land on an odd boundary.  Returning 0 for that case keeps
-// the launcher honest instead of silently computing a wrong slice.
+// `qs`/`signs` advance 8/4 bytes per PAIR.  This body derives both of those from
+// the ABSOLUTE `ib32` instead, so a slice may start or end on an ODD boundary and
+// `per` may be 1 -- which is what lets the launcher drive IQ3_S at split=8 on a
+// 20-block row.  Before that it was clamped to split=4 by `q35_split_min_per` and
+// measured 440 GB/s no matter what SPLIT was requested, while the structurally
+// identical IQ3_XXS went 417 -> 604 GB/s across the same split=4 -> 8 step.
+//
+// Errors this body has already had (both passed a plausible-looking token and
+// needed an exact integer gate to expose):
+//   - rebasing `qs`/`signs` per HALF (8/4) instead of per PAIR (16/8), which
+//     shifted every pair after the first;
+//   - reading `qh[half]` instead of `qh[ib32 - lo]`, which froze the high-bit
+//     byte at the slice's first pair, i.e. 8 wrong high bits per 32 values.
+// Gate: /tmp/mb/gate_3s.cu compares BOTH the eight single-unit slices and the
+// four pair slices against the whole block over 4096 random blocks.
 Q35_DEV float q35_vec_dot_iq3_s_q8_k_part(const unsigned char *w,
                                           const unsigned char *y, int lo, int hi) {
-    if ((lo & 1) != 0 || ((hi - lo) & 1) != 0) return 0.0f;
+    if (hi <= lo) return 0.0f;
     const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
-    // Rebasing mirrors the full-block body EXACTLY: it advances `qs` by 8 for
-    // each of the two halves (16 per pair) and `signs` by 4 per half (8 per
-    // pair), so a pair-aligned rebase must use 16 and 8, not 8 and 4.  The
-    // first version of this body used the per-half amounts and quietly read
-    // the wrong bytes from the second pair onward -- the result stayed in the
-    // right ballpark, so only the token stream showed it.
-    const unsigned char *qs = w + 2 + (lo / 2) * 16;
-    // `qh` is indexed by ABSOLUTE `ib32 + half` in the full-block body, so after
-    // rebasing to `lo` the index inside the loop has to walk back off `lo`.
-    // Reading plain `qh[half]` (which is what the first version did) freezes the
-    // high-bit byte at the slice's first pair, so every pair after the first
-    // decodes its 8 high bits from the WRONG byte: the products stay plausible
-    // and only an exact integer comparison exposes it (gate: `sum of 2-unit
-    // parts == whole block` was exact, `part(0,8) == whole block` was not).
+    // `qs`/`signs` advance 16/8 bytes per PAIR, so the base comes from the
+    // enclosing pair and `lo & 1` then adds the second half's 8/4.  An earlier
+    // version rejected any odd `lo` (`return 0.0f`) -- that guard plus a
+    // `min_per` of 1 made the launcher ask for a split it could not serve, half
+    // the slices computed nothing, decode "sped up" 25.9 -> 27.0 tok/s and the
+    // output turned into "茶，写茶，，".  Never let a slice reject a range.
+    const unsigned char *qs = w + 2 + (lo / 2) * 16 + (lo & 1) * 8;
     const unsigned char *qh = w + 66 + lo;
-    const unsigned char *signs = w + 74 + (lo / 2) * 8;
+    const unsigned char *signs = w + 74 + (lo / 2) * 8 + (lo & 1) * 4;
     const unsigned char *scales = w + 106;
     const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
     int bsum = 0;
-    for (int ib32 = lo; ib32 < hi; ib32 += 2) {
-        const unsigned int ls1 = 2 * (unsigned int)(scales[ib32 / 2] & 0xF) + 1;
-        const unsigned int ls2 = 2 * (unsigned int)(scales[ib32 / 2] >> 4) + 1;
-        for (int half = 0; half < 2; ++half) {
-            int sumi = 0;
-            for (int l = 0; l < 4; ++l) {
-                const unsigned int i1 = (unsigned int)qs[2 * l + 0] |
-                                        (((unsigned int)qh[ib32 - lo + half] << (8 - 2 * l)) & 256u);
-                const unsigned int i2 = (unsigned int)qs[2 * l + 1] |
-                                        (((unsigned int)qh[ib32 - lo + half] << (7 - 2 * l)) & 256u);
-                const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
-                const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
-                const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
-                const int g1 = (int)iq3s_grid[i1];
-                const int g2 = (int)iq3s_grid[i2];
-                sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
-                               q35_ld_u32((const unsigned char *)q8), sumi);
-                sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
-                               q35_ld_u32((const unsigned char *)q8 + 4), sumi);
-                q8 += 8;
-            }
-            qs += 8;
-            signs += 4;
-            bsum += sumi * (int)(half == 0 ? ls1 : ls2);
+    for (int ib32 = lo; ib32 < hi; ++ib32) {
+        // Low nibble drives the even `ib32` (ls1), high nibble the odd one --
+        // the same pairing the full-block body encodes by walking pairs.
+        const unsigned int ls = (ib32 & 1)
+            ? 2 * (unsigned int)(scales[ib32 / 2] >> 4) + 1
+            : 2 * (unsigned int)(scales[ib32 / 2] & 0xF) + 1;
+        int sumi = 0;
+        for (int l = 0; l < 4; ++l) {
+            const unsigned int i1 = (unsigned int)qs[2 * l + 0] |
+                                    (((unsigned int)qh[ib32 - lo] << (8 - 2 * l)) & 256u);
+            const unsigned int i2 = (unsigned int)qs[2 * l + 1] |
+                                    (((unsigned int)qh[ib32 - lo] << (7 - 2 * l)) & 256u);
+            const unsigned int sgn = (unsigned int)signs[l] * 0x01010101u;
+            const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+            const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+            const int g1 = (int)iq3s_grid[i1];
+            const int g2 = (int)iq3s_grid[i2];
+            sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                           q35_ld_u32((const unsigned char *)q8), sumi);
+            sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                           q35_ld_u32((const unsigned char *)q8 + 4), sumi);
+            q8 += 8;
         }
+        qs += 8;
+        signs += 4;
+        bsum += sumi * (int)ls;
     }
     return __fmul_rn(d, (float)bsum);
 }

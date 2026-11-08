@@ -130,7 +130,7 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
 // would have to reject.
 __device__ __host__ __forceinline__ int q35_split_min_per(int ttype) {
     switch (ttype) {
-        case Q35_TT_IQ3_S: return 2;
+        case Q35_TT_IQ3_S: return 1;
         default:           return 1;
     }
 }
