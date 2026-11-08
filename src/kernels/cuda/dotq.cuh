@@ -108,6 +108,11 @@ __device__ __host__ __forceinline__ int q35_split_units(int ttype) {
         // step), each touching 32 contiguous qs bytes, so all four boundaries
         // are valid.  See `q35_vec_dot_iq4_xs_q8_k_part`.
         case Q35_TT_IQ4_XS:  return 4;
+        // IQ2_XXS / IQ2_XS: eight 32-element `ib32` groups, each read as 8
+        // contiguous weight bytes plus 32 contiguous activation bytes and
+        // owning its own scale.  See the `_part` bodies.
+        case Q35_TT_IQ2_XXS: return 8;
+        case Q35_TT_IQ2_XS:  return 8;
         default:             return 0;   // no split path: caller uses 1blk
     }
 }
@@ -144,6 +149,8 @@ __device__ __forceinline__ float q35_dot_blk_part(int ttype, const unsigned char
         case Q35_TT_IQ3_S:   return q35_vec_dot_iq3_s_q8_k_part(w, a, lo, hi);
         case Q35_TT_Q4_K:    return q35_vec_dot_q4_k_q8_k_part(w, a, lo, hi);
         case Q35_TT_IQ4_XS:  return q35_vec_dot_iq4_xs_q8_k_part(w, a, lo, hi);
+        case Q35_TT_IQ2_XXS: return q35_vec_dot_iq2_xxs_q8_k_part(w, a, lo, hi);
+        case Q35_TT_IQ2_XS:  return q35_vec_dot_iq2_xs_q8_k_part(w, a, lo, hi);
         default:             return 0.0f;
     }
 }

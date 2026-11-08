@@ -610,6 +610,83 @@ Q35_DEV float q35_vec_dot_iq2_xs_q8_k_acc(const unsigned char *w,
     return __fadd_rn(acc, __fmul_rn(__fmul_rn(d, (float)bsum), 0.125f));
 }
 
+// IQ2_XXS `_part` over the eight 32-element `ib32` groups `[lo, hi)`.
+//
+// This is the natural slice boundary: each `ib32` step reads 8 contiguous bytes
+// of `q2` (4 grid indices + the `aux1` word holding the scale low nibble and
+// four 7-bit sign masks) and 32 contiguous q8_K bytes, and it owns its own `db`.
+//   q2 -> +8*lo   |  q8 -> +32*lo   |  no separate scales array
+Q35_DEV float q35_vec_dot_iq2_xxs_q8_k_part(const unsigned char *w,
+                                            const unsigned char *y, int lo, int hi) {
+    const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    const unsigned char *q2 = w + 2;
+    const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
+    float sum = 0.0f;
+    for (int ib32 = lo; ib32 < hi; ++ib32) {
+        const unsigned char *a = q2 + ib32 * 8;
+        const unsigned int aux1 = q35_ld_u32(a + 4);
+        const float db = __fmul_rn(__fmul_rn(d, 0.5f + (float)(aux1 >> 28)), 0.25f);
+        for (int l = 0; l < 4; ++l) {
+            const unsigned long long grid = iq2xxs_grid[a[l]];
+            const unsigned char signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
+            for (int j = 0; j < 8; ++j) {
+                signed char g = (signed char)((grid >> (8 * j)) & 0xFF);
+                if ((signs >> j) & 1) g = (signed char)(-g);
+                sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(db, (float)g),
+                                               (float)q8[l * 8 + j]));
+            }
+        }
+        q8 += 32;
+    }
+    return sum;
+}
+
+// IQ2_XS `_part` over the eight 32-element `ib32` groups `[lo, hi)`.
+//
+// Each `ib32` step reads 8 contiguous `q2` bytes (four u16 grid indices, two per
+// scale half), one `scales[ib32]` byte split into the two halves, and 32
+// contiguous q8_K bytes -- so the group boundary is the only valid slice edge.
+//   q2 -> +8*lo  |  scales -> +lo  |  q8 -> +32*lo
+Q35_DEV float q35_vec_dot_iq2_xs_q8_k_part(const unsigned char *w,
+                                           const unsigned char *y, int lo, int hi) {
+    const float d = __fmul_rn(q35_f16_at(w, 0), q35_q8k_d(y));
+    const unsigned char *q2 = w + 2;
+    const unsigned char *sc = w + 66 + lo;
+    const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
+    int bsum = 0;
+    for (int ib32 = lo; ib32 < hi; ++ib32) {
+        const unsigned short ls1 = (unsigned short)(2 * (sc[0] & 0xF) + 1);
+        const unsigned short ls2 = (unsigned short)(2 * (sc[0] >> 4) + 1);
+        sc++;
+        const unsigned short *q = (const unsigned short *)(q2 + ib32 * 8);
+        int sumi = 0;
+        for (int l = 0; l < 2; ++l) {
+            const unsigned short v = q35_ld_u16((const unsigned char *)(q + l));
+            const unsigned long long g = iq2xs_grid[v & 511];
+            const unsigned char signs = ksigns_iq2xs[v >> 9];
+            for (int j = 0; j < 8; ++j) {
+                const int wv = (int)((g >> (8 * j)) & 0xFF);
+                sumi += wv * (int)q8[j] * ((signs & kmask_iq2xs[j]) ? -1 : 1);
+            }
+            q8 += 8;
+        }
+        bsum += sumi * ls1;
+        sumi = 0;
+        for (int l = 2; l < 4; ++l) {
+            const unsigned short v = q35_ld_u16((const unsigned char *)(q + l));
+            const unsigned long long g = iq2xs_grid[v & 511];
+            const unsigned char signs = ksigns_iq2xs[v >> 9];
+            for (int j = 0; j < 8; ++j) {
+                const int wv = (int)((g >> (8 * j)) & 0xFF);
+                sumi += wv * (int)q8[j] * ((signs & kmask_iq2xs[j]) ? -1 : 1);
+            }
+            q8 += 8;
+        }
+        bsum += sumi * ls2;
+    }
+    return __fmul_rn(__fmul_rn(d, (float)bsum), 0.125f);
+}
+
 // --- IQ2_S: 82 B = d @0 (f16) | qs[64] @2 | qh[8] @66 | scales[8] @74 ------
 // iq_kernels.c:1576 (scalar fallback body).  Signs live inside qs at
 // qs + QK_K/8 (i.e. w + 2 + 32), not in a separate member.
