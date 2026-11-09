@@ -290,6 +290,39 @@ slot（169 次 `add_resid`、84 次 `swiglu`、63 次 `l2norm`、21 次 `rmsnorm
   **稳定掉 0.5 tok/s**（31.45 → 31.0，两轮）：多出来的 `findDev` 查找、
   env 检查和重复的 stat 记账比省下的那点 probe 更贵。已完整回滚。
 
+### 权重 32-bit 读取：4×u8 → 2×u16（活实现 +4%，纯加载 +13%）
+
+`q35_ld_u32()`（`vecdotq.cuh`）原本写成 `p[0] | p[1]<<8 | p[2]<<16 | p[3]<<24`。
+看起来编译器会合并成一条 32-bit load，**实际不会**：`-arch=sm_89` 的 PTX 里是
+**四条 `ld.global.u8`**。`__builtin_memcpy`、packed struct 解引用、对 `const unsigned*`
+用 `__ldg` 三种写法全都还是四条——nvcc 无法从 `unsigned char *` 推出对齐。
+每个 IQ 类型的内层循环都调它，所以整个家族每个 weight word 都在发 4 倍的访存指令。
+
+**为什么不能用一条 u32**：q3_K 的 `scales` 字段在 110 字节块的偏移 96 处，只有 2 字节对齐，
+`ld.u32` 在那里直接 `misaligned address` 崩掉（实测）。
+但每个 weight 块**基址都是偶数**（块大小全为偶数：q3_K 110、iq3_xxs 98、q8_0 34……），
+所以 2 字节对齐的 `ld.u16` 永远合法——这是这里最宽的可用宽度。
+
+**为什么用 generic `ld` 而不是 `ld.global`**：同一函数也被调用在非 global 地址空间的缓冲上。
+强制 `.global` 会崩，而且报错**延迟一轮**才冒出来：
+`constant upload failed (20480 B): operation not supported on global/shared address space`
+出现在**下一个** `cudaMemcpy` 上，指向的是无关的 norm 权重上传。`.nc` 同样不行。
+generic `ld` 运行期解析地址空间，正是原来那条字节链编译出来的东西。
+
+测量（`/tmp/mb/mb_ld.cu`，2 GB >L2 缓冲，98 字节步长、每块 24 word，即真实 IQ3_XXS 访问模式）：
+
+| 写法 | GB/s |
+|------|------|
+| 4× u8 链 | 742.9 |
+| **2× u16** | **841.8** |
+
+**位精确性**：`mb_exact.cu` 对 4,194,304 个 word 全比对，`0 mismatches`——u16×2 与 u8×4
+得到的是同一个整数（小端 `ld` 返回的就是字节链拼出来的值）。MVCHECK 在
+Q8_0 / Q4_0 / IQ4_NL / Q4_K_M / Q6_K / IQ2_S / IQ3_S / IQ4_XS / Q3_K_M / IQ2_XXS
+十种格式上全部 `mismatched=0`。
+
+27B IQ3_XXS 端到端：**32.21 → 33.66 tok/s**（`-n 400`，两次 33.67/33.65）。
+
 ### 27B decode 的 matvec：4-warp → 2-warp（+0.7 tok/s）
 
 `q35_coop_warps()` 在 sm_89 上原本写死 4 warps（128 线程），依据是 header 里那条

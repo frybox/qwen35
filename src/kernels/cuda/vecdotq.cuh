@@ -83,9 +83,40 @@
 // ===========================================================================
 
 // little-endian loads (block payloads are only 2-byte aligned)
+// Two 16-bit generic-address loads instead of four 8-bit ones.
+//
+// WHY: written as the obvious `p[0] | p[1]<<8 | ...` byte chain, nvcc emits
+// FOUR `ld.global.u8` per logical 32-bit word (verified in PTX for
+// -arch=sm_89; `__builtin_memcpy`, a packed struct and `__ldg` on a
+// `const unsigned*` ALL still produce four, because nvcc cannot prove
+// alignment from a `unsigned char *`).  Every IQ type's inner loop calls this,
+// so the family was issuing 4x the memory instructions per weight word.
+//
+// MEASURED (mb_ld.cu, 2 GB >L2 buffer, 98-byte-strided walk, 24 words/block,
+// i.e. the real IQ3_XXS access pattern): 4x u8 = 742.9 GB/s, 2x u16 = 841.8
+// GB/s, so the byte chain was costing 13% of the pure-load bandwidth.
+//
+// WHY NOT a single u32: q3_K's `scales` field sits at offset 96 of a 110-byte
+// block, i.e. only 2-byte aligned, and a 32-bit load there faults with
+// "misaligned address" (measured).  Every weight block base IS even (all block
+// sizes are: q3_K 110, iq3_xxs 98, q8_0 34, ...), so a 2-byte-aligned u16 load
+// is always legal.  That is the widest safe load here.
+//
+// WHY generic `ld`, not `ld.global`: the same helper is also called on buffers
+// that are not in the global address space, and a forced-.global load faults
+// with the misleadingly DELAYED message "operation not supported on
+// global/shared address space" surfacing at the *next* cudaMemcpy (measured at
+// startup on the 20480 B norm-weight upload).  Generic `ld` resolves the space
+// at runtime, which is what the byte chain compiled to anyway.
+Q35_DEV unsigned short q35_ld_u16_low(const unsigned char *p) {
+    unsigned short v;
+    asm("ld.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    return v;
+}
 Q35_DEV unsigned int q35_ld_u32(const unsigned char *p) {
-    return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
-           ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
+    const unsigned int lo = q35_ld_u16_low(p);
+    const unsigned int hi = q35_ld_u16_low(p + 2);
+    return lo | (hi << 16);
 }
 Q35_DEV unsigned short q35_ld_u16(const unsigned char *p) {
     return (unsigned short)((unsigned short)p[0] | ((unsigned short)p[1] << 8));
