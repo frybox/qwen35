@@ -276,6 +276,20 @@ decode **29.3 → 31.5 tok/s**（`-n 400`，`make test` 20/20，`QWEN35_MVCHECK`
 slot（169 次 `add_resid`、84 次 `swiglu`、63 次 `l2norm`、21 次 `rmsnorm`），
 即每层一次。**缓存已经到设计上限，继续抠 key 没有收益。**
 
+### 已否决：合并 GDN `alpha`/`beta` 的两个 matvec（`matvec2`）
+
+`x1 -> ssm_alpha` 和 `x1 -> ssm_beta` 是两个相邻的 `matvec`，输入相同，
+看起来是"共享一次激活量化"的现成机会，而且 `PROF` 里 `q8_0` 占 **20%**（6.4 ms/token，
+24 层 × 2 次 = 48 次/token）。实测否掉了：
+
+- 单独量 `24x5120` 的 mmvq：**0.0054 ms/call**，48 次/token = **0.26 ms**,不是 6.4 ms。
+  那 20% 是 `stat_by_type` 记的**host wall**（含已被 graph 隐藏的 launch 开销），不是 kernel。
+- 分离的两次调用本来就**共享量化缓存**（key 里没有 ttype，第二次直接 hit），
+  所以"合并"省不到东西。
+- 真做出来（`vtable.matvec2` + CUDA 里共享 `actQValid` 再背靠背发两个 launch）
+  **稳定掉 0.5 tok/s**（31.45 → 31.0，两轮）：多出来的 `findDev` 查找、
+  env 检查和重复的 stat 记账比省下的那点 probe 更贵。已完整回滚。
+
 ### 下一步的唯一有效方向
 
 要拿回那 ~10 ms，只有把 quantize 挪开关键路径，而不是让它更快或更少：
