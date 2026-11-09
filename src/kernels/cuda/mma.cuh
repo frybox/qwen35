@@ -147,6 +147,16 @@ static __device__ __forceinline__ uint32_t swizzle(const uint32_t offset, const 
     return offset ^ ((i % 8) << shift);
 }
 
+// The `ldmatrix.sync` asms below READ memory (they pull an int8 matrix out
+// of the address in `xs`) but write no register the compiler can see the
+// address flowing into, so WITHOUT the `"memory"` clobber the compiler
+// believes they have no memory side effect and may hoist/duplicate them
+// relative to the shared-memory staging writes and the `__syncthreads()`
+// barriers in `mmq.cu`.  In practice the barriers mask the mis-ordering
+// today, but the clobber is what makes the ordering a guarantee rather
+// than an accident -- the same class of silent-corruption bug as the
+// `ld.u16` fix in `vecdotq.cuh`.  `volatile` only prevents deletion, not
+// reordering, so it is not enough on its own.
 // 8x8 int tile: 8 rows x 8 int (32 int8).  Loads 2 m8n8 b16 matrices.
 static __device__ __forceinline__ void load_ldmatrix(
         q35_tile<8, 8, int> & t, const int * __restrict__ xs0, const int stride) {
@@ -154,7 +164,7 @@ static __device__ __forceinline__ void load_ldmatrix(
     const int * xs = xs0 + ((threadIdx.x & 31) % 8) * stride + (((threadIdx.x & 31) / 8) * (8 / 2)) % 8;
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
         : "=r"(xi[0]), "=r"(xi[1])
-        : "l"(xs));
+        : "l"(xs) : "memory");
 }
 
 // 16x4 int tile: 16 rows x 4 int (16 int8).
@@ -164,7 +174,7 @@ static __device__ __forceinline__ void load_ldmatrix(
     const int * xs = xs0 + ((threadIdx.x & 31) % 16) * stride;
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.b16 {%0, %1}, [%2];"
         : "=r"(xi[0]), "=r"(xi[1])
-        : "l"(xs));
+        : "l"(xs) : "memory");
 }
 
 // 16x8 int tile: 16 rows x 8 int (32 int8).
@@ -174,7 +184,7 @@ static __device__ __forceinline__ void load_ldmatrix(
     const int * xs = xs0 + ((threadIdx.x & 31) % 16) * stride + ((threadIdx.x & 31) / 16) * (8 / 2);
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.b16 {%0, %1, %2, %3}, [%4];"
         : "=r"(xi[0]), "=r"(xi[1]), "=r"(xi[2]), "=r"(xi[3])
-        : "l"(xs));
+        : "l"(xs) : "memory");
 }
 
 // int8 mma, k = 16: D[m,n] += sum_k A[m,k]*B[k,n],  A 16x16, B 16x8, int8.
