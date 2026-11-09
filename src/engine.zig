@@ -1801,14 +1801,20 @@ pub const Engine = struct {
         self.exec.matvec(self.v.span(0, kv_dim), lw.attn_v.?, self.x1);
 
         // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
-        for (0..heads) |h| {
-            const qs = q.span(h * hd, hd);
-            self.exec.rmsnorm(qs, qs, Buf.wrap(lw.attn_q_norm.?), c.rms_eps);
-        }
-        for (0..kv_heads) |h| {
-            const ks = self.k.span(h * hd, hd);
-            self.exec.rmsnorm(ks, ks, Buf.wrap(lw.attn_k_norm.?), c.rms_eps);
-        }
+        //
+        // ONE `rmsnormRows` for all heads, not one `rmsnorm` per head.  Head h
+        // of q occupies [h*hd, (h+1)*hd), so the heads are contiguous and the
+        // row-batched slot is exactly the loop it replaces -- on the CPU oracle
+        // it is *literally* that loop (`vRmsnormRows`), so this cannot change a
+        // single value.  On CUDA `rmsnormRows` is capture-safe (no graph gate),
+        // so the decode graph sees one node here instead of `heads` of them.
+        //
+        // RoPE stays per head on purpose: `dRope64_body` reads {pos, base} from
+        // a device buffer so its nodes need no retargeting, but `rope64_rows`
+        // launches a different kernel with no host-stub identity for the graph
+        // to match.  See `dRope64Rows_body`'s capture guard.
+        self.exec.rmsnormRows(q.span(0, heads * hd), q.span(0, heads * hd), Buf.wrap(lw.attn_q_norm.?), heads, c.rms_eps);
+        self.exec.rmsnormRows(self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), Buf.wrap(lw.attn_k_norm.?), kv_heads, c.rms_eps);
         // RoPE on first 64 dims of each q/k head
         for (0..heads) |h| {
             self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);

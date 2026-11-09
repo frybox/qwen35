@@ -323,6 +323,31 @@ Q8_0 / Q4_0 / IQ4_NL / Q4_K_M / Q6_K / IQ2_S / IQ3_S / IQ4_XS / Q3_K_M / IQ2_XXS
 
 27B IQ3_XXS 端到端：**32.21 → 33.66 tok/s**（`-n 400`，两次 33.67/33.65）。
 
+### q_norm/k_norm：每头一次 `rmsnorm` → 一次 `rmsnormRows`（+2%）
+
+`forwardAttention` 里原本是
+
+```zig
+for (0..heads)    |h| self.exec.rmsnorm(q.span(h*hd, hd), ...);
+for (0..kv_heads) |h| self.exec.rmsnorm(k.span(h*hd, hd), ...);
+```
+
+即**每层 `heads + kv_heads` 次 launch**。但 head h 在 `q` 里正是 `[h*hd, (h+1)*hd)`，
+各头连续，所以整段就是一个 `rows = heads` 的批量 rmsnorm。`rmsnormRows` 早就存在，
+CUDA 侧 `dRmsnormRows_body` **没有** graph 门槛（`dRope64Rows_body` 才有），
+而 CPU oracle `vRmsnormRows` 本身就是那个逐行循环。
+
+- 位精确性：CPU 路径 `QWEN35_DUMP_IDS` 40 token 的 md5 前后**完全相同**
+  （`1a2745e9…`），CUDA 路径同样相同（`3109fa4c…`）。这条改动**连一位都没动**。
+- 27B IQ3_XXS `-n 400`：33.74 → **34.40 tok/s**（34.46/34.33）。
+
+RoPE 没有一起批量，是**故意**的：`dRope64_body` 用 `k_rope64_dpos` 从设备缓冲读
+{pos, base}，所以那 448 个节点重放时一次 `GraphExecKernelNodeSetParams` 都不需要；
+而 `rope64_rows` 是**另一个 kernel**（`k_rope64_rows`），没有 `q35_func_rope64` 这个
+host-stub 身份，graph 按节点地址匹配不到它，所以 `dRope64Rows_body` 里有 capture 门槛。
+把 decode 的 rope 批量需要给 graph 加一条新的重定位路径，收益仅是每 token 少 ~298 个节点
+的派发，暂不做。
+
 ### 差距分解：live 425 GB/s vs 隔离 546 GB/s 的 4 ms 花在哪
 
 27B IQ3_XXS，`PROF-SLOT` 的 `mv_batchk` 在 10 token 窗口内 **496 次调用 / 244 ms**，
