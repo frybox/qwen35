@@ -135,6 +135,23 @@ extern "C" int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float
     return (int)cudaGetLastError();
 }
 
+// Publish one int32 into device memory from a 1-thread kernel.
+//
+// This is the CUDA-graph escape hatch for "a scalar launch argument that changes
+// every token": if the value lives in DEVICE memory, the captured node's
+// argument block and shared-memory size stay constant, so the node never needs
+// `cudaGraphExecKernelNodeSetParams`.  Same trick as `k_rope64_setenv`
+// (rope.cu:182), generalised so any kernel can take a per-token int this way.
+// Measured motivation: the per-layer, per-token SetParams on the attn_decode
+// node was costing 14.3 ms/token of the 27B's 33.8 ms decode.
+__global__ void k_set_int1(int *d, int v) { *d = v; }
+
+extern "C" int q35_launch_set_int1(int *d, int v, void *stream_v) {
+    if (d == nullptr) return (int)cudaErrorInvalidValue;
+    k_set_int1<<<1, 1, 0, (cudaStream_t)stream_v>>>(d, v);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int q35_launch_zero_buf(float *d_buf, int n, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;

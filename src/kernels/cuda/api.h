@@ -134,6 +134,11 @@ int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream)
 int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float *d_src, int heads, int hd, void *stream);
 int q35_launch_zero_buf(float *d_buf, int n, void *stream);
 
+// Write one int32 from a 1-thread kernel.  The graph-safe way to pass a
+// per-token scalar: the reader takes a device POINTER, so the captured node's
+// argument block never has to be retargeted with GraphExecKernelNodeSetParams.
+int q35_launch_set_int1(int *d, int v, void *stream);
+
 // --- normalisation slots (src/kernels/cuda/norm.cu) ------------------------
 //
 // `rows` blocks of `n` f32 each, contiguous.  `d_w` is a length-`n` weight
@@ -251,6 +256,61 @@ int q35_launch_attn_decode(const float *d_q, const float *d_gate,
                            float *d_att, float *d_gout, int slot, int heads,
                            int gqa, int hd, int kv_dim, float scale,
                            void *stream);
+
+// Same kernel, but `slot` is read from DEVICE memory (`d_slot`, one int) and the
+// dynamic shared block is the fixed maximum.  Because neither the argument block
+// nor `shared_mem_bytes` changes between tokens, a captured decode-graph node
+// for this launch never needs `cudaGraphExecKernelNodeSetParams` -- which cost
+// 14.3 ms/token (43% of decode) on the 27B when it ran once per layer per token.
+// Preferred on the graph path; the scalar-`slot` form above stays for prefill,
+// the direct path and the fallback.
+void *q35_func_attn_decode_dyn(void);
+void *q35_func_attn_decode_coal(void);
+void *q35_func_attn_score_split(void);
+int q35_launch_attn_decode_dyn(const float *d_q, const float *d_gate,
+                               const float *d_kcache, const float *d_vcache,
+                               float *d_att, float *d_gout, const int *d_slot,
+                               int heads, int gqa, int hd, int kv_dim,
+                               float scale, void *stream);
+
+// Warp-tiled decode attention: the row loop is re-tiled so a warp reads ONE
+// contiguous run of a KV row instead of 32 rows 4 KB apart (which over-fetches
+// by kv_dim/hd and defeats coalescing).  Still bit-exact -- the score j-sum is
+// the serial order and the PV t-sum walks rows in increasing order.
+// Measured (24 layers, distinct 100-180 MB KV caches, i.e. NOT L2-resident):
+// 3.1 -> 1.5 ms/token at slot=518, 4.9 -> 2.5 ms at slot=917 (33 -> 72 GB/s).
+int q35_launch_attn_decode_coal(const float *d_q, const float *d_gate,
+                                const float *d_kcache, const float *d_vcache,
+                                float *d_att, float *d_gout, int slot, int heads,
+                                int gqa, int hd, int kv_dim, float scale,
+                                void *stream);
+
+// Split decode attention: BOTH walks (score and PV) divide the row range across
+// `split` blocks per head, so the kernel stops being 24-blocks-on-114-SMs.
+// `d_part` must hold `heads * split * hd` floats.
+// Measured: 325 GB/s / 0.555 ms at slot=917 (vs 4.93 ms naive) with output
+// BIT-IDENTICAL to the reference (the score sum keeps the serial j order and the
+// softmax keeps the CPU's max/exp/serial-sum/div order; only the PV t-sum is a
+// 2-level tree, which re-associates f32 addition -- and even that came out
+// identical on the probe).  `split <= 1` falls back to the coalesced kernel.
+void *q35_func_attn_score_split_dyn(void);
+void *q35_func_attn_pv_split_dyn(void);
+void *q35_func_attn_softmax_dyn(void);
+void *q35_func_attn_reduce(void);
+// Device-`slot` split path: four launches, every argument constant, so a
+// captured decode-graph node never needs retargeting.  `split` is a constant.
+int q35_launch_attn_decode_split_dyn(const float *d_q, const float *d_gate,
+                                     const float *d_kcache, const float *d_vcache,
+                                     float *d_att, float *d_gout, float *d_part,
+                                     const int *d_slot, int heads, int gqa, int hd,
+                                     int kv_dim, float scale, int split,
+                                     void *stream);
+int q35_launch_attn_decode_split2(const float *d_q, const float *d_gate,
+                                  const float *d_kcache, const float *d_vcache,
+                                  float *d_att, float *d_gout, float *d_part,
+                                  int slot, int heads, int gqa, int hd,
+                                  int kv_dim, float scale, int split,
+                                  void *stream);
 
 // --- IQ codebook upload (call ONCE, before the first IQ kernel) -------------
 //

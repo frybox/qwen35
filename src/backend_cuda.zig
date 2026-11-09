@@ -146,6 +146,18 @@ const Kernels = struct {
     extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Warp-tiled / split decode attention (see api.h for the measurements).
+    extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_func_attn_score_split_dyn() callconv(.c) ?*anyopaque;
+    extern fn q35_func_attn_pv_split_dyn() callconv(.c) ?*anyopaque;
+    extern fn q35_func_attn_softmax_dyn() callconv(.c) ?*anyopaque;
+    extern fn q35_func_attn_reduce() callconv(.c) ?*anyopaque;
+    extern fn q35_launch_attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Device-`slot` form of the same kernel; see `dAttnDecode_body`.
+    extern fn q35_launch_attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Write one int32 from a 1-thread kernel (graph-safe per-token scalar).
+    extern fn q35_launch_set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
     extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_rope64_dpos(d_x: ?[*]f32, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
@@ -163,8 +175,30 @@ const Kernels = struct {
     extern fn q35_func_rope64() callconv(.c) ?*anyopaque;
     extern fn q35_func_rope64_dpos() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_decode() callconv(.c) ?*anyopaque;
+    extern fn q35_func_attn_decode_dyn() callconv(.c) ?*anyopaque;
     extern fn q35_func_copy_range() callconv(.c) ?*anyopaque;
 };
+
+/// Row-range split factor for decode attention.  `0` disables it (one block per
+/// head, the pre-2026-11 behaviour), `2..16` divides BOTH row walks of every
+/// head across that many blocks.
+///
+/// Default is `16` because it is a strict win and it does not change any result:
+/// the score sum keeps the serial `j` order, the softmax keeps the CPU's
+/// max/serial-sum/div order, and the PV t-sum is the only 2-level tree -- and
+/// even that came out bit-identical on the probe (`mismatched=0 worst=0` against
+/// the one-block reference for every head and slot 0/5/63/300/516-519/530/700/
+/// 1023).  A single block per head is 24 blocks on this GPU's 114 SMs (21%
+/// occupancy) and every lane then walks all `n` rows of a KV cache that does not
+/// fit in L2, which measured **33 GB/s**; splitting reaches **325 GB/s**.
+///
+/// `$QWEN35_CUDA_ATTN_SPLIT` overrides it (0 to turn it off for A/B).
+fn attnSplitFromEnv() usize {
+    const v = cudart.getenv("QWEN35_CUDA_ATTN_SPLIT") orelse return 16;
+    const n = std.fmt.parseInt(usize, std.mem.trim(u8, v, " \t"), 10) catch return 16;
+    return @min(n, 16);
+}
+
 
 // ==== link-time vs. CPU-only build =========================================
 //
@@ -234,6 +268,11 @@ const Launch = if (cuda_linked) struct {
     const conv_step = Kernels.q35_launch_conv_step;
     const argmax = Kernels.q35_launch_argmax;
     const attn_decode = Kernels.q35_launch_attn_decode;
+    const attn_decode_dyn = Kernels.q35_launch_attn_decode_dyn;
+    const attn_decode_coal = Kernels.q35_launch_attn_decode_coal;
+    const attn_decode_split2 = Kernels.q35_launch_attn_decode_split2;
+    const attn_decode_split_dyn = Kernels.q35_launch_attn_decode_split_dyn;
+    const set_int1 = Kernels.q35_launch_set_int1;
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
@@ -1096,6 +1135,27 @@ pub const CudaBackend = struct {
     } = .{},
     g_rope_dyn_pos: u32 = 0xFFFF_FFFF,
     g_rope_dyn_base: f32 = 0.0,
+    /// Device int holding the decode `slot` (the KV prefix length minus one).
+    /// `attn_decode` reads it instead of taking `slot` as a launch argument, so
+    /// the captured node's argument block AND its `shared_mem_bytes` are
+    /// constants and the per-token/per-layer `GraphExecKernelNodeSetParams` --
+    /// which cost 14.3 ms of the 27B's 33.8 ms decode -- disappears entirely.
+    /// Allocated once, written once per token by `set_int1`.
+    g_attn_dyn: ?*anyopaque = null,
+    /// PV partials for the split attention path: `heads * split * hd` floats.
+    d_att_part: ?*anyopaque = null,
+    d_att_part_bytes: usize = 0,
+    /// Per-head probability scratch for the split attention path.  The engine
+    /// hands every head the SAME `slot + 1` floats (`self.attn`), because the
+    /// reference kernel runs one block per head and each block re-derives the
+    /// same scores -- but the split path runs the softmax as its OWN kernel, one
+    /// block per head, so writing all heads into one shared row would race.
+    /// Sized `heads * Q35_ATTN_MAX_ROWS` so the stride matches the kernel.
+    d_att_prob: ?*anyopaque = null,
+    d_att_prob_bytes: usize = 0,
+    /// Rows-per-head reduction factor for the split attention path
+    /// (`$QWEN35_CUDA_ATTN_SPLIT`, 0 = off -> coalesced kernel).
+    attn_split: usize = 0,
     /// The captured graph, kept only between EndCapture and Instantiate.
     g_graph: ?*anyopaque = null,
     /// Replayable instantiation.  This is the only thing used per token.
@@ -1812,6 +1872,12 @@ pub const CudaBackend = struct {
         self.g_expect_attn += 1;
     }
 
+    /// `graphNoteAttn` for a launcher that emits `n` attn-class nodes per call.
+    fn graphNoteAttnN(self: *CudaBackend, slot: usize, n: usize) void {
+        var i: usize = 0;
+        while (i < n) : (i += 1) self.graphNoteAttn(slot);
+    }
+
     fn graphEnd(self: *CudaBackend) bool {
         const cu = &(self.cu orelse return false);
         self.g_capturing = false;
@@ -2147,6 +2213,7 @@ pub const CudaBackend = struct {
         var rope_found: usize = 0;
         var rope_dpos_found: usize = 0;
         var attn_found: usize = 0;
+        var attn_dyn_found: usize = 0;
         var kv_found: usize = 0;
         var kernel_nodes: usize = 0;
         self.g_cluster_n = 0;
@@ -2186,6 +2253,18 @@ pub const CudaBackend = struct {
                         // the banner reports how much of the graph is frozen)
                         // but never recorded for retargeting.
                         rope_dpos_found += 1;
+                    },
+                    .attn_score => {
+                        attn_dyn_found += 1;
+                    },
+                    .attn_reduce => {
+                        attn_dyn_found += 1;
+                    },
+                    .attn_dyn => {
+                        // Constant arguments AND constant shared size: nothing to
+                        // retarget, ever.  Counted so the node census matches
+                        // `g_expect_attn` (which the dyn path still increments).
+                        attn_dyn_found += 1;
                     },
                     .attn => {
                         if (attn_found >= graph_max_layers) continue;
@@ -2229,7 +2308,7 @@ pub const CudaBackend = struct {
         self.g_rope_n = rope_found;
         self.g_attn_n = attn_found;
         self.g_kv_n = kv_found;
-        if (rope_found == 0 and attn_found == 0) {
+        if (rope_found == 0 and attn_found == 0 and attn_dyn_found == 0) {
             self.graphAbandon("no rope64/attn_decode argument matched; identification untrustworthy");
             _ = cu.lib.GraphDestroy(graph);
             return false;
@@ -2267,7 +2346,8 @@ pub const CudaBackend = struct {
             return false;
         }
         if (rope_found != self.g_rope_n or attn_found != self.g_attn_n or
-            rope_found + rope_dpos_found != self.g_expect_rope or attn_found != self.g_expect_attn)
+            rope_found + rope_dpos_found != self.g_expect_rope or
+            attn_found + attn_dyn_found != self.g_expect_attn)
         {
             std.debug.print(
                 "cuda backend: decode graph skipped: matched {d}/{d} rope64 and {d}/{d} attn_decode nodes\n",
@@ -2314,7 +2394,7 @@ pub const CudaBackend = struct {
         _ = cu.lib.GraphUpload(self.g_exec, self.g_stream);
         std.debug.print(
             "cuda backend: decode graph live ({d} kernels, {d} rope64 (frozen: pos from device) + {d} rope64-retargeted + {d} attn_decode + {d} kv-append nodes)\n",
-            .{ kernel_nodes, rope_dpos_found, rope_found, attn_found, kv_found },
+            .{ kernel_nodes, rope_dpos_found, rope_found, attn_found + attn_dyn_found, kv_found },
         );
         return true;
     }
@@ -2365,7 +2445,23 @@ pub const CudaBackend = struct {
     /// src/cudart.zig), and the flag value is fixed by the ABI.
     const cudaHostAllocMapped: c_uint = 0x02;
 
-    const NodeClass = enum { rope, rope_dpos, attn, kv };
+    /// `attn_dyn` is the device-`slot` attention kernel: its argument block AND
+    /// its `shared_mem_bytes` are constant for the whole run, so -- like
+    /// `rope_dpos` -- it is recognised (so the node census matches) but never
+    /// recorded for retargeting.  That is the entire point of the variant:
+    /// retargeting the scalar-`slot` node cost one `SetParams` per LAYER per
+    /// token, 14.3 ms of a 33.8 ms decode on the 27B.
+    const NodeClass = enum { rope, rope_dpos, attn, attn_dyn, attn_score, attn_reduce, kv };
+
+/// `(Q35_ATTN_MAX_ROWS + 2) * sizeof(float)` -- the fixed dynamic shared block of
+/// `q35_attn_decode_kernel_dyn` (src/kernels/cuda/attn.cu).  Both sides must
+/// agree: the kernel is launched with it, and capture verifies the node carries
+/// it (a mismatch means the node is not the one we think it is).
+const q35_attn_smem_dynslot: usize = (8192 + 2) * @sizeOf(f32);
+
+/// Widest split-path attention kernel: `q35_attn_score_split_kernel_dyn(d_q,
+/// d_kcache, d_att, d_slot, heads, gqa, hd, kv_dim, scale, split)`.
+const attn_score_arity: usize = 10;
 
     /// Decide whether a captured kernel node is one of the two retargetable
     /// launches, by matching its `func` against the host-stub address each
@@ -2389,6 +2485,16 @@ pub const CudaBackend = struct {
         // a rope node that needs no per-token work.
         if (f == KernelFns.rope_dpos) return .rope_dpos;
         if (f == KernelFns.attn) return .attn;
+        if (f == KernelFns.attn_dyn) return .attn_dyn;
+        // Split-path kernels: constant arguments like `.attn_dyn`, but 256 threads
+        // and no dynamic shared memory, so they get their own class.
+        if (f == KernelFns.attn_score_dyn) return .attn_score;
+        if (f == KernelFns.attn_pv_dyn) return .attn_score;
+        if (f == KernelFns.attn_smax_dyn) return .attn_score;
+        // `q35_attn_reduce_kernel(d_part, d_gate, d_gout, heads, hd, split)` --
+        // six arguments, three pointers then three ints.  Its own class because
+        // `.attn_dyn`'s argument widths describe a twelve-argument kernel.
+        if (f == KernelFns.attn_reduce) return .attn_reduce;
         if (f == KernelFns.kv) return .kv;
         return null;
     }
@@ -2402,6 +2508,11 @@ pub const CudaBackend = struct {
         var rope: ?*anyopaque = null;
         var rope_dpos: ?*anyopaque = null;
         var attn: ?*anyopaque = null;
+        var attn_dyn: ?*anyopaque = null;
+        var attn_score_dyn: ?*anyopaque = null;
+        var attn_pv_dyn: ?*anyopaque = null;
+        var attn_smax_dyn: ?*anyopaque = null;
+        var attn_reduce: ?*anyopaque = null;
         var kv: ?*anyopaque = null;
 
         fn resolve() void {
@@ -2414,6 +2525,11 @@ pub const CudaBackend = struct {
                 rope = Kernels.q35_func_rope64();
                 rope_dpos = Kernels.q35_func_rope64_dpos();
                 attn = Kernels.q35_func_attn_decode();
+                attn_dyn = Kernels.q35_func_attn_decode_dyn();
+                attn_score_dyn = Kernels.q35_func_attn_score_split_dyn();
+                attn_pv_dyn = Kernels.q35_func_attn_pv_split_dyn();
+                attn_smax_dyn = Kernels.q35_func_attn_softmax_dyn();
+                attn_reduce = Kernels.q35_func_attn_reduce();
                 kv = Kernels.q35_func_copy_range();
             }
             resolved = true;
@@ -2470,9 +2586,23 @@ pub const CudaBackend = struct {
                 if (p.grid_dim_x != 1 or p.grid_dim_y != 1) return false;
                 if (p.shared_mem_bytes != 0) return false;
             },
-            .attn => {
+            .attn_reduce, .attn_score => {
                 if (p.grid_dim_x == 0 or p.grid_dim_y != 1) return false;
+                if (p.block_dim_x != 256 or p.block_dim_y != 1) return false;
+                if (p.shared_mem_bytes != 0) return false;
+            },
+            .attn, .attn_dyn => {
+                if (p.grid_dim_x == 0 or p.grid_dim_y != 1) return false;
+                // `.attn_dyn` here is `q35_attn_decode_kernel_dyn` (128 threads,
+                // fixed shared block); the split-path kernels are also classified
+                // `.attn_dyn` but run 256 threads with NO shared memory, so this
+                // branch cannot be the one that validates them -- they are checked
+                // by `attnScoreShaped` below.
                 if (p.block_dim_x != 128 or p.block_dim_y != 1) return false;
+                // `.attn_dyn` additionally has a FIXED shared size; that is what
+                // makes it un-retargetable, and a different size means this is
+                // not the node we think it is.
+                if (cls == .attn_dyn and p.shared_mem_bytes != q35_attn_smem_dynslot) return false;
             },
             .kv => {
                 // DELIBERATELY NOT the attn rule: `k_copy_range` is launched with
@@ -2527,6 +2657,11 @@ pub const CudaBackend = struct {
             // k_rope64_dpos(float *d_x, int heads, int hd, const void *d_dyn)
             .rope_dpos => 4,
             .attn => attn_arity,
+            // q35_attn_decode_kernel_dyn(... const int *d_slot, int heads,
+            //   int gqa, int hd, int kv_dim, float scale) -- same arity.
+            .attn_dyn => attn_arity,
+            .attn_score => attn_score_arity,
+            .attn_reduce => 6,
             .kv => kv_arity,
         };
     }
@@ -2602,6 +2737,27 @@ pub const CudaBackend = struct {
             //   int kv_dim, float scale)
             .attn => switch (i) {
                 0, 1, 2, 3, 4, 5 => 8,
+                else => 4,
+            },
+            // Same signature as `.attn`: the only change is that `slot` is now a
+            // device pointer (still an 8-byte argument in slot 6).
+            .attn_dyn => switch (i) {
+                0, 1, 2, 3, 4, 5 => 8,
+                else => 4,
+            },
+            // q35_attn_reduce_kernel(const float *d_part, const float *d_gate,
+            //   float *d_gout, int heads, int hd, int split)
+            .attn_reduce => switch (i) {
+                0, 1, 2 => 8,
+                else => 4,
+            },
+            // The three split-path kernels: score_split(d_q, d_kcache, d_att,
+            // d_slot, heads, gqa, hd, kv_dim, scale, split) = 10 args;
+            // softmax_dyn(d_att, d_slot, heads) = 3;
+            // pv_split_dyn(d_vcache, d_part, d_prob, d_slot, heads, gqa, hd,
+            //   kv_dim, split) = 9.  Widths below cover the widest (10).
+            .attn_score => switch (i) {
+                0, 1, 2, 3 => 8,           // pointers (score kernel)
                 else => 4,
             },
             // k_copy_range(float *dst, const float *src, int n) -- THREE
@@ -2805,6 +2961,28 @@ pub const CudaBackend = struct {
             const rc2 = cu.lib.GraphExecKernelNodeSetParams(gexec, node, &p);
             if (rc2 != cudart.cudaSuccess) {
                 self.ewLaunchFail("decode graph: kv append setParams", rc2);
+                return false;
+            }
+        }
+        // PUBLISH THE PER-TOKEN SCALARS THE GRAPH READS FROM DEVICE MEMORY.
+        //
+        // `gOpGate` suppresses every gated op on a replayed step, so the writer
+        // kernels that carry these values are NOT re-run by the ops -- they
+        // appear only as captured nodes holding the CAPTURE token's value, and a
+        // replay would then recompute the capture token forever.  Measured: the
+        // first decode token after capture came back as id 0.
+        //
+        // So the writes go here, ahead of the launch, on the default stream with
+        // an event to order them before `g_stream`.  They are 1-thread kernels:
+        // two launches per token instead of ~2 node `SetParams` per LAYER.
+        // Published on `g_stream` ITSELF, immediately before the graph launch:
+        // stream order alone guarantees the write is visible to every node of the
+        // graph, so there is no event dance to get wrong.
+        if (self.g_attn_dyn) |pdyn| {
+            const sslot: [*]c_int = @ptrCast(@alignCast(pdyn));
+            const wrc = Launch.set_int1(sslot, @intCast(slot), self.g_stream);
+            if (wrc != cudart.cudaSuccess) {
+                self.ewLaunchFail("decode graph: attn slot publish", wrc);
                 return false;
             }
         }
@@ -3817,6 +3995,20 @@ pub const CudaBackend = struct {
         // the first argmax.  It must not be allocated *during* a captured step,
         // so it is reserved here with everything else.
         try ensureBuf(&cu.lib, &self.d_idx, &self.d_idx_bytes, @sizeOf(c_int));
+        // PV partials for the split attention path.  Sized for the widest head
+        // count the config can produce at the largest split, allocated here so
+        // the split path never allocates inside a capture.
+        self.attn_split = attnSplitFromEnv();
+        if (self.attn_split > 0) {
+            try ensureBuf(&cu.lib, &self.d_att_part, &self.d_att_part_bytes, 64 * self.attn_split * 512 * @sizeOf(f32));
+            // `heads * Q35_ATTN_MAX_ROWS` floats; 64 heads x 8192 = 2 MB.
+            try ensureBuf(&cu.lib, &self.d_att_prob, &self.d_att_prob_bytes, 64 * 8192 * @sizeOf(f32));
+        }
+        // Same reasoning for the device `slot` cell that `attn_decode` reads:
+        // allocating it on first use would land inside a capture, where
+        // `cudaMalloc` is illegal ("operation not permitted when stream is
+        // capturing").  Reserved here so the dyn path is always ready.
+        _ = self.ensureAttnDyn();
     }
 
     /// K-token variant: the same buffers scaled by `k`.  `d_out`/`d_xq` dominate, so
@@ -4766,11 +4958,95 @@ pub const CudaBackend = struct {
                         if (dBufPtr(vcache)) |pv| {
                             if (dBufPtr(att)) |patt| {
                                 if (dBufPtr(gout)) |pgout| {
+                                    // Take the DEVICE-slot path whenever this launch
+                                    // may be captured (or is being replayed).  On that
+                                    // path the node's arguments and its
+                                    // `shared_mem_bytes` are both constants, so the
+                                    // replay never calls `GraphExecKernelNodeSetParams`
+                                    // for it.  Measured on the 27B: retargeting this
+                                    // one node per layer per token cost 14.3 ms of a
+                                    // 33.8 ms token (43%), against 1.4 ms of actual
+                                    // kernel time.  The scalar-`slot` form stays for
+                                    // the direct path, where there is no node to
+                                    // retarget and the smaller shared block is free.
+                                    const want_dyn = graphWanted() and
+                                        (self.g_state == .live or self.g_state == .rec or self.capturing());
+                                    if (want_dyn) {
+                                        if (self.ensureAttnDyn()) |pdyn| {
+                                            // DO NOT publish `slot` here.  During
+                                            // capture `launchStream()` is the capture
+                                            // stream, so a publish issued now would
+                                            // become a graph NODE with this token's
+                                            // value baked into its arguments -- and on
+                                            // every replay that node would overwrite
+                                            // the fresh value `graphReplayInner`
+                                            // writes, pinning the whole graph to the
+                                            // capture token's KV length.  (Measured:
+                                            // the first 6 tokens matched, then the text
+                                            // diverged exactly when replay began, and
+                                            // the device cell read back the capture
+                                            // value.)  The publish lives in
+                                            // `graphReplayInner`, on `g_stream`,
+                                            // immediately before `GraphLaunch`.
+                                            const sslot = @as([*]c_int, @ptrCast(@alignCast(pdyn)));
+                                            // Prefer the SPLIT device-slot path when
+                                            // enabled: four constant-argument nodes,
+                                            // still zero retargeting, and the row
+                                            // walk is spread over `split` blocks per
+                                            // head instead of one.
+                                            if (self.attn_split > 1) {
+                                                if (self.d_att_part) |ppart| {
+                                                    const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
+                                                    const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
+                                                    const rcs = Launch.attn_decode_split_dyn(pq, pgate, pk, pv, pprob, pgout, s2, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.launchStream());
+                                                    if (rcs == cudart.cudaSuccess) {
+                                                        // FOUR nodes (score, softmax,
+                                                        // PV, reduce+gate), all
+                                                        // `.attn_dyn`-class: none is
+                                                        // ever retargeted.  The census
+                                                        // must see all four.
+                                                        if (self.capturing()) self.graphNoteAttnN(slot, 4);
+                                                        return;
+                                                    }
+                                                    if (self.capturing()) self.graphAbandon("attn_decode split_dyn launch failed");
+                                                    self.ewLaunchFail("attn_decode_split_dyn", rcs);
+                                                }
+                                            }
+                                            const rc = Launch.attn_decode_dyn(pq, pgate, pk, pv, patt, pgout, sslot, @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.launchStream());
+                                            if (rc == cudart.cudaSuccess) {
+                                                // Counted, not recorded: the node is
+                                                // classified `.attn_dyn` and never
+                                                // retargeted, but `graphCaptureEnd`
+                                                // demands the census agree.
+                                                if (self.capturing()) self.graphNoteAttn(slot);
+                                                return;
+                                            }
+                                            if (self.capturing()) self.graphAbandon("attn_decode dyn launch failed");
+                                            self.ewLaunchFail("attn_decode_dyn", rc);
+                                        }
+                                    }
                                     // `slot` (and only `slot`) changes per token: the
                                     // cache POINTERS are fixed regions and the engine
                                     // merely hands over a longer prefix of them, so a
                                     // captured node stays valid as long as the kernel is
                                     // told the new slot.  That is the one retarget.
+                                    //
+                                    // With `$QWEN35_CUDA_ATTN_SPLIT` set, take the
+                                    // row-split variant instead: it divides BOTH row
+                                    // walks across that many blocks per head, because
+                                    // one block per head is 24 blocks on 114 SMs (21%)
+                                    // and every lane then walks all `n` rows serially
+                                    // (measured 33 GB/s on non-L2-resident KV caches).
+                                    if (self.attn_split > 1) {
+                                        if (self.d_att_part) |ppart| {
+                                            const s2 = @as([*]f32, @ptrCast(@alignCast(ppart)));
+                                            // `d_att_prob`, NOT `patt`: see the field note.
+                                            const pprob = if (self.d_att_prob) |pp| @as([*]f32, @ptrCast(@alignCast(pp))) else patt;
+                                            const rc2 = Launch.attn_decode_split2(pq, pgate, pk, pv, pprob, pgout, s2, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, @intCast(self.attn_split), self.launchStream());
+                                            if (rc2 == cudart.cudaSuccess) return;
+                                            self.ewLaunchFail("attn_decode split", rc2);
+                                        }
+                                    }
                                     const rc = Launch.attn_decode(pq, pgate, pk, pv, patt, pgout, @intCast(slot), @intCast(heads), @intCast(gqa), @intCast(hd), @intCast(kv_dim), scale, self.launchStream());
                                     if (rc == cudart.cudaSuccess) {
                                         if (self.capturing()) self.graphNoteAttn(slot);
@@ -4854,6 +5130,21 @@ pub const CudaBackend = struct {
             return null;
         }
         self.g_rope_dyn = p;
+        return p;
+    }
+
+    /// Lazily allocate the device int that carries the decode `slot` to
+    /// `q35_attn_decode_kernel_dyn`.  Returns null only if the allocation fails.
+    fn ensureAttnDyn(self: *CudaBackend) ?*anyopaque {
+        if (self.g_attn_dyn) |p| return p;
+        const cu = &(self.cu orelse return null);
+        var p: ?*anyopaque = null;
+        const rc = cu.lib.Malloc(&p, @sizeOf(c_int));
+        if (rc != cudart.cudaSuccess or p == null) {
+            self.ewLaunchFail("attn_dyn alloc", rc);
+            return null;
+        }
+        self.g_attn_dyn = p;
         return p;
     }
 
