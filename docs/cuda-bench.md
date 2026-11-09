@@ -323,6 +323,24 @@ Q8_0 / Q4_0 / IQ4_NL / Q4_K_M / Q6_K / IQ2_S / IQ3_S / IQ4_XS / Q3_K_M / IQ2_XXS
 
 27B IQ3_XXS 端到端：**32.21 → 33.66 tok/s**（`-n 400`，两次 33.67/33.65）。
 
+### 已否决：把 IQ2_XXS 点积改写成整数域（dp4a）
+
+理由看起来充分：`q35_vec_dot_iq2_xxs_q8_k_acc` 是**纯 float 标量**——每个 32 元素组跑 8 次
+`fadd(db*g*q8)`，完全没有 dp4a；而结构完全相同的 IQ3_XXS 走整数域、实测 644 GB/s，
+IQ2_XXS 只有 349。改写后（`q35_iq_signs8` + `__vsub4` + `dp4a`，与 IQ3_XXS 同构）
+**MVCHECK 全部 `mismatched=0`，数值正确——但带宽 349.3 → 349.3，一点没动。**
+所以 IQ2_XXS 不是计算瓶颈，改计算路径无效。已回滚。
+
+真正的原因在 split 阶梯上：`units=8` 与 IQ3_XXS 相同，但 iq2_xxs 块只有 **66 字节**
+（IQ3_XXS 98 字节）。split=2/4/8 给 224.5 / 299.3 / 348.6 GB/s，**单调上升且被 units=8 卡住**，
+即并行度不足而非算力不足。而 `_part` 的最小粒度是 8 元素（一个 dp4a），无法再切细分。
+
+### 已否决：按 microbench 挑 warps
+
+单类型 microbench 里 `warps=1` 明显最好（iq3_xxs 672 vs warps=2 的 643、iq2_xxs 382 vs 347），
+但端到端 `-n 400` 上 warps=1 (32.18) 反而**不如** warps=2 (32.42)。
+又一次证明**微基准的排名不能迁移到整机**，只能以端到端为准。
+
 ### 27B decode 的 matvec：4-warp → 2-warp（+0.7 tok/s）
 
 `q35_coop_warps()` 在 sm_89 上原本写死 4 warps（128 线程），依据是 header 里那条
