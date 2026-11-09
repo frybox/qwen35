@@ -148,6 +148,8 @@ const Kernels = struct {
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     /// rope64 over `heads` heads of `hd` floats (only the first 64 rotate).
     extern fn q35_launch_rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_rope64_dpos(d_x: ?[*]f32, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_rope64_setenv(d_dyn: ?*anyopaque, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
     /// Row-batched rope64: `rows` tokens `pos0..pos0+rows-1`, each `heads * hd`
     /// floats wide.  PREFILL ONLY (see the note on `VTable.rope64Rows`).
     extern fn q35_launch_rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
@@ -159,6 +161,7 @@ const Kernels = struct {
     /// probing it reads past the end of kernels with fewer arguments and
     /// segfaults (observed).
     extern fn q35_func_rope64() callconv(.c) ?*anyopaque;
+    extern fn q35_func_rope64_dpos() callconv(.c) ?*anyopaque;
     extern fn q35_func_attn_decode() callconv(.c) ?*anyopaque;
     extern fn q35_func_copy_range() callconv(.c) ?*anyopaque;
 };
@@ -235,6 +238,8 @@ const Launch = if (cuda_linked) struct {
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
     const rope64 = Kernels.q35_launch_rope64;
+    const rope64_dpos = Kernels.q35_launch_rope64_dpos;
+    const rope64_setenv = Kernels.q35_launch_rope64_setenv;
     const rope64_rows = Kernels.q35_launch_rope64_rows;
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -349,6 +354,14 @@ const Launch = if (cuda_linked) struct {
     }
     fn rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, heads, hd, pos, base, stream };
+        return stubNoCudaKernels();
+    }
+    fn rope64_dpos(d_x: ?[*]f32, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, heads, hd, d_dyn, stream };
+        return stubNoCudaKernels();
+    }
+    fn rope64_setenv(d_dyn: ?*anyopaque, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_dyn, pos, base, stream };
         return stubNoCudaKernels();
     }
     fn rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
@@ -1055,6 +1068,17 @@ pub const CudaBackend = struct {
     /// `Record` clobber the other direction's pending wait inside one token;
     /// two events remove that coupling for the cost of one extra handle.
     g_ev_out: ?*anyopaque = null,
+    /// Two device int32 {pos, bit pattern of base}: the per-token inputs of
+    /// `k_rope64_dpos`.  Allocated on first use and then just written, so the
+    /// 448 rope nodes of a 27B decode graph carry a constant pointer and never
+    /// need `GraphExecKernelNodeSetParams`.  See `dRope64_body`.
+    g_rope_dyn: ?*anyopaque = null,
+    /// Host alias of `g_rope_dyn` (the mapped pinned page).  Writing here is how
+    /// a token's `pos`/`base` reaches `k_rope64_dpos`.
+    /// What is currently published in `g_rope_dyn`, so the writer kernel runs
+    /// once per token instead of once per head.
+    g_rope_dyn_pos: u32 = 0xFFFF_FFFF,
+    g_rope_dyn_base: f32 = 0.0,
     /// The captured graph, kept only between EndCapture and Instantiate.
     g_graph: ?*anyopaque = null,
     /// Replayable instantiation.  This is the only thing used per token.
@@ -2104,6 +2128,7 @@ pub const CudaBackend = struct {
         }
 
         var rope_found: usize = 0;
+        var rope_dpos_found: usize = 0;
         var attn_found: usize = 0;
         var kv_found: usize = 0;
         var kernel_nodes: usize = 0;
@@ -2137,6 +2162,13 @@ pub const CudaBackend = struct {
                         self.g_rope_params[rope_found] = p;
                         self.g_rope_nodes[rope_found] = node;
                         rope_found += 1;
+                    },
+                    .rope_dpos => {
+                        // Exact and free: `d_dyn` is a constant device pointer,
+                        // so nothing about this node ever changes.  Counted (so
+                        // the banner reports how much of the graph is frozen)
+                        // but never recorded for retargeting.
+                        rope_dpos_found += 1;
                     },
                     .attn => {
                         if (attn_found >= graph_max_layers) continue;
@@ -2218,7 +2250,7 @@ pub const CudaBackend = struct {
             return false;
         }
         if (rope_found != self.g_rope_n or attn_found != self.g_attn_n or
-            rope_found != self.g_expect_rope or attn_found != self.g_expect_attn)
+            rope_found + rope_dpos_found != self.g_expect_rope or attn_found != self.g_expect_attn)
         {
             std.debug.print(
                 "cuda backend: decode graph skipped: matched {d}/{d} rope64 and {d}/{d} attn_decode nodes\n",
@@ -2264,8 +2296,8 @@ pub const CudaBackend = struct {
         // the token being measured.
         _ = cu.lib.GraphUpload(self.g_exec, self.g_stream);
         std.debug.print(
-            "cuda backend: decode graph live ({d} kernels, {d} rope64 + {d} attn_decode + {d} kv-append nodes retargeted per token)\n",
-            .{ kernel_nodes, rope_found, attn_found, kv_found },
+            "cuda backend: decode graph live ({d} kernels, {d} rope64 (frozen: pos from device) + {d} rope64-retargeted + {d} attn_decode + {d} kv-append nodes)\n",
+            .{ kernel_nodes, rope_dpos_found, rope_found, attn_found, kv_found },
         );
         return true;
     }
@@ -2311,7 +2343,12 @@ pub const CudaBackend = struct {
     const attn_arity: usize = 12;
     const kv_arity: usize = 3;
 
-    const NodeClass = enum { rope, attn, kv };
+    /// `cudaHostAllocMapped`.  Spelled out rather than bound from the header:
+    /// this file deliberately keeps to a small hand-written cudart surface (see
+    /// src/cudart.zig), and the flag value is fixed by the ABI.
+    const cudaHostAllocMapped: c_uint = 0x02;
+
+    const NodeClass = enum { rope, rope_dpos, attn, kv };
 
     /// Decide whether a captured kernel node is one of the two retargetable
     /// launches, by matching its `func` against the host-stub address each
@@ -2326,6 +2363,14 @@ pub const CudaBackend = struct {
     fn classifyNode(p: *const cudart.KernelNodeParams) ?NodeClass {
         const f = p.func orelse return null;
         if (f == KernelFns.rope) return .rope;
+        // `k_rope64_dpos` reads {pos, base} from device memory, so its node
+        // parameters are constant for the whole run.  Reporting it as `.rope`
+        // would put it in the retarget loop for no reason; reporting it as
+        // nothing at all would be indistinguishable from an unknown kernel, and
+        // `graphCaptureEnd` treats "nodes present but not all recognised" as a
+        // reason to abandon the graph.  `.rope_dpos` says exactly what it is:
+        // a rope node that needs no per-token work.
+        if (f == KernelFns.rope_dpos) return .rope_dpos;
         if (f == KernelFns.attn) return .attn;
         if (f == KernelFns.kv) return .kv;
         return null;
@@ -2338,6 +2383,7 @@ pub const CudaBackend = struct {
     const KernelFns = struct {
         var resolved: bool = false;
         var rope: ?*anyopaque = null;
+        var rope_dpos: ?*anyopaque = null;
         var attn: ?*anyopaque = null;
         var kv: ?*anyopaque = null;
 
@@ -2349,6 +2395,7 @@ pub const CudaBackend = struct {
             // build without CUDA kernels cannot be capturing a CUDA graph.
             if (cuda_linked) {
                 rope = Kernels.q35_func_rope64();
+                rope_dpos = Kernels.q35_func_rope64_dpos();
                 attn = Kernels.q35_func_attn_decode();
                 kv = Kernels.q35_func_copy_range();
             }
@@ -2402,7 +2449,7 @@ pub const CudaBackend = struct {
         // argument-index drift cannot turn into a wrong launch geometry -- it
         // just declines the node.
         switch (cls) {
-            .rope => {
+            .rope, .rope_dpos => {
                 if (p.grid_dim_x != 1 or p.grid_dim_y != 1) return false;
                 if (p.shared_mem_bytes != 0) return false;
             },
@@ -2460,6 +2507,8 @@ pub const CudaBackend = struct {
     fn arityOf(cls: NodeClass) usize {
         return switch (cls) {
             .rope => rope_arity,
+            // k_rope64_dpos(float *d_x, int heads, int hd, const void *d_dyn)
+            .rope_dpos => 4,
             .attn => attn_arity,
             .kv => kv_arity,
         };
@@ -2523,6 +2572,11 @@ pub const CudaBackend = struct {
             // k_rope64(float *d_x, int heads, int hd, int pos, float base)
             .rope => switch (i) {
                 0 => 8,
+                else => 4,
+            },
+            // k_rope64_dpos(float *d_x, int heads, int hd, const void *d_dyn)
+            .rope_dpos => switch (i) {
+                0, 3 => 8,
                 else => 4,
             },
             // q35_attn_decode_kernel(const float *d_q, const float *d_gate,
@@ -2751,6 +2805,10 @@ pub const CudaBackend = struct {
     /// stream no longer matches what was instantiated, and replaying again would
     /// hand back the same failure at best.
     fn graphDestroyForFallback(self: *CudaBackend) void {
+        // The device channel may already hold a value for a pos this run never
+        // published through the direct path; drop the cache so the next `rope64`
+        // rewrites it unconditionally instead of assuming it is current.
+        self.g_rope_dyn_pos = 0xFFFF_FFFF;
         if (self.cu) |*cu| {
             if (self.g_exec) |e| {
                 _ = cu.lib.GraphExecDestroy(e);
@@ -4672,6 +4730,53 @@ pub const CudaBackend = struct {
     //
     // If this ever goes zero-copy by default, the fix is to accept the drift
     // deliberately (with the measured number), NOT to rewrite the reference.
+    /// Lazily allocate the two-int {pos, base} channel for `k_rope64_dpos`.
+    /// Returns the DEVICE address the kernel reads, or null on failure (caller
+    /// then falls back to the constant-argument kernel, so a missing 8 bytes
+    /// degrades to "retarget per token" rather than to wrong math).
+    ///
+    /// The two rejected designs are worth recording, because both look right:
+    ///   1. `cudaMalloc` + `cudaMemcpyAsync(H2D)` on the launch stream -- a
+    ///      host-to-device copy is not capturable, so the first captured
+    ///      `rope64` failed and the whole decode graph was abandoned
+    ///      (`rope64 launch failed: operation failed due to a previous error
+    ///      during capture`).
+    ///   2. `cudaHostAlloc(Mapped)` + CPU stores -- no copy and capture-safe,
+    ///      but every rope kernel then reads the value over PCIe: measured
+    ///      26.9 -> 12.2 tok/s on the 27B.
+    /// What works is a plain DEVICE buffer written by a 1-thread kernel on the
+    /// launch stream (`k_rope64_setenv`), which captures like any other node and
+    /// costs one launch per token instead of 448 retargets.
+    fn ensureRopeDyn(self: *CudaBackend) ?*anyopaque {
+        if (self.g_rope_dyn) |p| return p;
+        const cu = &(self.cu orelse return null);
+        var p: ?*anyopaque = null;
+        const rc = cu.lib.Malloc(&p, @sizeOf([2]i32));
+        if (rc != cudart.cudaSuccess or p == null) {
+            self.ewLaunchFail("rope64_dpos alloc", rc);
+            return null;
+        }
+        self.g_rope_dyn = p;
+        return p;
+    }
+
+    /// Publish this token's `{pos, base}` into the device channel, but only when
+    /// it actually changed (the engine calls `rope64` once per head, so the same
+    /// token would otherwise publish 448 times).  Returns true if it launched the
+    /// writer, i.e. if the caller must not assume the values are already there.
+    fn ropeDynPublished(self: *CudaBackend, pos: u32, base: f32) bool {
+        if (self.g_rope_dyn == null) return false;
+        if (self.g_rope_dyn_pos == pos and self.g_rope_dyn_base == base) return false;
+        const rc = Launch.rope64_setenv(self.g_rope_dyn, @bitCast(pos), base, self.launchStream());
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("rope64_setenv", rc);
+            return false;
+        }
+        self.g_rope_dyn_pos = pos;
+        self.g_rope_dyn_base = base;
+        return true;
+    }
+
     fn dRope64_body(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.g_op_seen.rope64)) return;
@@ -4699,6 +4804,35 @@ pub const CudaBackend = struct {
                 // the capture token's base, which is a wrong angle on every
                 // replay (and if the swap happens to occur *during* capture it
                 // is wrong from the first replayed token).
+                // DEVICE-SIDE `pos` (see `k_rope64_dpos` in rope.cu).  The
+                // kernel reads {pos, base} out of a two-int device buffer, so
+                // the node's parameters never change and the decode graph can
+                // replay 448 rope nodes on a 27B without a single
+                // `cudaGraphExecKernelNodeSetParams`.  Measured on the 27B
+                // IQ3_XXS: retargeting those 448 nodes per token was the
+                // largest host cost in decode -- 17.5 `cuEventSynchronize` and
+                // ~1.9k libcuda calls per token, with the GPU idle 64% of the
+                // wall time waiting for the host to hand it the next token.
+                //
+                // The buffer is written with an ASYNC copy on the same stream,
+                // never a blocking one: a blocking `cuMemcpy` inside an open
+                // capture invalidates the graph (`cudaErrorStreamCaptureUnsupported`),
+                // which is what `copyFromHost` has to guard against.
+                if (self.ensureRopeDyn()) |dyn| {
+                    // Publish {pos, base} once per token (the engine calls this
+                    // once per head).  The writer is an ordinary kernel on the
+                    // launch stream, so it is captured and replayed with the
+                    // rest of the step and never needs re-parameterising.
+                    _ = self.ropeDynPublished(pos, base);
+                    const rc = Launch.rope64_dpos(px, 1, @intCast(n), dyn, self.launchStream());
+                    if (rc == cudart.cudaSuccess) {
+                        self.stat_rope_devices += 1;
+                        if (self.capturing()) self.graphNoteRope(pos, base);
+                        return;
+                    }
+                    if (self.capturing()) self.graphAbandon("rope64_dpos launch failed");
+                    self.ewLaunchFail("rope64_dpos", rc);
+                }
                 const rc = Launch.rope64(px, 1, @intCast(n), @bitCast(pos), base, self.launchStream());
                 if (rc == cudart.cudaSuccess) {
                     self.stat_rope_devices += 1;
@@ -5553,6 +5687,13 @@ pub const CudaBackend = struct {
                         return;
         }
         if (self.g_state == .warm and !self.g_failed) {
+            // Allocate the rope {pos, base} channel BEFORE the capture opens.
+            // A `cudaMalloc` inside an open stream capture is not legal, and the
+            // first `rope64` of the capture step is where it would have landed:
+            // measured as "rope64 launch failed: operation failed due to a
+            // previous error during capture" with the graph abandoned from the
+            // very first token.
+            _ = self.ensureRopeDyn();
             if (self.graphBegin(pos, pos)) self.g_capturing_step = true;
         }
     }

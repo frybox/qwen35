@@ -188,6 +188,19 @@ int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream);
 int q35_launch_rope64(float *d_x, int heads, int hd, int pos, float base,
                       void *stream);
 
+// `rope64` with the per-token inputs kept in DEVICE memory: `d_dyn` points at
+// two device int32, {pos, bit pattern of the f32 base}.  Same arithmetic as
+// `q35_launch_rope64` (see rope.cu), but because no kernel parameter changes
+// from token to token, a captured decode graph can replay these nodes without
+// `cudaGraphExecKernelNodeSetParams` -- which on a 27B meant 448 calls per
+// token and was the single largest host cost in decode.
+int q35_launch_rope64_dpos(float *d_x, int heads, int hd, const void *d_dyn,
+                           void *stream);
+void *q35_func_rope64_dpos(void);
+// Publish {pos, float-bits(base)} into the channel `q35_launch_rope64_dpos`
+// reads.  A kernel, not a memcpy, because only a kernel is capturable.
+int q35_launch_rope64_setenv(int *d_dyn, int pos, float base, void *stream);
+
 // --- Gated Delta Net state machine -----------------------------------------
 // All `heads` value heads of one delta-rule state update in ONE launch
 // (`heads` blocks; block h is the call above for head h).

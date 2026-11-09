@@ -214,6 +214,20 @@ __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
 // Deliberately NO `rpb`: multi-row-per-warp was measured worse on this model
 // (17.8 -> 12.6 tok/s at rpb=4), and it multiplies the shared-memory footprint
 // which is the other thing this kernel must keep small.
+// `WARPS` warps cooperate on ONE row (the shape llama.cpp's `mul_mat_vec_q`
+// uses: `blocks_per_iter = vdr*nwarps*32/qi`, so the whole block covers the row
+// in a single pass).  The alternative -- each warp taking its own row, which is
+// what this kernel originally did via `row = blockIdx.x*WARPS + warp` -- only
+// ever gave one warp's worth of loads per row in flight, and on 27B IQ3_XXS
+// decode that left the reduce cost dominant: a 20-block row needs 20 serial
+// `__fadd_rn` plus 20 shared stores per token, against only 5 rounds of actual
+// dot work when SPLIT=8.  Measured on the 27B: 26.9 tok/s with one warp per row
+// vs a warp-group per row below.
+//
+// Lane->work mapping: lane `l` handles block `b` and the `l % SPLIT` slice of it,
+// blocks stride by `WARPS*Q35_WARP/SPLIT` so the warp group covers the row in
+// `nblk / (WARPS * Q35_WARP / SPLIT)` rounds and each lane's reads for a block
+// stay contiguous.
 template <int WARPS, int SPLIT>
 __global__ void q35_k_mul_mat_vec_q_split_t(const unsigned char *__restrict__ w,
                                             const unsigned char *__restrict__ xq,
@@ -224,37 +238,40 @@ __global__ void q35_k_mul_mat_vec_q_split_t(const unsigned char *__restrict__ w,
     const int lane = threadIdx.x & (Q35_WARP - 1);
     const int warp = threadIdx.x / Q35_WARP;
 
-    // One float per (warp, block): each block's FULL sum lands here, so the
-    // lane-0 fold below is the same strict b = 0..nblk-1 order the coop kernel
-    // uses.
+    // One float per block for the whole warp group: each block's FULL sum lands
+    // here, so the lane-0 fold below is the same strict b = 0..nblk-1 order the
+    // coop kernel uses (bit-identical reduction order, checked by MVCHECK).
     extern __shared__ float part_dyn[];
-    float *part_w = part_dyn + (size_t)warp * (size_t)nblk;
+    float *part_w = part_dyn;
 
-    const int row = blockIdx.x * WARPS + warp;
+    const int row = blockIdx.x;
     if (row >= rows) return;
     const size_t row_stride = (size_t)nblk * (size_t)info.block_bytes;
 
     const int part = lane & (SPLIT - 1);        // which slice of the block
     const int lblock = lane / SPLIT;            // which lane-slot within a block
     constexpr int kBlocksPerStep = Q35_WARP / SPLIT;
-    // Round the block count UP to a multiple of `kBlocksPerStep` so every lane
+    // All WARPS warps walk one interleaved block sequence so no block is covered
+    // twice: warp `w` starts at `lblock + w*kBlocksPerStep` and every step
+    // advances by the full group width.
+    constexpr int kGroupStep = WARPS * kBlocksPerStep;
+    // Round the block count UP to a multiple of `kGroupStep` so every lane
     // executes the same number of loop rounds.  This is not cosmetic: with a
-    // ragged trip count (`nblk % kBlocksPerStep != 0`, e.g. SPLIT=4 and
-    // nblk=20 -> some lanes 3 rounds, some 2) the warp is left DIVERGENT at the
-    // loop exit, and the full-mask `__syncwarp()` that used to sit there hangs
-    // the device outright.  Measured: SPLIT=2/4 hung on the very first block,
-    // while SPLIT=8 looked fine only because 20 % 4 == 0 made every lane run 5
-    // rounds.  Keeping the `__shfl_down_sync` in the out-of-range rounds (on a
-    // dummy value) keeps the warp converged without an extra barrier.
-    const int rounds = (nblk + kBlocksPerStep - 1) / kBlocksPerStep;
+    // ragged trip count the warp is left DIVERGENT at the loop exit, and the
+    // `__shfl_down_sync` below would have to run on a partial mask.  (The
+    // original version used a full-mask `__syncwarp()` there instead and hung
+    // the device outright whenever `nblk % kBlocksPerStep != 0`; measured:
+    // SPLIT=2/4 hung on the very first block, while SPLIT=8 survived only
+    // because 20 % 4 == 0.)
+    const int rounds = (nblk + kGroupStep - 1) / kGroupStep;
     // Fast path: when `nblk` divides evenly the padding never triggers, so the
     // in-range test inside the loop is pure overhead on the hot path.
-    const bool even = (nblk % kBlocksPerStep) == 0;
+    const bool even = (nblk % kGroupStep) == 0;
 
     for (int t = 0; t < tokens; ++t) {
         const unsigned char *arow = xq + (size_t)t * (size_t)nblk * (size_t)info.act_bytes;
         for (int r = 0; r < rounds; ++r) {
-            const int b = lblock + r * kBlocksPerStep;
+            const int b = lblock + warp * kBlocksPerStep + r * kGroupStep;
             float v = 0.0f;
             if (even || b < nblk) {
                 const unsigned char *pb = w + (size_t)row * row_stride +
@@ -270,15 +287,18 @@ __global__ void q35_k_mul_mat_vec_q_split_t(const unsigned char *__restrict__ w,
             for (int o = 1; o < SPLIT; o <<= 1) v += __shfl_down_sync(0xffffffffu, v, o);
             if (part == 0 && (even || b < nblk)) part_w[b] = v;
         }
-        // Legitimate now: the padded loop above leaves the warp converged.
-        __syncwarp();
-        // Strict left-to-right fold per warp, matching q35_dot_row's order.
-        if (lane == 0) {
+        // Block-wide barrier, NOT `__syncwarp()`: the WARPS warps of this block
+        // all write into the shared `part_w`, so the fold has to wait for every
+        // warp, not just this one.  It must be reached by ALL threads
+        // unconditionally -- a `__syncthreads()` inside the `warp == 0` branch
+        // deadlocks the block.
+        __syncthreads();
+        // Strict left-to-right fold, matching q35_dot_row's order, on one lane.
+        if (warp == 0 && lane == 0) {
             float acc = 0.0f;
             for (int b = 0; b < nblk; ++b) acc = __fadd_rn(acc, part_w[b]);
             out[(size_t)t * rows + row] = acc;
         }
-        __syncwarp();
     }
 }
 
@@ -689,7 +709,7 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
             }
             if (split >= 2 && q35_memonly() == 0) {
                 const int warps_s = q35_coop_warps(nblk);
-                const size_t shmem_s = (size_t)warps_s * (size_t)nblk * sizeof(float);
+                const size_t shmem_s = (size_t)nblk * sizeof(float);
                 if (shmem_s > 48u * 1024u) {
                     static size_t max_set_s = 0;
                     if (shmem_s > max_set_s) {
@@ -722,7 +742,10 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
                         max_set_s = shmem_s;
                     }
                 }
-                const int blocks_s = (rows + warps_s - 1) / warps_s;
+                // One block per ROW now: the WARPS warps inside it split that
+                // row's K dimension between them (see the kernel header), so
+                // the shared buffer is one `nblk`-float row, not WARPS of them.
+                const int blocks_s = rows;
                 #define Q35_SPLIT_LAUNCH(W, S) \
                     q35_k_mul_mat_vec_q_split_t<W, S><<<blocks_s, W * Q35_WARP, shmem_s, stream>>>( \
                         d_w, d_xq, d_out, rows, cols, tokens, ttype)

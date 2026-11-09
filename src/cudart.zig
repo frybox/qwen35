@@ -234,6 +234,11 @@ pub const Lib = struct {
     /// without it even `cudaMemcpyAsync` silently takes the staged path, which is
     /// why the two are always used together here.
     HostAlloc: *const fn (*?*anyopaque, usize, u32) callconv(.c) c_int,
+    /// Device-side address of a `HostAlloc` region allocated with
+    /// `cudaHostAllocMapped`.  This is what makes a "per-token scalar" free:
+    /// the CPU stores it and the kernel reads it through the same physical
+    /// page, so neither a copy nor a graph retarget is needed.
+    HostGetDevicePointer: *const fn (*?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int,
     FreeHost: *const fn (?*anyopaque) callconv(.c) c_int,
     MemcpyAsync: *const fn (?*anyopaque, ?*const anyopaque, usize, c_int, ?*anyopaque) callconv(.c) c_int,
     /// Device-side `memset`.  Needed so the error paths of the numeric slots can
@@ -430,6 +435,7 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
     L.Free = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaFree", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.HostAlloc = bind(&out.lib, *const fn (*?*anyopaque, usize, u32) callconv(.c) c_int, "cudaHostAlloc", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.FreeHost = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaFreeHost", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.HostGetDevicePointer = bind(&out.lib, *const fn (*?*anyopaque, ?*anyopaque, u32) callconv(.c) c_int, "cudaHostGetDevicePointer", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.MemcpyAsync = bind(&out.lib, *const fn (?*anyopaque, ?*const anyopaque, usize, c_int, ?*anyopaque) callconv(.c) c_int, "cudaMemcpyAsync", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.Memcpy = bind(&out.lib, *const fn (?*anyopaque, ?*const anyopaque, usize, c_int) callconv(.c) c_int, "cudaMemcpy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.MemGetInfo = bind(&out.lib, *const fn (*usize, *usize) callconv(.c) c_int, "cudaMemGetInfo", mbuf, &miss_len) orelse return error.MissingSymbol;
