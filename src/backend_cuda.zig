@@ -637,14 +637,6 @@ const DevRow = struct {
 
 const Geometry = struct { rows: usize, cols: usize };
 
-/// A read-only per-layer weight (gamma, conv1d kernel) kept resident on the
-/// device.  `host`+`bytes` is the identity; see `CudaBackend.dev_const`.
-const DevConst = struct {
-    host: [*]const f32,
-    bytes: usize,
-    dev: *anyopaque,
-};
-
 /// Resolved kernel entry points.  They are link-time symbols from
 /// `src/kernels/cuda/*.cu` (never from cudart), so `Kernels` above is the single
 /// place to audit against `src/kernels/cuda/api.h`.
@@ -1312,9 +1304,9 @@ pub const CudaBackend = struct {
     // `gdnStepRows` consumes them straight from those device pointers.  The
     // scratch that used to live here existed only to re-upload host stack
     // arrays, which cost 2 * heads floats of H2D per layer per token plus a
-    // matching D2H to produce them.  Those two regions must never be
-    // `devConst`-cached either: `devConst` is pointer-keyed and upload-once,
-    // while their contents change every layer every token.
+    // matching D2H to produce them.  Those two regions must never be treated
+    // as read-only weights either: their contents change every layer every
+    // token, so an upload-once pointer-keyed copy would serve stale data.
     /// Every region `dAllocBuf` handed to the engine (activations, KV cache,
     /// GDN state).  The `Buf` values themselves are the engine's; this list is
     /// only so `freeScratch` / `deinit` can release them, since a `Buf` carries
@@ -1327,29 +1319,6 @@ pub const CudaBackend = struct {
     /// host bounce (correct answers, ~2.5 s of needless PCIe on a 355-token
     /// prefill).
     dev_bufs: std.ArrayList(DevRegion) = .empty,
-    /// Resident copies of the read-only per-layer weights the new elementwise
-    /// slots consume (`rmsnorm`'s gamma, `convStep`'s conv1d kernel).  Their
-    /// host buffers (`lw.attn_norm`, `lw.ssm_conv1d`, ...) are model metadata
-    /// that lives for the whole run and is re-passed on EVERY token, so an H2D
-    /// per call would be pure waste -- and for a 0.8B model it is not
-    /// negligible: 18 layers x (1024 + 6144) f32 = 516 KB per token at
-    /// 1000 tok/s = 0.5 GB/s of PCIe for data that never changes.
-    ///
-    /// Keyed on (host pointer, byte length), see `devConst`: the same page can
-    /// legitimately be asked for at two different lengths by two layers
-    /// sharing a weight buffer, and a longer request over an existing shorter
-    /// region must not be satisfied with the short copy.
-    ///
-    /// LIFETIME: allocated on first use, freed in `dFreeScratch` along with the
-    /// other scratch.  NOT freed per layer and not evicted under pressure --
-    /// the set is tiny (one entry per distinct weight buffer, ~20 for a 27B
-    /// model) and the alternative (an LRU) would cost more than it saves.
-    /// P2c: entries kept; the key changes from "host ptr" to "device ptr of
-    /// the already-resident tensor", i.e. `devConst` collapses to a lookup.
-    dev_const: std.ArrayList(DevConst) = .empty,
-
-
-
     // ==== construction ======================================================
 
     /// The engine's factory contract (`engine.backendImplFor` calls
@@ -1433,8 +1402,6 @@ pub const CudaBackend = struct {
             if (self.d_deq) |p| _ = cu.lib.Free(p);
             for (self.dev_bufs.items) |r| _ = cu.lib.Free(r.ptr);
             self.dev_bufs.clearRetainingCapacity();
-            for (self.dev_const.items) |e| _ = cu.lib.Free(e.dev);
-            self.dev_const.clearRetainingCapacity();
             self.d_act = null;
             self.d_xq = null;
             self.d_out = null;
@@ -3313,6 +3280,61 @@ const attn_score_arity: usize = 10;
         self.cpu.exec().freeLinear(w);
     }
 
+    // ==== slot: loadVecF32 ==================================================
+
+    /// Load a 1-D f32 weight vector by name and hand back a device-resident
+    /// `Buf`.  llama.cpp-style residency: the tensor is uploaded exactly once,
+    /// at load time, and the returned `Buf` IS the residency -- its `ptr` is
+    /// the device pointer the elementwise kernels (`rmsnorm`, `convStep`,
+    /// `gdnGamma`, ...) read.  There is no host copy and no first-use upload:
+    /// the old `devConst` path is gone.
+    ///
+    /// The widening/dequant is the CPU loader's single definition (f16/bf16/
+    /// q8_0 -> f32); we upload those bytes and then release the host slice, so
+    /// the weight lives only on the device from here on.
+    fn vLoadVecF32(ctx: *anyopaque, name: []const u8) backend.LoadError!backend.Buf {
+        const self = self_(ctx);
+        const host = self.cpu.exec().loadVecF32(name) catch |err| return err;
+        errdefer self.cpu.exec().freeVec(host);
+        if (host.len == 0) return backend.Buf.empty;
+        if (!self.gpuReady()) {
+            return error.BackendUnavailable;
+        }
+        const cu = &self.cu.?;
+        const bytes = host.len * @sizeOf(f32);
+        var dp: ?*anyopaque = null;
+        const rc = cu.lib.Malloc(&dp, bytes);
+        if (rc != cudart.cudaSuccess) {
+            std.debug.print("cuda backend: 1-D weight '{s}' ({d} B) cudaMalloc failed: {s}\n", .{
+                name, bytes, std.mem.span(cu.lib.errStr(rc)),
+            });
+            return error.OutOfMemory;
+        }
+        const host_bytes = mem.sliceAsBytes(host.slice());
+        const rc2 = cu.lib.Memcpy(dp, host_bytes.ptr, bytes, cudart.MemcpyHostToDevice);
+        if (rc2 != cudart.cudaSuccess) {
+            _ = cu.lib.Free(dp);
+            std.debug.print("cuda backend: 1-D weight '{s}' ({d} B) upload failed: {s}\n", .{
+                name, bytes, std.mem.span(cu.lib.errStr(rc2)),
+            });
+            return error.OutOfMemory;
+        }
+        // Uploaded: the host slice is dead; the `Buf` we hand back is the device
+        // region.  (Success return, so the `errdefer` above does NOT run.)
+        self.cpu.exec().freeVec(host);
+        const dev: [*]f32 = @ptrCast(@alignCast(dp.?));
+        return backend.Buf{ .ptr = dev, .len = host.len };
+    }
+
+    fn vFreeVec(ctx: *anyopaque, v: backend.Buf) void {
+        const self = self_(ctx);
+        if (v.len == 0) return; // `Buf.empty` sentinel: nothing was uploaded.
+        if (self.cu) |cu| {
+            _ = cu.lib.Free(@ptrCast(v.ptr));
+        }
+        // Context already torn down: the device memory died with it.
+    }
+
     // ==== slot: dequantRow ==================================================
 
     /// Expand one row of a packed weight on the device.
@@ -4134,8 +4156,6 @@ const attn_score_arity: usize = 10;
         if (self.d_xq) |p| _ = cu.lib.Free(p);
         if (self.d_out) |p| _ = cu.lib.Free(p);
         if (self.d_deq) |p| _ = cu.lib.Free(p);
-        for (self.dev_const.items) |e| _ = cu.lib.Free(e.dev);
-        self.dev_const.clearRetainingCapacity();
         self.d_act = null;
         self.d_act_bytes = 0;
         self.d_xq = null;
@@ -4159,8 +4179,9 @@ const attn_score_arity: usize = 10;
     // every slot below passes `buf.ptr` straight to the launcher.  The P2b
     // staging triple and its `d_stage` slots are gone: there is exactly one
     // legal host->device path left in this file,
-    // `devConst` (read-only weights, uploaded once), and no device->host path on
-    // the per-token execution at all -- the only D2H left is `downloadOut` for
+    // `vLoadVecF32` (read-only 1-D weight vectors, uploaded once at load time),
+    // and no device->host path on the per-token execution at all -- the only D2H
+    // left is `downloadOut` for
     // matvec results, which is the values the sampler needs.
     //
     // `dBufPtr` below is the whole replacement: it is `ensureGpu` + a pointer
@@ -4204,42 +4225,6 @@ const attn_score_arity: usize = 10;
         std.debug.print("cuda backend: {s} launch failed: {s}\n", .{
             what, std.mem.span(cu.lib.errStr(rc)),
         });
-    }
-
-    /// Device copy of a read-only weight slice, uploaded at most once per
-    /// (pointer, length).  Returns null when the device is unavailable or the
-    /// upload fails -- the caller then takes the CPU path, exactly like a
-    /// failed launch does.
-    ///
-    /// This is THE only host->device copy left on the per-token path, and it is
-    /// a cache rather than a transfer: a hit returns the resident pointer with
-    /// no `cudaMemcpy` at all, which is what makes re-passing a per-layer
-    /// weight every token free.  `bytes` is the identity's second half for the
-    /// reason in `dev_const`.
-    fn devConst(self: *CudaBackend, host: []const f32) !?[*]f32 {
-        if (host.len == 0) return null;
-        const bytes = host.len * @sizeOf(f32);
-        const cu = if (self.cu) |*c| c else return error.DeviceUnavailable;
-        for (self.dev_const.items) |e| {
-            if (e.host == host.ptr and e.bytes == bytes) return @ptrCast(@alignCast(e.dev));
-        }
-        var p: ?*anyopaque = null;
-        var cap: usize = 0;
-        try ensureBuf(&cu.lib, &p, &cap, bytes);
-        const rc = cu.lib.Memcpy(p.?, host.ptr, bytes, cudart.MemcpyHostToDevice);
-        if (rc != cudart.cudaSuccess) {
-            _ = cu.lib.Free(p.?);
-            std.debug.print("cuda backend: constant upload failed ({d} B): {s}\n", .{
-                bytes, std.mem.span(cu.lib.errStr(rc)),
-            });
-            return error.MemcpyFailed;
-        }
-        try self.dev_const.append(self.alloc, .{
-            .host = host.ptr,
-            .bytes = bytes,
-            .dev = p.?,
-        });
-        return @ptrCast(@alignCast(p.?));
     }
 
     // The four slots.  Each is a FORWARDER rather than an alias to
@@ -4481,8 +4466,9 @@ const attn_score_arity: usize = 10;
     //     different implementation in the device runtime than in glibc.  The
     //     measured figures are in the .cu headers.
     //   * The read-only weight operand (`w` in rmsnorm, `wconv` in convStep) is
-    //     a per-layer constant re-passed on every token, so it is NOT a device
-    //     `Buf` -- `devConst` keeps it resident, and a cache hit costs nothing.
+    //     a per-layer constant re-passed on every token, so it IS a device `Buf`
+    //     uploaded exactly once at load time (`loadVecF32`); each call just reads
+    //     the resident device pointer -- no per-token upload.
 
     fn dRmsnorm_body(ctx: *anyopaque, out: backend.Buf, x: backend.Buf, w: backend.Buf, eps: f32) void {
         const self = self_(ctx);
@@ -4494,14 +4480,12 @@ const attn_score_arity: usize = 10;
         if (x.len != 0 and w.len != 0 and x.len % w.len == 0 and x.len == out.len and self.cu != null) {
             if (dBufPtr(x)) |px| {
                 if (dBufPtr(out)) |po| {
-                    if (self.devConst(w.slice())) |pw_unwrapped| {
-                        if (pw_unwrapped) |pw| {
-                            const rows: c_int = @intCast(x.len / w.len);
-                            const rc = Launch.rmsnorm(po, px, pw, rows, @intCast(w.len), eps, self.launchStream());
-                            if (rc == cudart.cudaSuccess) return;
-                            self.ewLaunchFail("rmsnorm", rc);
-                        }
-                    } else |_| {}
+                    if (dBufPtr(w)) |pw| {
+                        const rows: c_int = @intCast(x.len / w.len);
+                        const rc = Launch.rmsnorm(po, px, pw, rows, @intCast(w.len), eps, self.launchStream());
+                        if (rc == cudart.cudaSuccess) return;
+                        self.ewLaunchFail("rmsnorm", rc);
+                    } else return;
                 } else return;
             } else return;
         }
@@ -4523,15 +4507,13 @@ const attn_score_arity: usize = 10;
         if (rows_in != 0 and n != 0 and x.len == rows_in * n and out.len == rows_in * n and self.cu != null) {
             if (dBufPtr(x)) |px| {
                 if (dBufPtr(out)) |po| {
-                    if (self.devConst(w.slice())) |pw_unwrapped| {
-                        if (pw_unwrapped) |pw| {
-                            const rc = Launch.rmsnorm(po, px, pw, @intCast(rows_in), @intCast(n), eps, self.launchStream());
-                            if (rc == cudart.cudaSuccess) {
-                                return;
-                            }
-                            self.ewLaunchFail("rmsnorm_rows", rc);
+                    if (dBufPtr(w)) |pw| {
+                        const rc = Launch.rmsnorm(po, px, pw, @intCast(rows_in), @intCast(n), eps, self.launchStream());
+                        if (rc == cudart.cudaSuccess) {
+                            return;
                         }
-                    } else |_| {}
+                        self.ewLaunchFail("rmsnorm_rows", rc);
+                    } else return;
                 } else return;
             } else return;
         }
@@ -4877,11 +4859,11 @@ const attn_score_arity: usize = 10;
                                         // sigmoid(b) write-back), so the kernel
                                         // reads them where they already live:
                                         // no H2D, no D2H, nothing per token.
-                                        // They must NOT go through `devConst`
-                                        // (pointer-keyed, upload-once): their
-                                        // contents change per layer per token,
-                                        // which would silently freeze layer 0's
-                                        // coefficients for the whole run.
+                                        // They must NOT be cached as read-only
+                                        // weights (pointer-keyed, upload-once):
+                                        // their contents change per layer per
+                                        // token, which would silently freeze
+                                        // layer 0's coefficients for the run.
                                         if (dBufPtr(gamma)) |pgamma| {
                                             if (dBufPtr(beta)) |pbeta| {
                                                 const rc = Launch.gdn_step_rows(
@@ -4914,9 +4896,10 @@ const attn_score_arity: usize = 10;
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.g_op_seen.gdn_gamma)) return;
-        // Every operand here except `ssm_a`/`dt_bias` is a live backend region.
-        // The two weight rows are per-layer constants, so they go through the
-        // `devConst` cache exactly like the norm weights do.
+        // Every operand here is a backend region.  The two weight rows
+        // (`ssm_a`, `dt_bias`) are per-layer constants and, like the norm
+        // weights, are device `Buf`s uploaded exactly once at load time
+        // (`loadVecF32`); the rest are live per-token regions.
         if (self.cu != null and nv != 0 and
             a_raw.len >= nv and b_raw.len >= nv and ssm_a.len >= nv and
             dt_bias.len >= nv and gamma.len >= nv)
@@ -4924,17 +4907,13 @@ const attn_score_arity: usize = 10;
             if (dBufPtr(a_raw)) |pa| {
                 if (dBufPtr(b_raw)) |pb| {
                     if (dBufPtr(gamma)) |pg| {
-                        if (self.devConst(ssm_a.slice())) |sa_unwrapped| {
-                            if (sa_unwrapped) |sa| {
-                                if (self.devConst(dt_bias.slice())) |db_unwrapped| {
-                                    if (db_unwrapped) |db| {
-                                        const rc = Launch.gdn_gamma(pa, pb, sa, db, pg, @intCast(nv), self.launchStream());
-                                        if (rc == cudart.cudaSuccess) return;
-                                        self.ewLaunchFail("gdn_gamma", rc);
-                                    }
-                                } else |_| {}
-                            }
-                        } else |_| {}
+                        if (dBufPtr(ssm_a)) |sa| {
+                            if (dBufPtr(dt_bias)) |db| {
+                                const rc = Launch.gdn_gamma(pa, pb, sa, db, pg, @intCast(nv), self.launchStream());
+                                if (rc == cudart.cudaSuccess) return;
+                                self.ewLaunchFail("gdn_gamma", rc);
+                            } else return;
+                        } else return;
                     } else return;
                 } else return;
             } else return;
@@ -5297,13 +5276,11 @@ const attn_score_arity: usize = 10;
         if (conv.len == 3 * y.len and wconv.len == 4 * y.len and self.cu != null) {
             if (dBufPtr(conv)) |pc| {
                 if (dBufPtr(y)) |py| {
-                    if (self.devConst(wconv.slice())) |pw_unwrapped| {
-                        if (pw_unwrapped) |pw| {
-                            const rc = Launch.conv_step(pc, py, pw, @intCast(y.len), self.launchStream());
-                            if (rc == cudart.cudaSuccess) return;
-                            self.ewLaunchFail("conv_step", rc);
-                        }
-                    } else |_| {}
+                    if (dBufPtr(wconv)) |pw| {
+                        const rc = Launch.conv_step(pc, py, pw, @intCast(y.len), self.launchStream());
+                        if (rc == cudart.cudaSuccess) return;
+                        self.ewLaunchFail("conv_step", rc);
+                    } else return;
                 } else return;
             } else return;
         }
@@ -6660,7 +6637,8 @@ pub const vtable = backend.Exec.VTable{
     .convStep = CudaBackend.dConvStep,
     .gdnStep = CudaBackend.dGdnStep,
     .gdnStepRows = CudaBackend.dGdnStepRows,
-    .constBuf = cpu_mod.CpuBackend.vtable.constBuf,
+    .loadVecF32 = CudaBackend.vLoadVecF32,
+    .freeVec = CudaBackend.vFreeVec,
     .attnDecode = CudaBackend.dAttnDecode,
     .gdnGamma = CudaBackend.dGdnGamma,
     .copyFromHost = CudaBackend.dCopyFromHost,

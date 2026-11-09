@@ -1049,9 +1049,35 @@ pub const CpuBackend = struct {
         return ew.bufSample(logits, scratch, sp);
     }
 
-    fn vConstBuf(ctx: *anyopaque, s: []const f32) Buf {
-        _ = ctx;
+    /// Load a 1-D f32 weight vector by name and hand back a `Buf` over the
+    /// widened copy.  The CPU backend keeps the copy in its own allocator and
+    /// the `Buf` is a plain host slice; the CUDA backend overrides this to
+    /// upload the same widened bytes to the device and hand back the device
+    /// region (see `backend_cuda.zig` `vLoadVecF32`).  `loadTensorF32` is the
+    /// single widening/dequant definition, so the CPU path is byte-identical
+    /// to the historical engine that called it directly.
+    fn vLoadVecF32(ctx: *anyopaque, name: []const u8) backend.LoadError!Buf {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        // `loadTensorF32` can surface a wide error set (every GGUF read error
+        // plus `NotMultipleOfBlock` and the allocator's).  Fold it into the
+        // backend's `LoadError`: missing tensor and OOM keep their names; every
+        // other failure (bad magic, unexpected EOF, a row that is not a whole
+        // block, ...) means "this tensor is unusable as a 1-D vector", which
+        // is reported as unsupported rather than silently truncated.
+        const s = loadTensorF32(self.alloc, self.g, name) catch |err| {
+            return switch (err) {
+                error.MissingTensor => error.MissingTensor,
+                error.OutOfMemory => error.OutOfMemory,
+                else => error.UnsupportedTensorType,
+            };
+        };
         return Buf.wrap(s);
+    }
+
+    fn vFreeVec(ctx: *anyopaque, v: Buf) void {
+        const self: *CpuBackend = @ptrCast(@alignCast(ctx));
+        if (v.len == 0) return; // `Buf.empty` sentinel: nothing was allocated.
+        self.alloc.free(v.slice());
     }
 
     /// `pub` so a backend that composes (rather than replaces) the CPU
@@ -1084,7 +1110,8 @@ pub const CpuBackend = struct {
         .convStep = vConvStep,
         .gdnStep = vGdnStep,
         .gdnStepRows = vGdnStepRows,
-        .constBuf = vConstBuf,
+        .loadVecF32 = vLoadVecF32,
+        .freeVec = vFreeVec,
         .allocBuf = vAllocBuf,
         .attnDecode = vAttnDecode,
         .gdnGamma = vGdnGamma,

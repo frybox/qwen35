@@ -572,7 +572,7 @@ pub const Engine = struct {
     /// token_embd.  GGUF `output.weight` has the SAME [vocab, hidden]
     /// row-major layout as token_embd.
     output_weight: ?LinearW,
-    output_norm: []f32, // [hidden]
+    output_norm: backend.Buf, // [hidden]
     /// Hardware boundary: matvecs, weight loading, dequantization and the
     /// activation scratch the kernels need.  The engine never learns which
     /// implementation this is -- CPU today, CUDA later.
@@ -692,24 +692,24 @@ pub const Engine = struct {
     }
 
     const LayerWeights = struct {
-        attn_norm: []f32,
-        post_attention_norm: []f32,
+        attn_norm: backend.Buf,
+        post_attention_norm: backend.Buf,
         // GDN-only
         attn_qkv: ?LinearW = null,
         attn_gate: ?LinearW = null,
         ssm_alpha: ?LinearW = null, // a (decay input)
         ssm_beta: ?LinearW = null, // b (beta input)
-        ssm_conv1d: ?[]f32 = null, // F32 [4, conv_dim]: w[ch*k + t]
-        ssm_dt_bias: ?[]f32 = null, // [nv], already softplus-anchored
-        ssm_a: ?[]f32 = null, // [nv], already -exp(A_log)
-        ssm_norm: ?[]f32 = null, // [128]
+        ssm_conv1d: backend.Buf = backend.Buf.empty, // F32 [4, conv_dim]: w[ch*k + t]
+        ssm_dt_bias: backend.Buf = backend.Buf.empty, // [nv], already softplus-anchored
+        ssm_a: backend.Buf = backend.Buf.empty, // [nv], already -exp(A_log)
+        ssm_norm: backend.Buf = backend.Buf.empty, // [128]
         ssm_out: ?LinearW = null,
         // full-attention-only
         attn_q: ?LinearW = null, // [1024, 4096] = per-head [q|gate] interleaved
         attn_k: ?LinearW = null,
         attn_v: ?LinearW = null,
-        attn_q_norm: ?[]f32 = null, // [256]
-        attn_k_norm: ?[]f32 = null, // [256]
+        attn_q_norm: backend.Buf = backend.Buf.empty, // [256]
+        attn_k_norm: backend.Buf = backend.Buf.empty, // [256]
         attn_output: ?LinearW = null,
         // shared
         ffn_gate: LinearW,
@@ -877,7 +877,7 @@ pub const Engine = struct {
             .owns_io = null,
             .token_embd = .{ .f32 = &.{} },
             .output_weight = null,
-            .output_norm = &.{},
+            .output_norm = backend.Buf.empty,
             .exec = exec,
             .layers = &.{},
             .kv = &.{},
@@ -915,19 +915,19 @@ pub const Engine = struct {
             error.MissingTensor => null,
             else => return err,
         };
-        e.output_norm = try backend_cpu.loadTensorF32(alloc, &g, "output_norm.weight");
+        e.output_norm = try exec.loadVecF32("output_norm.weight");
 
         const n_layers = cfg.n_layers;
         e.layers = try alloc.alloc(LayerWeights, n_layers);
         var loaded: usize = 0;
-        errdefer for (e.layers[0..loaded]) |lw| freeLayerWeights(alloc, lw);
+        errdefer for (e.layers[0..loaded]) |lw| e.freeLayerWeights(lw);
         for (0..n_layers) |li| {
             var b1: [64]u8 = undefined;
             var b2: [64]u8 = undefined;
             const idx: u32 = @intCast(li);
             const lw = LayerWeights{
-                .attn_norm = try backend_cpu.loadTensorF32(alloc, &g, std.fmt.bufPrint(&b1, "blk.{d}.attn_norm.weight", .{idx}) catch unreachable),
-                .post_attention_norm = try backend_cpu.loadTensorF32(alloc, &g, std.fmt.bufPrint(&b2, "blk.{d}.post_attention_norm.weight", .{idx}) catch unreachable),
+                .attn_norm = try exec.loadVecF32(std.fmt.bufPrint(&b1, "blk.{d}.attn_norm.weight", .{idx}) catch unreachable),
+                .post_attention_norm = try exec.loadVecF32(std.fmt.bufPrint(&b2, "blk.{d}.post_attention_norm.weight", .{idx}) catch unreachable),
                 .ffn_gate = try exec.loadLinear(tname(&b1, "blk.{d}.ffn_gate.weight", idx)),
                 .ffn_up = try exec.loadLinear(tname(&b2, "blk.{d}.ffn_up.weight", idx)),
                 .ffn_down = try exec.loadLinear(tname(&b1, "blk.{d}.ffn_down.weight", idx)),
@@ -971,7 +971,7 @@ pub const Engine = struct {
 
         // load the per-type weights now that layer type is known
         var loaded2: usize = 0;
-        errdefer for (e.layers[0..loaded2]) |*lw| freeLayerTyped(alloc, lw);
+        errdefer for (e.layers[0..loaded2]) |*lw| e.freeLayerTyped(lw);
         for (0..n_layers) |li| {
             const idx: u32 = @intCast(li);
             var b1: [64]u8 = undefined;
@@ -980,18 +980,18 @@ pub const Engine = struct {
                 e.layers[li].attn_q = try exec.loadLinear(tname(&b1, "blk.{d}.attn_q.weight", idx));
                 e.layers[li].attn_k = try exec.loadLinear(tname(&b2, "blk.{d}.attn_k.weight", idx));
                 e.layers[li].attn_v = try exec.loadLinear(tname(&b1, "blk.{d}.attn_v.weight", idx));
-                e.layers[li].attn_q_norm = try backend_cpu.loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.attn_q_norm.weight", idx));
-                e.layers[li].attn_k_norm = try backend_cpu.loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.attn_k_norm.weight", idx));
+                e.layers[li].attn_q_norm = try exec.loadVecF32(tname(&b2, "blk.{d}.attn_q_norm.weight", idx));
+                e.layers[li].attn_k_norm = try exec.loadVecF32(tname(&b1, "blk.{d}.attn_k_norm.weight", idx));
                 e.layers[li].attn_output = try exec.loadLinear(tname(&b2, "blk.{d}.attn_output.weight", idx));
             } else {
                 e.layers[li].attn_qkv = try exec.loadLinear(tname(&b1, "blk.{d}.attn_qkv.weight", idx));
                 e.layers[li].attn_gate = try exec.loadLinear(tname(&b2, "blk.{d}.attn_gate.weight", idx));
                 e.layers[li].ssm_alpha = try exec.loadLinear(tname(&b1, "blk.{d}.ssm_alpha.weight", idx));
                 e.layers[li].ssm_beta = try exec.loadLinear(tname(&b2, "blk.{d}.ssm_beta.weight", idx));
-                e.layers[li].ssm_conv1d = try backend_cpu.loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_conv1d.weight", idx));
-                e.layers[li].ssm_dt_bias = try backend_cpu.loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_dt.bias", idx));
-                e.layers[li].ssm_a = try backend_cpu.loadTensorF32(alloc, &g, tname(&b1, "blk.{d}.ssm_a", idx));
-                e.layers[li].ssm_norm = try backend_cpu.loadTensorF32(alloc, &g, tname(&b2, "blk.{d}.ssm_norm.weight", idx));
+                e.layers[li].ssm_conv1d = try exec.loadVecF32(tname(&b1, "blk.{d}.ssm_conv1d.weight", idx));
+                e.layers[li].ssm_dt_bias = try exec.loadVecF32(tname(&b2, "blk.{d}.ssm_dt.bias", idx));
+                e.layers[li].ssm_a = try exec.loadVecF32(tname(&b1, "blk.{d}.ssm_a", idx));
+                e.layers[li].ssm_norm = try exec.loadVecF32(tname(&b2, "blk.{d}.ssm_norm.weight", idx));
                 e.layers[li].ssm_out = try exec.loadLinear(tname(&b1, "blk.{d}.ssm_out.weight", idx));
             }
             loaded2 += 1;
@@ -1105,24 +1105,28 @@ pub const Engine = struct {
     }
 
 
-    fn freeLayerWeights(alloc: std.mem.Allocator, lw: LayerWeights) void {
-        // Linear weights are zero-copy views into the GGUF mapping (both the
-        // `.quant` and `.f32` arms), so there is nothing to release for them:
-        // the views die with the mapping.
-        alloc.free(lw.attn_norm);
-        alloc.free(lw.post_attention_norm);
+    /// Release the two norm vectors every layer has.  The `LinearW` fields are
+    /// zero-copy views into the GGUF mapping (both the `.quant` and `.f32`
+    /// arms), so there is nothing to release for those: the views die with the
+    /// mapping.  The norm vectors are backend regions (`loadVecF32`), so they
+    /// are released through the backend, not the engine allocator.
+    fn freeLayerWeights(self: *Engine, lw: LayerWeights) void {
+        self.exec.freeVec(lw.attn_norm);
+        self.exec.freeVec(lw.post_attention_norm);
     }
 
-    fn freeLayerTyped(alloc: std.mem.Allocator, lw: *LayerWeights) void {
+    fn freeLayerTyped(self: *Engine, lw: *LayerWeights) void {
         // The `?LinearW` fields (attn_qkv / ssm_alpha / ffn_gate / ...) are all
-        // zero-copy views into the mapping -- nothing to free.
-        // plain f32 scratch tensors (owned by the engine)
-        inline for (.{
-            &lw.ssm_conv1d,  &lw.ssm_dt_bias, &lw.ssm_a, &lw.ssm_norm,
-            &lw.attn_q_norm, &lw.attn_k_norm,
-        }) |p| {
-            if (p.*) |w| alloc.free(w);
-        }
+        // zero-copy views into the mapping -- nothing to free.  The 1-D f32
+        // vectors are backend regions (`loadVecF32`); a `Buf.empty` (a layer
+        // type that does not use that vector) is a no-op in `freeVec`, so all
+        // six are released unconditionally.
+        self.exec.freeVec(lw.ssm_conv1d);
+        self.exec.freeVec(lw.ssm_dt_bias);
+        self.exec.freeVec(lw.ssm_a);
+        self.exec.freeVec(lw.ssm_norm);
+        self.exec.freeVec(lw.attn_q_norm);
+        self.exec.freeVec(lw.attn_k_norm);
     }
 
     /// Release the KV / GDN regions for the first `n` layers.
@@ -1149,11 +1153,11 @@ pub const Engine = struct {
         const a = self.alloc;
         // `token_embd` / `output_weight` are zero-copy views into the mapping;
         // the layer `LinearW`s are the same (see `freeLayerWeights`).
-        if (self.output_norm.len > 0) a.free(self.output_norm);
+        self.exec.freeVec(self.output_norm);
         self.exec.freeScratch();
         if (self.layers.len > 0) {
-            for (self.layers) |lw| freeLayerWeights(a, lw);
-            for (self.layers) |*lw| freeLayerTyped(a, lw);
+            for (self.layers) |lw| self.freeLayerWeights(lw);
+            for (self.layers) |*lw| self.freeLayerTyped(lw);
             a.free(self.layers);
         }
         self.freeCachesUpTo(self.cfg.n_layers);
@@ -1249,7 +1253,7 @@ pub const Engine = struct {
         }
         const b = Io.Clock.Timestamp.now(io, .awake);
 
-        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(self.output_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, self.output_norm, c.rms_eps);
         // lm_head: untied `output.weight` when present, else tied token_embd.
         // Both are [vocab, hidden] row-major.
         if (self.output_weight) |ow| {
@@ -1363,7 +1367,7 @@ pub const Engine = struct {
             // is bit-identical to the per-token loop it replaces.  The
             // per-token loop issued `k` launches of a 5 us kernel per layer per
             // norm, which was 5.6% of prefill device time on 27B IQ3_XXS.
-            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), Buf.wrap(lw.attn_norm), k, c.rms_eps);
+            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.attn_norm, k, c.rms_eps);
 
             if (c.isFullAttention(@intCast(li))) {
                 self.exec.matvecBatchK(self.qkvK.span(0, k * 2 * q_dim), lw.attn_q.?, self.x1K, k);
@@ -1401,7 +1405,7 @@ pub const Engine = struct {
 
             // ---- MLP: chunk-wide norm, batched gate/up, chunk-wide SwiGLU,
             // batched down, residual ----
-            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), Buf.wrap(lw.post_attention_norm), k, c.rms_eps);
+            self.exec.rmsnormRows(self.x1K.span(0, k * hidden), self.xK.span(0, k * hidden), lw.post_attention_norm, k, c.rms_eps);
             self.exec.matvecBatchK(self.mlpK.span(0, k * n_ff), lw.ffn_gate, self.x1K, k);
             self.exec.matvecBatchK(self.mlpK1.span(0, k * n_ff), lw.ffn_up, self.x1K, k);
             // SwiGLU over the whole chunk: `gate[i] = silu(gate[i]) * up[i]` is
@@ -1415,7 +1419,7 @@ pub const Engine = struct {
 
         // ---- last token: final RMSNorm + lm_head on a single token (serial
         // path, so the first sampled logits are bit-identical) ----
-        self.exec.rmsnorm(self.x1, self.xK.span((k - 1) * hidden, hidden), Buf.wrap(self.output_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.xK.span((k - 1) * hidden, hidden), self.output_norm, c.rms_eps);
         if (self.output_weight) |ow| {
             switch (ow) {
                 .quant, .f32 => self.exec.matvec(self.logits, ow, self.x1),
@@ -1449,7 +1453,7 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd; // Q and K sections are nk*kd wide each
         const value_dim: usize = nv * vd; // 2048 (0.8B) / 4096 (4B)
 
-        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(lw.attn_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
 
         // in_proj_qkv [hidden, conv_dim]: [Q|K|V] contiguous (SPEC A1);
         // Q,K are nk*kd wide, V is nv*kd wide
@@ -1471,7 +1475,7 @@ pub const Engine = struct {
         // convStep handles history + silu for all channels; beta/gamma
         // are computed after, on the RAW a/b projections (not conv'd).
         const st = &self.gdn[li];
-        self.exec.convStep(st.conv, qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
+        self.exec.convStep(st.conv, qkv, lw.ssm_conv1d, c.conv_kernel);
 
         // beta = sigmoid(b); g = A * softplus(a + dt_bias) with A = ssm_a
         // (GGUF ssm_a is already -exp(A_log), i.e. negative, verified.)
@@ -1489,7 +1493,7 @@ pub const Engine = struct {
         // `VTable.gdnStepRows`.
         const beta = self.ab.span(nv, nv); // b half, overwritten with sigmoid(b)
         const gamma = self.gamma_scratch.span(0, nv);
-        self.exec.gdnGamma(ab.span(0, nv), beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), gamma, nv);
+        self.exec.gdnGamma(ab.span(0, nv), beta, lw.ssm_a, lw.ssm_dt_bias, gamma, nv);
 
         const state = st.state; // [nv, kd, vd] row-major S[k][v]
         const gout = self.gdn_out.span(0, value_dim);
@@ -1570,7 +1574,7 @@ pub const Engine = struct {
         //
         // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
         // shared `ssm_norm` row, so this is the three-condition batch.
-        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), Buf.wrap(lw.ssm_norm.?), nv, c.rms_eps);
+        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
         // `mulSilu` is elementwise with no reduction and no per-row state, so the
         // `nv` heads collapse into this one call over the same `nv * vd` run --
         // unlike the norm merges above, there is no repeat-count subtlety here.
@@ -1658,8 +1662,8 @@ pub const Engine = struct {
         // each row's normalisation is independent (own sum of squares), so this
         // is the three-condition batch.  `rmsnormRows` launches `heads` blocks
         // of `k_rmsnorm`, i.e. the identical per-row arithmetic.
-        self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), Buf.wrap(lw.attn_q_norm.?), heads, c.rms_eps);
-        self.exec.rmsnormRows(k.span(0, kv_dim), k.span(0, kv_dim), Buf.wrap(lw.attn_k_norm.?), kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), lw.attn_q_norm, heads, c.rms_eps);
+        self.exec.rmsnormRows(k.span(0, kv_dim), k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
         // (rope64 is NOT here: the chunk-wide `rope64Rows` pass in `forwardChunk`
         // has already rotated every token's q and k in one launch.  `pos` is kept
         // in the signature because the attention below still needs `slot`.)
@@ -1706,13 +1710,13 @@ pub const Engine = struct {
         const ab_a = self.abK.span(t * nv, nv);
         const beta = self.abK.span(k * nv + t * nv, nv);
         const st = &self.gdn[li];
-        self.exec.convStep(st.conv, qkv, Buf.wrap(lw.ssm_conv1d.?), c.conv_kernel);
+        self.exec.convStep(st.conv, qkv, lw.ssm_conv1d, c.conv_kernel);
         // Same regions as the serial path above: gamma is the backend's `nv`
         // decay values, beta has been overwritten in place by `gdnGamma` with
         // sigmoid(b), and both are consumed by `gdnStepRows` straight from
         // device memory -- no `copyToHost`, no re-upload.
         const gamma = self.gamma_scratch.span(0, nv);
-        self.exec.gdnGamma(ab_a, beta, Buf.wrap(lw.ssm_a.?), Buf.wrap(lw.ssm_dt_bias.?), gamma, nv);
+        self.exec.gdnGamma(ab_a, beta, lw.ssm_a, lw.ssm_dt_bias, gamma, nv);
 
         const state = st.state;
         const gout = self.goutK.span(t * value_dim, value_dim);
@@ -1771,7 +1775,7 @@ pub const Engine = struct {
         // shared `ssm_norm` row, so the rmsnorm batch is the three-condition
         // case.  `mulSilu` then collapses the same run in one call: it is
         // elementwise over arbitrary `n`, with no per-row state to preserve.
-        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), Buf.wrap(lw.ssm_norm.?), nv, c.rms_eps);
+        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
         self.exec.mulSilu(gout.span(0, value_dim), z.span(0, value_dim));
     }
 
@@ -1785,7 +1789,7 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd; // 512
         const gqa: usize = heads / kv_heads; // 4
 
-        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(lw.attn_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, lw.attn_norm, c.rms_eps);
 
         // q_proj [1024, 4096]: view(8, 512) then chunk -> per-head [q|gate]
         const qg = self.qkv.span(0, 2 * q_dim);
@@ -1813,8 +1817,8 @@ pub const Engine = struct {
         // a device buffer so its nodes need no retargeting, but `rope64_rows`
         // launches a different kernel with no host-stub identity for the graph
         // to match.  See `dRope64Rows_body`'s capture guard.
-        self.exec.rmsnormRows(q.span(0, heads * hd), q.span(0, heads * hd), Buf.wrap(lw.attn_q_norm.?), heads, c.rms_eps);
-        self.exec.rmsnormRows(self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), Buf.wrap(lw.attn_k_norm.?), kv_heads, c.rms_eps);
+        self.exec.rmsnormRows(q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
+        self.exec.rmsnormRows(self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
         // RoPE on first 64 dims of each q/k head
         for (0..heads) |h| {
             self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);
@@ -1849,7 +1853,7 @@ pub const Engine = struct {
     fn forwardMlp(self: *Engine, lw: *LayerWeights) void {
         const c = self.cfg;
         const hidden: usize = c.hidden;
-        self.exec.rmsnorm(self.x1, self.x, Buf.wrap(lw.post_attention_norm), c.rms_eps);
+        self.exec.rmsnorm(self.x1, self.x, lw.post_attention_norm, c.rms_eps);
         self.exec.matvec(self.mlp_h, lw.ffn_gate, self.x1);
         self.exec.matvec(self.mlp_h1, lw.ffn_up, self.x1);
         self.exec.swiglu(self.mlp_h, self.mlp_h1);
@@ -2120,7 +2124,7 @@ test "convStep: causal left-pad semantics" {
         .io = undefined,
         .token_embd = .{ .f32 = &.{} },
         .output_weight = null,
-        .output_norm = &.{},
+        .output_norm = backend.Buf.empty,
         .exec = undefined,
         .layers = &.{},
         .kv = &.{},

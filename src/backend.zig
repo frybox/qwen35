@@ -78,7 +78,8 @@ pub const Buf = struct {
     }
     /// Wrap an existing host slice (the CPU case for GGUF-side tensors: norm
     /// weights, conv taps, rope tables).  A device backend must instead upload
-    /// the tensor and return the device region — see `constBuf`.
+    /// the tensor at load time and hand back a device-backed `Buf` — see
+    /// `loadVecF32`.
     pub fn wrap(s: []const f32) Buf {
         return .{ .ptr = @constCast(s.ptr), .len = s.len };
     }
@@ -116,6 +117,18 @@ pub const Exec = struct {
         loadLinear: *const fn (ctx: *anyopaque, name: []const u8) LoadError!LinearW,
         /// Release what `loadLinear`/`allocScratch` allocated.
         freeLinear: *const fn (ctx: *anyopaque, w: LinearW) void,
+        /// Load one 1-D f32 weight vector (a norm's gamma, a conv tap row,
+        /// `ssm_a`, `dt_bias`, ...) by tensor name.  The returned `Buf` is a
+        /// backend region -- a host pointer on a CPU backend, a device pointer
+        /// on a device backend -- that the elementwise slots read directly; the
+        /// engine keeps only this handle and never dereferences it.  The tensor
+        /// is widened (f16/bf16/quant -> f32) and, on a device backend, uploaded
+        /// ONCE here at load time, not per token.
+        loadVecF32: *const fn (ctx: *anyopaque, tensor_name: []const u8) LoadError!Buf,
+        /// Release what `loadVecF32` allocated.  A `Buf.empty` argument is a
+        /// no-op (the sentinel the engine uses for an unallocated optional
+        /// vector), so callers can free unconditionally.
+        freeVec: *const fn (ctx: *anyopaque, v: Buf) void,
 
         // ---- activation scratch --------------------------------------------
         /// Allocate the per-token / per-chunk scratch the kernels need.
@@ -317,13 +330,6 @@ pub const Exec = struct {
         /// identically on both paths.
         sample: *const fn (ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32,
 
-        /// Make a constant tensor (norm weight, conv taps, rope table, ssm_a,
-        /// dt_bias) available as a `Buf` the elementwise slots can read.  A CPU
-        /// backend wraps the host slice; a device backend uploads it once and
-        /// returns the device region (cached, so this is called per tensor at
-        /// load time, not per token).  Copying is the backend's business; the
-        /// engine keeps only the returned handle.
-        constBuf: *const fn (ctx: *anyopaque, s: []const f32) Buf,
 
         /// Mark a phase boundary in the pool's timing counters (no-op for a
         /// device backend, which reports its own timings).
@@ -390,6 +396,12 @@ pub const Exec = struct {
     }
     pub fn freeLinear(self: Exec, w: LinearW) void {
         self.vtable.freeLinear(self.ptr, w);
+    }
+    pub fn loadVecF32(self: Exec, tensor_name: []const u8) LoadError!Buf {
+        return self.vtable.loadVecF32(self.ptr, tensor_name);
+    }
+    pub fn freeVec(self: Exec, v: Buf) void {
+        self.vtable.freeVec(self.ptr, v);
     }
     pub fn allocScratch(self: Exec, max_cols: usize) anyerror!void {
         return self.vtable.allocScratch(self.ptr, max_cols);
@@ -510,9 +522,6 @@ pub const Exec = struct {
     }
     pub fn sample(self: Exec, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         return self.vtable.sample(self.ptr, logits, scratch, sp);
-    }
-    pub fn constBuf(self: Exec, s: []const f32) Buf {
-        return self.vtable.constBuf(self.ptr, s);
     }
     pub fn profPhase(self: Exec, on: bool) void {
         self.vtable.profPhase(self.ptr, on);
