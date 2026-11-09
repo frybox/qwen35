@@ -119,7 +119,12 @@ Q35_DEV unsigned int q35_ld_u32(const unsigned char *p) {
     return lo | (hi << 16);
 }
 Q35_DEV unsigned short q35_ld_u16(const unsigned char *p) {
-    return (unsigned short)((unsigned short)p[0] | ((unsigned short)p[1] << 8));
+    // Same defect as q35_ld_u32 above, same fix: the byte chain
+    // `p[0] | p[1]<<8` compiles to TWO ld.global.u8 because nvcc cannot prove
+    // the alignment of an `unsigned char *`.  Every block payload is at least
+    // 2-byte aligned (all block sizes are even, and every u16 field sits at an
+    // even offset inside them), so delegate to the same generic `ld.u16`.
+    return q35_ld_u16_low(p);
 }
 Q35_DEV float q35_f16_at(const unsigned char *p, int off) {
     return q35_ld_scale(p + off);  // common.cuh: f16 bits -> f32 (exact)
