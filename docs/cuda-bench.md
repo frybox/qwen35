@@ -296,6 +296,21 @@ slot（169 次 `add_resid`、84 次 `swiglu`、63 次 `l2norm`、21 次 `rmsnorm
 
 - **跨层流水**：为第 `i+1` 层的激活做 quantize 的同时跑第 `i` 层的 matvec。
   需要 `d_xq` 双缓冲 + 提前拿到下一个激活。引擎按 phase 产激活，天然可预取。
-- 或者 **matvec 内部融合 quantize**（`vecdotq.cuh` 直接从 f32 现算 Q8_K 量化值），
-  彻底消灭这个独立 launch —— llama.cpp 的 mmq 在 prefill 走的就是这条路。
+
+**已否决："llama.cpp 的 matvec 内部融合了 quantize，照它做就能消灭这个 launch"。**
+这条曾经写在本节里，是错的，2026-11 逐行核对了 `/mnt/llm-dev/llama.cpp/ggml/src/ggml-cuda/`：
+
+- **decode（mmvq）**：`mmvq.cu:1534` 在发起 matvec 之前调
+  `quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), ...)`，
+  它落在 `quantize.cu:570` 的 `ggml_cuda_kernel_launch(quantize_q8_1, ...)` ——
+  **独立的 kernel launch**，和本项目的 `q35_launch_quantize_q8k` 是一回事。
+- **prefill（mmq）**：`mmq.cu:253` 同样先调 `quantize_mmq_q8_1_cuda(...)`，
+  它在 `quantize.cu:574` 也是独立 `__global__`（`CUDA_QUANTIZE_BLOCK_SIZE_MMQ` 的 block）。
+- `vecdotq.cuh` 里没有"从 f32 现算 Q8_K"的路径：所有 dot kernel 的第二个参数都是
+  已量化好的 `block_q8_1` / `block_q8_K`。llama.cpp **没有**融合这一步。
+
+所以 llama.cpp 也有这个 launch；它比我们快不是因为它省了它。
+（它确实省了一点：`src1_q8_1` 分配到**一个** pool buffer，而我们的
+`actQValid/actQMark` 记忆化已经做到 192 hit / 310 miss，比逐次量化更好。）
+这条不要再当依据。
 
