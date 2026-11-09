@@ -214,6 +214,48 @@ QWEN35_MVCHECK=1       # 逐类型与 CPU 后端比对（开销极大）
    之前"graph 比 standalone 慢 13 ms"是 bench 假象（`mb_replay` 复用同一个 1 MB 输出缓冲区，
    写上被 L2 吸收，且没做 quantize）。
 
+### decode attention 的访存（已修，`f36a45d`）
+
+`attn_decode` 曾是 decode 里除 matvec 之外最大的一项：**`QWEN35_ABLATE=attn_decode`
+能省 14.3 ms/token**（33.8 → 19.4 ms），且**与上下文长度无关**（n=60/300/900 都是 14.3）。
+当时误判成 CUDA graph 的 `GraphExecKernelNodeSetParams`，花了一轮把 `slot` 改成设备标量
+（`q35_attn_decode_kernel_dyn` + `q35_launch_set_int1`）——**24 次/token 的 SetParams 全部消失，
+tok/s 一点没动**。所以那个归因是错的。
+
+真实原因是**访存**，而且必须用 24 份各自独立的 per-layer KV cache 才量得出来：
+
+- `mb_attn`（共享一份 cache，n≤300）给出 0.0174/0.0578 ms —— **这是 L2 命中，不是 DRAM**，
+  被它误导了整整一轮。换成 24 份 102/141/180 MB 的 cache 后真相是
+  **3.05 / 3.86 / 4.97 ms**（slot 518/717/917），只有 **33–37 GB/s**。
+- 原因：一个 head 一个 block → **24 个 block 打在 114 个 SM 上（21% 占用率）**，
+  而每个 lane 串行走完整个 n 行；naive kernel 还把第 `t` 行分给第 `t` 号线程，
+  一个 warp 的 32 个线程读相距 4 KB 的 32 行，每行只用 `hd/kv_dim = 256/1024`。
+- 两步修复，都在 `attn.cu`：
+  1. `q35_attn_decode_kernel_coal`：warp 读一行的连续段、lane 铺 `j`、
+     `__shfl_down_sync` 归约 → **33 → 68 GB/s**（3.09 → 1.50 ms），逐位不变。
+  2. `q35_attn_score_split_kernel` + `q35_attn_softmax_kernel` +
+     `q35_attn_decode_kernel_split` + `q35_attn_reduce_kernel`（`split2`）：
+     **score 和 PV 两段行走都按行切成 `split` 份**（切一段没用，实测只切 PV
+     反而 1.52 → 1.66 ms）→ **325 GB/s / 0.555 ms @ slot 917**，8.9×。
+- **精确性**：score 的 j 求和仍是串行顺序，softmax 仍是 CPU 的 max/串行求和/除法顺序，
+  唯一被二级树重结合的是 PV 的 t 求和 —— 即便这样也是 `mismatched=0 worst=0`
+  （对每个 head、slot 0/5/63/300/516–519/530/700/1023 全对）。
+- **必须让 `split` 留在 CUDA graph 里**才有收益（graph 关掉时 28.99 → 30.90，
+  开 graph 才到 31.5）。做法是设备标量版 `q35_launch_attn_decode_split_dyn`：
+  每层 **4 个常量参数节点**（score/softmax/PV/reduce+gate），
+  在节点普查里各有自己的 class（`attn_score`/`attn_reduce`），永不需要 SetParams。
+- 三个 bug 全是 microbench 抓到的，值得记下：
+  1. softmax 拆成独立 kernel 后**每个 head 一个 block**，但引擎给所有 head 的是
+     **同一份 `slot+1` 行**（原 kernel 一个 head 一个 block 所以无所谓）。
+     不改就是 head>0 读到别的 head 的分数 → **输出非确定**（同一条命令跑两次 md5 不同）。
+     现在 split 路径用自己的 `heads * Q35_ATTN_MAX_ROWS` scratch（`d_att_prob`）。
+  2. PV kernel 的 `d_prob` 少了同样的 per-head 步长，`split2` 与 `split_dyn` 差 0.35。
+  3. 文件里还留着旧 launcher 的副本，仍在跑"不切分的 pass 1"。
+
+**结果：`QWEN35_ABLATE=attn_decode` 现在只省 1.2 ms**（31.36 → 32.55 tok/s），
+即那 14.3 ms 已经基本消灭，decode 重新是 **95%+ matvec**（ablate matvec → 196.9 tok/s）。
+decode **29.3 → 31.5 tok/s**（`-n 400`，`make test` 20/20，`QWEN35_MVCHECK` mismatched=0）。
+
 ### 激活量化缓存（已修）
 
 `backend_cuda.zig` 有 `actQValid`/`actQMark` 记忆化：`d_xq` 里现成装着
