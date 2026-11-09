@@ -108,9 +108,22 @@
 // global/shared address space" surfacing at the *next* cudaMemcpy (measured at
 // startup on the 20480 B norm-weight upload).  Generic `ld` resolves the space
 // at runtime, which is what the byte chain compiled to anyway.
+//
+// WHY the `"memory"` clobber is mandatory (measured regression, 2026-11): the
+// asm tells the compiler it has NO side effects and reads no memory, so ptxas
+// is free to reorder it relative to ordinary stores.  The q4_k SPLIT part body
+// (q35_vec_dot_q4_k_q8_k_part) writes the local `w8[16]` and reads it back
+// through q35_ld_u32 inside one small unrolled loop; without the clobber the
+// loads get scheduled before the stores and the dot reads the PREVIOUS
+// iteration's w8 -- Q4_K_M/Q3_K decode decodes to garble while every
+// direct-call test of this very loader passes (a plain buffer has no reorder
+// opportunity), and SPLIT=0/coop happens to schedule fine.  The 6233a1d
+// byte-chain version could not misbehave because `p[0]|p[1]<<8|...` is an
+// ordinary tracked memory read.  Do not drop the clobber to "simplify" the
+// asm; it is the only thing standing between this and silent corruption.
 Q35_DEV unsigned short q35_ld_u16_low(const unsigned char *p) {
     unsigned short v;
-    asm("ld.u16 %0, [%1];" : "=h"(v) : "l"(p));
+    asm("ld.u16 %0, [%1];" : "=h"(v) : "l"(p) : "memory");
     return v;
 }
 Q35_DEV unsigned int q35_ld_u32(const unsigned char *p) {
