@@ -600,15 +600,31 @@ static int q35_coop_warps(int nblk) {
     if (warps == 0) {
         const int cc = q35_gpu_cc();
         if (cc == 809) {
-            // sm_89 measured best: 4 warps (128 threads).  See the header
-            // comment above for the 124 vs 77 tok/s decode measurement.
-            warps = 4;
+            // sm_89: 2 warps (64 threads), NOT the 4 the older 124-vs-77 tok/s
+            // header measurement picked.  That measurement predates the
+            // K-split decode path; once the row is split across lanes the
+            // shared-memory footprint per block is what limits occupancy, and
+            // 64 threads doubles the resident block count.  Re-measured on the
+            // 27B IQ3_XXS at -n 300 and -n 400 with the long prompt, twice each:
+            //   warps=1  32.18 / 32.03   (long: 31.89)
+            //   warps=2  32.42 / 32.28   (long: 32.30)   <- best
+            //   warps=3  28.90 / 28.92   (3 warps leaves a partial warp's
+            //                             worth of lanes idle in the 4-warp
+            //                             scheduler slots: never pick it)
+            //   warps=4  31.76 / 31.55   (long: 31.59)
+            // +0.7 tok/s over 4.  The {1,2,4,8} switch below also means 3 could
+            // only ever be reached by the occupancy probe, never by this table.
+            warps = 2;
         } else if (cc > 0) {
+            // The probe can return 3, which the launch switch rounds up to the
+            // 8-warp kernel (see `default:` in Q35_SPLIT_SW) -- a shape the
+            // sm_89 sweep above measured 10% slower.  Snap it down instead.
             const int best = q35_coop_occ_best_warps(nblk);
-            warps = (best >= 1 && best <= 8) ? best : 4;
+            warps = (best >= 1 && best <= 8) ? best : 2;
+            if (warps == 3) warps = 2;
         } else {
             // No usable device (probe failed): keep the sm_89-measured value.
-            warps = 4;
+            warps = 2;
         }
     }
     cached = warps;

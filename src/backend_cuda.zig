@@ -553,7 +553,14 @@ const slot_count = @intFromEnum(Slot.const_buf) + 1;
 /// (`$QWEN35_PROF_GPU` in the environment); the events are created lazily by
 /// `gpuEvEnsure` and destroyed on teardown, so raising it costs nothing at
 /// runtime outside a profiling run.
-const gpu_ev_capacity = 4096;
+///
+/// RAISED AGAIN: the 27B decode token issues ~2273 *timed* calls, but each
+/// call records a pair and the pool is also consumed by the draining slot, so
+/// 4096 still overflowed (measured: 7519 in one 60-token run, i.e. the
+/// attribution below 0.5 ms was being silently dropped).  16384 is the next
+/// power of two with real headroom; it costs 2 * 16384 * sizeof(cudaEvent_t)
+/// in the debug path only.
+const gpu_ev_capacity = 16384;
 
 /// Human-readable slot names for the `PROF-SLOT` line.  Indexed by
 /// `@intFromEnum`, so a `comptime`-checked length ties them to the enum.
