@@ -170,3 +170,76 @@ QWEN35_MVLIST=1        # 打印每个 matvec 形状
 QWEN35_CUDA_GRAPH=0    # 关 CUDA graph，否则 dump 读到的是 capture 期的陈旧零值
 QWEN35_MVCHECK=1       # 逐类型与 CPU 后端比对（开销极大）
 ```
+
+## decode 35.4 ms 的成分拆解（2026-11，27B IQ3_XXS）
+
+这一节记录"到底慢在哪"的实测结论，**所有数字都可用给出的 microbench 复现**，
+不要凭直觉再猜一次。
+
+### 口径修正：microbench 曾经测的是 L2，不是显存
+
+`/tmp/mb/mb_one` 用 `iq3_xxs 17408x5120` 报 353–660 GB/s，看起来"kernel 已经接近带宽上限"。
+但这个形状的权重只有 **34 MB**，而 4090 D 的 L2 是 **72 MB** —— 整个缓冲区都在 L2 里，
+测到的是 **L2 带宽**。把同样的 kernel 换成 **1 GB** 缓冲区（`/tmp/mb/mb_big`）后：
+
+| 缓冲 | ms | GB/s |
+|------|-----|------|
+| 32 MB | 0.052 | 651 |
+| 256 MB | 0.443 | 606 |
+| **1024 MB** | **1.756** | **612** |
+
+结论：**单形状 matvec 在真实显存上能做到 612 GB/s**，不是 353。
+"kernel 效率不足"这个判断当时被 L2 污染了。
+
+### 真实差距：quantize 在关键路径上
+
+用 `QWEN35_MVLIST` dump 出真实 token 的 **500 个 matvec 序列**，把 51 个权重缓冲区
+散在 **10.8 GB arena**（= 真实模型足迹，避开 L2）里重放（`/tmp/mb/mb_spread`）：
+
+| 配置 | ms/token | GB/s |
+|------|---------|------|
+| 只跑 500 个 matvec | 22.67 | 483 |
+| + 每 matvec 之间插入 l2norm 等小 kernel | 23.09 | 475 |
+| **+ 每个 matvec 前做一次 quantize（真实 app 的形状）** | **32.24** | **340** |
+| + 两者都有（≈ 真实 app） | 33.69 | 325 |
+
+**真实 app 实测 35.4 ms / 310 GB/s，与最后一行吻合。**
+两个结论因此是硬的：
+
+1. **显存带宽不是瓶颈**：同样的 500 次 matvec 单独跑只要 22.7 ms（就是 483 GB/s，
+   已经是 DRAM 的合理水平）。app 的 35.4 ms 里 **约 10 ms 纯粹是 quantize 的串行代价**。
+   因为 quantize 与 matvec 在同一条 stream 上，matvec 必须等自己的 quantize 排空，
+   这 10 ms 期间显存是**闲着的**。
+2. **CUDA graph 无辜**：同一个 launch 序列 bare-loop 21.85 ms vs graph 21.47 ms。
+   之前"graph 比 standalone 慢 13 ms"是 bench 假象（`mb_replay` 复用同一个 1 MB 输出缓冲区，
+   写上被 L2 吸收，且没做 quantize）。
+
+### 激活量化缓存（已修）
+
+`backend_cuda.zig` 有 `actQValid`/`actQMark` 记忆化：`d_xq` 里现成装着
+`(src, family, cols)` 的 Q8_K 激活就不重复量化。两处曾经让它形同虚设：
+
+- **key 里带了 `ttype`**。打包布局只由 **family** 决定（`actFamily` 把所有 256 元素块类型
+  折叠成 Q8_K），所以 q4_k→iq4_xs→iq3_xxs 的切换每次都 miss。去掉 `ttype` 后
+  hit 从 103 升到 176（**28.26 → 29.23 tok/s**）。
+- **`slotExit` 用"非 matvec 即失效"**。实际只有 `rmsnorm`/`add_resid`/`l2norm`/`swiglu`/
+  `copy_range`/`copy_from_host` 等会写激活缓冲区；`rope64`/`attn_decode`/`gdn_*`/`conv_step`/
+  `scale_vec`/`zero_buf` 只碰 qkv/z/ab/KV cache。改成**写者白名单**后 hit 176→192
+  （**29.23 → 29.39 tok/s**）。
+
+两次改动都验证 **`QWEN35_DUMP_IDS` 80 token 逐位相同**。
+
+**剩余的 310 次 miss 是真实工作量，不是缓存缺陷**：用 `QWEN35_QDBG` 逐条打印
+`[qmiss] … last=<slot>` 可以确认，每次 miss 前面都紧跟一个**真的写了那个缓冲区**的
+slot（169 次 `add_resid`、84 次 `swiglu`、63 次 `l2norm`、21 次 `rmsnorm`），
+即每层一次。**缓存已经到设计上限，继续抠 key 没有收益。**
+
+### 下一步的唯一有效方向
+
+要拿回那 ~10 ms，只有把 quantize 挪开关键路径，而不是让它更快或更少：
+
+- **跨层流水**：为第 `i+1` 层的激活做 quantize 的同时跑第 `i` 层的 matvec。
+  需要 `d_xq` 双缓冲 + 提前拿到下一个激活。引擎按 phase 产激活，天然可预取。
+- 或者 **matvec 内部融合 quantize**（`vecdotq.cuh` 直接从 f32 现算 Q8_K 量化值），
+  彻底消灭这个独立 launch —— llama.cpp 的 mmq 在 prefill 走的就是这条路。
+

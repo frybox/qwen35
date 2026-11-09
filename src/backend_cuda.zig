@@ -1077,6 +1077,23 @@ pub const CudaBackend = struct {
     /// a token's `pos`/`base` reaches `k_rope64_dpos`.
     /// What is currently published in `g_rope_dyn`, so the writer kernel runs
     /// once per token instead of once per head.
+    /// What `d_xq` currently holds (see `actQValid`).  `n == 0` means empty.
+    q_hit: usize = 0,
+    q_miss: usize = 0,
+    /// QWEN35_GRTIME: pure graph-replay device time (no host wait inside).
+    gr_ev: [2]?*anyopaque = .{ null, null },
+    gr_ms: f64 = 0,
+    gr_n: usize = 0,
+    /// QWEN35_MVTIME: per-matvec device time accumulator (events, not wall).
+    mv_ev: [2]?*anyopaque = .{ null, null },
+    mv_ns: u64 = 0,
+    mv_on: bool = false,
+    act_q: struct {
+        src: ?[*]const f32 = null,
+        n: usize = 0,
+        cols: usize = 0,
+        fam: cpu_mod.ActFamily = .q8_0,
+    } = .{},
     g_rope_dyn_pos: u32 = 0xFFFF_FFFF,
     g_rope_dyn_base: f32 = 0.0,
     /// The captured graph, kept only between EndCapture and Instantiate.
@@ -2612,6 +2629,29 @@ pub const CudaBackend = struct {
     /// no garbage, just a wrong answer several tokens later.
     ///
     /// Cost is one event record + one wait per token, both host-side, ~1 us.
+    fn grMark(self: *CudaBackend, begin: bool) void {
+        const cu = &(self.cu orelse return);
+        const st = self.g_stream orelse return;
+        var i: usize = 0;
+        if (!begin) i = 1;
+        if (self.gr_ev[i] == null) {
+            var e: ?*anyopaque = null;
+            if (cu.lib.EventCreate(&e, 0) != cudart.cudaSuccess) return;
+            self.gr_ev[i] = e;
+        }
+        if (begin) {
+            _ = cu.lib.EventRecord(self.gr_ev[0], st);
+            return;
+        }
+        _ = cu.lib.EventRecord(self.gr_ev[1], st);
+        _ = cu.lib.EventSynchronize(self.gr_ev[1]);
+        var ms: f32 = 0;
+        if (cu.lib.EventElapsedTime(&ms, self.gr_ev[0], self.gr_ev[1]) == cudart.cudaSuccess) {
+            self.gr_ms += ms;
+            self.gr_n += 1;
+        }
+    }
+
     fn graphSyncFromDefault(self: *CudaBackend) void {
         const cu = &(self.cu orelse return);
         const st = self.g_stream orelse return;
@@ -2933,6 +2973,30 @@ pub const CudaBackend = struct {
             return error.LaunchFailed;
         }
         return nb * actBlockBytes(ttype);
+    }
+
+    /// Memoisation for `quantizeActFrom`: does `d_xq` already hold the
+    /// activation of `src` quantised to `fam` at width `cols`?  Cleared by
+    /// `stepBegin` and by every host write into an activation buffer
+    /// (`copyFromHost`), the only two ways those bytes can change under us.
+    fn actQValid(self: *CudaBackend, src: [*]const f32, fam: cpu_mod.ActFamily, cols: usize) bool {
+        const k = self.act_q;
+        // NB: no ttype in the key.  The packed layout is a function of the
+        // FAMILY alone (`actFamily` collapses every 256-element block type onto
+        // Q8_K), so q4_k -> iq4_xs -> iq3_xxs in one phase must hit.  Keying on
+        // the ttype too made every one of those transitions a MISS and put the
+        // quantize back on the critical path: measured 103 hits / 399 misses per
+        // token, which is the 9.6 ms/token the replay bench reproduces exactly
+        // (matvecs alone 22.7 ms, +quantize-per-matvec 32.2 ms).
+        return k.n != 0 and k.src == src and k.cols == cols and k.fam == fam;
+    }
+
+    fn actQMark(self: *CudaBackend, src: [*]const f32, fam: cpu_mod.ActFamily, cols: usize) void {
+        self.act_q = .{ .src = src, .n = 1, .cols = cols, .fam = fam };
+    }
+
+    fn actQClear(self: *CudaBackend) void {
+        self.act_q = .{ .src = null, .n = 0, .cols = 0, .fam = .q8_0 };
     }
 
     // ==== slot: loadLinear / freeLinear =====================================
@@ -3277,10 +3341,40 @@ pub const CudaBackend = struct {
                     self.clearDevBuf(outBuf);
                     return;
                 };
-                _ = self.quantizeActFrom(d_x, q.ttype, cols) catch {
-                    self.clearDevBuf(outBuf);
-                    return;
-                };
+                // QUANTISE ONCE PER (source, width, activation FAMILY), not once
+                // per matvec.  The engine hands every matvec of one phase the
+                // SAME activation buffer (measured on the 27B: 497 matvecs per
+                // token touch exactly 3 distinct buffers), and the packed form
+                // depends only on the family -- `actFamily` collapses all 256-
+                // element block types onto one Q8_K layout -- so the same bytes
+                // were being re-quantised up to a hundred times per token.
+                //
+                // Why it matters: the quantize is a launch on the CRITICAL PATH
+                // ahead of the matvec, so the GPU cannot start the 60+ us of
+                // weight traffic until it drains.  Measured on 17408x5120
+                // iq3_xxs: matvec alone 54.9 us (666 GB/s), matvec behind its
+                // own quantize 75.2 us (486 GB/s) -- a third of the bandwidth
+                // lost to duplicated work.
+                //
+                // Sound because a matvec only READS `x` (engine.zig writes the
+                // projections into other buffers) and `stepBegin` clears this
+                // cache every token.  Keying on the family rather than on the
+                // ttype is what makes it legal: q4_k / iq4_xs / iq3_xxs all take
+                // the same Q8_K activation, so switching between them must NOT
+                // invalidate it.
+                const fam = cpu_mod.actFamily(q.ttype);
+                const _hit = self.actQValid(d_x, fam, cols);
+                if (cudart.getenv("QWEN35_QSTAT") != null) {
+                    self.q_hit += @intFromBool(_hit);
+                    self.q_miss += @intFromBool(!_hit);
+                }
+                if (!_hit) {
+                    _ = self.quantizeActFrom(d_x, q.ttype, cols) catch {
+                        self.clearDevBuf(outBuf);
+                        return;
+                    };
+                    self.actQMark(d_x, fam, cols);
+                }
                 if (dBufPtr(outBuf)) |pd| {
                     // api.h order: (d_w, d_xq, d_out, rows, cols, tokens, ttype, stream).
                     const rc = Launch.mul_mat_vec(
@@ -4110,6 +4204,9 @@ pub const CudaBackend = struct {
 
     fn dCopyFromHost_body(ctx: *anyopaque, dst: backend.Buf, src: []const f32) void {
         const self = self_(ctx);
+        // The bytes behind `dst` just changed, so anything quantised from it is
+        // stale.  Conservative and free: the next matvec re-quantises.
+        self.actQClear();
         // A blocking copy INVALIDATES an open capture (the runtime returns
         // `cudaErrorStreamCaptureUnsupported` and the graph is left empty), so
         // the capture is abandoned here instead: this token then runs on the
@@ -5024,6 +5121,32 @@ pub const CudaBackend = struct {
         // correctly here (the capture state has not changed during the slot).
         self.gpuEvExit(self.gpu_ev_open, s);
         self.gpu_ev_open = null;
+        // INVALIDATE THE QUANTISED-ACTIVATION CACHE for the slots that can
+        // WRITE an activation buffer.  Matvecs only READ their `x`; the engine
+        // reuses a single `x1` across phases (`rmsnorm(x1) -> 4 matvecs ->
+        // rmsnorm(x1, post_attention_norm) -> 2 matvecs ...`), so a cached hit
+        // surviving a norm would hand the second phase the FIRST phase's
+        // quantised activation.
+        //
+        // The list is an ALLOW-list of writers, not "everything but matvec".
+        // Clearing on every other slot threw the cache away several times per
+        // phase, which put the quantize back on the critical path: measured
+        // 176 hits / 326 misses per token and four distinct activations being
+        // re-quantised 180/80/80/60 times.  The slots NOT listed here
+        // (`rope64`, `attn_decode`, `gdn_step`, `conv_step`, `gdn_gamma`,
+        // `scale_vec`, `zero_buf`, `deinterleave_qg`, `silu`, `softmax`,
+        // `argmax`, `sample`, the allocators) operate on the projection
+        // buffers (`qkv`, `z`, `ab`, `mlp_h`, the KV cache) -- never on the
+        // hidden-state buffer a matvec is about to consume -- so keeping the
+        // cache across them is sound.  Anything added to the engine that writes
+        // the ACTIVATION of a pending matvec must be added here too.
+        //
+        // This must run before the `t0 orelse return` below because the
+        // profiling toggle is off by default.
+        switch (s) {
+            .rmsnorm, .l2norm, .add_resid, .copy_range, .copy_from_host, .swiglu, .mul_silu, .dequant_row, .load_linear, .const_buf => self.act_q.n = 0,
+            else => {},
+        }
         const start = t0 orelse return;
         const ns = durNs(start, self.io);
         const i = @intFromEnum(s);
@@ -5667,11 +5790,14 @@ pub const CudaBackend = struct {
     fn dStepBegin(ctx: *anyopaque, pos: u32) void {
         const self = self_(ctx);
         if (!self.gpuReady()) return;
+        // A new token writes new activations, possibly at the same addresses.
+        self.actQClear();
         if (!graphWanted()) {
             // `$QWEN35_CUDA_GRAPH=0`: the direct path, untouched.
             self.g_state = .off;
             return;
         }
+        if (cudart.getenv("QWEN35_GRTIME") != null) self.grMark(true);
         if (self.g_state == .live) {
             // `slot` starts at `pos` in this engine (`slot == kv.len`, advanced
             // once per step), but it is only a *seed*: `attn_decode`'s own slot is
@@ -5701,6 +5827,10 @@ pub const CudaBackend = struct {
     /// Close a decode step: if this step was captured, instantiate the graph so
     /// the NEXT step can replay it.
     fn dStepEnd(ctx: *anyopaque) void {
+        if (cudart.getenv("QWEN35_QSTAT") != null) {
+            const self0 = self_(ctx);
+            std.debug.print("[qstat] hit={d} miss={d}\n", .{ self0.q_hit, self0.q_miss });
+        }
         const self = self_(ctx);
         if (!self.g_capturing_step) {
             // A REPLAYED step lands here.  Its launches went to `g_stream`, and
@@ -5713,6 +5843,12 @@ pub const CudaBackend = struct {
             // This is the mirror of `graphSyncFromDefault` in `dStepBegin`, and
             // a replay step is precisely when it is needed, so it cannot live
             // behind the `g_capturing_step` early return above.
+            if (cudart.getenv("QWEN35_GRTIME") != null) {
+                self.grMark(false);
+                std.debug.print("[grt] n={d} gpu_ms={d:.3} avg={d:.3} tok/s={d:.2}\n",
+                    .{ self.gr_n, self.gr_ms, if (self.gr_n > 0) self.gr_ms / @as(f64, @floatFromInt(self.gr_n)) else 0,
+                        if (self.gr_ms > 0) @as(f64, @floatFromInt(self.gr_n)) * 1000.0 / self.gr_ms else 0 });
+            }
             if (self.g_state == .live) self.graphSyncToDefault();
             return;
         }

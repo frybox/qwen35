@@ -185,9 +185,108 @@ __global__ void k_argmax(const float *__restrict__ d_x, int n, int *d_out) {
     if (tid == 0) *d_out = s_idx[0];
 }
 
+// ---------------------------------------------------------------------------
+// argmax: TWO-STAGE, MANY BLOCKS.
+//
+// The single-block version above (`k_argmax<<<1,256>>>`) scans all `n` logits
+// from ONE SM.  On the 27B the lm_head is 248320 rows, i.e. ~1 MB of f32, and a
+// lone SM streams that at roughly 1/114 of the chip's bandwidth: measured
+// 13.4 ms of DEVICE time per token for `argmax` alone, which was 34% of the
+// whole decode step (35.4 ms total, of which the matvecs were only 22.4 ms).
+// The wait showed up as "sample"/"argmax" in PROF-SLOT and looked like host
+// overhead; it was one block reading 1 MB.
+//
+// Stage 1 runs `blocks` blocks of 256 threads over strided slices and writes
+// one (value, index) pair each.  Stage 2 folds those `blocks` pairs with a
+// single block.  Ties still resolve to the SMALLER index -- the same
+// "value, then index" combine, so the answer is identical to the serial scan --
+// which is why this can replace the old kernel without changing the token
+// stream.
+// ---------------------------------------------------------------------------
+constexpr int kArgmaxThreads = 256;
+constexpr int kArgmaxMaxBlocks = 512;
+
+__device__ __forceinline__ void argmax_combine(float &bv, int &bi, float v, int i) {
+    if (v > bv || (v == bv && i < bi)) { bv = v; bi = i; }
+}
+
+// Reduce (value, index) across one block into lane 0 of `s_val`/`s_idx`.
+__device__ __forceinline__ void argmax_block_reduce(float *s_val, int *s_idx, int tid) {
+    __syncthreads();
+    for (int stride = kArgmaxThreads >> 1; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            float v = s_val[tid + stride];
+            int i = s_idx[tid + stride];
+            argmax_combine(s_val[tid], s_idx[tid], v, i);
+        }
+        __syncthreads();
+    }
+}
+
+__global__ void k_argmax_partial(const float *__restrict__ d_x, int n,
+                                 float *__restrict__ d_pv, int *__restrict__ d_pi,
+                                 int nblocks) {
+    __shared__ float s_val[kArgmaxThreads];
+    __shared__ int s_idx[kArgmaxThreads];
+    const int tid = threadIdx.x;
+    // Interleave block and thread so consecutive warps read consecutive memory
+    // and the whole grid strides the array exactly once.
+    const int stride = blockDim.x * nblocks;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = blockIdx.x * blockDim.x + tid; i < n; i += stride) {
+        const float v = d_x[i];
+        if (v > best) { best = v; best_i = i; }
+    }
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    argmax_block_reduce(s_val, s_idx, tid);
+    if (tid == 0) { d_pv[blockIdx.x] = s_val[0]; d_pi[blockIdx.x] = s_idx[0]; }
+}
+
+__global__ void k_argmax_final(const float *__restrict__ d_pv, const int *__restrict__ d_pi,
+                               int m, int *__restrict__ d_out) {
+    __shared__ float s_val[kArgmaxThreads];
+    __shared__ int s_idx[kArgmaxThreads];
+    const int tid = threadIdx.x;
+    float best = -CUDART_INF_F;
+    int best_i = 0;
+    for (int i = tid; i < m; i += blockDim.x) argmax_combine(best, best_i, d_pv[i], d_pi[i]);
+    s_val[tid] = best;
+    s_idx[tid] = best_i;
+    argmax_block_reduce(s_val, s_idx, tid);
+    if (tid == 0) *d_out = s_idx[0];
+}
+
 extern "C" int q35_launch_argmax(const float *d_x, int n, int *d_out, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;
-    k_argmax<<<1, 256, 0, stream>>>(d_x, n, d_out);
+    if (n <= kArgmaxThreads * 8) {
+        k_argmax<<<1, 256, 0, stream>>>(d_x, n, d_out);
+        return (int)cudaGetLastError();
+    }
+    // ONE scratch allocation, made on the first call and never resized: this
+    // launcher also runs INSIDE a CUDA graph capture (decode replays `argmax`
+    // as a graph node), and `cudaMalloc` during a capture is illegal -- it
+    // aborts the graph, exactly as `ensureRopeDyn`'s comment records for the
+    // rope channel.  Fixed size for `kArgmaxMaxBlocks`, allocated once.
+    static float *s_pv = nullptr;
+    static int *s_pi = nullptr;
+    if (s_pv == nullptr) {
+        if (cudaMalloc((void **)&s_pv, sizeof(float) * kArgmaxMaxBlocks) != cudaSuccess) {
+            s_pv = nullptr;
+            return (int)cudaGetLastError();
+        }
+        if (cudaMalloc((void **)&s_pi, sizeof(int) * kArgmaxMaxBlocks) != cudaSuccess) {
+            cudaFree(s_pv);
+            s_pv = nullptr;
+            return (int)cudaGetLastError();
+        }
+    }
+    int blocks = (n + kArgmaxThreads * 4 - 1) / (kArgmaxThreads * 4);
+    if (blocks > kArgmaxMaxBlocks) blocks = kArgmaxMaxBlocks;
+    if (blocks < 1) blocks = 1;
+    k_argmax_partial<<<blocks, kArgmaxThreads, 0, stream>>>(d_x, n, s_pv, s_pi, blocks);
+    k_argmax_final<<<1, kArgmaxThreads, 0, stream>>>(s_pv, s_pi, blocks, d_out);
     return (int)cudaGetLastError();
 }
