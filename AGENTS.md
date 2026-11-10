@@ -153,14 +153,29 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
   不要用 `skip` / 放宽阈值 / 删用例的方式"变绿"。
 - **token 流不是验收标准**（2026-11 决定：项目后续支持多模型 / 多硬件，固定 prompt
   的 token 比对不可扩展；llama.cpp 也没有这种探针——它的跨后端验收是逐 op 的 nmse
-  容差 `tests/test-backend-ops.cpp` + 手工 perplexity）。§6 的固定 prompt 运行仅作手动调试 /
-  性能对比用，不进回归判据：
-  - CPU/CUDA 的 token 流不可能稳定逐位相同（f32 收尾 / 归约顺序 / 超越函数 1–2 ulp，
-    见 `docs/cuda-elementwise-ulp.md`；MVCHECK 全过时 token 流仍会分叉，实测见
-    `src/kernels/cuda/mmq.cu:1105`）；
-  - llama.cpp 默认采样是 temp 0.8 + 随机 seed，其参照输出本身不可复现。
-  正确性以 kernel 级对拍为准（`make test` 三路对拍 + `QWEN35_MVCHECK`），
-  端到端只作输出是否通顺的烟雾信号（完整口径见 `docs/cuda-backend-brief.md` §2bis）。
+  容差 `tests/test-backend-ops.cpp` + 手工 perplexity）。
+
+  **也不得作为单次改动的验收条件。** 2026-11 起明确：不等 token 流逐位一致再提交。
+  理由不是"麻烦"，而是**逐位一致在算法级改动面前是错误的目标**：
+  - 任何改变浮点归约顺序的改动（分块算法取代递归、flash-attention 取代逐 token、
+    换 kernel 的 tiling）在数学上等价，但末位必然不同。用逐位一致当门槛等于
+    **禁止所有算法级优化**，只能做"代码搬到别处"型的改动——而 prefill 剩余的差距
+    （对照 llama.cpp 的 `build_delta_net_chunking` / `flash_attn_ext`）恰恰只能靠
+    算法级改动消除。
+  - 它还会给出**假阴性**：改动正确但 token 流分叉时会被误判成回归；
+    反之局部 bug 可能因为采样落在同一 token 而不被发现。
+  - CPU/CUDA 本来就不逐位相同（f32 收尾 / 归约顺序 / 超越函数 1–2 ulp，见
+    `docs/cuda-elementwise-ulp.md`；MVCHECK 全过时 token 流仍会分叉，实测见
+    `src/kernels/cuda/mmq.cu:1105`），llama.cpp 默认采样是 temp 0.8 + 随机 seed，
+    其参照输出本身不可复现。
+
+  **正确的做法**：
+  - kernel 级对拍（`make test` 三路对拍 + `QWEN35_MVCHECK`）保证算子正确；
+  - 算法级改动另写**等价性论证**（为什么数学上等价）并记录在提交说明里；
+  - 端到端只用 `QWEN35_DUMP_IDS` 看输出是否通顺 / 长度是否合理，作为烟雾信号；
+  - `QWEN35_DUMP_IDS` 仍是**调试**手段（定位分叉起点），不是判据。
+  零容忍的场景只剩一种：**改动前后都不应出现乱码 / 空输出 / 提前 EOS**。
+  完整口径见 `docs/cuda-backend-brief.md` §2bis。
 - 现有测试入口：`src/root.zig` 的 import 列表 + `refAllDecls`；`make test` 跑两个 test artifact
   （`mod_tests` 与 `exe_tests`，见 `build.zig`），`mod_tests` 会 `linkLibrary(c_kernels)`。
   注意 `-Doptimize=ReleaseFast` 下 `exe_tests` 那条链不参与，`make test` 用默认 optimize。
@@ -191,7 +206,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_F32_TYPES` | ~~只把列出的类型转 f32~~ **已于 `0cdfb23` 删除** |
 | `QWEN35_FORCE_ROWDOT` | ~~强制 Zig 量化域 rowDot~~ **已于 `0cdfb23` 删除** |
 | `QWEN35_KERNEL_CHECK` | ~~kernel 结果与 Zig 参照逐块比对~~ **已于 `0cdfb23` 删除** |
-| `QWEN35_DUMP_OUT` / `QWEN35_DUMP_IDS` | 导出中间输出 / token id |
+| `QWEN35_DUMP_OUT` / `QWEN35_DUMP_IDS` | 导出中间输出 / token id。**调试用**（定位分叉起点），不是验收判据，见 §4 |
 | `QWEN35_NO_BATCH` | 关闭 K-token 批量 prefill chunk |
 | `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析（`PROF-M` 行由 `backend_cpu` 输出） |
 | `QWEN35_MVCHECK` | **仅 CUDA 后端、仅调试用，不是计算路径**。每个量化 matvec 之后，用内嵌的 CPU 后端对同一行再算一遍并逐行比对，打印 `MVCHECK[<type>] rows= cols= mismatched= batchk= k=`。用于确认"GPU kernel 结果与 CPU 参照一致"（CUDA 逐格式验收的自动化手段）。开销极大，只在 A/B 时开 |
@@ -228,7 +243,9 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
        拿到的是两组不同 logits）。它**不能在 capture 内**跑（阻塞 D2H 非法），
        开了会 `graphAbandon` 并降级——所以只用图形关闭时（`QWEN35_CUDA_GRAPH=0`）做 A/B。
        实测：graph=0 下 device sampler 与 CPU 参照在 greedy / temperature / top_k /
-       top_p 各组合上 token 流**逐位一致**；greedy 下与改动前的 argmax 路径也逐位一致。
+       top_p 各组合上 token 流完全相同；greedy 下与改动前的 argmax 路径也相同。
+       注意这是**两个采样器喂同一份 logits**的特例，不能用同样的办法去要求
+       两个不同 kernel 的 logits 一致（见 §4：token 流不是验收标准）。
      - graph on/off 的 token 流**本来就会分叉**（既存，已用改动前的构建复现）：
        不要把它当成采样器的回归信号，用 `QWEN35_DUMP_IDS` 看分叉起点。
      **被拒绝的 slice 返回 0 = 假加速**。切分必须能算它拿到的每一种 range；
@@ -287,8 +304,8 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 
 ## 6. 手动运行与性能对比（模型与 target）
 
-> 固定 prompt 的"token 流探针"已移出验收标准（见 §4 规则）。以下 target 只用于手动调试与
-> 性能对比，不属于回归判据。
+> 固定 prompt 的"token 流探针"已完全退出验收（见 §4 规则）：既不是判据，也不是
+> 提交前必跑的步骤。以下 target 只用于手动调试与性能对比。
 
 - 量化格式覆盖很广，`make run0.8b` 会跑全部 22 个 GGUF 变体；单个变体按需跑
   （如 `make run0.8biq3xxs`、`make run27biq3xxs`、`make run0.8biq2xxs-llamacpp`）。
