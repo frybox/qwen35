@@ -923,11 +923,29 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
 
     // 16 rows x 256 int8 = 4 KB per warp (32 KB/block) + one shared 8x256
     // activation tile (2 KB) + per-row group scales.
-    __shared__ int8_t sA[NWARPS * 16 * 256];
+    //
+    // BANK CONFLICTS: every stride here was a power of two, which is the worst
+    // possible case on a 32-bank / 4-byte-wide shared memory:
+    //   * sA rows were 256 int8 == 64 int, and 64 % 32 == 0, so ALL 16 rows of a
+    //     warp started on bank 0.  The producer writes `dst[g*8+i]` with
+    //     dst = row*64 int, so lanes 0..31 (16 rows x 2 group-pairs) all touched
+    //     the same bank at the same instruction -- a full 32-way conflict on
+    //     every one of the 32 int stores per lane.
+    //   * the same 64-int stride is what load_ldmatrix reads with, so the
+    //     consumer hit it again, 16 times per super-block.
+    //   * sLs rows were 16 int, and 16 % 32 == 0, so the 16 lsum lanes collided too.
+    // Padding by 4 int (16 B) makes consecutive rows start 4 banks apart, which
+    // is a coprime-ish rotation over the 16 rows of a warp: 16*4 = 64 == 0 mod
+    // 32 only every 8 rows, so at most 2 rows share a bank instead of 16.
+    // (llama.cpp solves the same problem with its `sram_stride` "+4" padding,
+    // mmq.cuh:131 -- `static_assert(stride % 8 == 4)` in every layout.)
+    constexpr int SA_STRIDE = 256 + 16;       // int8 per row, padded
+    constexpr int LS_STRIDE = 16 + 4;         // int per row, padded
+    __shared__ int8_t sA[NWARPS * 16 * SA_STRIDE];
     __shared__ int8_t sB[8 * 256];
-    int8_t *sAw = sA + warp * 16 * 256;
-    __shared__ int sLs[NWARPS * 16 * 16];  // per-warp per-row ls[16]: one per 16-element half
-    int *ls_w = sLs + warp * 16 * 16;
+    int8_t *sAw = sA + warp * 16 * SA_STRIDE;
+    __shared__ int sLs[NWARPS * 16 * LS_STRIDE];  // per-warp per-row ls[16]: one per 16-element half
+    int *ls_w = sLs + warp * 16 * LS_STRIDE;
 
     // One accumulator per token-tile.  With grid.y == 1 the whole token range
     // is handled inside the kernel, so the 128-row weight slice is dequantized
@@ -946,34 +964,39 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         const unsigned char *wb0 =
             w + (size_t)r0 * (size_t)nblk * block_bytes + (size_t)b * block_bytes;
 
-        // Weight dequant, spread over the WHOLE warp: lane = row * 2 +
-        // group-pair, so 16 rows x 4 group-pairs = 32 lanes, each unpacking 2
-        // of the block's 8 groups (64 elements).  Unpacking a whole row on one
-        // lane left 31 of 32 lanes idle here and was the kernel's real cost.
+        // Weight dequant, spread over the WHOLE warp so all 32 lanes unpack:
+        // 16 rows x 2 group-pairs = 32 lanes, each taking 4 of the block's 8
+        // groups.  Unpacking a whole row on one lane left 31 of 32 lanes idle
+        // and was the kernel's real cost.
+        //
         // Staged ONCE per b (hoisted over the token-tile loop below).
+        //
+        // NOTE on the row spread: this makes a warp touch 16 rows, whose HBM
+        // addresses are 16*nblk*block_bytes apart (~104 KB for the 27B ffn,
+        // where nblk*98 = 6664 B).  Narrowing it to 4 rows per warp (8 lanes
+        // per row, which is what llama.cpp's loader does) was measured and made
+        // NO difference (170.25 vs 170.29 tok/s), so the L2/coalescer already
+        // absorbs the row stride and the address spread is not the bottleneck.
+        // Do not "fix" it again without a measurement.
+        const int row = lane >> 1;              // 0..15
+        const int gp = lane & 1;                // 0..1
         if (row_live) {
-            const int row = lane >> 1;              // 0..15
-            // Groups 0..7 must all be covered: 16 rows x 2 lanes leaves 2
-            // lanes per row, so each lane takes FOUR groups, not two.
-            const int gp = lane & 1;                // 0..1
             const unsigned char *wb = wb0 + (size_t)row * (size_t)nblk * block_bytes;
-            int *dst = (int *)(sAw + row * 256);
+            int *dst = (int *)(sAw + row * SA_STRIDE);
 #pragma unroll
             for (int k = 0; k < 4; ++k) {
                 const int g = 4 * gp + k;
                 int p[8];
                 int ls[2];
                 T::group(wb, g, p, ls);
-                ls_w[row * 16 + g * 2 + 0] = ls[0];
-                ls_w[row * 16 + g * 2 + 1] = ls[1];
+                ls_w[row * LS_STRIDE + g * 2 + 0] = ls[0];
+                ls_w[row * LS_STRIDE + g * 2 + 1] = ls[1];
                 for (int i = 0; i < 8; ++i) dst[g * 8 + i] = p[i];
             }
         } else {
-            const int row = lane >> 1;
-            const int gp = lane & 1;
             for (int k = 0; k < 4; ++k) {
-                ls_w[row * 16 + (4 * gp + k) * 2 + 0] = 1;
-                ls_w[row * 16 + (4 * gp + k) * 2 + 1] = 1;
+                ls_w[row * LS_STRIDE + (4 * gp + k) * 2 + 0] = 1;
+                ls_w[row * LS_STRIDE + (4 * gp + k) * 2 + 1] = 1;
             }
         }
 
@@ -1038,9 +1061,10 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                 q35_tile<16, 4, int> A_frag;
                 q35_tile<8, 4, int> B_frag;
                 q35_tile<16, 8, int> D;
-                // Shared rows are 256 int8 wide = 64 int, so the ldmatrix stride
-                // is 64 int and a 16-element half starts at int offset h*4.
-                q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, 64);
+                // Shared rows are SA_STRIDE int8 wide, so the ldmatrix stride is
+                // SA_STRIDE/4 int (68 with the padding) and a 16-element half
+                // starts at int offset h*4.
+                q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, SA_STRIDE / 4);
                 q35_mma::load_generic(B_frag, (const int *)sB + h * 4, 64);
                 q35_mma::mma(D, A_frag, B_frag);
                 const int g = h >> 1;               // 32-element group
@@ -1050,7 +1074,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                     const int mp = q35_tile<16, 8, int>::get_i(l);
                     // ls2 holds the second half's scale when the type has 16-element
                     // granularity; for 32-element types both entries are equal.
-                    isum[l] += (half ? ls_w[mp * 16 + g * 2 + 1] : ls_w[mp * 16 + g * 2]) * D.x[l];
+                    isum[l] += (half ? ls_w[mp * LS_STRIDE + g * 2 + 1] : ls_w[mp * LS_STRIDE + g * 2]) * D.x[l];
                 }
             }
             __syncthreads();   // sB is re-staged next token-tile
@@ -1121,8 +1145,15 @@ static int q35_iq_warps(int rows) {
     if (forced > 0) return forced;
     // 4 warps (64 rows/block) is the measured optimum on the 27B shapes, and the
     // 1..8 sweep is flat enough around it that a per-shape search is not worth a
-    // getenv-free table: 79-token IQ3_XXS prefill measured 88.5 (w=8), 97.4
-    // (w=4), 96.0 (w=2), 94.6 (w=1).
+    // getenv-free table.  525-token IQ3_XXS prefill, tok/s, before and after the
+    // shared-memory bank-conflict padding (SA_STRIDE/LS_STRIDE above):
+    //     warps:   1      2      4      8
+    //   before:  94.6   96.0   97.4   88.5    (79-token prompt, pre-padding)
+    //   after:  141.6  160.1  170.0  160.2    (525-token prompt, padded)
+    // The padding is what pulled w=8 up from the clear loser to a near tie: the
+    // 8-warp shape is the one whose shared tiles suffered the worst conflicts.
+    // w=4 still wins on block count -- the 8-warp 128-row block would give the 27B ffn
+    // (rows=5120) only (5120+127)/128 = 40 blocks for 114 SMs.
     //
     // The reason 4 wins over 2 and 1 despite fewer blocks per SM: the block's
     // shared-memory tile is the same 8-token activation tile whatever the warp
