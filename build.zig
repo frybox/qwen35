@@ -129,6 +129,12 @@ const cuda_sources = [_][]const u8{
     // is not glibc's, and the phase error grows with `pos`), so dRope64 keeps
     // it behind $QWEN35_CUDA_ROPE; see rope.cu's header for why.
     "rope.cu",
+    // Device-side sampling (q35_launch_sample): temperature -> top-k -> top-p ->
+    // draw, all reading their per-token parameters from one device control
+    // block so the chain can live INSIDE the captured decode graph.  Replaces
+    // the host sampler's 1 MB D2H; see the file header for the graph constraint
+    // that dictates the design.
+    "sample.cu",
 };
 
 /// Every regular file under src/kernels/cuda/.  These become explicit inputs of

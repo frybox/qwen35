@@ -112,10 +112,11 @@ fn runInference(
 ) !void {
     if (args.len < 4) {
         try err_out.print(
-            "usage: {s} run <file.gguf> <prompt> [-n N] [-t TEMPERATURE] [-k K] [-s SEED]\n" ++
+            "usage: {s} run <file.gguf> <prompt> [-n N] [-t TEMPERATURE] [-k K] [-p P] [-s SEED]\n" ++
                 "  -n  predict N new tokens (default: until the context fills)\n" ++
                 "  -t  temperature; 0 (default) = greedy argmax\n" ++
                 "  -k  top-k cutoff (0 = off, default)\n" ++
+                "  -p  top-p / nucleus cutoff in (0,1); <=0 or >=1 = off (default)\n" ++
                 "  -s  PRNG seed for sampling (default 12345)\n" ++
                 "  --threads N  intra-op worker count (0 = default)\n" ++
                 "  --backend cpu|cuda  execution backend; cuda runs the quantized\n" ++
@@ -131,6 +132,7 @@ fn runInference(
     var n_predict: usize = engine.Engine.max_seq; // default: until the context fills
     var temp: f32 = 0;
     var top_k: usize = 0;
+    var top_p: f32 = 0;
     var seed: u64 = 12345;
     var n_threads: usize = 0; // 0 = default (min(16, cpus))
     var backend_kind: qwen35.backend.Kind = .cpu;
@@ -173,6 +175,13 @@ fn runInference(
                 return error.InvalidArgument;
             };
             i += 1;
+        } else if (std.mem.eql(u8, args[i], "-p") and i + 1 < args.len) {
+            top_p = std.fmt.parseFloat(f32, args[i + 1]) catch {
+                try err_out.print("error: -p expects a number, got '{s}'\n", .{args[i + 1]});
+                try err_out.flush();
+                return error.InvalidArgument;
+            };
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "-s") and i + 1 < args.len) {
             seed = std.fmt.parseInt(u64, args[i + 1], 10) catch {
                 try err_out.print("error: -s expects a number, got '{s}'\n", .{args[i + 1]});
@@ -194,7 +203,7 @@ fn runInference(
     };
     defer e.deinit();
 
-    e.sampler = engine.Sampler.init(.{ .temperature = temp, .top_k = top_k, .seed = seed });
+    e.sampler = engine.Sampler.init(.{ .temperature = temp, .top_k = top_k, .top_p = top_p, .seed = seed });
 
     var tok = try qwen35.tokenizer.Tokenizer.initFromGguf(arena, &e.g);
 

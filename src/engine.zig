@@ -1233,9 +1233,14 @@ pub const Engine = struct {
         // dequantize row is a few microseconds, so keeping it out of the graph
         // costs nothing measurable and removes a whole class of staleness.
         //
-        // The boundary ENDS BEFORE `sample`: its result is the next token, so it
-        // has to reach the host before the next step can exist.  A backend that
-        // ignores the hint (the CPU one does) is unaffected either way.
+        // The boundary ENDS at `stepEnd`, which the caller invokes -- and the
+        // caller samples BEFORE that, so the sampler is inside the span.  That
+        // is what lets a device backend put sampling in its captured graph (the
+        // way llama.cpp keeps the sampler as a node of the model graph) instead
+        // of paying a launch + full-vocabulary D2H after the graph has finished.
+        // The token id still has to reach the host before the next step can
+        // exist, so the download itself happens at `stepEnd`; see
+        // `VTable.sampledToken` for the split.
         self.exec.stepBegin(pos);
         for (self.layers, 0..) |*lw, li| {
             if (c.isFullAttention(@intCast(li))) {
@@ -1290,8 +1295,15 @@ pub const Engine = struct {
         // token, so it has to reach the host before the next step exists.  A
         // backend that ignores the hint (the CPU one does) is unaffected.
         const logits = self.forwardLogits(token, pos);
+        // SAMPLE INSIDE THE SPAN, DOWNLOAD AT THE BOUNDARY.  A backend that
+        // captures the step into a CUDA graph must record the sampler as part of
+        // it; the 4-byte token download cannot be captured, so it happens in
+        // `stepEnd` and `sampledToken` collects it.  For the CPU backend
+        // `sample` is synchronous and `sampledToken` returns its argument
+        // unchanged, so this split costs nothing there.
+        const hinted = self.exec.sample(logits, self.sample_scratch, &self.sampler);
         self.exec.stepEnd();
-        return self.exec.sample(logits, self.sample_scratch, &self.sampler);
+        return self.exec.sampledToken(hinted);
     }
 
     /// Dequantize the embedding row of `token` into `dst` (hidden wide).

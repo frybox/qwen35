@@ -196,6 +196,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析（`PROF-M` 行由 `backend_cpu` 输出） |
 | `QWEN35_MVCHECK` | **仅 CUDA 后端、仅调试用，不是计算路径**。每个量化 matvec 之后，用内嵌的 CPU 后端对同一行再算一遍并逐行比对，打印 `MVCHECK[<type>] rows= cols= mismatched= batchk= k=`。用于确认"GPU kernel 结果与 CPU 参照一致"（CUDA 逐格式验收的自动化手段）。开销极大，只在 A/B 时开 |
 | `QWEN35_MVCHECK_ONLY` | 限定只对某一种量化类型做 MVCHECK（值 = `q.ttype` 的 tagName，如 `iq1_s`）。batch-K 参照需要 CPU scratch 按 K 塑形，不是每种类型在每个 launch 顺序下都能活，所以追单一 kernel 时用这个定向跑 |
+| `QWEN35_CUDA_SAMPLE_CPU` | **仅 CUDA 后端、仅调试**。把 `sample` 交给 CPU 参照，喂的是**同一份 GPU logits**（D2H 后）。这是唯一能隔离采样器差异的 A/B。capture 内会 `graphAbandon` 降级，故配合 `QWEN35_CUDA_GRAPH=0` 使用 |
 | `QWEN35_CUDA_COOP_WARPS` | **仅 CUDA 后端**。decode（tokens==1）warp-per-row matvec 的 block 形状（1..8 个 warp/block），A/B 用。不设时由硬件探测决定：sm_89 → 4（本机实测最佳），其他 cc → 占用率公式（cudaOccupancyMaxActiveBlocksPerMultiprocessor 选驻留 warp 最多的形状），见 `mmvq.cu` 的 `q35_coop_warps()`。探测来源是 `caps.cu`（`q35_gpu_cc()`/`q35_gpu_sm_count()`/`q35_gpu_name()`，一次探测、缓存读，x86 侧 `cpu_caps.c` 的 CUDA 镜像） |
 | `QWEN35_CUDA_SPLIT` | **仅 CUDA 后端**。decode K-split 的每 block lane 数，默认 8。合法值 0/1/2/4/8/16/32；launcher 会把它 clamp 成 `q35_split_units(ttype)` 的最大因子，并对每种类型再按 `q35_split_min_per` 收窄。`split<2` 退回 coop kernel |
 | `QWEN35_SPLITDBG` | **仅 CUDA 后端**。每次走 split 路径的 launcher 往 stderr 打一行 `[split] ttype= rows= cols= nblk= split= warps= shmem=`。确认某类型**真的**走了 split、以及 per 是多少，只需看这一行——不要凭 tok/s 反推 |
@@ -212,6 +213,24 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    - **`_part` body 不能对任何 range `return 0.0f` 来「拒绝」**。
      曾把 IQ3_S 的 `min_per` 放宽到 1 却没改 body，旧的 `if (lo & 1) return 0.0f`
      让一半 slice 算 0 → "27.03 tok/s"（比真值快 4%）而输出是「茶，写茶，，」。
+   - **采样器在 decode graph 内，下载在 graph 外**（2026-11）。`sample` 必须在
+     `stepBegin`..`stepEnd` 之间调用（`engine.zig` 的 `step()` 已这样排），才能被
+     capture 进 decode graph；4 字节 token 的 D2H **不能** capture，所以它在 `stepEnd`
+     里做，再由 vtable 的 `sampledToken` 交给 engine（CPU 后端是恒等）。
+     - 逐 token 的采样参数（temperature / top_k / top_p / PRNG 状态）走**设备常驻控制块**
+       `d_sample_ctl`（64 B，每 token 一次 H2D），**不要**用 `GraphExecKernelNodeSetParams`
+       ——那会把采样变回每个 replay 都要 retarget 的节点。
+     - `sample.cu` 的节点表是**扁平无条件**的：host 读不到设备内存里的参数，所以
+       greedy/k/p 的分支全在 kernel 内（`k_plan` 写 flags，其余 kernel 早退）。
+       由此 graph 里固定 18 个采样节点，代价是禁用阶段的微秒级空跑。
+     - `QWEN35_CUDA_SAMPLE_CPU=1` 是唯一能端到端比两个采样器的开关：它把**同一份 GPU
+       logits** D2H 后交给 CPU 参照（其它比法都会先撞上 CPU/CUDA matvec 的 f32 分叉，
+       拿到的是两组不同 logits）。它**不能在 capture 内**跑（阻塞 D2H 非法），
+       开了会 `graphAbandon` 并降级——所以只用图形关闭时（`QWEN35_CUDA_GRAPH=0`）做 A/B。
+       实测：graph=0 下 device sampler 与 CPU 参照在 greedy / temperature / top_k /
+       top_p 各组合上 token 流**逐位一致**；greedy 下与改动前的 argmax 路径也逐位一致。
+     - graph on/off 的 token 流**本来就会分叉**（既存，已用改动前的构建复现）：
+       不要把它当成采样器的回归信号，用 `QWEN35_DUMP_IDS` 看分叉起点。
      **被拒绝的 slice 返回 0 = 假加速**。切分必须能算它拿到的每一种 range；
      `q35_split_min_per` 的 clamp 只是第一道防线。
    - **切分数必须从 `_acc` 的循环步长推导，不能猜**。IQ4_XS 是 4 不是 8

@@ -1049,6 +1049,14 @@ pub const CpuBackend = struct {
         return ew.bufSample(logits, scratch, sp);
     }
 
+    /// The CPU sampler is synchronous, so `vSample` already returned the real
+    /// token and this is the identity.  See `VTable.sampledToken`: the split
+    /// exists only for backends that defer the download past `stepEnd`.
+    fn vSampledToken(ctx: *anyopaque, hinted: u32) u32 {
+        _ = ctx;
+        return hinted;
+    }
+
     /// Load a 1-D f32 weight vector by name and hand back a `Buf` over the
     /// widened copy.  The CPU backend keeps the copy in its own allocator and
     /// the `Buf` is a plain host slice; the CUDA backend overrides this to
@@ -1123,6 +1131,7 @@ pub const CpuBackend = struct {
         .zeroBuf = vZeroBuf,
         .argmax = vArgmax,
         .sample = vSample,
+        .sampledToken = vSampledToken,
         .setThreads = vSetThreads,
         .profPhase = vProfPhase,
         .profReset = vProfReset,

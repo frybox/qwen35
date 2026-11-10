@@ -140,6 +140,17 @@ const Kernels = struct {
     /// Index of the largest logit; first index wins on ties.
     extern fn q35_launch_argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
+    // Device sampler (sample.cu).  The per-token parameters -- temperature,
+    // top_k, top_p, PRNG state -- travel through `d_ctl`, a RESIDENT device
+    // control block rewritten by a 64-byte H2D before each replay, so a captured
+    // graph node never needs its parameters retargeted.  `n` (vocab) is a launch
+    // argument because it decides the grid shape and never changes.
+    extern fn q35_launch_sample(d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_sample_deinit(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) void;
+    extern fn q35_sample_scratch_ints() callconv(.c) c_int;
+    extern fn q35_sample_ctl_ints() callconv(.c) c_int;
+
     // P2c: the two state machines.  One launch per value head for gdn_step,
     // one launch (block per head) for attn_decode; see the kernel headers.
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -267,6 +278,11 @@ const Launch = if (cuda_linked) struct {
     const softmax = Kernels.q35_launch_softmax;
     const conv_step = Kernels.q35_launch_conv_step;
     const argmax = Kernels.q35_launch_argmax;
+    const sample = Kernels.q35_launch_sample;
+    const sample_init = Kernels.q35_launch_sample_init;
+    const sample_deinit = Kernels.q35_launch_sample_deinit;
+    const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
+    const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
     const attn_decode = Kernels.q35_launch_attn_decode;
     const attn_decode_dyn = Kernels.q35_launch_attn_decode_dyn;
     const attn_decode_coal = Kernels.q35_launch_attn_decode_coal;
@@ -374,6 +390,23 @@ const Launch = if (cuda_linked) struct {
     fn argmax(d_x: ?[*]const f32, n: c_int, d_out: ?*c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, n, d_out, stream };
         return stubNoCudaKernels();
+    }
+    fn sample(d_logits: ?[*]const f32, n: c_int, d_ctl: ?*c_int, d_scratch: ?*anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_logits, n, d_ctl, d_scratch, stream };
+        return stubNoCudaKernels();
+    }
+    fn sample_init(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_ctl, d_scratch };
+        return stubNoCudaKernels();
+    }
+    fn sample_deinit(d_ctl: ?*?*anyopaque, d_scratch: ?*?*anyopaque) callconv(.c) void {
+        _ = .{ d_ctl, d_scratch };
+    }
+    fn sample_scratch_ints() callconv(.c) c_int {
+        return 0;
+    }
+    fn sample_ctl_ints() callconv(.c) c_int {
+        return 0;
     }
     fn attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
@@ -1055,6 +1088,44 @@ pub const CudaBackend = struct {
     /// per-token download the greedy path makes: 4 bytes.
     d_idx: ?*anyopaque = null,
     d_idx_bytes: usize = 0,
+
+    // ---- device sampler (src/kernels/cuda/sample.cu) ------------------------
+    //
+    // `d_sample_ctl` is a RESIDENT 64-byte control block holding every
+    // per-token sampler input (temperature, top_k, top_p, PRNG state) plus the
+    // result.  It exists so the sampler can live INSIDE the captured decode
+    // graph: a captured node keeps the parameters it was recorded with, so all
+    // of them have to arrive through memory instead of through `SetParams`.
+    // `d_sample_scratch` is the kernel's working set (histogram, per-block
+    // extrema, the f64 mass), sized once by `q35_sample_scratch_ints()`.
+    //
+    // Both are allocated lazily by `ensureSampleBufs` BEFORE any capture opens,
+    // because `cudaMalloc` is illegal inside a capture interval.
+    d_sample_ctl: ?*anyopaque = null,
+    d_sample_scratch: ?*anyopaque = null,
+    /// Host row for the `$QWEN35_CUDA_SAMPLE_CPU` A/B, grown on demand.
+    h_sample_ab: ?[]f32 = null,
+    /// Host scratch for the same A/B: the CPU sampler sorts through it.
+    h_sample_ab_scratch: ?[]f32 = null,
+    /// `$QWEN35_CUDA_SAMPLE_CPU`: route `sample` to the CPU reference on the
+    /// device's own logits, so the two samplers can be compared without the
+    /// matvec divergence in the way.  Debug only; default off.
+    sample_cpu_ab: bool = false,
+    /// Pinned HOST mirror of the first `SampleCtl.host_ints` ints of
+    /// `d_sample_ctl`.  Pinned so the per-token H2D is an async copy of a small
+    /// constant address rather than a pageable one (pageable H2D inside a
+    /// capture is rejected outright).
+    h_sample_ctl: ?*anyopaque = null,
+    /// The token `sample` produced on the current step, collected by
+    /// `sampledToken` after `stepEnd` has done the download.  The split exists
+    /// because the download cannot be captured but the sampler must be.
+    sample_pending: bool = false,
+    sample_token: u32 = 0,
+    /// The sampler whose PRNG state the pending download must advance.  A bare
+    /// pointer on purpose: the engine owns the object and outlives every step
+    /// (it is allocated with the engine's arena), so the backend must not copy
+    /// or free it -- only write `state` through it, exactly as `dSample` would.
+    sample_sampler: ?*sampler.Sampler = null,
 
     // ---- decode CUDA graph ($QWEN35_CUDA_GRAPH) -----------------------------
     //
@@ -4736,46 +4807,257 @@ const attn_score_arity: usize = 10;
         return cpu_mod.CpuBackend.vtable.argmax(@ptrCast(&self.cpu), logits);
     }
 
-    /// Host staging for `dSample`: pull the row down, run the reference
-    /// sampler on it -- the one place the sampler's own `[]f32` contract has to
-    /// be fed, and it is fed with a copy the caller cannot observe later.
-    ///
-    /// The scratch buffer handed in is a device region too, so its contents are
-    /// not needed by the caller (`bufSample` treats it as write-only scratch);
-    /// the sampler gets a temporary host array instead.
-    fn sampleViaHost(self: *CudaBackend, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
-        const alloc = self.alloc;
-        const host_logits = alloc.alloc(f32, logits.len) catch return 0;
-        defer alloc.free(host_logits);
-        const host_scratch = alloc.alloc(f32, @max(scratch.len, logits.len)) catch return 0;
-        defer alloc.free(host_scratch);
-        CudaBackend.dCopyToHost(@ptrCast(self), host_logits, logits);
-        return sp.sample(host_logits, host_scratch);
+    /// Grow the A/B host row to at least `n` floats.  Only ever called from the
+    /// debug branch, i.e. outside any capture, so a plain allocation is fine.
+    fn ensureSampleAbHost(self: *CudaBackend, n: usize) bool {
+        if (self.h_sample_ab) |b| {
+            if (b.len >= n) return true;
+        }
+        const alloc = std.heap.page_allocator;
+        if (self.h_sample_ab) |b| alloc.free(b);
+        self.h_sample_ab = alloc.alloc(f32, n) catch {
+            self.h_sample_ab = null;
+            return false;
+        };
+        return true;
     }
 
-    /// TEMPORARY DIAGNOSTIC -- remove before finishing.
-
-    /// TEMPORARY DIAGNOSTIC -- remove before finishing.
-
-    fn dSample_body(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
-        const self = self_(ctx);
-        // Greedy fast path: `Sampler.sample` with temperature <= 0 is a pure
-        // argmax (sampler.zig:73), so it needs no distribution -- run it on the
-        // device and bring back 4 bytes instead of the whole vocabulary.  This
-        // is the default decode path, so it is what keeps the per-token
-        // cross-boundary traffic at a single int.
-        if (sp.temperature <= 0) return CudaBackend.dArgmax(ctx, logits);
-        // True sampling: one D2H per generated token, of the vocabulary-length
-        // logits row, and it is unavoidable while the sampler is the CPU
-        // reference.  It is also the only reason `scratch` has to be host
-        // memory: the sampler writes its normalised distribution there.  Sized
-        // by the engine.
-        if (self.cu != null and logits.len != 0) {
-            if (dBufPtr(logits) != null) {
-                return self.sampleViaHost(logits, scratch, sp);
+    /// Allocate (once) the device control block, its pinned host mirror, and
+    /// the kernel scratch.  Must run BEFORE any capture opens: `cudaMalloc`
+    /// inside a capture interval is illegal, and the sampler's very first launch
+    /// would land there.
+    fn ensureSampleBufs(self: *CudaBackend) bool {
+        if (self.d_sample_ctl == null or self.d_sample_scratch == null) {
+            const rc = Launch.sample_init(&self.d_sample_ctl, &self.d_sample_scratch);
+            if (rc != cudart.cudaSuccess) {
+                self.ewLaunchFail("sample init", rc);
+                return false;
             }
         }
-        return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+        if (self.h_sample_ctl == null) {
+            var p: ?*anyopaque = null;
+            const n: usize = @intCast(@max(Launch.sample_ctl_ints(), 16));
+            // flags 0 = plain pinned memory: page-locked but not mapped, which
+            // is all `cudaMemcpyAsync` H2D needs to stay a true async copy.
+            const hrc = (&(self.cu orelse return false)).lib.HostAlloc(&p, n * @sizeOf(c_int), 0);
+            if (hrc != cudart.cudaSuccess or p == null) {
+                self.ewLaunchFail("sample ctl host alloc", hrc);
+                return false;
+            }
+            const hc: [*]c_int = @ptrCast(@alignCast(p.?));
+            @memset(hc[0..n], 0);
+            self.h_sample_ctl = p;
+        }
+        return true;
+    }
+
+    /// Mirror of `q35_sample_ctl` in `src/kernels/cuda/sample.cu`.  Field order
+    /// is the WIRE FORMAT of the 64-byte H2D -- change both files or neither.
+    const SampleCtl = extern struct {
+        vocab: c_int = 0,
+        temperature_bits: c_int = 0,
+        top_k: c_int = 0,
+        top_p_bits: c_int = 0,
+        rng_lo: c_int = 0,
+        rng_hi: c_int = 0,
+        token_out: c_int = 0,
+        rng_out_lo: c_int = 0,
+        rng_out_hi: c_int = 0,
+        thresh_bits: c_int = 0,
+        flags: c_int = 0,
+        sel_prefix: c_int = 0,
+        sel_mask: c_int = 0,
+        sel_rank: c_int = 0,
+        reserved0: c_int = 0,
+        reserved1: c_int = 0,
+    };
+
+    /// Publish this token's sampler parameters into the device control block.
+    /// One 64-byte H2D onto the caller's stream; no kernel, no allocation.
+    ///
+    /// `sp.seed` is not re-read every token: `Sampler.state` is the live PRNG
+    /// position, and it advances exactly once per drawn token (the kernel writes
+    /// the advanced value back into `rng_out_*`, which `dSample_body` copies into
+    /// `sp.state` when it collects the token).  Publishing `state` here is what
+    /// makes a replayed stream continue instead of restarting.
+    fn publishSampleCtl(self: *CudaBackend, logits_len: usize, sp: *const sampler.Sampler, stream: ?*anyopaque) bool {
+        const h = self.h_sample_ctl orelse return false;
+        const hc: *SampleCtl = @ptrCast(@alignCast(h));
+        hc.* = .{};
+        hc.vocab = @intCast(logits_len);
+        hc.temperature_bits = @bitCast(sp.temperature);
+        hc.top_k = @intCast(sp.top_k);
+        hc.top_p_bits = @bitCast(sp.top_p);
+        const seed: u64 = sp.state;
+        hc.rng_lo = @bitCast(@as(u32, @truncate(seed)));
+        hc.rng_hi = @bitCast(@as(u32, @truncate(seed >> 32)));
+        const cu = &(self.cu orelse return false);
+        const rc = cu.lib.MemcpyAsync(
+            self.d_sample_ctl, @ptrCast(h), @sizeOf(SampleCtl), cudart.MemcpyHostToDevice, stream,
+        );
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("sample ctl publish", rc);
+            return false;
+        }
+        self.stat_h2d_bytes += @sizeOf(SampleCtl);
+        return true;
+    }
+
+    /// Read back the 4-byte token and the advanced PRNG state, and hand the
+    /// token to the engine.  Called from `stepEnd` (outside any capture) and, on
+    /// the un-captured path, directly from `dSample_body`.
+    fn collectSampledToken(self: *CudaBackend, sp: *sampler.Sampler) u32 {
+        const cu = &(self.cu orelse return self.sample_token);
+        const h = self.h_sample_ctl orelse return self.sample_token;
+        const hc: *SampleCtl = @ptrCast(@alignCast(h));
+        // Blocking 64-byte pull (the stream already carries every dependency:
+        // this runs on the DEFAULT stream, which `graphSyncToDefault` ordered
+        // after the graph).  Reading the last 64 bytes of the block -- rather
+        // than only `token_out` -- also brings back the advanced PRNG state, so
+        // the next token's `publishSampleCtl` continues the same stream without
+        // a second copy.  Cost is the same: one D2H of one cache line.
+        const rc = cu.lib.Memcpy(
+            @ptrCast(h), self.d_sample_ctl, @sizeOf(SampleCtl), cudart.MemcpyDeviceToHost,
+        );
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("sample token download", rc);
+            return self.sample_token;
+        }
+        self.stat_d2h_bytes += @sizeOf(SampleCtl);
+        // `Sampler.sample` consumes exactly one `nextU64` per non-greedy draw
+        // (sampler.zig:120 `nextF32`), and the kernel does the same, so the state
+        // it wrote back IS the position the CPU reference would be at.
+        if (sp.temperature > 0.0) {
+            sp.state = (@as(u64, @as(u32, @bitCast(hc.rng_out_hi))) << 32) | @as(u32, @bitCast(hc.rng_out_lo));
+        }
+        const tok: u32 = @intCast(@as(u32, @bitCast(hc.token_out)));
+        self.sample_token = tok;
+        if (self.gpu_ev_on) self.gpuEvReadToken();
+        return tok;
+    }
+
+    /// Device sampling.
+    ///
+    /// The whole policy -- greedy argmax, temperature, top-k, top-p, PRNG advance
+    /// -- runs in `sample.cu`.  Two things matter about HOW it is invoked:
+    ///
+    ///   * The launch goes to `launchStream()`, i.e. to the capture stream while a
+    ///     decode graph is being recorded, so the sampler becomes a node of that
+    ///     graph exactly like the matvecs.  On a replay the gate below suppresses
+    ///     the host launch because the graph already contains it.
+    ///   * The result is NOT downloaded here on the captured path.  A D2H cannot
+    ///     be captured; `stepEnd` performs it after the graph has been closed, and
+    ///     `sampledToken` hands the value to the engine.  On the direct path the
+    ///     download happens immediately and `sampledToken` is the identity.
+    fn dSample_body(ctx: *anyopaque, logits: backend.Buf, scratch: backend.Buf, sp: *sampler.Sampler) u32 {
+        const self = self_(ctx);
+        // A/B switch: run the CPU reference sampler on the GPU's own logits.
+        //
+        // This is the ONLY way to compare the two samplers end to end, because
+        // every other comparison runs into the CPU/CUDA matvec divergence first
+        // (f32 accumulation order, documented in AGENTS.md §4) and the samplers
+        // are then fed different logits.  With this set, both runs consume the
+        // identical device logits row, so any token difference is the sampler's
+        // fault alone.  Read once per process, on the host, before any capture.
+        if (self.sample_cpu_ab and self.capturing()) {
+            // A blocking D2H inside a capture is illegal and would silently
+            // corrupt the graph.  Refuse loudly: this switch is for A/B on the
+            // direct path only, and `graphAbandon` is the documented way to say
+            // "this capture cannot continue".
+            self.graphAbandon("QWEN35_CUDA_SAMPLE_CPU inside a capture");
+        }
+        if (self.sample_cpu_ab) {
+            // The CPU sampler indexes the row directly, so it needs a HOST copy:
+            // `logits` is a device pointer here.  `h_sample_ab` is grown on
+            // demand and reused, and the copy is blocking -- this whole branch is
+            // a debug A/B, never the compute path.
+            if (!self.ensureSampleAbHost(logits.len)) {
+                return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            }
+            const dst = self.h_sample_ab.?[0..logits.len];
+            // Inlined blocking D2H (`dCopyToHost_body` is a sibling struct's
+            // method and is not reachable by name from here).
+            const cu = &(self.cu orelse return cpu_mod.CpuBackend.vtable.sample(
+                @ptrCast(&self.cpu), logits, scratch, sp,
+            ));
+            const ps = dBufPtr(logits) orelse return cpu_mod.CpuBackend.vtable.sample(
+                @ptrCast(&self.cpu), logits, scratch, sp,
+            );
+            const rc = cu.lib.Memcpy(
+                @ptrCast(dst.ptr), @ptrCast(ps), dst.len * @sizeOf(f32), cudart.MemcpyDeviceToHost,
+            );
+            if (rc != cudart.cudaSuccess) {
+                self.ewLaunchFail("sample ab row download", rc);
+                return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+            }
+            const host_row = backend.Buf.wrap(dst);
+            // `scratch` reaches the CPU sampler too, and the engine's copy is a
+            // DEVICE buffer when this backend is in use; hand the reference a
+            // host scratch of the same length or it will sort a device pointer.
+            if (self.h_sample_ab_scratch == null or self.h_sample_ab_scratch.?.len < logits.len) {
+                const alloc = std.heap.page_allocator;
+                if (self.h_sample_ab_scratch) |b| alloc.free(b);
+                self.h_sample_ab_scratch = alloc.alloc(f32, logits.len) catch null;
+            }
+            const hs = self.h_sample_ab_scratch orelse
+                return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), host_row, scratch, sp);
+            return cpu_mod.CpuBackend.vtable.sample(
+                @ptrCast(&self.cpu), host_row, backend.Buf.wrap(hs[0..logits.len]), sp,
+            );
+        }
+        // The device sampler owns its own scratch (`d_sample_scratch`); the
+        // engine-provided one is only needed by the CPU fallbacks below.
+        if (self.cu == null or logits.len == 0) {
+            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+        }
+        // `gOpGate` cannot be used verbatim: it returns true for a REPLAYED step,
+        // where this call still has to produce a token (from the graph's own
+        // output), so the sampler branch is spelled out.
+        const replayed = self.g_state == .live;
+        if (replayed) {
+            // The graph already ran the sampler on `g_stream`.  `stepEnd` ordered
+            // that stream before the default one, so the control block holds this
+            // token's result; `collectSampledToken` is deferred to `stepEnd`.
+            self.sample_pending = true;
+            self.sample_sampler = sp;
+            return 0; // placeholder; `sampledToken` overrides it
+        }
+        if (!self.ensureSampleBufs()) {
+            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+        }
+        const px = dBufPtr(logits) orelse
+            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+        const stream = self.launchStream(); // capture stream while recording
+        if (!self.publishSampleCtl(logits.len, sp, stream)) {
+            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+        }
+        const rc = Launch.sample(
+            px, @intCast(logits.len), @ptrCast(@alignCast(self.d_sample_ctl)), self.d_sample_scratch, stream,
+        );
+        if (rc != cudart.cudaSuccess) {
+            self.ewLaunchFail("sample", rc);
+            return cpu_mod.CpuBackend.vtable.sample(@ptrCast(&self.cpu), logits, scratch, sp);
+        }
+        if (self.capturing()) {
+            // Inside the capture: nothing can be downloaded, and nothing needs to
+            // be -- this step's token comes back through `stepEnd`.
+            self.sample_pending = true;
+            self.sample_sampler = sp;
+            return 0;
+        }
+        // Direct path: the launch is on the default stream, so a blocking copy
+        // right here is already ordered after it.
+        self.sample_pending = false;
+        self.sample_sampler = null;
+        return self.collectSampledToken(sp);
+    }
+
+    /// The token from the current step's `sample`, after `stepEnd` downloaded it.
+    fn dSampledToken(ctx: *anyopaque, hinted: u32) u32 {
+        const self = self_(ctx);
+        if (!self.sample_pending) return hinted;
+        self.sample_pending = false;
+        return self.sample_token;
     }
 
     // ==== slots: the two state machines (P2c) ===============================
@@ -5511,6 +5793,12 @@ const attn_score_arity: usize = 10;
     /// Parse `QWEN35_ABLATE="slot,slot,..."` into `ablate_bits` (names are the
     /// `PROF-SLOT` names).  Unknown names are counted and reported once.
     fn ablateInit(self: *CudaBackend) void {
+        // Value, not mere presence: `FOO=0` must mean OFF, like every other
+        // switch in the table (`QWEN35_CUDA_GRAPH=0` is documented as "disable").
+        self.sample_cpu_ab = if (cudart.getenv("QWEN35_CUDA_SAMPLE_CPU")) |v|
+            v.len > 0 and !std.mem.eql(u8, v, "0")
+        else
+            false;
         const raw = cudart.getenv("QWEN35_ABLATE") orelse return;
         var it = std.mem.splitScalar(u8, std.mem.trim(u8, raw, " \t\r\n"), ',');
         var n_ablated: usize = 0;
@@ -6125,6 +6413,14 @@ const attn_score_arity: usize = 10;
                         if (self.gr_ms > 0) @as(f64, @floatFromInt(self.gr_n)) * 1000.0 / self.gr_ms else 0 });
             }
             if (self.g_state == .live) self.graphSyncToDefault();
+            // The graph's tail IS the sampler, so its result is only readable now
+            // -- after the ordering barrier above, and outside any capture, which
+            // is the only place a blocking D2H is legal.  This is the single
+            // 64-byte-per-token crossing the device sampler exists to produce:
+            // 4 bytes of token plus the advanced PRNG state.
+            if (self.sample_pending) {
+                if (self.sample_sampler) |sp| _ = self.collectSampledToken(sp);
+            }
             return;
         }
         self.g_capturing_step = false;
@@ -6140,6 +6436,11 @@ const attn_score_arity: usize = 10;
         // graph stream before any replay -- is the one where `g_state` is
         // already `.live` on entry to this function.
         if (self.g_state == .live) self.graphSyncToDefault();
+        // The capture step executed too (capture still runs the kernels), so its
+        // token has to be downloaded the same way a replayed step's is.
+        if (self.sample_pending) {
+            if (self.sample_sampler) |sp| _ = self.collectSampledToken(sp);
+        }
     }
 
     fn dProfPhase(ctx: *anyopaque, on: bool) void {
@@ -6645,6 +6946,7 @@ pub const vtable = backend.Exec.VTable{
     .copyToHost = CudaBackend.dCopyToHost,
     .argmax = CudaBackend.dArgmax,
     .sample = CudaBackend.dSample,
+    .sampledToken = CudaBackend.dSampledToken,
     // The four pure elementwise slots.  Forwarders, NOT aliases: they need
     // `ctx` to reach the device, and the ctx here is a `*CudaBackend`
     // (aliasing a CPU body would work only because those bodies ignore ctx).

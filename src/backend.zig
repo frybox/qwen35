@@ -329,6 +329,23 @@ pub const Exec = struct {
         /// Passing the sampler by pointer keeps its PRNG state advancing
         /// identically on both paths.
         sample: *const fn (ctx: *anyopaque, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32,
+        /// Return the token that the LAST `sample` on this step produced.
+        ///
+        /// WHY THIS EXISTS: a device backend that captures its decode step into a
+        /// CUDA graph needs the sampler to be INSIDE the graph (llama.cpp does
+        /// the same: the sampler is a node of the same `ggml_cgraph`), otherwise
+        /// the graph's tail is a serialised launch + full-vocabulary D2H at the
+        /// one moment the device has nothing to do.  But the token id is the next
+        /// token, so it must reach the host before the next step can exist -- and
+        /// that download cannot happen inside a capture.
+        ///
+        /// So the split is: `sample` LAUNCHES the sampler (inside the span, so it
+        /// is captured); `stepEnd` closes the graph and performs the download; and
+        /// this method hands the value over afterwards.  Its argument is the value
+        /// `sample` returned (`sample` must return a BEST GUESS that this call is
+        /// free to override), which lets a CPU backend -- where the sampler
+        /// already produced the answer synchronously -- be the identity.
+        sampledToken: *const fn (ctx: *anyopaque, hinted: u32) u32,
 
 
         /// Mark a phase boundary in the pool's timing counters (no-op for a
@@ -522,6 +539,11 @@ pub const Exec = struct {
     }
     pub fn sample(self: Exec, logits: Buf, scratch: Buf, sp: *sampler.Sampler) u32 {
         return self.vtable.sample(self.ptr, logits, scratch, sp);
+    }
+    /// The token the last `sample` of the current step produced; see the vtable
+    /// slot for why sampling and its download are split around `stepEnd`.
+    pub fn sampledToken(self: Exec, hinted: u32) u32 {
+        return self.vtable.sampledToken(self.ptr, hinted);
     }
     pub fn profPhase(self: Exec, on: bool) void {
         self.vtable.profPhase(self.ptr, on);
