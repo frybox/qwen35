@@ -436,13 +436,6 @@ pub const blockElemBytes = gguf.blockBytes;
 pub const q8_0_block_elems = blockElemsOf(.q8_0);
 pub const q8_0_block_bytes = blockElemBytes(.q8_0);
 
-/// Elements in one GGUF row-block: the unit `QuantRow.blocks_per_row` counts
-/// for every type except Q8_0 (whose rows are plain 32-element blocks).
-/// All framed types pack 8 x 32 = 256 elements per row-block; it is spelled
-/// as an expression over the layout table rather than a bare 256 so that the
-/// 32-element block size still has a single source.
-pub const rowBlockElems = q8_0_block_elems * 8;
-
 /// Bytes `q8_scratch` must hold to quantize a matvec INPUT of `cols` elements
 /// (ceil(cols/32) blocks of 34 bytes).  Every Q8_0 matvec writes its quantized
 /// input into this scratch, so the scratch is sized by the widest INPUT, never
