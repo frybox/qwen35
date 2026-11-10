@@ -302,6 +302,16 @@ const Launch = if (cuda_linked) struct {
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
+    // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
+    // the same order) so `Launch` is the only seam between a launcher and its
+    // no-CUDA fallback: the `dGdnPrefillCore` call sites used to name
+    // `Kernels.q35_launch_*` directly, which made those 4 stubs dead code and
+    // broke `zig build` (without -Dcuda) at LINK time on an undefined symbol -- a
+    // class of failure the type errors above cannot catch.
+    const conv_step_rows = Kernels.q35_launch_conv_step_rows;
+    const gdn_gamma_rows = Kernels.q35_launch_gdn_gamma_rows;
+    const l2norm_strided = Kernels.q35_launch_l2norm_strided;
+    const scale_vec_strided = Kernels.q35_launch_scale_vec_strided;
     const rope64 = Kernels.q35_launch_rope64;
     const rope64_dpos = Kernels.q35_launch_rope64_dpos;
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
@@ -422,6 +432,31 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
         return stubNoCudaKernels();
     }
+    // Same order and same signatures as the `Kernels` aliases above: every
+    // launcher the CUDA branch exposes must have a member here, or any call site
+    // added later breaks `zig build` (no -Dcuda) with `no member named ...` --
+    // which is exactly how `set_int1` and the three `attn_decode_*` variants got
+    // away: they were aliased and called long after this struct was last read.
+    fn attn_decode_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_slot, heads, gqa, hd, kv_dim, scale, stream };
+        return stubNoCudaKernels();
+    }
+    fn attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
+        return stubNoCudaKernels();
+    }
+    fn attn_decode_split2(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, slot, heads, gqa, hd, kv_dim, scale, split, stream };
+        return stubNoCudaKernels();
+    }
+    fn attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, d_part, d_slot, heads, gqa, hd, kv_dim, scale, split, stream };
+        return stubNoCudaKernels();
+    }
+    fn set_int1(d: ?[*]c_int, v: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d, v, stream };
+        return stubNoCudaKernels();
+    }
     fn gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_state, d_k, d_v, d_q, d_km, d_delta, d_out, gamma, beta, vd, stream };
         return stubNoCudaKernels();
@@ -434,8 +469,8 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
-    // Prefill-only twins, same stub treatment (they are called directly from
-    // `dGdnPrefillCore`, never through `Launch`).
+    // Prefill-only twins, now reached through `Launch` like every other launcher
+    // (see the note in the CUDA branch: they used to bypass the seam).
     fn conv_step_rows(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_conv, d_y, d_wconv, n, tokens, y_stride, stream };
         return stubNoCudaKernels();
@@ -5276,7 +5311,7 @@ const attn_score_arity: usize = 10;
                                 if (dBufPtr(dt_bias)) |db| {
                                     if (dBufPtr(gamma)) |pg| {
                                         // 1. conv + silu for every token, one shared history.
-                                        var rc = Kernels.q35_launch_conv_step_rows(
+                                        var rc = Launch.conv_step_rows(
                                             pc, pq, pw, @intCast(conv_dim), @intCast(tokens),
                                             @intCast(conv_dim), stream);
                                         if (rc != cudart.cudaSuccess) {
@@ -5284,7 +5319,7 @@ const attn_score_arity: usize = 10;
                                             return;
                                         }
                                         // 2. beta (in place) + gamma, one row per token.
-                                        rc = Kernels.q35_launch_gdn_gamma_rows(
+                                        rc = Launch.gdn_gamma_rows(
                                             pab + ab_a_offset, pab + ab_b_offset, sa, db, pg,
                                             @intCast(nv), @intCast(tokens),
                                             @intCast(ab_stride), @intCast(ab_stride),
@@ -5298,21 +5333,21 @@ const attn_score_arity: usize = 10;
                                         //    them: l2norm(q), l2norm(k), q *= qscale.
                                         var rep: usize = 0;
                                         while (rep < nk_reps) : (rep += 1) {
-                                            rc = Kernels.q35_launch_l2norm_strided(
+                                            rc = Launch.l2norm_strided(
                                                 pq, 0, @intCast(nk), @intCast(kd), eps,
                                                 @intCast(tokens), @intCast(conv_dim), stream);
                                             if (rc != cudart.cudaSuccess) {
                                                 self.ewLaunchFail("l2norm_strided_q", rc);
                                                 return;
                                             }
-                                            rc = Kernels.q35_launch_l2norm_strided(
+                                            rc = Launch.l2norm_strided(
                                                 pq, @intCast(kq_dim), @intCast(nk), @intCast(kd),
                                                 eps, @intCast(tokens), @intCast(conv_dim), stream);
                                             if (rc != cudart.cudaSuccess) {
                                                 self.ewLaunchFail("l2norm_strided_k", rc);
                                                 return;
                                             }
-                                            rc = Kernels.q35_launch_scale_vec_strided(
+                                            rc = Launch.scale_vec_strided(
                                                 pq, 0, qscale, @intCast(kq_dim),
                                                 @intCast(tokens), @intCast(conv_dim), stream);
                                             if (rc != cudart.cudaSuccess) {
