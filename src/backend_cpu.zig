@@ -1003,6 +1003,32 @@ pub const CpuBackend = struct {
         ew.bufAttnDecode(q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
+    /// CPU oracle for `VTable.gdnStepRowsChunk`: literally `rows` successive
+    /// `gdnStepRows` calls, each on the next slice of every strided operand.
+    ///
+    /// The per-row slices are exactly what the engine's old
+    /// `while (t < k) forwardGdnCore(...)` loop passed, so a device kernel that
+    /// fuses the loop has something meaningful to be compared against instead
+    /// of a copy checked against a copy.
+    fn vGdnStepRowsChunk(ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+                         gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
+                         rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
+        if (heads == 0 or vd == 0 or nk == 0) return;
+        for (0..rows) |t| {
+            vGdnStepRows(ctx,
+                state,
+                k.span(t * k_stride, nk * kd),
+                v.span(t * v_stride, heads * vd),
+                q.span(t * q_stride, nk * kd),
+                km.span(t * heads * vd, heads * vd),
+                delta.span(t * heads * vd, heads * vd),
+                out.span(t * heads * vd, heads * vd),
+                gamma.span(t * heads, heads),
+                beta.span(t * heads, heads),
+                heads, nk, kd, vd);
+        }
+    }
+
     /// CPU oracle for `VTable.attnChunk`: literally the per-row `attnDecode`
     /// calls the engine made before the chunk slot existed, in the same order.
     /// Keeping the naive loop here is what makes a device implementation's
@@ -1198,6 +1224,7 @@ pub const CpuBackend = struct {
         .convStep = vConvStep,
         .gdnStep = vGdnStep,
         .gdnStepRows = vGdnStepRows,
+        .gdnStepRowsChunk = vGdnStepRowsChunk,
         .loadVecF32 = vLoadVecF32,
         .freeVec = vFreeVec,
         .allocBuf = vAllocBuf,

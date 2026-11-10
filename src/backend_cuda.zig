@@ -156,6 +156,7 @@ const Kernels = struct {
     // one launch (block per head) for attn_decode; see the kernel headers.
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     // Prefill (batched) twins of conv_step / gdn_gamma / l2norm / scale_vec.
@@ -306,6 +307,7 @@ const Launch = if (cuda_linked) struct {
     const set_int1 = Kernels.q35_launch_set_int1;
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
+    const gdn_step_rows_chunk = Kernels.q35_launch_gdn_step_rows_chunk;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
     // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
     // the same order) so `Launch` is the only seam between a launcher and its
@@ -476,6 +478,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, d_delta, d_out, d_gamma, d_beta, heads, nk, kd, vd, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
     fn gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int {
@@ -7049,6 +7055,90 @@ const attn_score_arity: usize = 10;
         dGdnStepRows_body(ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
     }
 
+    /// Chunk-wide `gdnStepRows` (`VTable.gdnStepRowsChunk`): the same state
+    /// recurrence for `rows` tokens in ONE launch.
+    ///
+    /// The steps are sequential -- `state` is carried -- so this does not add
+    /// parallelism.  What it removes is the launch: the per-token loop issued
+    /// 10,500 launches for a 525-token prefill (48 GDN layers), whose device
+    /// time was 42 ms but whose wall clock was 641 ms.  Deleting the loop
+    /// outright (measurement only) took prefill 299 -> 453 tok/s.
+    fn dGdnStepRowsChunk_body(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                              q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                              gamma: backend.Buf, beta: backend.Buf,
+                              heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
+                              k_stride: usize, v_stride: usize, q_stride: usize) void {
+        const self = self_(ctx);
+        // Same shape gate as the per-row body, plus the strides the chunk form
+        // needs.  The last row must be fully inside each buffer, so the length
+        // check uses (rows-1)*stride + the row width -- not rows*stride, which
+        // would reject a view whose tail exactly ends the buffer.
+        const need = struct {
+            fn n(r: usize, s: usize, w: usize) usize {
+                return if (r == 0) 0 else (r - 1) * s + w;
+            }
+        }.n;
+        if (vd == 128 and kd == 128 and heads != 0 and nk != 0 and nk <= heads and rows != 0 and
+            gamma.len >= rows * heads and beta.len >= rows * heads and
+            state.len >= heads * kd * vd and
+            k.len >= need(rows, k_stride, nk * kd) and q.len >= need(rows, q_stride, nk * kd) and
+            v.len >= need(rows, v_stride, heads * vd) and
+            out.len >= rows * heads * vd and
+            km.len >= rows * heads * vd and delta.len >= rows * heads * vd and
+            self.cu != null)
+        {
+            if (dBufPtr(state)) |pstate| {
+                if (dBufPtr(k)) |pk| {
+                    if (dBufPtr(v)) |pv| {
+                        if (dBufPtr(q)) |pq| {
+                            if (dBufPtr(km)) |pkm| {
+                                if (dBufPtr(delta)) |pdelta| {
+                                    if (dBufPtr(out)) |pout| {
+                                        if (dBufPtr(gamma)) |pgamma| {
+                                            if (dBufPtr(beta)) |pbeta| {
+                                                const rc = Launch.gdn_step_rows_chunk(
+                                                    pstate, @intCast(kd * vd),
+                                                    pk, @intCast(k_stride),
+                                                    pv, @intCast(v_stride),
+                                                    pq, @intCast(q_stride),
+                                                    pkm, @intCast(heads * vd),
+                                                    pdelta, @intCast(heads * vd),
+                                                    pout, @intCast(heads * vd),
+                                                    pgamma, @intCast(heads),
+                                                    pbeta, @intCast(heads),
+                                                    @intCast(heads), @intCast(nk),
+                                                    @intCast(kd), @intCast(vd), @intCast(rows),
+                                                    self.launchStream(),
+                                                );
+                                                if (rc == cudart.cudaSuccess) return;
+                                                self.ewLaunchFail("gdn_step_rows_chunk", rc);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fallback: the CPU oracle walks the rows one at a time, so a shape or
+        // residency miss costs speed, never correctness.
+        cpu_mod.CpuBackend.vtable.gdnStepRowsChunk(@ptrCast(&self.cpu), state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+    }
+
+    fn dGdnStepRowsChunk(ctx: *anyopaque, state: backend.Buf, k: backend.Buf, v: backend.Buf,
+                         q: backend.Buf, km: backend.Buf, delta: backend.Buf, out: backend.Buf,
+                         gamma: backend.Buf, beta: backend.Buf,
+                         heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
+                         k_stride: usize, v_stride: usize, q_stride: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.gdn_step, t0);
+        if (self.ablated(.gdn_step)) return ;
+        dGdnStepRowsChunk_body(ctx, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
+    }
+
     /// The `gdnGamma` slot, timed (`$QWEN35_PROF`).
     fn dGdnGamma(ctx: *anyopaque, a_raw: backend.Buf, b_raw: backend.Buf, ssm_a: backend.Buf,
                  dt_bias: backend.Buf, gamma: backend.Buf, nv: usize) void {
@@ -7249,6 +7339,7 @@ pub const vtable = backend.Exec.VTable{
     .convStep = CudaBackend.dConvStep,
     .gdnStep = CudaBackend.dGdnStep,
     .gdnStepRows = CudaBackend.dGdnStepRows,
+    .gdnStepRowsChunk = CudaBackend.dGdnStepRowsChunk,
     .loadVecF32 = CudaBackend.vLoadVecF32,
     .freeVec = CudaBackend.vFreeVec,
     .attnDecode = CudaBackend.dAttnDecode,

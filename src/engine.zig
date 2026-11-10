@@ -1062,6 +1062,11 @@ pub const Engine = struct {
         // `nv` slices of `vd` each, NOT one shared `vd` buffer: `gdnStepRows`
         // gives every head its own block, and `heads` blocks writing one shared
         // km/delta slice would be a silent race (wrong tokens, no crash).
+        //
+        // ONE TOKEN is all these need: nothing reads them (they are scratch the
+        // kernel fills), so the decode path keeps the minimal size.  The prefill
+        // chunk path needs `K` rows and REALLOCATES them below -- see the
+        // `gdnStepRowsChunk` note there.
         e.delta = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.kv_mem = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.gamma_scratch = try e.exec.allocBuf(@as(usize, cfg.gdn_n_heads));
@@ -1091,6 +1096,19 @@ pub const Engine = struct {
         // matter of activation memory only (measured: bufs_MiB 22 -> 157 at
         // K=1024 on the 27B).
         const K: usize = 1024;
+        // `gdnStepRowsChunk` runs the state recurrence for ALL K tokens of a
+        // chunk in one launch, striding km/delta per row, so those two scratch
+        // buffers must cover K rows (gdn_nv * gdn_kd per row).  Sized here rather
+        // than with the other GDN scratch above because `K` is defined here.
+        //
+        // `no_batch` (decode) still uses the one-row `gdnStepRows` and only ever
+        // touches the first row, so allocating the full chunk unconditionally
+        // costs 2 * K * 16 * 128 * 4 B = 16 MiB of device scratch and nothing
+        // else.  A one-row buffer would make the backend's length gate reject
+        // the chunk call, which silently falls back to the CPU oracle -- correct
+        // output, ~10x slower, and it then walks off the end of the buffer.
+        e.delta = try e.exec.allocBuf(K * gdn_nv * gdn_kd);
+        e.kv_mem = try e.exec.allocBuf(K * gdn_nv * gdn_kd);
         const q_dimK: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
         const kv_dimK: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
         e.nbatch = if (no_batch) 0 else K;
@@ -1431,7 +1449,7 @@ pub const Engine = struct {
                 // what turns ~14 launches per token into 4 per chunk plus the
                 // per-token state step.
                 self.forwardGdnPrelude(lw, li, k);
-                while (t < k) : (t += 1) self.forwardGdnCore(li, t, k);
+                self.forwardGdnCoreChunk(li, k);
                 // Chunk-wide gated RMSNorm + silu gate, hoisted out of the
                 // token loop above; `ssm_out` is the first reader of `goutK`.
                 self.forwardGdnGated(lw, k);
@@ -1812,8 +1830,31 @@ pub const Engine = struct {
         );
     }
 
-    /// state in serial order), writing the gated RMS-normed output to goutK[t].
-    fn forwardGdnCore(self: *Engine, li: usize, t: usize, k: usize) void {
+    /// Chunk-wide state update: the SAME per-token recurrence as
+    /// `forwardGdnCore` did, but for all `k` tokens in ONE backend call.
+    ///
+    /// WHY: the steps are sequential (`state` is the carried recurrence), so
+    /// fusing them adds no parallelism -- what it removes is the LAUNCH.  The
+    /// per-token loop issued one launch per token per GDN layer: 10,500 for a
+    /// 525-token prefill at 48 layers, with the kernel itself doing ~4 us of
+    /// work each.  PROFILE put the device time of those launches at 42 ms while
+    /// the wall clock they occupied was 641 ms of a 1752 ms prefill -- the host
+    /// could not submit them fast enough.  Deleting the loop outright
+    /// (measurement only, wrong results) took prefill 299 -> 453 tok/s, which
+    /// prices the whole overhead at ~594 ms.
+    ///
+    /// CORRECTNESS: this is pure code motion, not an algorithm change.  The
+    /// device kernel is `q35_gdn_step_rows_kernel`'s body verbatim with the
+    /// token index as a loop variable (same __fmul_rn/__fadd_rn pinning, same
+    /// i-order, same two-pass structure), and the CPU oracle for the new slot
+    /// is literally the old `rows` successive calls.  Every operand that used to
+    /// be sliced per token is now sliced per row inside the call.
+    ///
+    /// Layout note: `qkvK` is `k * conv_dim` row-major, so q/k/v for the whole
+    /// chunk are three strided views of it (stride `conv_dim`), NOT three
+    /// contiguous blocks -- which is why the chunk slot takes explicit strides
+    /// instead of inferring them from the buffer length.
+    fn forwardGdnCoreChunk(self: *Engine, li: usize, k: usize) void {
         const c = self.cfg;
         const nv: usize = c.gdn_n_heads;
         const nk: usize = c.gdn_num_k_heads;
@@ -1823,44 +1864,34 @@ pub const Engine = struct {
         const kq_dim: usize = nk * kd;
         const value_dim: usize = nv * vd;
 
-        const qkv = self.qkvK.span(t * conv_dim, conv_dim);
-        const st = &self.gdn[li];
+        if (k == 0) return;
         // conv + silu, beta = sigmoid(b), gamma, and the l2norm/scale passes were
         // all done for the whole chunk by `forwardGdnPrelude`; qkv and abK are
-        // already in their final form here.  Only the state update is per token.
-        const gamma = self.gdn_prefill_gamma.span(t * nv, nv);
-        // `beta` is the in-place sigmoid(b) `gdnPrefillCore` wrote into the b half.
-        const beta = self.abK.span(k * nv + t * nv, nv);
-        const state = st.state;
-        const gout = self.goutK.span(t * value_dim, value_dim);
-        // (The l2norm(q)/(k)/scale passes the per-head loop used to make here are
-        // now part of `forwardGdnPrelude`; the `nv / nk` repeat count and its
-        // order are preserved there verbatim.)
-
-        // All `nv` heads in one backend call -- this is the 355-token prefill
-        // path, so the 48 launches/token this replaces are the ones profile
-        // shows.  Same arguments and same reasoning as `forwardGdn`'s call.
-        self.exec.gdnStepRows(
-            state,
-            qkv.span(kq_dim, kq_dim),
-            qkv.span(2 * kq_dim, value_dim),
-            qkv.span(0, kq_dim),
+        // already in their final form here.  Only the state update is per token,
+        // and it is now per token inside the kernel rather than per launch.
+        //
+        // Every argument is the CHUNK-RESIDENT buffer, not token 0's slice: the
+        // backend strides it.  That is what makes this one launch instead of `k`.
+        const beta_base: usize = k * nv; // the b half of abK follows the a half
+        self.exec.gdnStepRowsChunk(
+            self.gdn[li].state,
+            self.qkvK.span(kq_dim, k * conv_dim - kq_dim),
+            self.qkvK.span(2 * kq_dim, k * conv_dim - 2 * kq_dim),
+            self.qkvK.span(0, k * conv_dim),
             self.kv_mem,
             self.delta,
-            gout,
-            gamma,
-            beta,
+            self.goutK.span(0, k * value_dim),
+            self.gdn_prefill_gamma.span(0, k * nv),
+            self.abK.span(beta_base, k * nv),
             nv,
             nk,
             kd,
             vd,
+            k,
+            conv_dim, // k per-token stride (qkv rows interleave q, k, gate)
+            conv_dim, // v per-token stride
+            conv_dim, // q per-token stride
         );
-
-        // (Gated RMSNorm + mulSilu used to be here, per token.  They touch only
-        // this token's `gout`/`z` rows and carry no state, so they were hoisted
-        // out of the token loop into `forwardGdnGated` below -- 2 launches per
-        // token per GDN layer, 50,304 of the 281,384 launches a 525-token
-        // prefill made.  See that function for the correctness argument.)
     }
 
     /// Chunk-wide tail of the GDN block: the gated RMSNorm (SPEC A6, norm ->

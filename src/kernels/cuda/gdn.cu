@@ -231,6 +231,105 @@ extern "C" int q35_launch_gdn_step_rows(float *d_state, int state_stride,
     return (int)cudaGetLastError();
 }
 
+// Chunk form: one block per value head, and the per-token loop runs INSIDE the
+// kernel instead of once per launch.
+//
+// The steps are sequential by construction (`state` is the recurrence), so this
+// buys no parallelism over `q35_gdn_step_rows_kernel` -- it buys the launch.
+// A 525-token prefill used to issue 525 launches per GDN layer (10,500 total at
+// 48 layers); each ran ~4 us of work but the host could not submit them faster
+// than ~57 us apart, so 641 ms of a 1752 ms prefill was the host, not the GPU.
+// Removing the loop entirely (measurement only, wrong results) took prefill
+// 299 -> 453 tok/s, i.e. the whole overhead was ~594 ms.
+//
+// Everything below is `q35_gdn_step_rows_kernel`'s body verbatim -- same
+// intrinsics, same i-order, same pass structure -- with the token index `t`
+// advancing every strided base by one row.  The only edits are the loop and the
+// per-row pointer bumps, which is what keeps the two versions comparable
+// line by line.
+__global__ void q35_gdn_step_rows_chunk_kernel(
+    float *__restrict__ d_state, int state_stride,
+    const float *__restrict__ d_k, int k_stride,
+    const float *__restrict__ d_v, int v_stride,
+    const float *__restrict__ d_q, int q_stride,
+    float *__restrict__ d_km, int km_stride,
+    float *__restrict__ d_delta, int delta_stride,
+    float *__restrict__ d_out, int out_stride,
+    const float *__restrict__ d_gamma, int gamma_stride,
+    const float *__restrict__ d_beta, int beta_stride,
+    int nk, int kd, int vd, int rows)
+{
+    const int h = blockIdx.x;
+    const int j = threadIdx.x;
+    if (j >= vd) return;
+
+    const int kh = h % nk;
+    // Per-head bases that do NOT move with the token.
+    float *__restrict__ state = d_state + (size_t)h * state_stride;
+    const float *__restrict__ k_h0 = d_k + (size_t)kh * kd;
+    const float *__restrict__ q_h0 = d_q + (size_t)kh * kd;
+
+    for (int t = 0; t < rows; ++t) {
+        const float gamma = d_gamma[(size_t)t * gamma_stride + h];
+        const float beta = d_beta[(size_t)t * beta_stride + h];
+        const float *__restrict__ k_h = k_h0 + (size_t)t * k_stride;
+        const float *__restrict__ q_h = q_h0 + (size_t)t * q_stride;
+        const float *__restrict__ v_h = d_v + (size_t)t * v_stride + (size_t)h * vd;
+        float *__restrict__ km_p = d_km + (size_t)t * km_stride + (size_t)h * vd;
+        float *__restrict__ delta_p = d_delta + (size_t)t * delta_stride + (size_t)h * vd;
+        float *__restrict__ out_p = d_out + (size_t)t * out_stride + (size_t)h * vd;
+
+        // Pass 1: read-only sweep.
+        float acc = 0.0f;
+        for (int i = 0; i < kd; ++i) {
+            const float s = state[(size_t)i * vd + j];
+            acc = __fadd_rn(acc, __fmul_rn(s, k_h[i]));
+        }
+        const float km = __fmul_rn(acc, gamma);
+        km_p[j] = km;
+
+        // delta = beta * (v - km)
+        const float delta = __fmul_rn(__fsub_rn(v_h[j], km), beta);
+        delta_p[j] = delta;
+
+        // Pass 2: rewrite the column, accumulate S^T q in the same i order.
+        float out = 0.0f;
+        for (int i = 0; i < kd; ++i) {
+            const size_t idx = (size_t)i * vd + j;
+            const float r = __fadd_rn(__fmul_rn(state[idx], gamma), __fmul_rn(k_h[i], delta));
+            state[idx] = r;
+            out = __fadd_rn(out, __fmul_rn(r, q_h[i]));
+        }
+        out_p[j] = out;
+    }
+}
+
+extern "C" int q35_launch_gdn_step_rows_chunk(float *d_state, int state_stride,
+                                              const float *d_k, int k_stride,
+                                              const float *d_v, int v_stride,
+                                              const float *d_q, int q_stride,
+                                              float *d_km, int km_stride,
+                                              float *d_delta, int delta_stride,
+                                              float *d_out, int out_stride,
+                                              const float *d_gamma, int gamma_stride,
+                                              const float *d_beta, int beta_stride,
+                                              int heads, int nk, int kd, int vd,
+                                              int rows, void *stream)
+{
+    // Same shape gate as the per-row launcher: 128-wide fast path only, and a
+    // zero/negative head count or row count launches nothing (an empty batch is
+    // not an error).
+    if (heads <= 0 || rows <= 0) return (int)cudaSuccess;
+    if (vd != 128 || kd != 128) return cudaErrorInvalidValue;
+    if (nk <= 0) return cudaErrorInvalidValue;
+    if (nk > heads) return cudaErrorInvalidValue;
+    q35_gdn_step_rows_chunk_kernel<<<heads, Q35_GDN_THREADS, 0, (cudaStream_t)stream>>>(
+        d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride,
+        d_km, km_stride, d_delta, delta_stride, d_out, out_stride,
+        d_gamma, gamma_stride, d_beta, beta_stride, nk, kd, vd, rows);
+    return (int)cudaGetLastError();
+}
+
 extern "C" int q35_launch_gdn_gamma(const float *d_a_raw, float *d_b_raw,
                                     const float *d_ssm_a,
                                     const float *d_dt_bias, float *d_gamma,

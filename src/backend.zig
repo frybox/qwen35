@@ -268,6 +268,33 @@ pub const Exec = struct {
         gdnStepRows: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
             gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void,
 
+        /// Chunk-wide twin of `gdnStepRows` for prefill: `rows` successive state
+        /// steps in ONE call.  Row r is exactly the `gdnStepRows` call on the
+        /// r-th slice of every strided operand, and the steps are inherently
+        /// SEQUENTIAL (`state` is carried from row to row), so this is not a
+        /// parallelism win -- it is a LAUNCH-count win.
+        ///
+        /// Rationale, measured: the per-token loop issued `rows` launches of a
+        /// ~4 us kernel per GDN layer.  On a 525-token prefill that is 10,500
+        /// launches whose device time totalled 42 ms while the wall clock they
+        /// occupied was 641 ms -- the host could not submit them fast enough.
+        /// Deleting the loop entirely (wrong results, measurement only) took
+        /// prefill from 299 to 453 tok/s, which puts the whole launch overhead
+        /// at ~594 ms.  Fusing the loop into the kernel recovers it without
+        /// touching the arithmetic: same statements, same __fmul_rn/__fadd_rn
+        /// pinning, same i-order, only the row index becomes a loop variable.
+        ///
+        /// `gamma`/`beta` are per-head coefficient rows (`heads` floats each
+        /// per token), so they stride the same way `out` does.
+        ///
+        /// Explicit strides: `k` and `q` live inside one `qkv` row of
+        /// `2*nk*kd + heads*vd` floats, so their per-token stride is the whole
+        /// row, NOT `nk*kd`.  Inferring it from the buffer length would read the
+        /// gate half as if it were the next token's k.
+        gdnStepRowsChunk: *const fn (ctx: *anyopaque, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+            gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize, rows: usize,
+            k_stride: usize, v_stride: usize, q_stride: usize) void,
+
         /// Full-attention decode for one token: scores against the KV rows,
         /// softmax, PV accumulation into `gout`, then the sigmoid gate.  `kcache`
         /// / `vcache` are this layer's KV rows (`kv_dim` wide per token,
@@ -552,6 +579,13 @@ pub const Exec = struct {
     pub fn gdnStepRows(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
                        gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize) void {
         self.vtable.gdnStepRows(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd);
+    }
+    /// See `VTable.gdnStepRowsChunk`: `rows` sequential `gdnStepRows` steps in
+    /// one call, on the successive slices of every strided operand.
+    pub fn gdnStepRowsChunk(self: Exec, state: Buf, k: Buf, v: Buf, q: Buf, km: Buf, delta: Buf, out: Buf,
+                            gamma: Buf, beta: Buf, heads: usize, nk: usize, kd: usize, vd: usize,
+                            rows: usize, k_stride: usize, v_stride: usize, q_stride: usize) void {
+        self.vtable.gdnStepRowsChunk(self.ptr, state, k, v, q, km, delta, out, gamma, beta, heads, nk, kd, vd, rows, k_stride, v_stride, q_stride);
     }
     pub fn attnDecode(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {

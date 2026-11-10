@@ -250,6 +250,29 @@ int q35_launch_gdn_step_rows(float *d_state, int state_stride,
                              int heads, int nk, int kd, int vd,
                              void *stream);
 
+// Chunk form: the SAME state update, `rows` times, with the per-token loop
+// inside the kernel.  The steps are sequential (state is the recurrence), so
+// this is a launch-count win, not a parallelism win -- see gdn.cu.
+//
+// Unlike q35_launch_gdn_step_rows, every per-token operand carries a stride,
+// because one call now spans the whole chunk:
+//   d_gamma/d_beta   rows of `heads` floats, stride gamma_stride/beta_stride
+//   d_km/d_delta/d_out/d_v  rows of heads*vd floats, stride *_stride
+//   d_k/d_q          rows of nk*kd floats, stride k_stride/q_stride
+// `state` does NOT stride: it is the carried recurrence, one [kd,vd] block per
+// head for the whole call.
+int q35_launch_gdn_step_rows_chunk(float *d_state, int state_stride,
+                                   const float *d_k, int k_stride,
+                                   const float *d_v, int v_stride,
+                                   const float *d_q, int q_stride,
+                                   float *d_km, int km_stride,
+                                   float *d_delta, int delta_stride,
+                                   float *d_out, int out_stride,
+                                   const float *d_gamma, int gamma_stride,
+                                   const float *d_beta, int beta_stride,
+                                   int heads, int nk, int kd, int vd,
+                                   int rows, void *stream);
+
 // One token of the delta-rule state update, one launch per value head.
 // d_state is the [kd, vd] slice for THIS head (row-major S[k][v], kd*vd floats),
 // updated in place; d_k/d_q are kd, d_v/d_km/d_delta/d_out are vd.  See
