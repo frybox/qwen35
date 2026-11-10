@@ -65,6 +65,17 @@ test {
 }
 
 test {
+    // `engine.refErrF64` (the f64 matvec oracle) is called by nothing in the
+    // engine, and Zig analyses unreferenced functions lazily -- so `zig build
+    // test` never even type-checked it.  Its Q8_0 branch called
+    // `q.row_blocks()`, a method that does not exist (`QuantRow.rowBlocks`), i.e.
+    // the oracle for the Q8_0 cross-check did not compile.  This file references
+    // it, which is the guard: adding a ttype without registering its row fn now
+    // fails a build instead of silently returning -2.
+    _ = @import("referr_tests.zig");
+}
+
+test {
     // `elementwise.zig` is the slot body of the elementwise kernels; import it
     // here so its tests (notably the `bufDeinterleaveQG` oracle comparison,
     // which pins the batched q/gate split to the per-head `copyRange` sequence

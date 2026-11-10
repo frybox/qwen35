@@ -365,38 +365,34 @@ pub fn refErrF64(w: Engine.LinearW, out: []const f32, dx: DumpX, cols: usize) f6
         var acc: f64 = 0;
         switch (w) {
             .quant => |q| {
-                if (q.ttype == .q8_0) {
-                    // Q8_0: 32-element blocks, f16 block scale + i8 quants.
-                    const blen = q.rowBytes();
-                    if (rr * blen + blen > q.data.len) return -4;
-                    const wrow = q.data[rr * blen ..][0..blen];
-                    for (0..q.row_blocks()) |b| {
-                        const wb = wrow[b * q8_0_block_bytes ..][0..q8_0_block_bytes];
-                        const d: f64 = @floatCast(@as(f16, @bitCast(std.mem.readInt(u16, wb[0..2], .little))));
-                        for (0..q8_0_block_elems) |j| {
-                            const wv: f64 = d * @as(f64, @as(i8, @bitCast(wb[2 + j])));
-                            acc += wv * @as(f64, dx.x[xoff + b * q8_0_block_elems + j]);
-                        }
-                    }
-                } else {
-                    // Row-block framing, identical to `backend_cpu.dequantRowInto`:
-                    // one `deq` call consumes one 256-element row-block (8 x 32
-                    // sub-blocks for q4_0/iq4_nl, 8 x 32 single-element blocks for
-                    // f16/bf16) and emits `rbe` floats.  Keying on `blockElems()`
-                    // alone is wrong here: f16/bf16 have blockElems == 1 (one
-                    // element per 2-byte block), so the old per-block loop asked a
-                    // 256-wide dequantizer for a 1-wide output.
-                    const bb = q.blockBytes(); // one block of this type
-                    const rbe = q.rowBlockElems();
-                    const per_rb = rbe / q.blockElems(); // blocks per row-block
-                    const deq = backend_cpu.dequantRowFnFor(q.ttype) orelse return -2;
-                    for (0..q.blocks_per_row) |b| {
-                        const i = rr * q.blocks_per_row + b;
-                        const span = per_rb * bb;
-                        if (i * span + span > q.data.len) return -4;
-                        deq(q.data[i * span ..][0..span], rowbuf[0..rbe]);
-                        for (0..rbe) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * rbe + j]);
-                    }
+                // One `deq` call per row-block, every ttype including Q8_0 --
+                // deliberately the SAME framing as `backend_cpu.dequantRowInto`,
+                // because that shared shape is what makes the two comparable at
+                // all: this function is the f64 oracle matvec results are checked
+                // against, so it must not be a second, independently written
+                // decode of the same bytes.
+                //
+                // Q8_0 needs no branch of its own here.  The reason it has one in
+                // `dequantRowInto` -- "a row is not a whole number of 256-element
+                // units" -- does not apply, because this loop does not iterate in
+                // 256-element units: it iterates `rowBlockElems()`, which for Q8_0
+                // IS its native 32-element block (`gguf.rowBlockElems`), so
+                // `per_rb == 1` and one 34-byte block goes to `deq` per call.
+                // `dequantRowFnFor(.q8_0)` is registered to make that work.
+                //
+                // Keying on `blockElems()` alone WOULD be wrong: f16/bf16 have
+                // blockElems == 1 (one element per 2-byte block), so a per-block
+                // loop asks a 256-wide dequantizer for a 1-wide output.
+                const bb = q.blockBytes(); // one block of this type
+                const rbe = q.rowBlockElems();
+                const per_rb = rbe / q.blockElems(); // blocks per row-block
+                const deq = backend_cpu.dequantRowFnFor(q.ttype) orelse return -2;
+                for (0..q.blocks_per_row) |b| {
+                    const i = rr * q.blocks_per_row + b;
+                    const span = per_rb * bb;
+                    if (i * span + span > q.data.len) return -4;
+                    deq(q.data[i * span ..][0..span], rowbuf[0..rbe]);
+                    for (0..rbe) |j| acc += @as(f64, rowbuf[j]) * @as(f64, dx.x[xoff + b * rbe + j]);
                 }
             },
             .f32 => |m| {
