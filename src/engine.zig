@@ -614,6 +614,11 @@ pub const Engine = struct {
     /// backend, and `gdnStepRows` consumes it there as a `Buf` -- nothing reads
     /// it back to the host.
     gamma_scratch: backend.Buf,
+    /// Prefill twin of `gamma_scratch`: `nbatch * gdn_n_heads`, one gamma row per
+    /// token of the current chunk, written by `gdnPrefillCore` and consumed by
+    /// `forwardGdnCore`.  Separate from `gamma_scratch` so the serial decode path
+    /// keeps its single-row region untouched.
+    gdn_prefill_gamma: backend.Buf,
     /// Number of tokens batched per prefill chunk (K-token batched projection:
     /// each layer's weights are read once per chunk and reused across K tokens
     /// through cache).  0 => the batched path is unavailable.
@@ -900,6 +905,7 @@ pub const Engine = struct {
             .delta = backend.Buf.empty,
             .kv_mem = backend.Buf.empty,
             .gamma_scratch = backend.Buf.empty,
+            .gdn_prefill_gamma = backend.Buf.empty,
         };
         errdefer e.freeAll();
 
@@ -1070,6 +1076,9 @@ pub const Engine = struct {
         e.delta = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.kv_mem = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.gamma_scratch = try e.exec.allocBuf(@as(usize, cfg.gdn_n_heads));
+        // Sized for a full chunk even when `nbatch == 0` (then it is unused):
+        // `forwardGdnPrelude` only runs on the batched path.  Cheap: 128 * 48.
+        e.gdn_prefill_gamma = try e.exec.allocBuf(128 * @as(usize, cfg.gdn_n_heads));
         e.sample_scratch = try e.exec.allocBuf(cfg.vocab);
 
         // ---- K-token batched prefill scratch (K = 128) ----
@@ -1406,14 +1415,24 @@ pub const Engine = struct {
                 self.exec.matvecBatchK(self.abK.span(0, k * nv), lw.ssm_alpha.?, self.x1K, k);
                 self.exec.matvecBatchK(self.abK.span(k * nv, k * nv), lw.ssm_beta.?, self.x1K, k);
                 t = 0;
+                // Chunk-wide GDN prelude: conv+silu, gamma/beta and the
+                // l2norm/scale passes do not touch the running state, and
+                // `gdnStepRows` only READS qkv, so all of it can run before the
+                // first state update.  The conv history is the one ordering
+                // constraint and it stays ascending inside the call.  This is
+                // what turns ~14 launches per token into 4 per chunk plus the
+                // per-token state step.
+                self.forwardGdnPrelude(lw, li, k);
                 while (t < k) : (t += 1) self.forwardGdnCore(lw, li, t, k);
                 self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
             }
 
-            // ---- per-token residual add ----
-            t = 0;
-            while (t < k) : (t += 1)
-                self.exec.addResid(self.xK.span(t * hidden, hidden), self.x2K.span(t * hidden, hidden));
+            // ---- residual add: the `k` rows are CONSECUTIVE (`xK`/`x2K` are
+            // `k * hidden` contiguous), so one call covers the chunk.  This was a
+            // per-token loop (one launch per token per layer: 3353 launches for
+            // a 525-token prefill, which PROFILE showed at 2.7%).  `addResid` is
+            // elementwise with no per-row state, so the merge is exact.
+            self.exec.addResid(self.xK.span(0, k * hidden), self.x2K.span(0, k * hidden));
 
             // ---- MLP: chunk-wide norm, batched gate/up, chunk-wide SwiGLU,
             // batched down, residual ----
@@ -1702,6 +1721,61 @@ pub const Engine = struct {
     /// Batched-chunk twin of `forwardGdn`: qkv / gate / alpha / beta were
     /// batched into qkvK / gateK / abK; this runs the per-token conv + GDN
     /// state kernel for slot `t` (updating the shared conv history and 128x128
+    /// Chunk-wide GDN prelude -- the per-token work in `forwardGdnCore` that does
+    /// not depend on the running state, hoisted out of the token loop.
+    ///
+    /// What it replaces, per token, per GDN layer: one `convStep` (2 launches),
+    /// one `gdnGamma`, and `nk_reps` x (2 `l2normRows` + 1 `scaleVec`).  On the
+    /// 27B model that is 14 launches per token per layer; for a 525-token
+    /// prefill that is ~59k launches, all of them 1 KB of work.
+    ///
+    /// CORRECTNESS: this is a pure code motion, not a new algorithm.  Every
+    /// call below is the identical expression `forwardGdnCore` used to make for
+    /// token `t`, in the same order, on the same regions -- `gdnStepRows` only
+    /// reads qkv (it writes state/km/delta/out), so nothing the prelude writes is
+    /// consumed before the state loop starts.  The conv is the one real
+    /// cross-token dependency (token t's taps read the history token t-1 left
+    /// behind) and it stays ascending, inside the backend call.
+    fn forwardGdnPrelude(self: *Engine, lw: *LayerWeights, li: usize, k: usize) void {
+        const c = self.cfg;
+        const nv: usize = c.gdn_n_heads;
+        const nk: usize = c.gdn_num_k_heads;
+        const kd: usize = c.gdn_head_dim;
+        const conv_dim: usize = 2 * nk * kd + nv * kd;
+        const kq_dim: usize = nk * kd;
+
+        const st = &self.gdn[li];
+        // The scratch is `nv` wide and every token writes its own row, so it is
+        // sized `k * nv` by `forwardChunk`'s caller.  `st.conv` stays single-token
+        // (the history is shared across the chunk, by design).
+        const gamma = self.gdn_prefill_gamma.span(0, k * nv);
+        self.exec.gdnPrefillCore(
+            self.qkvK.span(0, k * conv_dim),
+            st.conv,
+            lw.ssm_conv1d,
+            self.abK.span(0, 2 * k * nv),
+            lw.ssm_a,
+            lw.ssm_dt_bias,
+            gamma,
+            k,
+            conv_dim,
+            0, // ab_a_offset: alpha half starts at 0
+            k * nv, // ab_b_offset: beta half starts at k*nv
+            nv, // ab_stride: token t at t*nv inside each half
+            nv, // gamma_stride
+            kq_dim,
+            nv,
+            nk,
+            kd,
+            c.conv_kernel,
+            // `elementwise.l2norm` pins eps at 1e-6 (inside the sum, SPEC A3);
+            // the CUDA l2norm slots pass the same constant.  There is no config
+            // knob for it, so this is not a choice: passing anything else would
+            // diverge from the CPU oracle.
+            1e-6,
+        );
+    }
+
     /// state in serial order), writing the gated RMS-normed output to goutK[t].
     fn forwardGdnCore(self: *Engine, lw: *LayerWeights, li: usize, t: usize, k: usize) void {
         const c = self.cfg;
@@ -1715,52 +1789,18 @@ pub const Engine = struct {
 
         const qkv = self.qkvK.span(t * conv_dim, conv_dim);
         const z = self.gateK.span(t * value_dim, value_dim);
-        // forwardChunk wrote alpha as abK[0..k*nv] (token t at t*nv) and beta
-        // as abK[k*nv..2*k*nv] (token t at k*nv + t*nv) — two half-regions,
-        // matching the two linMatvecBatchK calls.  Read them back in exactly
-        // that layout; beta is stored in place (same order as the serial path).
-        const ab_a = self.abK.span(t * nv, nv);
-        const beta = self.abK.span(k * nv + t * nv, nv);
         const st = &self.gdn[li];
-        self.exec.convStep(st.conv, qkv, lw.ssm_conv1d, c.conv_kernel);
-        // Same regions as the serial path above: gamma is the backend's `nv`
-        // decay values, beta has been overwritten in place by `gdnGamma` with
-        // sigmoid(b), and both are consumed by `gdnStepRows` straight from
-        // device memory -- no `copyToHost`, no re-upload.
-        const gamma = self.gamma_scratch.span(0, nv);
-        self.exec.gdnGamma(ab_a, beta, lw.ssm_a, lw.ssm_dt_bias, gamma, nv);
-
+        // conv + silu, beta = sigmoid(b), gamma, and the l2norm/scale passes were
+        // all done for the whole chunk by `forwardGdnPrelude`; qkv and abK are
+        // already in their final form here.  Only the state update is per token.
+        const gamma = self.gdn_prefill_gamma.span(t * nv, nv);
+        // `beta` is the in-place sigmoid(b) `gdnPrefillCore` wrote into the b half.
+        const beta = self.abK.span(k * nv + t * nv, nv);
         const state = st.state;
         const gout = self.goutK.span(t * value_dim, value_dim);
-        // Same per-head calls as `forwardGdn`, batched the same way (see the
-        // long comment there, including why `l2norm` must be applied
-        // `nv / nk` times to each row); `qkv` here is this slot's `conv_dim`
-        // row, so the q run starts at 0 and the k run at `kq_dim`.
-        const nk_reps = nv / nk;
-        if (gdnHeadsTiled(nv, nk)) {
-            const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            var rep: usize = 0;
-            while (rep < nk_reps) : (rep += 1) {
-                self.exec.l2normRows(qkv.span(0, kq_dim), kd);
-                self.exec.l2normRows(qkv.span(kq_dim, kq_dim), kd);
-                self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
-            }
-        }
-        // Per-head l2norm/scale fallback for a non-tiled layout: see the same
-        // branch in `forwardGdn` (dead code for nv/nk == 3, kept for the general
-        // shape).  Keeping it as its own loop is what lets the `gdnStepRows`
-        // call below stay byte-for-byte the batched loop of `forwardGdn`.
-        if (!gdnHeadsTiled(nv, nk)) {
-            for (0..nv) |h| {
-                const kh = h % nk;
-                const q_h = qkv.span(kh * kd, kd);
-                const k_h = qkv.span(kq_dim + kh * kd, kd);
-                self.exec.l2norm(q_h);
-                self.exec.l2norm(k_h);
-                const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-                self.exec.scaleVec(q_h, qscale);
-            }
-        }
+        // (The l2norm(q)/(k)/scale passes the per-head loop used to make here are
+        // now part of `forwardGdnPrelude`; the `nv / nk` repeat count and its
+        // order are preserved there verbatim.)
 
         // All `nv` heads in one backend call -- this is the 355-token prefill
         // path, so the 48 launches/token this replaces are the ones profile
@@ -2158,6 +2198,7 @@ test "convStep: causal left-pad semantics" {
         .delta = backend.Buf.empty,
         .kv_mem = backend.Buf.empty,
         .gamma_scratch = backend.Buf.empty,
+        .gdn_prefill_gamma = backend.Buf.empty,
         .prefill_ms = 0,
     };
     // taps: w = [1, 0.5, 0.25, 2]

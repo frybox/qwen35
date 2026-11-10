@@ -156,6 +156,16 @@ const Kernels = struct {
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+
+    // Prefill (batched) twins of conv_step / gdn_gamma / l2norm / scale_vec.
+    // These exist only to collapse the per-token GDN prelude into a handful of
+    // launches per chunk -- they are NOT part of the decode graph (prefill never
+    // captures), so they are called directly and deliberately kept out of
+    // `Launch`.  Each one is bit-identical to the per-token kernel it replaces.
+    extern fn q35_launch_conv_step_rows(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_gdn_gamma_rows(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_l2norm_strided(d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_scale_vec_strided(d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     /// Warp-tiled / split decode attention (see api.h for the measurements).
     extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
@@ -424,6 +434,24 @@ const Launch = if (cuda_linked) struct {
         _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, stream };
         return stubNoCudaKernels();
     }
+    // Prefill-only twins, same stub treatment (they are called directly from
+    // `dGdnPrefillCore`, never through `Launch`).
+    fn conv_step_rows(d_conv: ?[*]f32, d_y: ?[*]f32, d_wconv: ?[*]const f32, n: c_int, tokens: c_int, y_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_conv, d_y, d_wconv, n, tokens, y_stride, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_gamma_rows(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, tokens: c_int, a_stride: c_int, b_stride: c_int, gamma_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, tokens, a_stride, b_stride, gamma_stride, stream };
+        return stubNoCudaKernels();
+    }
+    fn l2norm_strided(d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, row_offset, rows, n, eps, tokens, row_stride, stream };
+        return stubNoCudaKernels();
+    }
+    fn scale_vec_strided(d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, offset, s, n, tokens, stride, stream };
+        return stubNoCudaKernels();
+    }
     fn rope64(d_x: ?[*]f32, heads: c_int, hd: c_int, pos: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, heads, hd, pos, base, stream };
         return stubNoCudaKernels();
@@ -514,6 +542,7 @@ pub const Slot = enum(u8) {
     l2norm,
     attn_decode,
     gdn_gamma,
+    gdn_prelude,
     gdn_step,
     conv_step,
     silu,
@@ -609,6 +638,7 @@ fn slotName(s: Slot) []const u8 {
         .l2norm => "l2norm",
         .attn_decode => "attn_decode",
         .gdn_gamma => "gdn_gamma",
+        .gdn_prelude => "gdn_prelude",
         .gdn_step => "gdn_step",
         .conv_step => "conv_step",
         .silu => "silu",
@@ -5203,6 +5233,108 @@ const attn_score_arity: usize = 10;
         cpu_mod.CpuBackend.vtable.gdnGamma(@ptrCast(&self.cpu), a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
+    /// CUDA form of `VTable.gdnPrefillCore`: the whole chunk's conv+silu, gamma /
+    /// beta and l2norm/scale passes in FOUR launches instead of `tokens` x ~14.
+    ///
+    /// Order matters and is preserved: conv first (token t's taps need what
+    /// token t-1 shifted in -- the kernel walks the tokens ascending inside one
+    /// thread per channel), then gamma (reads the RAW a/b projections, which conv
+    /// does not touch), then the norm/scale passes (read the conv output).
+    /// `gdnStepRows` afterwards only READS qkv, so hoisting all of this ahead of
+    /// the state loop is order-preserving, not just commute-safe.
+    ///
+    /// Falls back to the CPU body when any region is not device-resident or a
+    /// launch fails -- same policy as every other forwarder here (numbers stay
+    /// right, only the speedup is lost).
+    fn dGdnPrefillCore_body(ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
+                            wconv: backend.Buf, ab: backend.Buf, ssm_a: backend.Buf,
+                            dt_bias: backend.Buf, gamma: backend.Buf, tokens: usize,
+                            conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
+                            ab_stride: usize, gamma_stride: usize, kq_dim: usize,
+                            nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void {
+        const self = self_(ctx);
+        const stream = self.launchStream();
+        const nk_reps = if (nk != 0) nv / nk else 0;
+        const qscale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+
+        // Shape gates: conv is fixed at 4 taps (elementwise.zig `convStepKernel`
+        // asserts it), the q/k runs must be `nk` whole `kd` rows, and the tiled
+        // layout is what makes the batched norm legal at all.
+        const shaped = tokens > 0 and nv > 0 and nk > 0 and kd > 0 and
+            conv_k == 4 and nv % nk == 0 and nk_reps >= 1 and
+            kq_dim == nk * kd and
+            conv_dim >= 2 * kq_dim and
+            qkv.len >= tokens * conv_dim and
+            ab.len >= @max(ab_a_offset, ab_b_offset) + tokens * ab_stride and
+            gamma.len >= tokens * gamma_stride;
+        if (self.cu != null and shaped) {
+            if (dBufPtr(qkv)) |pq| {
+                if (dBufPtr(conv)) |pc| {
+                    if (dBufPtr(wconv)) |pw| {
+                        if (dBufPtr(ab)) |pab| {
+                            if (dBufPtr(ssm_a)) |sa| {
+                                if (dBufPtr(dt_bias)) |db| {
+                                    if (dBufPtr(gamma)) |pg| {
+                                        // 1. conv + silu for every token, one shared history.
+                                        var rc = Kernels.q35_launch_conv_step_rows(
+                                            pc, pq, pw, @intCast(conv_dim), @intCast(tokens),
+                                            @intCast(conv_dim), stream);
+                                        if (rc != cudart.cudaSuccess) {
+                                            self.ewLaunchFail("conv_step_rows", rc);
+                                            return;
+                                        }
+                                        // 2. beta (in place) + gamma, one row per token.
+                                        rc = Kernels.q35_launch_gdn_gamma_rows(
+                                            pab + ab_a_offset, pab + ab_b_offset, sa, db, pg,
+                                            @intCast(nv), @intCast(tokens),
+                                            @intCast(ab_stride), @intCast(ab_stride),
+                                            @intCast(gamma_stride), stream);
+                                        if (rc != cudart.cudaSuccess) {
+                                            self.ewLaunchFail("gdn_gamma_rows", rc);
+                                            return;
+                                        }
+                                        // 3. the q/k norm + q scale passes, `nk_reps`
+                                        //    times in the order the per-head loop made
+                                        //    them: l2norm(q), l2norm(k), q *= qscale.
+                                        var rep: usize = 0;
+                                        while (rep < nk_reps) : (rep += 1) {
+                                            rc = Kernels.q35_launch_l2norm_strided(
+                                                pq, 0, @intCast(nk), @intCast(kd), eps,
+                                                @intCast(tokens), @intCast(conv_dim), stream);
+                                            if (rc != cudart.cudaSuccess) {
+                                                self.ewLaunchFail("l2norm_strided_q", rc);
+                                                return;
+                                            }
+                                            rc = Kernels.q35_launch_l2norm_strided(
+                                                pq, @intCast(kq_dim), @intCast(nk), @intCast(kd),
+                                                eps, @intCast(tokens), @intCast(conv_dim), stream);
+                                            if (rc != cudart.cudaSuccess) {
+                                                self.ewLaunchFail("l2norm_strided_k", rc);
+                                                return;
+                                            }
+                                            rc = Kernels.q35_launch_scale_vec_strided(
+                                                pq, 0, qscale, @intCast(kq_dim),
+                                                @intCast(tokens), @intCast(conv_dim), stream);
+                                            if (rc != cudart.cudaSuccess) {
+                                                self.ewLaunchFail("scale_vec_strided", rc);
+                                                return;
+                                            }
+                                        }
+                                        return;
+                                    } else return;
+                                } else return;
+                            } else return;
+                        } else return;
+                    } else return;
+                } else return;
+            } else return;
+        }
+        cpu_mod.CpuBackend.vtable.gdnPrefillCore(
+            @ptrCast(&self.cpu), qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens,
+            conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim,
+            nv, nk, kd, conv_k, eps);
+    }
+
     fn dAttnDecode_body(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
                    heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
@@ -6846,6 +6978,22 @@ const attn_score_arity: usize = 10;
         dGdnGamma_body(ctx, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
+    /// The prefill-only GDN prelude, timed separately so a profile shows
+    /// directly how many launches the per-token form used to cost.
+    fn dGdnPrefillCore(ctx: *anyopaque, qkv: backend.Buf, conv: backend.Buf,
+                       wconv: backend.Buf, ab: backend.Buf, ssm_a: backend.Buf,
+                       dt_bias: backend.Buf, gamma: backend.Buf, tokens: usize,
+                       conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
+                       ab_stride: usize, gamma_stride: usize, kq_dim: usize,
+                       nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.gdn_prelude, t0);
+        dGdnPrefillCore_body(ctx, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens,
+            conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim,
+            nv, nk, kd, conv_k, eps);
+    }
+
     /// The `attnDecode` slot, timed (`$QWEN35_PROF`).
     fn dAttnDecode(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
                    vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot: usize,
@@ -6942,6 +7090,7 @@ pub const vtable = backend.Exec.VTable{
     .freeVec = CudaBackend.vFreeVec,
     .attnDecode = CudaBackend.dAttnDecode,
     .gdnGamma = CudaBackend.dGdnGamma,
+    .gdnPrefillCore = CudaBackend.dGdnPrefillCore,
     .copyFromHost = CudaBackend.dCopyFromHost,
     .copyToHost = CudaBackend.dCopyToHost,
     .argmax = CudaBackend.dArgmax,

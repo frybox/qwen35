@@ -277,6 +277,34 @@ pub const Exec = struct {
             kv_dim: usize, scale: f32) void,
         /// GDN per-token beta/gamma from the raw a/b projections.
         gdnGamma: *const fn (ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
+
+        /// GDN chunk prelude: the three per-token GDN steps that do NOT depend on
+        /// the running state, done for a whole prefill chunk in a handful of
+        /// launches instead of per token.
+        ///
+        /// `forwardGdnCore` needs `tokens` x {convStep, gdnGamma, l2norm(x 2
+        /// runs x nk_reps), scaleVec(x nk_reps)} before the first `gdnStepRows`.
+        /// None of those read or write `state`, and `gdnStepRows` only *reads*
+        /// qkv -- it writes state/km/delta/out -- so they can all run up front.
+        /// The one genuine coupling is the conv history: token t's taps read what
+        /// token t-1 shifted in, so a backend MUST process the tokens in ascending
+        /// order (the CUDA kernel does, inside one thread per channel).
+        ///
+        /// Semantics are defined as exactly the CPU bodies below, so a backend
+        /// is free to fuse/launch as it likes as long as the numbers match.
+        /// Every region is `tokens` rows of `row_stride` floats:
+        ///   qkv   [t*row_stride .. +conv_dim]   conv + silu applied in place
+        ///   ab    [t*a_stride .. +nv]           a, and [t*b_stride .. +nv] b
+        ///   gamma [t*gamma_stride .. +nv]       written by gamma, shared by tokens
+        ///   l2q   [t*row_stride + row_offset .. ] the q run, normalised nk_reps
+        ///   l2k   [t*row_stride + kq_offset ..]  the k run, same
+        /// `nk_reps` is `nv / nk` and is applied to each run in exactly the order
+        /// the per-head loop did (q then k, then the q scale, repeated).
+        gdnPrefillCore: *const fn (ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf,
+            ab: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf,
+            tokens: usize, conv_dim: usize, ab_a_offset: usize, ab_b_offset: usize,
+            ab_stride: usize, gamma_stride: usize,
+            kq_dim: usize, nv: usize, nk: usize, kd: usize, conv_k: usize, eps: f32) void,
         /// Region-to-region copy (KV writes, MTP state snapshots): a device
         /// backend maps this to cudaMemcpy, so a snapshot never touches host.
         copyRange: *const fn (ctx: *anyopaque, dst: Buf, src: Buf) void,
@@ -511,6 +539,15 @@ pub const Exec = struct {
     /// of one row.
     pub fn gdnGamma(self: Exec, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
         self.vtable.gdnGamma(self.ptr, a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
+    }
+
+    /// GDN chunk prelude -- see `VTable.gdnPrefillCore` for the contract.
+    pub fn gdnPrefillCore(self: Exec, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
+        ssm_a: Buf, dt_bias: Buf, gamma: Buf, tokens: usize, conv_dim: usize,
+        ab_a_offset: usize, ab_b_offset: usize, ab_stride: usize,
+        gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
+        conv_k: usize, eps: f32) void {
+        self.vtable.gdnPrefillCore(self.ptr, qkv, conv, wconv, ab, ssm_a, dt_bias, gamma, tokens, conv_dim, ab_a_offset, ab_b_offset, ab_stride, gamma_stride, kq_dim, nv, nk, kd, conv_k, eps);
     }
     pub fn copyRange(self: Exec, dst: Buf, src: Buf) void {
         self.vtable.copyRange(self.ptr, dst, src);

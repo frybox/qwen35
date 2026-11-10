@@ -52,6 +52,15 @@ __global__ void k_scale_vec(float *__restrict__ x, float s, int n) {
     if (i < n) x[i] = __fmul_rn(x[i], s);
 }
 
+// `tokens` runs of `n` elements starting `stride` floats apart (see
+// `q35_launch_scale_vec_strided`).  Same `__fmul_rn` per element.
+__global__ void k_scale_vec_strided(float *__restrict__ x, float s, int n, int stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float *xp = x + (size_t)blockIdx.y * (size_t)stride + (size_t)i;
+    *xp = __fmul_rn(*xp, s);
+}
+
 __global__ void k_add_resid(float *__restrict__ dst, const float *__restrict__ src, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) dst[i] = __fadd_rn(dst[i], src[i]);
@@ -101,6 +110,19 @@ extern "C" int q35_launch_scale_vec(float *d_x, float s, int n, void *stream_v) 
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;
     k_scale_vec<<<gridFor(n), kThreads, 0, stream>>>(d_x, s, n);
+    return (int)cudaGetLastError();
+}
+
+// `tokens * n` elements scaled in ONE launch: token t's run starts `stride`
+// floats past token t-1's.  Same per-element multiply as `q35_launch_scale_vec`,
+// so a prefill chunk gets one launch where it used to get one per token.
+extern "C" int q35_launch_scale_vec_strided(float *d_x, int offset, float s, int n,
+                                          int tokens, int stride, void *stream_v) {
+    if (n <= 0 || tokens <= 0) return (int)cudaSuccess;
+    if (stride < offset + n) return (int)cudaErrorInvalidValue;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_scale_vec_strided<<<dim3((unsigned)gridFor(n), (unsigned)tokens), kThreads, 0,
+                          stream>>>(d_x + (size_t)offset, s, n, stride);
     return (int)cudaGetLastError();
 }
 

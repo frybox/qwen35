@@ -243,3 +243,43 @@ extern "C" int q35_launch_gdn_gamma(const float *d_a_raw, float *d_b_raw,
         d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv);
     return (int)cudaGetLastError();
 }
+
+// `tokens` tokens' worth of gamma/beta in ONE launch.  Token t reads its own
+// `nv`-wide a/b slices (`a_stride`/`b_stride` floats apart) and writes its own
+// `gamma_stride`-apart gamma row; `d_ssm_a`/`d_dt_bias` are per-head model
+// weights shared by every token.  Per token the arithmetic is identical to the
+// single-token launcher, so a prefill chunk replaces `tokens` launches.
+__global__ void q35_gdn_gamma_rows_kernel(
+    const float *__restrict__ d_a_raw, float *__restrict__ d_b_raw,
+    const float *__restrict__ d_ssm_a, const float *__restrict__ d_dt_bias,
+    float *__restrict__ d_gamma, int nv, int a_stride, int b_stride,
+    int gamma_stride)
+{
+    const int h = blockIdx.x * blockDim.x + threadIdx.x;
+    const int t = blockIdx.y;
+    if (h >= nv) return;
+    const int a_off = t * a_stride + h;
+    const int b_off = t * b_stride + h;
+    // sigmoid(b) written back into b_raw, exactly like the CPU version.
+    d_b_raw[b_off] = 1.0f / (1.0f + expf(-d_b_raw[b_off]));
+    const float g = d_ssm_a[h] * q35_softplus(d_a_raw[a_off] + d_dt_bias[h]);
+    d_gamma[t * gamma_stride + h] = expf(g);
+}
+
+extern "C" int q35_launch_gdn_gamma_rows(const float *d_a_raw, float *d_b_raw,
+                                         const float *d_ssm_a,
+                                         const float *d_dt_bias, float *d_gamma,
+                                         int nv, int tokens, int a_stride,
+                                         int b_stride, int gamma_stride,
+                                         void *stream)
+{
+    if (nv <= 0 || tokens <= 0) return (int)cudaSuccess;
+    if (a_stride < nv || b_stride < nv || gamma_stride < nv)
+        return (int)cudaErrorInvalidValue;
+    const int threads = 32;
+    const dim3 blocks((unsigned)((nv + threads - 1) / threads), (unsigned)tokens);
+    q35_gdn_gamma_rows_kernel<<<blocks, threads, 0, (cudaStream_t)stream>>>(
+        d_a_raw, d_b_raw, d_ssm_a, d_dt_bias, d_gamma, nv, a_stride, b_stride,
+        gamma_stride);
+    return (int)cudaGetLastError();
+}

@@ -128,6 +128,24 @@ __global__ void k_l2norm(float *__restrict__ x, int n, float eps) {
     for (int i = threadIdx.x; i < n; i += stride) xr[i] = __fmul_rn(xr[i], scale);
 }
 
+// Same computation, but the `rows` rows are `row_stride` floats apart instead of
+// packed at `row * n`.  Prefill needs this: one token's q run lives at
+// `qkvK[t * conv_dim]`, so the same head across `tokens` is a strided row set.
+// blockIdx.y is the token, blockIdx.x the row within it, so the arithmetic per
+// row is unchanged (own sum of squares, same eps, same reduce order).
+__global__ void k_l2norm_strided(float *__restrict__ x, int n, float eps,
+                                 int rows, int row_stride) {
+    const int row = blockIdx.x;
+    const int tok = blockIdx.y;
+    const int stride = blockDim.x;
+    float *xr = x + (size_t)tok * (size_t)row_stride + (size_t)row * (size_t)n;
+
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < n; i += stride) ss += __fmul_rn(xr[i], xr[i]);
+    const float scale = 1.0f / sqrtf(block_reduce(ss) + eps);
+    for (int i = threadIdx.x; i < n; i += stride) xr[i] = __fmul_rn(xr[i], scale);
+}
+
 } // namespace
 
 extern "C" int q35_launch_rmsnorm(float *d_out, const float *d_x, const float *d_w,
@@ -142,5 +160,21 @@ extern "C" int q35_launch_l2norm(float *d_x, int rows, int n, float eps, void *s
     if (n <= 0 || rows <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;
     k_l2norm<<<rows, kThreads, 0, stream>>>(d_x, n, eps);
+    return (int)cudaGetLastError();
+}
+
+// `tokens * rows` normalisations in ONE launch, token t's row set starting
+// `row_stride` floats past token t-1's.  `row_offset` selects which run inside
+// the row block (the q run at 0, the k run at `kq_dim`); it is an element offset
+// so the caller does not have to slice the Buf.
+extern "C" int q35_launch_l2norm_strided(float *d_x, int row_offset, int rows, int n,
+                                        float eps, int tokens, int row_stride,
+                                        void *stream_v) {
+    if (n <= 0 || rows <= 0 || tokens <= 0) return (int)cudaSuccess;
+    if (row_stride < row_offset + rows * n) return (int)cudaErrorInvalidValue;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    const dim3 grid((unsigned)rows, (unsigned)tokens);
+    k_l2norm_strided<<<grid, kThreads, 0, stream>>>(
+        d_x + (size_t)row_offset, n, eps, rows, row_stride);
     return (int)cudaGetLastError();
 }

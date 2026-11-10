@@ -1001,6 +1001,45 @@ pub const CpuBackend = struct {
         ew.bufGdnGamma(a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
     }
 
+    /// CPU oracle for `VTable.gdnPrefillCore`: literally the per-token calls the
+    /// engine used to make, in the same order.  A device backend must reproduce
+    /// these numbers; keeping this as the naive loop is what makes that a
+    /// meaningful comparison rather than a copy against a copy.
+    fn vGdnPrefillCore(ctx: *anyopaque, qkv: Buf, conv: Buf, wconv: Buf, ab: Buf,
+        ssm_a: Buf, dt_bias: Buf, gamma: Buf, tokens: usize, conv_dim: usize,
+        ab_a_offset: usize, ab_b_offset: usize, ab_stride: usize,
+        gamma_stride: usize, kq_dim: usize, nv: usize, nk: usize, kd: usize,
+        conv_k: usize, eps: f32) void {
+        _ = ctx;
+        const nk_reps = if (nk != 0) nv / nk else 0;
+        const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+        var t: usize = 0;
+        while (t < tokens) : (t += 1) {
+            const qkv_t = qkv.span(t * conv_dim, conv_dim);
+            // 1. causal conv + silu over this token's whole conv_dim row.
+            ew.bufConvStep(conv, qkv_t, wconv, conv_k);
+            // 2. beta (in place) + gamma for this token's heads.
+            ew.bufGdnGamma(
+                ab.span(ab_a_offset + t * ab_stride, nv),
+                ab.span(ab_b_offset + t * ab_stride, nv),
+                ssm_a,
+                dt_bias,
+                gamma.span(t * gamma_stride, nv),
+                nv,
+            );
+            // 3. l2norm(q) then l2norm(k) then q *= qscale, nk_reps times.
+            if (nk != 0 and nv % nk == 0) {
+                var rep: usize = 0;
+                while (rep < nk_reps) : (rep += 1) {
+                    ew.bufL2norm(qkv_t.span(0, kq_dim));
+                    ew.bufL2norm(qkv_t.span(kq_dim, kq_dim));
+                    ew.bufScaleVec(qkv_t.span(0, kq_dim), qscale);
+                }
+            }
+        }
+        _ = eps; // the CPU l2norm pins its own eps, exactly as `Exec.l2norm` does
+    }
+
     fn vCopyRange(ctx: *anyopaque, dst: Buf, src: Buf) void {
         _ = ctx;
         ew.bufCopyRange(dst, src);
@@ -1123,6 +1162,7 @@ pub const CpuBackend = struct {
         .allocBuf = vAllocBuf,
         .attnDecode = vAttnDecode,
         .gdnGamma = vGdnGamma,
+        .gdnPrefillCore = vGdnPrefillCore,
         .copyRange = vCopyRange,
         .copyRangeSlot = vCopyRangeSlot,
         .deinterleaveQG = vDeinterleaveQG,
@@ -1324,4 +1364,94 @@ test "dequantRowInto q4_0: every 256-element row-block of a wide row is written"
     var direct: [256]f32 = undefined;
     dequantRowFnFor(.q4_0).?(wq[8 * 18 ..], &direct);
     for (0..256) |i| try std.testing.expectEqual(direct[i], out[256 + i]);
+}
+
+test "gdnPrefillCore equals the per-token primitive sequence" {
+    // The whole point of the prefill prelude is that it is CODE MOTION: the same
+    // calls, made once for the chunk instead of once per token.  So the oracle
+    // for it is literally the per-token loop, and this test pins that equality.
+    //
+    // Shapes are the 27B GDN geometry shrunk to something a test can hold:
+    // nv = 6 value heads, nk = 2 k heads (so nk_reps = 3 -- the repeat count is
+    // what makes l2norm non-idempotent, so it MUST be > 1 here), kd = 4.
+    // conv_k is pinned at 4, the only width `ew.convStep` implements.
+    const nv: usize = 6;
+    const nk: usize = 2;
+    const kd: usize = 4;
+    const tokens: usize = 5;
+    const conv_k: usize = 4;
+    const kq_dim = nk * kd;
+    const conv_dim = 2 * kq_dim + nv * kd;
+    const ab_stride = nv;
+    const ab_a_offset: usize = 0;
+    const ab_b_offset = tokens * ab_stride;
+
+    var prng = std.Random.DefaultPrng.init(7);
+    const rand = prng.random();
+
+    // qkv, the conv history (one token long: conv_k - 1 + 1), weights and the
+    // a/b projections.  Two independent copies so the batched run cannot see
+    // what the serial run wrote.
+    var qkv_batch: [tokens * conv_dim]f32 = undefined;
+    var qkv_serial: [tokens * conv_dim]f32 = undefined;
+    for (&qkv_batch, 0..) |*v, i| {
+        v.* = rand.float(f32) * 2.0 - 1.0;
+        qkv_serial[i] = v.*;
+    }
+    // The conv history is `conv_k - 1` slots per channel, so 3 * conv_dim floats.
+    var conv_batch: [3 * conv_dim]f32 = undefined;
+    var conv_serial: [3 * conv_dim]f32 = undefined;
+    for (&conv_batch, 0..) |*v, i| {
+        v.* = rand.float(f32) * 2.0 - 1.0;
+        conv_serial[i] = v.*;
+    }
+    var wconv: [conv_dim * conv_k]f32 = undefined;
+    for (&wconv) |*v| v.* = rand.float(f32) * 2.0 - 1.0;
+    var ab_batch: [2 * tokens * ab_stride]f32 = undefined;
+    var ab_serial: [2 * tokens * ab_stride]f32 = undefined;
+    for (&ab_batch, 0..) |*v, i| {
+        v.* = rand.float(f32) * 2.0 - 1.0;
+        ab_serial[i] = v.*;
+    }
+    var ssm_a: [nv]f32 = undefined;
+    var dt_bias: [nv]f32 = undefined;
+    for (&ssm_a) |*v| v.* = -(rand.float(f32) * 2.0 + 0.1);
+    for (&dt_bias) |*v| v.* = rand.float(f32) * 3.0 - 1.0;
+    var gamma_batch: [tokens * ab_stride]f32 = @splat(std.math.nan(f32));
+    var gamma_serial: [tokens * ab_stride]f32 = @splat(std.math.nan(f32));
+
+    const ctx: *anyopaque = undefined;
+    CpuBackend.vGdnPrefillCore(ctx, Buf.wrap(&qkv_batch), Buf.wrap(&conv_batch), Buf.wrap(&wconv),
+        Buf.wrap(&ab_batch), Buf.wrap(&ssm_a), Buf.wrap(&dt_bias),
+        Buf.wrap(&gamma_batch), tokens, conv_dim, ab_a_offset, ab_b_offset,
+        ab_stride, ab_stride, kq_dim, nv, nk, kd, conv_k, 1e-6);
+
+    // ---- reference: exactly what `forwardGdnCore` used to do, per token ----
+    const nk_reps = nv / nk;
+    const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+    for (0..tokens) |t| {
+        const qkv_t = qkv_serial[t * conv_dim ..][0..conv_dim];
+        ew.bufConvStep(Buf.wrap(&conv_serial), Buf.wrap(qkv_t), Buf.wrap(&wconv), conv_k);
+        ew.bufGdnGamma(
+            Buf.wrap(ab_serial[ab_a_offset + t * ab_stride ..][0..nv]),
+            Buf.wrap(ab_serial[ab_b_offset + t * ab_stride ..][0..nv]),
+            Buf.wrap(&ssm_a),
+            Buf.wrap(&dt_bias),
+            Buf.wrap(gamma_serial[t * ab_stride ..][0..nv]),
+            nv,
+        );
+        for (0..nk_reps) |_| {
+            ew.bufL2norm(Buf.wrap(qkv_t[0..kq_dim]));
+            ew.bufL2norm(Buf.wrap(qkv_t[kq_dim..][0..kq_dim]));
+            ew.bufScaleVec(Buf.wrap(qkv_t[0..kq_dim]), qscale);
+        }
+    }
+
+    // The batched path must be bit-identical here: every underlying primitive is
+    // per-row independent and the conv walks the tokens in the same ascending
+    // order, so there is no reassociation to tolerate.
+    try std.testing.expectEqualSlices(f32, &qkv_serial, &qkv_batch);
+    try std.testing.expectEqualSlices(f32, &conv_serial, &conv_batch);
+    try std.testing.expectEqualSlices(f32, &gamma_serial, &gamma_batch);
+    try std.testing.expectEqualSlices(f32, &ab_serial, &ab_batch);
 }

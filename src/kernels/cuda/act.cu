@@ -187,6 +187,54 @@ __global__ void k_conv_step(float *__restrict__ conv, float *__restrict__ y,
     hp[2] = cur;
 }
 
+// Batched twin of `k_conv_step`: `tokens` consecutive rows of `y`, `y_stride`
+// floats apart, sharing ONE per-channel history block `conv`.
+//
+// Why this exists: prefill used to call `convStep` once per token (525 launches
+// per GDN layer for a 525-token prompt, times two because of the silu tail).
+// The convolution is a per-channel sliding window, so the tokens are NOT
+// independent -- token t's taps read the history token t-1 left behind.  What
+// makes batching legal is that every channel's chain is independent of every
+// other channel's: one thread owns one channel and walks its own k tokens in
+// ascending order, which is exactly the sequence of per-token launches the
+// engine used to issue.  Same 4 products, same left-to-right `__fadd_rn` chain,
+// same history shift -- the result is bit-identical.
+//
+// `silu` is a separate pass over the whole `tokens` x `n` region afterwards,
+// preserving "silu after the entire conv" (what the engine's two-pass CPU form
+// does; the old launcher also ran it as its own kernel per token).
+__global__ void k_conv_step_rows(float *__restrict__ conv, float *__restrict__ y,
+                                 const float *__restrict__ wconv, int n,
+                                 int tokens, int y_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float *hp = conv + (size_t)i * 3;
+    const float *wp = wconv + (size_t)i * 4;
+    float *yp = y + (size_t)i;
+    for (int t = 0; t < tokens; ++t, yp += y_stride) {
+        const float cur = *yp;
+        // Identical spelling to `k_conv_step`: `__fmul_rn` per product and
+        // `__fadd_rn` per add, so `-fmad` cannot fold `p0 + p1` into `p3`'s
+        // rounding.  This is the whole numeric contract of the kernel.
+        const float p0 = __fmul_rn(hp[0], wp[0]);
+        const float p1 = __fmul_rn(hp[1], wp[1]);
+        const float p2 = __fmul_rn(hp[2], wp[2]);
+        const float p3 = __fmul_rn(cur, wp[3]);
+        *yp = __fadd_rn(__fadd_rn(__fadd_rn(p0, p1), p2), p3);
+        hp[0] = hp[1];
+        hp[1] = hp[2];
+        hp[2] = cur;
+    }
+}
+
+// silu over `tokens` rows of `y` (`y_stride` apart), one thread per element run.
+__global__ void k_silu_tail_rows(float *__restrict__ y, int n, int tokens, int y_stride) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) return;
+    float *yp = y + (size_t)i;
+    for (int t = 0; t < tokens; ++t, yp += y_stride) *yp = silu_dev(*yp);
+}
+
 __global__ void k_silu_tail(float *__restrict__ y, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) y[i] = silu_dev(y[i]);
@@ -234,5 +282,25 @@ extern "C" int q35_launch_conv_step(float *d_conv, float *d_y, const float *d_wc
     if (rc != cudaSuccess) return (int)rc;
     // Second launch for the activation tail; its error is what the caller sees.
     k_silu_tail<<<gridFor(n), kThreads, 0, stream>>>(d_y, n);
+    return (int)cudaGetLastError();
+}
+
+// Batched form: `tokens` rows of `d_y`, consecutive rows `y_stride` floats
+// apart, one shared per-channel history `d_conv`.  Equivalent to calling
+// `q35_launch_conv_step` on each row in ascending order, in TWO launches
+// instead of `2 * tokens`.  See `k_conv_step_rows` for why the per-token
+// coupling does not forbid batching.
+extern "C" int q35_launch_conv_step_rows(float *d_conv, float *d_y,
+                                         const float *d_wconv, int n, int tokens,
+                                         int y_stride, void *stream_v) {
+    if (n <= 0 || tokens <= 0) return (int)cudaSuccess;
+    // A stride narrower than the row would make consecutive tokens alias.
+    if (y_stride < n) return (int)cudaErrorInvalidValue;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_conv_step_rows<<<gridFor(n), kThreads, 0, stream>>>(
+        d_conv, d_y, d_wconv, n, tokens, y_stride);
+    const cudaError_t rc = cudaGetLastError();
+    if (rc != cudaSuccess) return (int)rc;
+    k_silu_tail_rows<<<gridFor(n), kThreads, 0, stream>>>(d_y, n, tokens, y_stride);
     return (int)cudaGetLastError();
 }

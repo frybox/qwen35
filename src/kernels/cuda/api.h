@@ -129,6 +129,10 @@ int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x, float *d_out,
 // reassociation), which is why the engine's token stream must not change when
 // these are served by the GPU.  See the file's own comment.
 int q35_launch_scale_vec(float *d_x, float s, int n, void *stream);
+// Prefill twin: `tokens` runs of `n` elements, consecutive runs `stride` floats
+// apart, `offset` floats into `d_x`.  One launch instead of one per token.
+int q35_launch_scale_vec_strided(float *d_x, int offset, float s, int n,
+                                 int tokens, int stride, void *stream);
 int q35_launch_add_resid(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float *d_src, int heads, int hd, void *stream);
@@ -154,6 +158,11 @@ int q35_launch_set_int1(int *d, int v, void *stream);
 int q35_launch_rmsnorm(float *d_out, const float *d_x, const float *d_w,
                        int rows, int n, float eps, void *stream);
 int q35_launch_l2norm(float *d_x, int rows, int n, float eps, void *stream);
+// Prefill twin: `tokens` x `rows` normalisations in one launch; token t's row
+// block starts `row_stride` floats past token t-1's, and `row_offset` selects
+// the q run (0) or the k run (kq_dim) inside that block.
+int q35_launch_l2norm_strided(float *d_x, int row_offset, int rows, int n,
+                              float eps, int tokens, int row_stride, void *stream);
 
 // --- activation / conv slots (src/kernels/cuda/act.cu) ---------------------
 //
@@ -172,6 +181,11 @@ int q35_launch_softmax(float *d_x, int n, void *stream);
 // shifted in place), then silu over the whole row.  Two launches internally.
 int q35_launch_conv_step(float *d_conv, float *d_y, const float *d_wconv,
                          int n, void *stream);
+// Prefill twin: `tokens` rows of `d_y` (`y_stride` floats apart) sharing ONE
+// per-channel history `d_conv`, in two launches instead of `2 * tokens`.
+// Equivalent to calling `q35_launch_conv_step` on each row in ascending order.
+int q35_launch_conv_step_rows(float *d_conv, float *d_y, const float *d_wconv,
+                              int n, int tokens, int y_stride, void *stream);
 
 // index of the largest logit (first index wins on ties, matching
 // elementwise.argmaxKernel).  Input is device logits, output a single int.
@@ -246,6 +260,15 @@ int q35_launch_gdn_step(float *d_state, const float *d_k, const float *d_v,
 int q35_launch_gdn_gamma(const float *d_a_raw, float *d_b_raw,
                          const float *d_ssm_a, const float *d_dt_bias,
                          float *d_gamma, int nv, void *stream);
+// Prefill twin: `tokens` tokens' gamma/beta in ONE launch.  Token t reads its
+// `nv`-wide a/b slices `a_stride`/`b_stride` floats apart, writes gamma
+// `gamma_stride` floats apart; `d_ssm_a`/`d_dt_bias` are shared per-head model
+// weights.  beta is still overwritten in place with sigmoid(b).
+// Per-token arithmetic is identical to `q35_launch_gdn_gamma`.
+int q35_launch_gdn_gamma_rows(const float *d_a_raw, float *d_b_raw,
+                              const float *d_ssm_a, const float *d_dt_bias,
+                              float *d_gamma, int nv, int tokens, int a_stride,
+                              int b_stride, int gamma_stride, void *stream);
 
 // --- Full-attention decode -------------------------------------------------
 // scores(q,K) -> softmax -> P.V -> sigmoid gate, for every head, in ONE launch.
