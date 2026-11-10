@@ -475,6 +475,10 @@ pub const dequantRowFn = *const fn (row: []const u8, out: []f32) void;
 /// Zig implementations are the reference the C kernels are checked against.
 pub fn dequantRowFnFor(ttype: gguf.TensorType) ?dequantRowFn {
     return switch (ttype) {
+        // Q8_0 is registered too: its row-block unit is its own 32-element
+        // block, so `dequantRowInto`'s generic walk gives it exactly one block
+        // per call.  No per-type special case needed anywhere downstream.
+        .q8_0 => &quant.dequantQ8_0,
         .q4_0 => &quant.dequantQ4_0,
         .q4_1 => &quant.dequantQ4_1,
         .q4_k => &quant.dequantQ4K,
@@ -638,11 +642,14 @@ fn loadLinear(g: *const gguf.File, name: []const u8) backend.LoadError!LinearW {
 
 /// Dequantize one row of `w` into `dst` (len == w.cols()).
 ///
-/// Q8_0 must NOT go through the generic per-row path: `dequantRowFnFor` covers
-/// the 256-element K/IQ types, whose row framing is QK_K-based.  Q8_0 packs
-/// plain 32-element blocks with no 256 framing, so a row of it is not a whole
-/// number of 256-element units and the generic path would drop the tail
-/// whenever cols % 256 != 0.
+/// Q8_0 takes the short path: its rows ARE a plain run of 32-element blocks
+/// (`rowBlockElems(.q8_0) == 32`, the only type whose row-block unit is its
+/// native block), so `dequantizeQ8_0` decodes the whole row in one call, with
+/// size validation.  Going through the generic loop would be correct too --
+/// `dequantRowFnFor(.q8_0)` is registered precisely so the row-block walk can
+/// serve every packed type, see `engine.refErrF64` -- but one call over 34-byte
+/// blocks is cheaper than one call per 32 elements and it keeps the
+/// `row.len % 256 != 0` question off the table for the widest Q8_0 tensors.
 ///
 /// `dequantRowFn` is the one-256-element-row-block reference: it loops `0..8`
 /// over 8 x 32-element sub-blocks and writes exactly 256 floats.  A row wider

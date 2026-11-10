@@ -1325,6 +1325,29 @@ fn bf16BitsToF32(h: u16) f32 {
     return @as(f32, @bitCast(@as(u32, h) << 16));
 }
 
+/// Dequantize packed Q8_0 bytes in the `dequantRowFn` shape (see
+/// `backend_cpu.dequantRowFnFor`): one call consumes `out.len / 32` whole
+/// 34-byte blocks and writes `out.len` floats.  Pure adapter around
+/// `dequantizeQ8_0` below -- same arithmetic, no second decode.
+///
+/// Why it is registered: Q8_0's row-block unit IS its native block
+/// (`gguf.rowBlockElems(.q8_0) == 32`, unlike the 256-framed types), so the
+/// generic row walk in `dequantRowInto` / `engine.refErrF64` feeds it exactly
+/// one block per call and needs no special case of its own.  The wider call is
+/// allowed too (that is what `dequantRowInto`'s Q8_0 fast path does with a full
+/// row).
+///
+/// Not the canonical Q8_0 dequant: `dequantizeQ8_0` is, and it keeps its error
+/// set for the callers that validate sizes (`loadTensorF32`, `dequantRowInto`).
+pub fn dequantQ8_0(row: []const u8, out: []f32) void {
+    // Loud, never silent: handing a 256-wide buffer to a 32-element unit (or a
+    // mis-sliced row) must not decode the wrong number of bytes.
+    std.debug.assert(out.len % QK8_0 == 0);
+    const need = @divExact(out.len, QK8_0) * block_q8_0_bytes;
+    std.debug.assert(row.len >= need);
+    dequantizeQ8_0(row[0..need], out) catch unreachable;
+}
+
 /// Dot of one f16 row (512 B = 256 x 2 B) with an f32 activation.
 pub fn rowDotF16(row: []const u8, x: []const f32) f32 {
     // Same layout rule as bf16 below: 32 x f16 per block, no block metadata.
