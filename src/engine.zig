@@ -1076,19 +1076,32 @@ pub const Engine = struct {
         e.delta = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.kv_mem = try e.exec.allocBuf(gdn_nv * gdn_kd);
         e.gamma_scratch = try e.exec.allocBuf(@as(usize, cfg.gdn_n_heads));
-        // Sized for a full chunk even when `nbatch == 0` (then it is unused):
-        // `forwardGdnPrelude` only runs on the batched path.  Cheap: 128 * 48.
-        e.gdn_prefill_gamma = try e.exec.allocBuf(128 * @as(usize, cfg.gdn_n_heads));
         e.sample_scratch = try e.exec.allocBuf(cfg.vocab);
 
-        // ---- K-token batched prefill scratch (K = 128) ----
-        // K is the number of prompt tokens folded into one batched chunk:
-        // every layer's quantized weights are read from HBM once per chunk
-        // (the mma tile kernel hoists the weight over the token loop), so
-        // 543 tokens = 5 launches at K=128 instead of 34 at K=16 -- the
-        // weight bytes pass through DRAM 13x less often.  128 == the mma tile
-        // kernel's MAX_TILES (16 token-tiles of 8), so a chunk is one launch.
-        const K: usize = 128;
+        // ---- K-token batched prefill scratch (K = 1024) ----
+        // K is the number of prompt tokens folded into one batched chunk, and it
+        // is THE knob that decides prefill throughput: every layer's weight
+        // matrix is streamed from HBM once per chunk, so the total weight
+        // traffic is (n_prompt / K) x model_bytes.  Nothing else on the prefill
+        // path scales that way.
+        //
+        // Measured on 27B IQ3_XXS, 525-token prompt (tok/s, this kernel only
+        // needs Q35_MMQ_MAX_TOKENS >= K):
+        //     K =  128 -> 170.3   525 = 5 chunks, i.e. 51.7 GB of weight reads
+        //     K =  256 -> 184.1
+        //     K =  512 -> 187.3   525 = 2 chunks
+        //     K = 1024 -> 200.5   525 = 1 chunk,  i.e. 10.3 GB
+        // The gain is sublinear in the traffic ratio (5x fewer bytes, 18%
+        // faster) because at these sizes the kernel is latency-bound, not
+        // bandwidth-bound: one launch costs almost the same whether it serves
+        // 105 or 525 tokens (2.68 vs 2.83 ms/call on the same shapes).  Bucket
+        // sizes 4x the prompt would stop helping; 1024 covers the realistic
+        // prompt range and keeps 4 chunks for a 4k-token prompt.
+        //
+        // The buffers below are all sized from K, so raising it further is a
+        // matter of activation memory only (measured: bufs_MiB 22 -> 157 at
+        // K=1024 on the 27B).
+        const K: usize = 1024;
         const q_dimK: usize = @as(usize, cfg.n_heads) * cfg.head_dim;
         const kv_dimK: usize = @as(usize, cfg.n_kv_heads) * cfg.head_dim;
         e.nbatch = if (no_batch) 0 else K;
@@ -1101,6 +1114,12 @@ pub const Engine = struct {
         e.kK = try e.exec.allocBuf(K * kv_dimK);
         e.vK = try e.exec.allocBuf(K * kv_dimK);
         e.goutK = try e.exec.allocBuf(K * @max(gdn_value_dim, q_dimK));
+        // Sized for a full chunk even when `nbatch == 0` (then it is unused):
+        // `forwardGdnPrelude` only runs on the batched path.  Must be `K`, not a
+        // literal: the chunk size is the one knob that decides how many times
+        // the weights are streamed, and a stale 128 here aborts the run as soon
+        // as K grows (assert in `span`).
+        e.gdn_prefill_gamma = try e.exec.allocBuf(K * @as(usize, cfg.gdn_n_heads));
         e.x2K = try e.exec.allocBuf(K * cfg.hidden);
         e.mlpK = try e.exec.allocBuf(K * cfg.n_ff);
         e.mlpK1 = try e.exec.allocBuf(K * cfg.n_ff);

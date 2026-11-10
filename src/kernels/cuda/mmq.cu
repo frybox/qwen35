@@ -85,7 +85,7 @@
 // trivially-parallel kernel -- order still ascending, but the fold leaves the
 // critical path.  Re-measure both before flipping the default.
 //
-// `tokens > Q35_MMQ_MAX_TOKENS` (the engine's prefill chunk is 128) is declined
+// `tokens > Q35_MMQ_MAX_TOKENS` (the engine's prefill chunk is 1024) is declined
 // at launch time: the launcher returns -1, which mmvq.cu reads as "use the
 // thread-per-row kernel".  A half-idle tile would be slower than the fallback,
 // and a silently wrong tile is worse than either.
@@ -94,11 +94,18 @@
 
 #define Q35_MMQ_THREADS 256
 #define Q35_MMQ_WARPS (Q35_MMQ_THREADS / Q35_WARP)
-// engine.zig nbatch: the register budget boundary.  The mma tile kernel now
-// handles up to 128 tokens per launch (MAX_TILES == 16 token-tiles of 8, with
-// the 128-row weight slice hoisted over the token loop), so this matches the
-// engine's K == 128.
-#define Q35_MMQ_MAX_TOKENS 128
+// engine.zig nbatch: must be >= the engine's chunk size K, or the launcher
+// declines the shape and prefill silently drops to the thread-per-row kernel.
+// Lifting this from 128 to 1024 is what lets a whole 525-token prompt run as
+// ONE chunk: the weight slice is hoisted over the token loop, so weight traffic
+// is (n_prompt/K) x model_bytes, and 5 chunks was 5 full passes over 10.3 GB.
+// The cost is `acc[MAX_TILES][4]` -- MAX_TILES has to cover K/8 tiles and the
+// accumulator lands in local memory, see the TILE_BATCH note in the kernel.
+//
+// Measured (27B IQ3_XXS, 525-token prompt, tok/s): K=128 170.3, K=256 184.1,
+// K=512 187.3, K=1024 200.5.  Sublinear because the kernel is latency-bound:
+// one launch costs ~the same for 105 or 525 tokens (2.68 vs 2.83 ms/call).
+#define Q35_MMQ_MAX_TOKENS 1024
 
 // ---------------------------------------------------------------------------
 // One warp = one (weight row, token).  Lane l folds the block run
@@ -954,7 +961,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     // once per 8-token tile -- the prefill bandwidth cliff.)  acc[t] holds the
     // (16 rows x 8 tokens) D-fragment sum for token-tile t, accumulated across
     // all super-blocks b.
-    constexpr int MAX_TILES = 16;   // K == 128 tokens / 8 per tile
+    constexpr int MAX_TILES = 128;  // >= Q35_MMQ_MAX_TOKENS / 8 == 128 tiles
     const int ntiles = (tokens + 7) / 8;
     float acc[MAX_TILES][4];
     for (int t = 0; t < MAX_TILES; ++t)
