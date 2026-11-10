@@ -62,6 +62,139 @@
 // rather than silently truncating the attention window.
 #define Q35_ATTN_MAX_ROWS 8192
 
+// Chunk-wide causal attention for PREFILL: one launch for a whole chunk instead
+// of one launch per token.
+//
+// The decode kernel is `<<<heads, 128>>>` and handles exactly one token, so a
+// 525-token prefill issues 16 layers x 525 = 8400 launches (`PROF-GPU` on 27B:
+// 15.1 ms, 19 us each).  This merges them into 16 launches.
+//
+// THE PARALLELISM PROBLEM, measured twice
+// ---------------------------------------
+// The first version of this kernel was `<<<heads, 256>>>` with token r handled
+// inside the block in a serial r-loop.  It was SLOWER than the per-token form:
+//
+//   attn_chunk  calls/tok=2   dev_us/tok=31455   avg_us/call=20970   (6.8%)
+//   vs  attn_decode  8400 calls x 19 us = 15070 us
+//
+// i.e. 40 us per (head, row) instead of 19.  Reason: 24 blocks cannot fill 114
+// SMs.  The per-token form had the same 24-block shape, but it got 525
+// INDEPENDENT launches, so a launch's tail overlapped the next launch's head and
+// the r-loop's six `__syncthreads()` per row were hidden.  Serialising the r-loop
+// inside one launch put those barriers on the critical path with nothing to
+// overlap them.
+//
+// So the rows must be PARALLEL, not serial: `<<<dim3(rows, heads), 128>>>`, one
+// block per (token, head).  525 x 24 = 12600 blocks -- the GPU is saturated and
+// each block does exactly the work the per-token launch did.  Total arithmetic
+// is unchanged (both forms compute the full causal prefix per row, so both are
+// O(n^2) in the chunk); only the launch/fill pattern changes.
+//
+// WHY THIS IS STILL SAFE WITHOUT A CACHE-FILL BARRIER between rows: the caller
+// writes EVERY row's k/v to the cache before calling (see `forwardFullChunk`),
+// and row r reads `[0, slot0+r]` -- a prefix of what is already there.  No block
+// reads a row another block writes, so blocks are independent.
+//
+// NUMERIC CONTRACT: identical to the per-token kernel, term for term -- thread t
+// owns history row t and its j-sum runs in increasing j (the CPU order), the
+// softmax reduces in increasing t, V is reduced in increasing t.  Gated against
+// the per-row launches in `/tmp/gate_attn_chunk.cu`: bit-identical.
+
+// The largest `rows` that `q35_launch_attn_chunk` will accept at this `slot0`.
+// `s_scores` must hold the longest prefix any row sees, i.e. slot0+rows floats,
+// so this is bounded by the 48 KB dynamic shared budget.
+#define Q35_ATTN_CHUNK_SMEM_MAX (48 * 1024 / (int)sizeof(float))
+
+// One block per (row, head).  `d_q`/`d_gate`/`d_gout` are indexed by
+// (token, head): row r at `r * heads * hd + h * hd`, matching the chunk buffers
+// `qK`/`gateK`/`goutK` that engine.zig fills.
+__global__ void q35_attn_chunk_kernel(
+    const float *__restrict__ d_q,
+    const float *__restrict__ d_gate,
+    const float *__restrict__ d_kcache,
+    const float *__restrict__ d_vcache,
+    float *__restrict__ d_gout,
+    int slot0, int heads, int gqa, int hd, int kv_dim, float scale)
+{
+    const int r = blockIdx.x;               // token within the chunk
+    const int h = blockIdx.y;               // head
+    const int tid = threadIdx.x;
+    const int nt = blockDim.x;
+    if (h >= heads) return;
+
+    const int kvh = h / gqa;
+    const int n = slot0 + r + 1;            // causal prefix, inclusive
+    const int row_len = heads * hd;
+    const float *__restrict__ qs = d_q + (size_t)r * row_len + (size_t)h * hd;
+
+    extern __shared__ float s_scores[];
+    float *const s_max = &s_scores[n];
+    float *const s_sum = &s_scores[n + 1];
+
+    for (int t = tid; t < n; t += nt) {
+        const float *__restrict__ ks = d_kcache + (size_t)t * kv_dim + (size_t)kvh * hd;
+        float acc = 0.0f;
+        for (int j = 0; j < hd; ++j) acc = __fadd_rn(acc, __fmul_rn(qs[j], ks[j]));
+        s_scores[t] = __fmul_rn(acc, scale);
+    }
+    __syncthreads();
+
+    if (tid == 0) {
+        float m = -CUDART_INF_F;
+        for (int t = 0; t < n; ++t) m = fmaxf(m, s_scores[t]);
+        *s_max = m;
+    }
+    __syncthreads();
+    for (int t = tid; t < n; t += nt) s_scores[t] = expf(s_scores[t] - *s_max);
+    __syncthreads();
+    if (tid == 0) {
+        float s = 0.0f;
+        for (int t = 0; t < n; ++t) s += s_scores[t];
+        *s_sum = s;
+    }
+    __syncthreads();
+    for (int t = tid; t < n; t += nt) s_scores[t] = s_scores[t] / *s_sum;
+    __syncthreads();
+
+    float *__restrict__ gout = d_gout + (size_t)r * row_len + (size_t)h * hd;
+    const float *__restrict__ gt = d_gate + (size_t)r * row_len + (size_t)h * hd;
+    for (int j = tid; j < hd; j += nt) {
+        float acc = 0.0f;
+        for (int t = 0; t < n; ++t) {
+            const float w = s_scores[t];
+            const float vv = d_vcache[(size_t)t * kv_dim + (size_t)kvh * hd + j];
+            acc = __fadd_rn(acc, __fmul_rn(w, vv));
+        }
+        // Gate folded in: the per-token launcher ran this as a second kernel over
+        // the whole head set.  Per-element and order-independent, so exact.
+        const float g = gt[j];
+        gout[j] = acc * (1.0f / (1.0f + expf(-g)));
+    }
+}
+
+extern "C" int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
+                                     const float *d_kcache, const float *d_vcache,
+                                     float *d_gout, int slot0, int rows, int heads,
+                                     int gqa, int hd, int kv_dim, float scale,
+                                     void *stream)
+{
+    if (rows <= 0 || heads <= 0 || hd <= 0) return (int)cudaSuccess;
+    if (slot0 < 0 || slot0 + rows > Q35_ATTN_MAX_ROWS) return cudaErrorInvalidValue;
+    if (slot0 + rows > Q35_ATTN_CHUNK_SMEM_MAX) return cudaErrorInvalidValue;
+    const size_t smem = (size_t)(slot0 + rows + 2) * sizeof(float);
+    dim3 grid((unsigned)rows, (unsigned)heads);
+    q35_attn_chunk_kernel<<<grid, 128, smem, (cudaStream_t)stream>>>(
+        d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, heads, gqa, hd, kv_dim, scale);
+    return (int)cudaGetLastError();
+}
+
+extern "C" int q35_attn_chunk_max_rows(int slot0)
+{
+    if (slot0 < 0 || slot0 >= Q35_ATTN_MAX_ROWS) return 0;
+    return Q35_ATTN_CHUNK_SMEM_MAX - slot0;
+}
+
+
 // One block per head.  Threads cooperate differently in the three phases, but
 // every sum keeps the CPU's index order.
 __global__ void q35_attn_decode_kernel(

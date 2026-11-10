@@ -136,6 +136,10 @@ int q35_launch_scale_vec_strided(float *d_x, int offset, float s, int n,
 int q35_launch_add_resid(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_copy_range(float *d_dst, const float *d_src, int n, void *stream);
 int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float *d_src, int heads, int hd, void *stream);
+// `tokens` rows of [q|gate] split in ONE launch (chunk-wide prefill).  Row t
+// starts at `t * 2 * heads * hd`; bit-identical to `tokens` calls above.
+int q35_launch_deinterleave_qg_strided(float *d_q, float *d_gate, const float *d_src,
+                                       int heads, int hd, int tokens, void *stream);
 int q35_launch_zero_buf(float *d_buf, int n, void *stream);
 
 // Write one int32 from a 1-thread kernel.  The graph-safe way to pass a
@@ -279,6 +283,24 @@ int q35_launch_attn_decode(const float *d_q, const float *d_gate,
                            float *d_att, float *d_gout, int slot, int heads,
                            int gqa, int hd, int kv_dim, float scale,
                            void *stream);
+
+// Chunk-wide causal attention for PREFILL: one launch for `rows` tokens instead
+// of `rows` launches.  `d_q`/`d_gate`/`d_gout` are `rows * heads * hd` (row r at
+// `r*heads*hd + h*hd`); the KV cache must already hold slots [0, slot0+rows).
+// Row r attends to [0, slot0+r] inclusive, so the r-loop inside the kernel is
+// serial -- what the merge removes is the per-token KERNEL BOUNDARY (8400
+// launches -> 16 on a 525-token 27B prefill), not the dependency.
+//
+// `s_scores` is `slot0+rows` floats, so a chunk appended to a long KV cache can
+// exceed the 48 KB dynamic budget; the caller slices with
+// `q35_attn_chunk_max_rows` in that case.  Slicing is safe: row r depends only
+// on earlier rows and the cache prefix it needs.
+int q35_launch_attn_chunk(const float *d_q, const float *d_gate,
+                          const float *d_kcache, const float *d_vcache,
+                          float *d_gout, int slot0, int rows, int heads,
+                          int gqa, int hd, int kv_dim, float scale,
+                          void *stream);
+int q35_attn_chunk_max_rows(int slot0);
 
 // Same kernel, but `slot` is read from DEVICE memory (`d_slot`, one int) and the
 // dynamic shared block is the fixed maximum.  Because neither the argument block
