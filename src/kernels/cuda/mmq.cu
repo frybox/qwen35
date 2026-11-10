@@ -1037,26 +1037,63 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         // NO difference (170.25 vs 170.29 tok/s), so the L2/coalescer already
         // absorbs the row stride and the address spread is not the bottleneck.
         // Do not "fix" it again without a measurement.
-        const int row = lane >> 1;              // 0..15
-        const int gp = lane & 1;                // 0..1
-        if (row_live) {
-            const unsigned char *wb = wb0 + (size_t)row * (size_t)nblk * block_bytes;
-            int *dst = (int *)(sAw + row * SA_STRIDE);
+        // Lane assignment: 4 lanes per row (llama.cpp's threads_per_row for
+        // IQ3_XXS), so one warp covers 8 rows and needs TWO passes for the
+        // 16-row warp tile.  Lane -> (row, group pair) is unchanged in meaning:
+        // row = lane>>2 + pass*8, gp = lane&3 picks one of the 8 groups.
+        // Each lane therefore unpacks 2 groups instead of 4 -- the whole point:
+        // the per-lane IQ3_XXS unpack (~4 grid lookups + 2 sign expansions) is
+        // cut in half and the row's K is spread over 4 lanes rather than 2.
+        for (int pass = 0; pass < 2; ++pass) {
+            const int row = ((lane >> 2) + 8 * pass);          // 0..15
+            const int gp = lane & 3;                           // 0..3
+            const bool live = row_live && (r0 + row < rows);
+            if (live) {
+                const unsigned char *wb = wb0 + (size_t)row * (size_t)nblk * block_bytes;
+                int *dst = (int *)(sAw + row * SA_STRIDE);
 #pragma unroll
-            for (int k = 0; k < 4; ++k) {
-                const int g = 4 * gp + k;
-                int p[8];
-                int ls[2];
-                T::group(wb, g, p, ls);
-                ls_w[row * LS_STRIDE + g * 2 + 0] = ls[0];
-                ls_w[row * LS_STRIDE + g * 2 + 1] = ls[1];
-                for (int i = 0; i < 8; ++i) dst[g * 8 + i] = p[i];
+                for (int k = 0; k < 2; ++k) {
+                    // 4 lanes x 2 groups = groups 0..7 with NO gaps: 2*gp+k.
+                    // (4*gp+k with only k<2 covers 0,1,4,5 and silently drops
+                    // the other half -- MVCHECK caught exactly that.)
+                    const int g = 2 * gp + k;
+                    int p[8];
+                    int ls[2];
+                    T::group(wb, g, p, ls);
+                    ls_w[row * LS_STRIDE + g * 2 + 0] = ls[0];
+                    ls_w[row * LS_STRIDE + g * 2 + 1] = ls[1];
+                    for (int i = 0; i < 8; ++i) dst[g * 8 + i] = p[i];
+                }
+            } else {
+                for (int k = 0; k < 2; ++k) {
+                    const int g = 2 * gp + k;
+                    ls_w[row * LS_STRIDE + g * 2 + 0] = 1;
+                    ls_w[row * LS_STRIDE + g * 2 + 1] = 1;
+                }
             }
+        }
+
+        // A-fragment REGISTERS, hoisted over the token-tile loop exactly like
+        // sAw: the weight is the same for every token, so re-running
+        // `load_ldmatrix` inside the token loop was pure waste -- 8 ldmatrix per
+        // super-block per token tile, against llama.cpp doing it once
+        // (mmq-vec-dot.cuh:226 `tile_A A[ntx][MMQ_TILE_NE_K/QI8_0]` filled
+        // before the j loop).  With ntx == 1 our warp tile is a single 16-row
+        // mini-tile, so the whole A tile is 8 fragments (k32 path) or 16 (k16).
+        //
+        // Registers: 8 * tile<16,8,int> == 8 * 4 int = 32 registers for k32,
+        // 64 for the k16 path.  Both fit -- and they are the same registers the
+        // per-tile loads were already occupying, just live across the loop.
+        q35_tile<16, 8, int> Af[8];    // k32 path (scale16 == false)
+        q35_tile<16, 4, int> Af16[16]; // k16 path (scale16 == true)
+        if (!T::scale16) {
+#pragma unroll
+            for (int g = 0; g < 8; ++g)
+                q35_mma::load_ldmatrix(Af[g], (const int *)sAw + g * 8, SA_STRIDE / 4);
         } else {
-            for (int k = 0; k < 4; ++k) {
-                ls_w[row * LS_STRIDE + (4 * gp + k) * 2 + 0] = 1;
-                ls_w[row * LS_STRIDE + (4 * gp + k) * 2 + 1] = 1;
-            }
+#pragma unroll
+            for (int h = 0; h < 16; ++h)
+                q35_mma::load_ldmatrix(Af16[h], (const int *)sAw + h * 4, SA_STRIDE / 4);
         }
 
         // Token tiles: sAw/ls_w are staged above and hoisted over this loop;
@@ -1130,12 +1167,10 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
             if (!T::scale16) {
 #pragma unroll
                 for (int g = 0; g < 8; ++g) {
-                    q35_tile<16, 8, int> A_frag;
                     q35_tile<8, 8, int> B_frag;
                     q35_tile<16, 8, int> D;
-                    q35_mma::load_ldmatrix(A_frag, (const int *)sAw + g * 8, SA_STRIDE / 4);
                     q35_mma::load_generic(B_frag, (const int *)sB + g * 8, SB_STRIDE / 4);
-                    q35_mma::mma(D, A_frag, B_frag);
+                    q35_mma::mma(D, Af[g], B_frag);
 #pragma unroll
                     for (int l = 0; l < 4; ++l) {
                         const int mp = q35_tile<16, 8, int>::get_i(l);
@@ -1145,15 +1180,12 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
             } else {
 #pragma unroll
                 for (int h = 0; h < 16; ++h) {
-                    q35_tile<16, 4, int> A_frag;
                     q35_tile<8, 4, int> B_frag;
                     q35_tile<16, 8, int> D;
-                    // Shared rows are SA_STRIDE int8 wide, so the ldmatrix stride is
-                    // SA_STRIDE/4 int (68 with the padding) and a 16-element half
-                    // starts at int offset h*4.
-                    q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, SA_STRIDE / 4);
+                    // A_frag comes from the hoisted Af[] above; only B (the
+                    // activation tile) is re-read per token tile.
                     q35_mma::load_generic(B_frag, (const int *)sB + h * 4, SB_STRIDE / 4);
-                    q35_mma::mma(D, A_frag, B_frag);
+                    q35_mma::mma(D, Af16[h], B_frag);
                     const int g = h >> 1;               // 32-element group
                     const int half = h & 1;
 #pragma unroll
