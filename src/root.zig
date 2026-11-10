@@ -65,6 +65,15 @@ test {
 }
 
 test {
+    // `Launch` (backend_cuda.zig) is a two-branch comptime table: real aliases vs
+    // fallback stubs.  Only one branch exists per build, so nothing can notice the
+    // lists drifting -- and a call site that names `Kernels.q35_launch_*` instead
+    // of `Launch.*` bypasses the seam and breaks `make cpu` at link time.  Both
+    // happened; these are the structural checks that make them fail a test run.
+    _ = @import("backend_cuda_launch_tests.zig");
+}
+
+test {
     // `engine.refErrF64` (the f64 matvec oracle) is called by nothing in the
     // engine, and Zig analyses unreferenced functions lazily -- so `zig build
     // test` never even type-checked it.  Its Q8_0 branch called
