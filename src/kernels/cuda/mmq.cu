@@ -913,7 +913,16 @@ template <class T, int NWARPS>
 __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                                  const unsigned char *__restrict__ xq,
                                  float *__restrict__ out,
-                                 int rows, int cols, int tokens) {
+                                 int rows, int cols, int tokens, int njsplit) {
+    // grid.y splits the TOKEN dimension: block y owns token tiles
+    // [y*tpt, (y+1)*tpt), so each block covers fewer tokens and the weight slice
+    // is re-read njsplit times.  njsplit == 1 is exactly the old grid.y == 1
+    // shape.  `tokens` stays the global count -- xq and out are indexed by
+    // global token id, only the loop bounds use the slice.
+    //
+    // This re-reads weights on purpose and it is a 15% win; the launcher's
+    // q35_iq_warps-adjacent comment explains why (latency-bound, needs streams
+    // in flight, not bytes saved).
     constexpr int block_bytes = T::block_bytes;
     constexpr int OUT_SCALE_Q = T::out_scale_q;
     constexpr int OUT_SCALE_DEN = T::out_scale_den;
@@ -963,9 +972,14 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     // all super-blocks b.
     constexpr int MAX_TILES = 128;  // >= Q35_MMQ_MAX_TOKENS / 8 == 128 tiles
     const int ntiles = (tokens + 7) / 8;
+    const int tpt = (ntiles + njsplit - 1) / njsplit;
+    const int t_lo = (int)blockIdx.y * tpt;
+    const int t_hi = min(ntiles, t_lo + tpt);
     float acc[MAX_TILES][4];
     for (int t = 0; t < MAX_TILES; ++t)
         for (int l = 0; l < 4; ++l) acc[t][l] = 0.0f;
+    // acc[] is indexed by LOCAL tile (0..t_hi-t_lo-1): the global tile index is
+    // t_lo+ti.
 
     for (int b = b_lo; b < b_hi; ++b) {
         const unsigned char *wb0 =
@@ -1016,9 +1030,9 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         // gave only ~1.6x -- the weight-bandwidth win was eaten by the spill).
         // `tb >= tokens` guards the partial last tile; tokens is launch-uniform
         // (not thread-dependent), so the __syncthreads() below stay uniform.
-        for (int t = 0; t < MAX_TILES; ++t) {
+        for (int ti = 0; ti < t_hi - t_lo; ++ti) {
+            const int t = t_lo + ti;
             const int tb = t * 8;
-            if (tb >= tokens) continue;
             // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).
             // Byte copies, not int4: 292 % 16 == 4, so neither a token row nor a
             // block start is 16-byte aligned.
@@ -1098,20 +1112,20 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                 // T::out_scale_q * OUT_SCALE_DEN: an integer template argument
                 // times a power-of-two denominator, because C++ forbids a
                 // floating-point template parameter.  Both factors are exact.
-                acc[t][l] = __fadd_rn(acc[t][l], __fmul_rn(
+                acc[ti][l] = __fadd_rn(acc[ti][l], __fmul_rn(
                     __fmul_rn(d, (float)isum[l]), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
             }
         }
     }
 
-    for (int t = 0; t < ntiles; ++t) {
-        const int tb = t * 8;
+    for (int ti = 0; ti < t_hi - t_lo; ++ti) {
+        const int tb = (t_lo + ti) * 8;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const int mp = q35_tile<16, 8, int>::get_i(l);
             const int np = q35_tile<16, 8, int>::get_j(l);
             if (tb + np < tokens && r0 + mp < rows) {
-                out[(size_t)(tb + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[t][l];
+                out[(size_t)(tb + np) * (size_t)rows + (size_t)(r0 + mp)] = acc[ti][l];
             }
         }
     }
@@ -1157,6 +1171,11 @@ static int q35_iq_warps(int rows) {
     //     warps:   1      2      4      8
     //   before:  94.6   96.0   97.4   88.5    (79-token prompt, pre-padding)
     //   after:  141.6  160.1  170.0  160.2    (525-token prompt, padded)
+    //  re-swept with the J=128 token split in place (the row tile is no longer
+    //  the only source of parallelism, so the w=8 penalty is gone):
+    //           180.0  216.5  231.4  231.8
+    // w=4 vs w=8 is a tie on speed; w=4 keeps twice the blocks, which is what the
+    // small-row matrices need (27B ffn: 272 vs 136 blocks per token slice).
     // The padding is what pulled w=8 up from the clear loser to a near tie: the
     // 8-warp shape is the one whose shared tiles suffered the worst conflicts.
     // w=4 still wins on block count -- the 8-warp 128-row block would give the 27B ffn
@@ -1177,22 +1196,54 @@ static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned ch
                                      cudaStream_t stream) {
     const int nw = q35_iq_warps(rows);
     const int rowtile = nw * 16;
-    // grid.x is one row tile per block; grid.y stays 1 because the kernel loops
-    // over the 8-token tiles itself, so the weight slice is dequantized from HBM
-    // once per super-block instead of once per tile.
-    const dim3 grid((unsigned)((rows + rowtile - 1) / rowtile), 1);
+    // grid.x is one row tile (NWARPS*16 rows) per block; grid.y is the token
+    // split below.
+    // J = tokens per block.  0 in the env var means "use the default"; a
+    // negative value disables the split entirely (grid.y == 1, the old shape).
+    //
+    // 128 is not a padding-friendly round number, it is the measured optimum and
+    // it is the SAME value llama.cpp's IQ3_XXS config picks (J=128,
+    // mmq-config-ampere.cuh:293) -- two independent implementations converging.
+    // 525-token IQ3_XXS prefill, tok/s:
+    //     J:     0(old)  8     16    32    64    96    128   160   192   256
+    //   tok/s:   202.3  121.0 169.6 206.2 225.7 224.8 233.7 231.8 227.9 225.0
+    // The shape is a broad plateau, not a spike, so it does not need tuning per
+    // model: 92/145/183-token prompts all peak at 64 or 128 too.
+    //
+    // Why splitting -- which RE-READS the weights 5x at 525 tokens -- is faster:
+    // it is the same conclusion the chunk-size work reached from the other side.
+    // This kernel is latency-bound, not bandwidth-bound (one launch costs ~the
+    // same for 105 or 525 tokens), so what matters is how many independent
+    // memory streams are in flight to hide the 600-800 ns HBM latency between
+    // two __syncthreads().  grid.y == 1 gives the 27B ffn 272 blocks (2.4 per
+    // SM); J=128 gives 272 x 5 = 1360 (12 per SM), and the extra parallelism is
+    // worth far more than the duplicated traffic.  Confirmed by the J=8 point:
+    // maximum parallelism but 66 weight re-reads, and it is the worst result.
+    //
+    // (K side of the same coin: raising the chunk 128 -> 1024 in engine.zig is
+    // worth +18% and the two combine, 170.3 -> 233.7.)
+    static int j_env = -2;
+    if (j_env == -2) { const char* e = getenv("QWEN35_CUDA_MMQ_J"); j_env = e ? atoi(e) : 128; }
+    int njsplit = 1;
+    if (j_env > 0) {
+        const int ntiles = (tokens + 7) / 8;
+        const int jtiles = j_env / 8;                     // j_env is tokens/block
+        njsplit = jtiles > 0 ? (ntiles + jtiles - 1) / jtiles : 1;
+        if (njsplit < 1) njsplit = 1;
+    }
+    const dim3 grid((unsigned)((rows + rowtile - 1) / rowtile), (unsigned)njsplit);
     const int threads = nw * Q35_WARP;
     #define Q35_IQ_LAUNCH(TP)                                                   \
         do {                                                                    \
             switch (nw) {                                                       \
             case 1: q35_k_mmq_mma_iq<TP, 1><<<grid, threads, 0, stream>>>(      \
-                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+                        d_w, d_xq, d_out, rows, cols, tokens, njsplit); break;           \
             case 2: q35_k_mmq_mma_iq<TP, 2><<<grid, threads, 0, stream>>>(      \
-                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+                        d_w, d_xq, d_out, rows, cols, tokens, njsplit); break;           \
             case 4: q35_k_mmq_mma_iq<TP, 4><<<grid, threads, 0, stream>>>(      \
-                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+                        d_w, d_xq, d_out, rows, cols, tokens, njsplit); break;           \
             default: q35_k_mmq_mma_iq<TP, 8><<<grid, threads, 0, stream>>>(     \
-                        d_w, d_xq, d_out, rows, cols, tokens); break;           \
+                        d_w, d_xq, d_out, rows, cols, tokens, njsplit); break;           \
             }                                                                   \
         } while (0)
     switch (ttype) {
