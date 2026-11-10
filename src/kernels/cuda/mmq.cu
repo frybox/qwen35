@@ -102,9 +102,19 @@
 // The cost is `acc[MAX_TILES][4]` -- MAX_TILES has to cover K/8 tiles and the
 // accumulator lands in local memory, see the TILE_BATCH note in the kernel.
 //
-// Measured (27B IQ3_XXS, 525-token prompt, tok/s): K=128 170.3, K=256 184.1,
-// K=512 187.3, K=1024 200.5.  Sublinear because the kernel is latency-bound:
-// one launch costs ~the same for 105 or 525 tokens (2.68 vs 2.83 ms/call).
+// MAX_TILES is deliberately SMALL (16 tiles = 128 tokens per block) and the
+// launcher raises njsplit instead of letting it grow with the chunk size.
+// History: it used to be Q35_MMQ_MAX_TOKENS/8 == 128 to cover the whole chunk
+// in one block, which ptxas turned into a `2048 bytes stack frame` per thread.
+// That frame is the accumulator living in local memory (spill stores/loads read
+// 0 because the array is user-declared, not ptxas-spilled), and it is why the
+// IQ tensor-core kernel measured 37 TFLOPS where llama.cpp measures 127 on the
+// equivalent ggml shape (m=4096 n=512 k=14336, test-backend-ops).  MAX_TILES=16
+// -> 128 B frame, and grid.y (=njsplit) supplies the parallelism instead; the
+// duplicated weight traffic is absorbed by L2 (a 27B ffn slice is 34 MB against
+// 72 MB of L2).  Measured 256.0 -> 264.3 tok/s on 27B IQ3_XXS prefill.
+// Keep this in sync with the kernel's acc[] declaration.
+#define Q35_MMQ_MAX_TILES 16
 #define Q35_MMQ_MAX_TOKENS 1024
 
 // ---------------------------------------------------------------------------
@@ -701,18 +711,28 @@ __device__ __forceinline__ int q35_iq3xxs_ls(const unsigned char *gas, int g) {
 // function, which keeps nvcc's template substitution happy.
 struct Q35Iq3Xxs {
     static constexpr int block_bytes = 98;
+    // One scale per 32 elements, so both halves of a super-block group share it
+    // and the k32 mma (which spans a whole 32-element group) applies it once.
+    static constexpr bool scale16 = false;
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 4;   // 0.25f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
 };
 struct Q35Iq3S {
     static constexpr int block_bytes = 110;
+    static constexpr bool scale16 = false;
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 1;   // 1.0f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
 };
 struct Q35Iq2S {
     static constexpr int block_bytes = 82;
+    // 16-element granularity, like IQ4_XS: scales[g] packs ls1 in the low nibble
+    // and ls2 in the high nibble, so the two halves of a group carry DIFFERENT
+    // scales.  See Q35Iq2S::group -- this is not a style choice, a k32 mma here
+    // mixes the two and MVCHECK catches it as mismatched=5209727 (the whole
+    // matrix), because every element with a non-equal nibble pair is wrong.
+    static constexpr bool scale16 = true;
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 8;   // 0.125f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
@@ -727,6 +747,11 @@ struct Q35Iq2S {
 // vecdotq.cuh:710 q35_vec_dot_iq4_xs_q8_k_acc.
 struct Q35Iq4Xs {
     static constexpr int block_bytes = 136;
+    // THE ONE 16-element-granularity type: ls[0] != ls[1] (dequantize_row_iq4_xs,
+    // ggml-quants.c:2744), so a k32 mma would mix two different scales in one
+    // D fragment and the group() contract below forbids that.  This is why the
+    // kernel keeps a k16 path at all.
+    static constexpr bool scale16 = true;
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 1;   // 1.0f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
@@ -741,6 +766,7 @@ struct Q35Iq4Xs {
 // vecdotq.cuh:498 q35_vec_dot_iq2_xxs_q8_k_acc.
 struct Q35Iq2Xxs {
     static constexpr int block_bytes = 66;
+    static constexpr bool scale16 = false;
     static constexpr int out_scale_q = 1;
     // 1/8, NOT IQ3_XXS's 1/4 -- see the derivation in group() below:
     //   db = d * (0.5f + hi) * 0.25f  and  ls = 2*hi + 1
@@ -957,8 +983,15 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     // mmq.cuh:131 -- `static_assert(stride % 8 == 4)` in every layout.)
     constexpr int SA_STRIDE = 256 + 16;       // int8 per row, padded
     constexpr int LS_STRIDE = 16 + 4;         // int per row, padded
+    // sB is the activation tile: 8 token rows x 256 int8, read by load_generic
+    // as (token * SB_STRIDE + col).  It was the one stride left at a power of
+    // two: 256 B == 64 banks * 4 B, so 256 % 128 == 0 and ALL 8 token rows
+    // started on the same bank -- an 8-way conflict on every one of the 16
+    // loads per super-block, per token tile.  Same fix as sA: pad by 16 B so
+    // consecutive rows rotate 4 banks apart.
+    constexpr int SB_STRIDE = 256 + 16;       // int8 per row, padded
     __shared__ int8_t sA[NWARPS * 16 * SA_STRIDE];
-    __shared__ int8_t sB[8 * 256];
+    __shared__ int8_t sB[8 * SB_STRIDE];
     int8_t *sAw = sA + warp * 16 * SA_STRIDE;
     __shared__ int sLs[NWARPS * 16 * LS_STRIDE];  // per-warp per-row ls[16]: one per 16-element half
     int *ls_w = sLs + warp * 16 * LS_STRIDE;
@@ -970,11 +1003,16 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     // once per 8-token tile -- the prefill bandwidth cliff.)  acc[t] holds the
     // (16 rows x 8 tokens) D-fragment sum for token-tile t, accumulated across
     // all super-blocks b.
-    constexpr int MAX_TILES = 128;  // >= Q35_MMQ_MAX_TOKENS / 8 == 128 tiles
+    constexpr int MAX_TILES = Q35_MMQ_MAX_TILES;
     const int ntiles = (tokens + 7) / 8;
     const int tpt = (ntiles + njsplit - 1) / njsplit;
     const int t_lo = (int)blockIdx.y * tpt;
     const int t_hi = min(ntiles, t_lo + tpt);
+    // The launcher guarantees tpt <= MAX_TILES (it raises njsplit until it is),
+    // so a violation means that contract broke.  Clamp instead of trapping: the
+    // kernel still has to reach its __syncthreads() unconditionally, and a trap
+    // here would turn a wrong-but-running shape into a dead device.
+    const int t_end = min(t_hi, t_lo + MAX_TILES);
     float acc[MAX_TILES][4];
     for (int t = 0; t < MAX_TILES; ++t)
         for (int l = 0; l < 4; ++l) acc[t][l] = 0.0f;
@@ -1030,7 +1068,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         // gave only ~1.6x -- the weight-bandwidth win was eaten by the spill).
         // `tb >= tokens` guards the partial last tile; tokens is launch-uniform
         // (not thread-dependent), so the __syncthreads() below stay uniform.
-        for (int ti = 0; ti < t_hi - t_lo; ++ti) {
+        for (int ti = 0; ti < t_end - t_lo; ++ti) {
             const int t = t_lo + ti;
             const int tb = t * 8;
             // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).
@@ -1058,7 +1096,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                 for (int i = tid * 8; i < 8 * 256; i += nt * 8) {
                     const int trow = i >> 8;               // which of the 8 tokens
                     const int tcol = i & 255;              // byte offset in the row
-                    int8_t *dst = sB + i;
+                    int8_t *dst = sB + trow * SB_STRIDE + tcol;
                     if (tb + trow < tokens && tcol + 8 <= 256) {
                         const unsigned char *row =
                             xq + (size_t)(tb + trow) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
@@ -1071,31 +1109,59 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
             }
             __syncthreads();
 
-            // k16 mma, one per 16-element HALF-group: D.x[l] is then the exact
-            // int32 dot of 16 elements, so the per-half scale is applied without
-            // mixing.  k16 costs 16 mma instead of 8 per super-block; the tensor
-            // cores are nowhere near the bottleneck (dequant + shared staging is),
-            // so this is free.
+            // Two mma paths, chosen by the scale granularity of T:
+            //
+            //  * scale16 == false (IQ3_XXS / IQ3_S / IQ2_S / IQ2_XXS): ONE scale
+            //    per 32 elements, so `mma.sync.m16n8k32` gives the exact int32
+            //    dot of a whole group in D.x[l] and the scale applies once.
+            //    8 mma + 8 ldmatrix + 8 B-loads per super-block instead of 16.
+            //  * scale16 == true (IQ4_XS): ls[0] != ls[1], so the two halves must
+            //    stay separate -- keep the k16 loop.
+            //
+            // The old comment here claimed "the tensor cores are nowhere near
+            // the bottleneck ... so this is free".  They are not free: at 16
+            // k16 mma per super-block the kernel measured 42 TFLOPS against
+            // llama.cpp's 127 on the same shape, and halving the instruction
+            // count is part of closing that.  Association is unchanged -- both
+            // paths accumulate `isum[l] += ls * D.x[l]` in the integer domain,
+            // so the result is the same exact int32 dot either way.
             int isum[4] = {0, 0, 0, 0};
+            if (!T::scale16) {
 #pragma unroll
-            for (int h = 0; h < 16; ++h) {
-                q35_tile<16, 4, int> A_frag;
-                q35_tile<8, 4, int> B_frag;
-                q35_tile<16, 8, int> D;
-                // Shared rows are SA_STRIDE int8 wide, so the ldmatrix stride is
-                // SA_STRIDE/4 int (68 with the padding) and a 16-element half
-                // starts at int offset h*4.
-                q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, SA_STRIDE / 4);
-                q35_mma::load_generic(B_frag, (const int *)sB + h * 4, 64);
-                q35_mma::mma(D, A_frag, B_frag);
-                const int g = h >> 1;               // 32-element group
-                const int half = h & 1;
+                for (int g = 0; g < 8; ++g) {
+                    q35_tile<16, 8, int> A_frag;
+                    q35_tile<8, 8, int> B_frag;
+                    q35_tile<16, 8, int> D;
+                    q35_mma::load_ldmatrix(A_frag, (const int *)sAw + g * 8, SA_STRIDE / 4);
+                    q35_mma::load_generic(B_frag, (const int *)sB + g * 8, SB_STRIDE / 4);
+                    q35_mma::mma(D, A_frag, B_frag);
 #pragma unroll
-                for (int l = 0; l < 4; ++l) {
-                    const int mp = q35_tile<16, 8, int>::get_i(l);
-                    // ls2 holds the second half's scale when the type has 16-element
-                    // granularity; for 32-element types both entries are equal.
-                    isum[l] += (half ? ls_w[mp * LS_STRIDE + g * 2 + 1] : ls_w[mp * LS_STRIDE + g * 2]) * D.x[l];
+                    for (int l = 0; l < 4; ++l) {
+                        const int mp = q35_tile<16, 8, int>::get_i(l);
+                        isum[l] += ls_w[mp * LS_STRIDE + g * 2] * D.x[l];
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int h = 0; h < 16; ++h) {
+                    q35_tile<16, 4, int> A_frag;
+                    q35_tile<8, 4, int> B_frag;
+                    q35_tile<16, 8, int> D;
+                    // Shared rows are SA_STRIDE int8 wide, so the ldmatrix stride is
+                    // SA_STRIDE/4 int (68 with the padding) and a 16-element half
+                    // starts at int offset h*4.
+                    q35_mma::load_ldmatrix(A_frag, (const int *)sAw + h * 4, SA_STRIDE / 4);
+                    q35_mma::load_generic(B_frag, (const int *)sB + h * 4, SB_STRIDE / 4);
+                    q35_mma::mma(D, A_frag, B_frag);
+                    const int g = h >> 1;               // 32-element group
+                    const int half = h & 1;
+#pragma unroll
+                    for (int l = 0; l < 4; ++l) {
+                        const int mp = q35_tile<16, 8, int>::get_i(l);
+                        // ls2 holds the second half's scale when the type has 16-element
+                        // granularity; for 32-element types both entries are equal.
+                        isum[l] += (half ? ls_w[mp * LS_STRIDE + g * 2 + 1] : ls_w[mp * LS_STRIDE + g * 2]) * D.x[l];
+                    }
                 }
             }
             __syncthreads();   // sB is re-staged next token-tile
@@ -1118,7 +1184,7 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         }
     }
 
-    for (int ti = 0; ti < t_hi - t_lo; ++ti) {
+    for (int ti = 0; ti < t_end - t_lo; ++ti) {
         const int tb = (t_lo + ti) * 8;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
@@ -1164,31 +1230,27 @@ static int q35_iq_warps(int rows) {
         }
     }
     if (forced > 0) return forced;
-    // 4 warps (64 rows/block) is the measured optimum on the 27B shapes, and the
-    // 1..8 sweep is flat enough around it that a per-shape search is not worth a
-    // getenv-free table.  525-token IQ3_XXS prefill, tok/s, before and after the
-    // shared-memory bank-conflict padding (SA_STRIDE/LS_STRIDE above):
+    // 8 warps (128 rows/block, 256 threads) -- re-measured after Q35_MMQ_MAX_TILES
+    // dropped 128 -> 16.  The old note here said 4 warps and "w=4 vs w=8 is a
+    // tie"; that tie was an artifact of the 2 KB per-thread accumulator.  With
+    // the frame down to 128 B the 8-warp block no longer loses on occupancy and
+    // wins outright:
+    //   27B IQ3_XXS, 525-token prompt, tok/s:
+    //     MAX_TILES \ warps:   4       8
+    //          8              265.0   265.1
+    //         16              268.7   274.1   <- both defaults
+    //         24              267.7   274.1
+    //         32              268.3   274.4
+    // w=8 also halves the grid (27B ffn: 136 blocks per token slice instead of
+    // 272), which is still 1.2x the 114 SMs once the token split is applied.
+    // Historical sweep (MAX_TILES=128, IQ3_XXS, 525-token prompt) -- kept so the
+    // old numbers are not re-litigated:
     //     warps:   1      2      4      8
     //   before:  94.6   96.0   97.4   88.5    (79-token prompt, pre-padding)
     //   after:  141.6  160.1  170.0  160.2    (525-token prompt, padded)
-    //  re-swept with the J=128 token split in place (the row tile is no longer
-    //  the only source of parallelism, so the w=8 penalty is gone):
-    //           180.0  216.5  231.4  231.8
-    // w=4 vs w=8 is a tie on speed; w=4 keeps twice the blocks, which is what the
-    // small-row matrices need (27B ffn: 272 vs 136 blocks per token slice).
-    // The padding is what pulled w=8 up from the clear loser to a near tie: the
-    // 8-warp shape is the one whose shared tiles suffered the worst conflicts.
-    // w=4 still wins on block count -- the 8-warp 128-row block would give the 27B ffn
-    // (rows=5120) only (5120+127)/128 = 40 blocks for 114 SMs.
-    //
-    // The reason 4 wins over 2 and 1 despite fewer blocks per SM: the block's
-    // shared-memory tile is the same 8-token activation tile whatever the warp
-    // count, and each block pays one __syncthreads() per token tile.  Halving
-    // the warps halves the rows that barrier work is amortized over, so past
-    // w=4 that cost overtakes the occupancy gain.  The 8-warp shape is the clear
-    // loser because it underfills the device (27B ffn: 40 blocks for 114 SMs).
+    //   J=128:  180.0  216.5  231.4  231.8
     (void)rows;
-    return 4;
+    return 8;
 }
 
 static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned char *d_xq,
@@ -1230,6 +1292,21 @@ static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned ch
         const int jtiles = j_env / 8;                     // j_env is tokens/block
         njsplit = jtiles > 0 ? (ntiles + jtiles - 1) / jtiles : 1;
         if (njsplit < 1) njsplit = 1;
+    }
+    // HARD FLOOR, not a preference: `acc[MAX_TILES][4]` is a compile-time-sized
+    // array indexed by LOCAL tile (t_hi - t_lo == tpt), so a tpt above
+    // MAX_TILES writes past it with no diagnostic.  The kernel used to hard-code
+    // MAX_TILES = Q35_MMQ_MAX_TOKENS/8 = 128, which made that impossible and
+    // simultaneously put 2 KB of accumulator per thread in local memory (ptxas:
+    // `2048 bytes stack frame`) -- that spill is what held IQ3_XXS at 37 TFLOPS
+    // against llama.cpp's 127 on the same m=4096 n=512 k=14336 shape.  Dropping
+    // MAX_TILES to 16 shrinks the frame to 128 B, and this floor keeps the
+    // smaller array safe for ANY token count by raising njsplit (the token
+    // split) until tpt fits.
+    {
+        const int ntiles = (tokens + 7) / 8;
+        const int need = (ntiles + Q35_MMQ_MAX_TILES - 1) / Q35_MMQ_MAX_TILES;
+        if (njsplit < need) njsplit = need;
     }
     const dim3 grid((unsigned)((rows + rowtile - 1) / rowtile), (unsigned)njsplit);
     const int threads = nw * Q35_WARP;
