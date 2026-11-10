@@ -1111,12 +1111,13 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
 
             // Two mma paths, chosen by the scale granularity of T:
             //
-            //  * scale16 == false (IQ3_XXS / IQ3_S / IQ2_S / IQ2_XXS): ONE scale
+            //  * scale16 == false (IQ3_XXS / IQ3_S / IQ2_XXS): ONE scale
             //    per 32 elements, so `mma.sync.m16n8k32` gives the exact int32
             //    dot of a whole group in D.x[l] and the scale applies once.
             //    8 mma + 8 ldmatrix + 8 B-loads per super-block instead of 16.
-            //  * scale16 == true (IQ4_XS): ls[0] != ls[1], so the two halves must
-            //    stay separate -- keep the k16 loop.
+            //  * scale16 == true (IQ4_XS / IQ2_S): ls[0] != ls[1] -- IQ2_S packs
+            //    both nibbles into scales[g] -- so the two halves must stay
+            //    separate.  Keep the k16 loop for those two.
             //
             // The old comment here claimed "the tensor cores are nowhere near
             // the bottleneck ... so this is free".  They are not free: at 16
