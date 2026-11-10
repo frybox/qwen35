@@ -1014,7 +1014,9 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     // here would turn a wrong-but-running shape into a dead device.
     const int t_end = min(t_hi, t_lo + MAX_TILES);
     float acc[MAX_TILES][4];
+#pragma unroll
     for (int t = 0; t < MAX_TILES; ++t)
+#pragma unroll
         for (int l = 0; l < 4; ++l) acc[t][l] = 0.0f;
     // acc[] is indexed by LOCAL tile (0..t_hi-t_lo-1): the global tile index is
     // t_lo+ti.
@@ -1105,8 +1107,10 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         // gave only ~1.6x -- the weight-bandwidth win was eaten by the spill).
         // `tb >= tokens` guards the partial last tile; tokens is launch-uniform
         // (not thread-dependent), so the __syncthreads() below stay uniform.
-        for (int ti = 0; ti < t_end - t_lo; ++ti) {
+#pragma unroll
+        for (int ti = 0; ti < MAX_TILES; ++ti) {
             const int t = t_lo + ti;
+            if (t >= t_end) break;
             const int tb = t * 8;
             // Activation tile: Q8_K qs[256] at byte 4 (292-byte block).
             // Byte copies, not int4: 292 % 16 == 4, so neither a token row nor a
@@ -1217,8 +1221,11 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
         }
     }
 
-    for (int ti = 0; ti < t_end - t_lo; ++ti) {
-        const int tb = (t_lo + ti) * 8;
+#pragma unroll
+    for (int ti = 0; ti < MAX_TILES; ++ti) {
+        const int t = t_lo + ti;
+        if (t >= t_end) break;
+        const int tb = t * 8;
 #pragma unroll
         for (int l = 0; l < 4; ++l) {
             const int mp = q35_tile<16, 8, int>::get_i(l);
