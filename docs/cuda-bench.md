@@ -2,7 +2,54 @@
 
 日期：2026-10-31。原始数据：`bench_raw/cuda_qwen35.tsv`（69 行）、`bench_raw/cuda_llamacpp.tsv`（66 行）。
 
-## 测试口径
+## `q35_dot_i8_local`：把 `"memory"` clobber 的代价只留在真正需要它的操作数上（+9%）
+
+`e3a8e1a` 给 `q35_ld_u16_low` 加了 `"memory"` clobber，修的是真 bug（q4_k SPLIT 的
+`q35_vec_dot_q4_k_q8_k_part` 写本地 `w8[16]` 再用 `q35_ld_u32` 读回来，没有 clobber 时
+ptxas 会把 load 排到 store 前面，读到上一轮的 `w8`，Q4_K_M/Q3_K_M 输出乱码）。
+但 clobber 让**每一次** `q35_ld_u16/u32` 都变成编译器的全屏障 —— 而 IQ 内层循环每轮调它
+~47 次，编译器再也不能跨调用保留寄存器值。
+
+实测代价：**34.4 → 33.4 tok/s（−3%）**（`91fcdef` vs `e3a8e1a`，各跑两次，27B IQ3_XXS `-n 400`）。
+
+关键观察：clobber 之所以必要，只是因为 `q35_ld_u32` 被用来读**本地栈数组**；
+真正的权重流 / 激活流本身不可能被 store 重排。所以按操作数拆开：
+
+| 操作数 | 来源 | 读法 |
+|--------|------|------|
+| `w`（`q35_dot_i8_local` 的） | 本地 scratch `signed char[16]` | `__builtin_memcpy` 普通读，编译器可跟踪 |
+| `a` | q8_K 激活流（`y + 4`，真全局内存） | 仍走 `q35_ld_u32` 的 asm + clobber |
+| 其余所有 `q35_ld_u16/u32` 调用点 | 权重 | 不变（asm + clobber） |
+
+`q35_dot_i8_local` 用在两个本地 `w8` 的调用点（`q35_dot_scaled16` 与 q4_k `_part`），
+第三个调用点（`q35_dot_i8((const signed char *)(w + 2), ...)`）读的是真权重，保持原样。
+两条路径的 dp4a 累加顺序与逐元素乘的顺序完全一致，所以结果位精确。
+
+**实测**：33.4 → **36.4 tok/s**（36.41/36.45，`-n 400`），长 prompt **36.11/36.08**，
+prefill 119 → **126 tok/s**。比 clobber 之前（34.4）还快 —— 因为原来读本地 `w8`
+的那条路径现在完全没有屏障了。
+
+**正确性复核**（这是修 clobber 时被弄坏的那类 bug，必须逐条过）：
+- Q4_K_M / Q3_K_M / Q4_K_S / Q5_K_M / Q6_K / Q8_0 / IQ4_XS / IQ3_S / Q4_0 / IQ4_NL
+  十个格式输出全部连贯（人工读了中文正文，不是只看退出码）。
+- Q4_K_M 的 launch 矩阵全绿：default / `SPLIT=0` / `SPLIT=2` / `SPLIT=4` /
+  `warps=1` / `warps=4` / `graph=0` → 全部 `mismatched=0`。
+- 10 个格式 `MVCHECK` 全部 `mismatched=0`。
+- `zig build test` 20/20 steps, 80/80 tests。
+
+**已否决：把 `addResid` 与紧随其后的 `rmsnorm` 融成一个 kernel。**
+推理是这两者总是相邻（`forwardFull`/`forwardGdn` 的结尾 + `forwardMlp` 的开头），
+中间的 kernel 边界让 add 的尾部排空落在 norm 的关键路径上（`mb_dep` 测过 7–55%）。
+实现了 `q35_launch_add_resid_rmsnorm` 并跨层融合（用 `x1_ready` 标志跳过下一层自己的 norm），
+graph 节点 2436 → 2309，**位精确**（0.8B 与 27B 的 `QWEN35_DUMP_IDS` md5 前后完全相同：
+CPU `1a2745e9…` / 27B CPU `55ca96e8…` / CUDA `3109fa4c…`），但**实测 34.4 → 33.3 tok/s**。
+原因：`k_add_resid` 是 `gridFor(n)` = 4 个 block，`k_rmsnorm` 是 1 个 block/row，融合后
+变成 **1 个 block** 干两件事 —— 反而丢了 add 原有的跨 SM 展开；这两个 kernel 本来就是
+launch 延迟受限（各 ~1–2 µs）而不是算力受限，省下的那次 launch 抵消不了并行度的损失。
+`PROF-SLOT` 也印证：`add_resid` + `rmsnorm` 全 token 累计只有 3–4 ms（1.4% + 1.1%），
+本来就不值得动。已完整回滚。
+
+## ## 测试口径
 
 - **机器**：Intel Xeon Gold 6430（32 核）+ **NVIDIA GeForce RTX 4090 D**（24564 MiB，driver 580.178.04）。跑前 `nvidia-smi` 确认无其它 GPU 进程，全程串行、一次一个引擎。
 - **模型**：`/mnt/Qwen3.5-0.8B-GGUF/` 全部 22 个 GGUF（排除 mmproj）。

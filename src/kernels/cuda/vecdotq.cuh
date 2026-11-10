@@ -160,6 +160,34 @@ Q35_DEV unsigned int q35_iq_signs8(unsigned int v7) {
 // len consecutive int8 x int8 dot products.  Integer-only, so the association
 // order is irrelevant to the result; __dp4a folds four int8 products into one
 // (sm_61+), the tail is scalar so any len stays correct.
+// Same dot, but for a `w` that is LOCAL scratch (a stack `signed char[16]`
+// the caller just filled) rather than the weight stream.  `q35_ld_u32` carries
+// a `"memory"` clobber -- mandatory, see its comment, because it is also used
+// to read back such scratch in a write-then-read loop -- and that clobber
+// makes every load a full compiler barrier.  Reading the scratch through
+// ordinary indexing instead keeps the values in registers and costs nothing:
+// `w8` is 16 bytes, so the four 32-bit words are already adjacent scalars.
+//
+// Byte order is irrelevant to the result here: `q35_dp4a` folds the four int8
+// products of the two words it is handed, and the plain path multiplies the
+// same four element pairs.  Both accumulate into `s` one group of four at a
+// time, in the same order, so the two are bit-identical.
+Q35_DEV int q35_dot_i8_local(const signed char *w, const signed char *a, int len) {
+    int s = 0;
+    const int n4 = len & ~3;
+    for (int i = 0; i < n4; i += 4) {
+        // `w` is local: plain tracked reads, so no barrier is needed on it.
+        int aw;
+        __builtin_memcpy(&aw, w + i, 4);
+        // `a` is the q8_K activation stream -- real global memory, so it keeps
+        // the asm loader (and its clobber) for the same reason as
+        // `q35_dot_i8`: a byte-chain read here is four `ld.global.u8`.
+        s = q35_dp4a(aw, q35_ld_u32((const unsigned char *)a + i), s);
+    }
+    for (int i = n4; i < len; ++i) s += (int)w[i] * (int)a[i];
+    return s;
+}
+
 Q35_DEV int q35_dot_i8(const signed char *w, const signed char *a, int len) {
     int s = 0;
     const int n4 = len & ~3;
@@ -189,7 +217,7 @@ Q35_DEV int q35_dot_scaled16(const signed char *w8, const signed char *a8,
                              const int *sc) {
     int isum = 0;
     for (int g = 0; g < 16; ++g) {
-        const int sub = q35_dot_i8(w8 + g * 16, a8 + g * 16, 16);
+        const int sub = q35_dot_i8_local(w8 + g * 16, a8 + g * 16, 16);
         isum += sc[g] * sub;
     }
     return isum;
@@ -501,7 +529,7 @@ Q35_DEV float q35_vec_dot_q4_k_q8_k_part(const unsigned char *w,
                 const unsigned char b = q4[c * 32 + half + l];
                 w8[l] = (signed char)(hi_nib ? (b >> 4) : (b & 0x0F));
             }
-            isum += q35_dot_i8(w8, aq + g * 16, 16) * (int)sm[g / 2];
+            isum += q35_dot_i8_local(w8, aq + g * 16, 16) * (int)sm[g / 2];
             sumi += q35_q8k_bsum(y, g) * (int)sm[8 + g / 2];
         }
     }
