@@ -1431,7 +1431,10 @@ pub const Engine = struct {
                 // what turns ~14 launches per token into 4 per chunk plus the
                 // per-token state step.
                 self.forwardGdnPrelude(lw, li, k);
-                while (t < k) : (t += 1) self.forwardGdnCore(lw, li, t, k);
+                while (t < k) : (t += 1) self.forwardGdnCore(li, t, k);
+                // Chunk-wide gated RMSNorm + silu gate, hoisted out of the
+                // token loop above; `ssm_out` is the first reader of `goutK`.
+                self.forwardGdnGated(lw, k);
                 self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.ssm_out.?, self.goutK, k);
             }
 
@@ -1785,7 +1788,7 @@ pub const Engine = struct {
     }
 
     /// state in serial order), writing the gated RMS-normed output to goutK[t].
-    fn forwardGdnCore(self: *Engine, lw: *LayerWeights, li: usize, t: usize, k: usize) void {
+    fn forwardGdnCore(self: *Engine, li: usize, t: usize, k: usize) void {
         const c = self.cfg;
         const nv: usize = c.gdn_n_heads;
         const nk: usize = c.gdn_num_k_heads;
@@ -1796,7 +1799,6 @@ pub const Engine = struct {
         const value_dim: usize = nv * vd;
 
         const qkv = self.qkvK.span(t * conv_dim, conv_dim);
-        const z = self.gateK.span(t * value_dim, value_dim);
         const st = &self.gdn[li];
         // conv + silu, beta = sigmoid(b), gamma, and the l2norm/scale passes were
         // all done for the whole chunk by `forwardGdnPrelude`; qkv and abK are
@@ -1829,14 +1831,37 @@ pub const Engine = struct {
             vd,
         );
 
-        // Gated RMSNorm: norm -> weight -> silu(gate) (SPEC A6).
-        //
-        // The `nv` norm rows are consecutive (`gout` is `nv * vd` wide) with one
-        // shared `ssm_norm` row, so the rmsnorm batch is the three-condition
-        // case.  `mulSilu` then collapses the same run in one call: it is
-        // elementwise over arbitrary `n`, with no per-row state to preserve.
-        self.exec.rmsnormRows(gout.span(0, value_dim), gout.span(0, value_dim), lw.ssm_norm, nv, c.rms_eps);
-        self.exec.mulSilu(gout.span(0, value_dim), z.span(0, value_dim));
+        // (Gated RMSNorm + mulSilu used to be here, per token.  They touch only
+        // this token's `gout`/`z` rows and carry no state, so they were hoisted
+        // out of the token loop into `forwardGdnGated` below -- 2 launches per
+        // token per GDN layer, 50,304 of the 281,384 launches a 525-token
+        // prefill made.  See that function for the correctness argument.)
+    }
+
+    /// Chunk-wide tail of the GDN block: the gated RMSNorm (SPEC A6, norm ->
+    /// weight) followed by `silu(gate)` for every token in ONE call each.
+    ///
+    /// CORRECTNESS: this is pure code motion out of `forwardGdnCore`'s token
+    /// loop.  Both kernels are elementwise with no per-row state, and every row
+    /// they touch (`goutK[t*value_dim ..][value_dim]`, `gateK[t*value_dim ..]`)
+    /// was written by token t's own `gdnStepRows` and is read by nothing else in
+    /// between -- the only cross-token dependency in the GDN block is the conv
+    /// history / 128x128 state, and that stays in the serial `gdnStepRows` loop.
+    /// `rmsnormRows` reduces each row independently in the same order, and
+    /// `mulSilu` is elementwise over arbitrary `n`, so both produce bit-identical
+    /// bytes to the per-token calls they replace.
+    ///
+    /// This MUST run after the last `forwardGdnCore` of the chunk and before
+    /// `ssm_out` reads `goutK`.
+    fn forwardGdnGated(self: *Engine, lw: *LayerWeights, k: usize) void {
+        const c = self.cfg;
+        const nv: usize = c.gdn_n_heads;
+        const value_dim: usize = nv * c.gdn_head_dim;
+        // The `nv` norm rows of a token are consecutive (`gout` is `nv * vd`
+        // wide) with one shared `ssm_norm` row, so `k * nv` rows is the same
+        // three-condition batch case, `k` tokens deep.
+        self.exec.rmsnormRows(self.goutK.span(0, k * value_dim), self.goutK.span(0, k * value_dim), lw.ssm_norm, k * nv, c.rms_eps);
+        self.exec.mulSilu(self.goutK.span(0, k * value_dim), self.gateK.span(0, k * value_dim));
     }
 
     fn forwardFull(self: *Engine, lw: *LayerWeights, li: usize, pos: u32) void {
