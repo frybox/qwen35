@@ -39,6 +39,14 @@ test {
     _ = @import("simd_tests32.zig");
 }
 
+// Chunk-wide prefill slots (`attnChunk`, `deinterleaveQGStrided`): each is
+// checked against the per-row calls it replaced, which is the whole contract of
+// a launch merge.  See the file header for why an off-by-one row is the failure
+// mode worth a test.
+test {
+    _ = @import("chunk_slot_tests.zig");
+}
+
 test {
     _ = @import("simd_tests256.zig");
 }

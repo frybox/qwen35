@@ -119,6 +119,7 @@ const Kernels = struct {
     extern fn q35_launch_add_resid(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_copy_range(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_deinterleave_qg(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_zero_buf(d_buf: ?[*]f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     /// Norms (src/kernels/cuda/norm.cu), activations + conv
@@ -167,6 +168,8 @@ const Kernels = struct {
     extern fn q35_launch_l2norm_strided(d_x: ?[*]f32, row_offset: c_int, rows: c_int, n: c_int, eps: f32, tokens: c_int, row_stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_scale_vec_strided(d_x: ?[*]f32, offset: c_int, s: f32, n: c_int, tokens: c_int, stride: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_attn_chunk_max_rows(slot0: c_int) callconv(.c) c_int;
     /// Warp-tiled / split decode attention (see api.h for the measurements).
     extern fn q35_launch_attn_decode_coal(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_attn_decode_split_dyn(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, d_part: ?[*]f32, d_slot: ?[*]const c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, split: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -278,6 +281,7 @@ const Launch = if (cuda_linked) struct {
     const add_resid = Kernels.q35_launch_add_resid;
     const copy_range = Kernels.q35_launch_copy_range;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
+    const deinterleave_qg_strided = Kernels.q35_launch_deinterleave_qg_strided;
     const zero_buf = Kernels.q35_launch_zero_buf;
     const rmsnorm = Kernels.q35_launch_rmsnorm;
     const l2norm = Kernels.q35_launch_l2norm;
@@ -294,6 +298,7 @@ const Launch = if (cuda_linked) struct {
     const sample_scratch_ints = Kernels.q35_sample_scratch_ints;
     const sample_ctl_ints = Kernels.q35_sample_ctl_ints;
     const attn_decode = Kernels.q35_launch_attn_decode;
+    const attn_chunk = Kernels.q35_launch_attn_chunk;
     const attn_decode_dyn = Kernels.q35_launch_attn_decode_dyn;
     const attn_decode_coal = Kernels.q35_launch_attn_decode_coal;
     const attn_decode_split2 = Kernels.q35_launch_attn_decode_split2;
@@ -430,6 +435,14 @@ const Launch = if (cuda_linked) struct {
     }
     fn attn_decode(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_att: ?[*]f32, d_gout: ?[*]f32, slot: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_q, d_gate, d_kcache, d_vcache, d_att, d_gout, slot, heads, gqa, hd, kv_dim, scale, stream };
+        return stubNoCudaKernels();
+    }
+    fn attn_chunk(d_q: ?[*]const f32, d_gate: ?[*]const f32, d_kcache: ?[*]const f32, d_vcache: ?[*]const f32, d_gout: ?[*]f32, slot0: c_int, rows: c_int, heads: c_int, gqa: c_int, hd: c_int, kv_dim: c_int, scale: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_kcache, d_vcache, d_gout, slot0, rows, heads, gqa, hd, kv_dim, scale, stream };
+        return stubNoCudaKernels();
+    }
+    fn deinterleave_qg_strided(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, tokens: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_q, d_gate, d_src, heads, hd, tokens, stream };
         return stubNoCudaKernels();
     }
     // Same order and same signatures as the `Kernels` aliases above: every
@@ -576,6 +589,10 @@ pub const Slot = enum(u8) {
     rope64_rows,
     l2norm,
     attn_decode,
+    /// Chunk-wide prefill attention (`VTable.attnChunk`).  Separate from
+    /// `attn_decode` so the profile shows the two shapes apart: prefill should
+    /// drop to a handful of calls per layer while decode keeps one per token.
+    attn_chunk,
     gdn_gamma,
     gdn_prelude,
     gdn_step,
@@ -672,6 +689,7 @@ fn slotName(s: Slot) []const u8 {
         .rope64_rows => "rope64_rows",
         .l2norm => "l2norm",
         .attn_decode => "attn_decode",
+        .attn_chunk => "attn_chunk",
         .gdn_gamma => "gdn_gamma",
         .gdn_prelude => "gdn_prelude",
         .gdn_step => "gdn_step",
@@ -6851,6 +6869,34 @@ const attn_score_arity: usize = 10;
         cpu_mod.CpuBackend.vtable.deinterleaveQG(@ptrCast(&self.cpu), dst_q, dst_gate, src, heads, hd);
     }
 
+    /// Chunk-wide `deinterleaveQG`: `tokens` rows in one launch.  Same move as
+    /// `dDeinterleaveQG`, so this is exact; it exists because the per-row form
+    /// cost 940 launches per 525-token prefill (1.2% of device time at 6 us).
+    fn dDeinterleaveQGStrided(ctx: *anyopaque, dst_q: backend.Buf, dst_gate: backend.Buf,
+                              src: backend.Buf, heads: usize, hd: usize, tokens: usize) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.deinterleave_qg, t0);
+        if (self.ablated(.deinterleave_qg)) return;
+        const row_len = heads * hd;
+        const shapes_ok = tokens != 0 and heads != 0 and hd != 0 and
+            dst_q.len >= tokens * row_len and dst_gate.len >= tokens * row_len and
+            src.len >= tokens * 2 * row_len;
+        if (self.cu != null and shapes_ok) {
+            if (dBufPtr(dst_q)) |pq| {
+                if (dBufPtr(dst_gate)) |pg| {
+                    if (dBufPtr(src)) |ps| {
+                        const rc = Launch.deinterleave_qg_strided(pq, pg, ps,
+                            @intCast(heads), @intCast(hd), @intCast(tokens), self.launchStream());
+                        if (rc == cudart.cudaSuccess) return;
+                        self.ewLaunchFail("deinterleave_qg_strided", rc);
+                    }
+                }
+            }
+        }
+        cpu_mod.CpuBackend.vtable.deinterleaveQGStrided(@ptrCast(&self.cpu), dst_q, dst_gate, src, heads, hd, tokens);
+    }
+
     /// The `zeroBuf` slot, timed (`$QWEN35_PROF`).
     fn dZeroBuf(ctx: *anyopaque, buf: backend.Buf) void {
         const self = self_(ctx);
@@ -7040,6 +7086,88 @@ const attn_score_arity: usize = 10;
         dAttnDecode_body(ctx, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
+    /// `attnChunk` -- the chunk-wide prefill attention, timed separately
+    /// (`$QWEN35_PROF` shows `attn_chunk` beside `attn_decode`).
+    ///
+    /// Falls back to the per-row `dAttnDecode_body` whenever the device path is
+    /// unavailable or the caller's buffers do not match the chunk contract, so
+    /// a size violation degrades to known-good behaviour instead of a launch on
+    /// bad pointers.  The CUDA kernel was gated bit-identical against exactly
+    /// that per-row form (`/tmp/gate_attn_chunk.cu`).
+    fn dAttnChunk(ctx: *anyopaque, q: backend.Buf, gate: backend.Buf, kcache: backend.Buf,
+                  vcache: backend.Buf, att: backend.Buf, gout: backend.Buf, slot0: usize,
+                  rows: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize,
+                  scale: f32) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.attn_chunk, t0);
+        if (self.ablated(.attn_chunk)) return;
+
+        const row_len = heads * hd;
+        const n_tot = slot0 + rows;
+        // The gate kernel that the per-row path runs separately is folded into
+        // the chunk kernel, so this path is only taken when EVERY input lines up.
+        const shapes_ok = rows != 0 and heads != 0 and hd != 0 and gqa != 0 and
+            q.len >= rows * row_len and gate.len >= rows * row_len and
+            gout.len >= rows * row_len and
+            kcache.len >= n_tot * kv_dim and vcache.len >= n_tot * kv_dim;
+
+        // A chunk appended to a long KV cache can need more `s_scores` than the
+        // 48 KB dynamic budget allows; `q35_attn_chunk_max_rows` reports the
+        // slice size, and slicing is safe because row r depends only on earlier
+        // rows and the cache prefix it needs.
+        var maxrows: usize = 0;
+        if (self.cu != null and shapes_ok) {
+            const m = Kernels.q35_attn_chunk_max_rows(@intCast(slot0));
+            if (m > 0) maxrows = @intCast(m);
+        }
+
+        if (maxrows != 0) {
+            if (dBufPtr(q)) |pq| {
+                if (dBufPtr(gate)) |pgate| {
+                    if (dBufPtr(kcache)) |pk| {
+                        if (dBufPtr(vcache)) |pv| {
+                            if (dBufPtr(gout)) |pgout| {
+                                var done: usize = 0;
+                                while (done < rows) {
+                                    // `maxrows` shrinks as `slot0` grows, so
+                                    // recompute it per slice rather than
+                                    // trusting the first value.
+                                    const m2 = Kernels.q35_attn_chunk_max_rows(@intCast(slot0 + done));
+                                    if (m2 <= 0) break;
+                                    const take = @min(rows - done, @as(usize, @intCast(m2)));
+                                    const rc = Launch.attn_chunk(
+                                        pq + done * row_len, pgate + done * row_len,
+                                        pk, pv,
+                                        pgout + done * row_len,
+                                        @intCast(slot0 + done), @intCast(take),
+                                        @intCast(heads), @intCast(gqa), @intCast(hd),
+                                        @intCast(kv_dim), scale, self.launchStream());
+                                    if (rc != 0) {
+                                        std.debug.print("cuda backend: attn_chunk launch failed ({d})\n", .{rc});
+                                        break;
+                                    }
+                                    done += take;
+                                }
+                                if (done == rows) return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // Fall back row by row (bad shapes, no device, or a rejected slice).
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            dAttnDecode_body(ctx,
+                q.span(r * row_len, row_len),
+                gate.span(r * row_len, row_len),
+                kcache, vcache, att,
+                gout.span(r * row_len, row_len),
+                slot0 + r, heads, gqa, hd, kv_dim, scale);
+        }
+    }
+
     /// `rope64(slot)`, timed (`$QWEN35_PROF`).
     fn dRope64(ctx: *anyopaque, x: backend.Buf, pos: u32, base: f32) void {
         const self = self_(ctx);
@@ -7124,6 +7252,7 @@ pub const vtable = backend.Exec.VTable{
     .loadVecF32 = CudaBackend.vLoadVecF32,
     .freeVec = CudaBackend.vFreeVec,
     .attnDecode = CudaBackend.dAttnDecode,
+    .attnChunk = CudaBackend.dAttnChunk,
     .gdnGamma = CudaBackend.dGdnGamma,
     .gdnPrefillCore = CudaBackend.dGdnPrefillCore,
     .copyFromHost = CudaBackend.dCopyFromHost,
@@ -7140,6 +7269,7 @@ pub const vtable = backend.Exec.VTable{
     .copyRange = CudaBackend.dCopyRange,
     .copyRangeSlot = CudaBackend.dCopyRangeSlot,
     .deinterleaveQG = CudaBackend.dDeinterleaveQG,
+    .deinterleaveQGStrided = CudaBackend.dDeinterleaveQGStrided,
     .zeroBuf = CudaBackend.dZeroBuf,
     // Activations are PROPER device regions after P2c, so `allocBuf` is a real
     // `cudaMalloc` and `freeScratch` releases them (`dAllocBuf`/`dFreeScratch`).

@@ -1415,7 +1415,7 @@ pub const Engine = struct {
                 self.exec.rope64Rows(self.qK.span(0, k * q_dim), pos0, c.rope_freq_base, k, heads_q_rope, hd_q);
                 self.exec.rope64Rows(self.kK.span(0, k * kv_dim), pos0, c.rope_freq_base, k, kv_heads_rope, hd_q);
                 t = 0;
-                while (t < k) : (t += 1) self.forwardFullCore(lw, li, t, pos0 + @as(u32, @intCast(t)));
+                self.forwardFullChunk(lw, li, k);
                 self.exec.matvecBatchK(self.x2K.span(0, k * hidden), lw.attn_output.?, self.goutK, k);
             } else {
                 self.exec.matvecBatchK(self.qkvK.span(0, k * conv_dim), lw.attn_qkv.?, self.x1K, k);
@@ -1672,11 +1672,32 @@ pub const Engine = struct {
 
     // ------------- Full attention block (SPEC B) -------------
 
-    /// Batched-chunk twin of `forwardFull`: the q / k / v projections have
-    /// already been run as K-token batched matvecs into qkvK / kK / vK; this
-    /// runs the per-token attention kernel for slot `t`, writing KV at
-    /// position `pos`, and leaves the gated attention output in goutK[t].
-    fn forwardFullCore(self: *Engine, lw: *LayerWeights, li: usize, t: usize, pos: u32) void {
+    // `forwardFullCore` (the per-token body) was removed when `forwardFullChunk`
+    // replaced it: the per-row form now lives in the CPU backend as
+    // `vAttnChunk`, which IS the old loop and is the oracle the chunk kernel is
+    // checked against (`/tmp/gate_attn_chunk.cu`).  Keeping a second copy here
+    // would mean two per-row implementations to keep in sync for no caller.
+
+    /// Chunk-wide twin of `forwardFullCore`: the whole chunk's full-attention
+    /// layer in ONE `attnChunk` call instead of `k` `attnDecode` calls.
+    ///
+    /// WHAT MOVED.  `forwardFullCore`'s per-token body had four parts:
+    ///   1. `deinterleaveQG`   [q|gate] split for token t
+    ///   2. `rmsnormRows` x2   q_norm over `heads` rows, k_norm over `kv_heads`
+    ///   3. `copyRangeSlot` x2 KV cache write for token t
+    ///   4. `attnDecode`       scores -> softmax -> PV -> gate
+    /// Only (4) touches the growing window, so only (4) is what `attnChunk`
+    /// replaces.  (1)-(3) were already cheap single launches; they stay per
+    /// token here because each one writes the row that token r's attention
+    /// needs, and the cache rows must ALL be present before `attnChunk` runs.
+    /// Folding (1)-(3) into the chunk kernel is a separate change.
+    ///
+    /// CORRECTNESS: `attnChunk(slot0, k)` is defined as the k per-row
+    /// `attnDecode(slot0+r)` calls, and the CUDA kernel was gated bit-identical
+    /// against exactly that (`/tmp/gate_attn_chunk.cu`, 23 rows / 4 heads /
+    /// slot0=37: worst abs diff 0).  The cache is filled in ascending order
+    /// first, so row r sees the same `[0, slot0+r]` prefix it saw before.
+    fn forwardFullChunk(self: *Engine, lw: *LayerWeights, li: usize, k: usize) void {
         const c = self.cfg;
         const heads: usize = c.n_heads;
         const kv_heads: usize = c.n_kv_heads;
@@ -1685,48 +1706,39 @@ pub const Engine = struct {
         const kv_dim: usize = kv_heads * hd;
         const gqa: usize = heads / kv_heads;
 
-        const qg = self.qkvK.span(t * 2 * q_dim, 2 * q_dim);
-        const q = self.qK.span(t * q_dim, q_dim);
-        const gate = self.gateK.span(t * q_dim, q_dim);
-        // One slot for the whole split: the per-head form was `2*heads`
-        // launches of 1 KB each every token, which `PROF-COPY` put at 99% of
-        // the `copy_range` slot (the `attn_q` rows themselves are interleaved
-        // in the GGUF, so this move cannot be avoided -- only batched).
-        self.exec.deinterleaveQG(q, gate, qg, heads, hd);
-        const k = self.kK.span(t * kv_dim, kv_dim);
-        const v = self.vK.span(t * kv_dim, kv_dim);
-
-        // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w)
-        //
-        // One call per tensor instead of one per head: the `heads` rows of `q`
-        // are CONSECUTIVE (`q` is `qK[t*q_dim..]`, each head a `hd`-wide slice
-        // of it), the weight is the SAME `attn_q_norm` row for every head and
-        // each row's normalisation is independent (own sum of squares), so this
-        // is the three-condition batch.  `rmsnormRows` launches `heads` blocks
-        // of `k_rmsnorm`, i.e. the identical per-row arithmetic.
-        self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), lw.attn_q_norm, heads, c.rms_eps);
-        self.exec.rmsnormRows(k.span(0, kv_dim), k.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
-        // (rope64 is NOT here: the chunk-wide `rope64Rows` pass in `forwardChunk`
-        // has already rotated every token's q and k in one launch.  `pos` is kept
-        // in the signature because the attention below still needs `slot`.)
-        _ = pos;
-
-        // KV cache: slot == cache.len, exactly as the serial path
         const cache = &self.kv[li];
-        std.debug.assert(cache.len < max_seq);
-        const slot: usize = cache.len;
-        self.exec.copyRangeSlot(cache.k.span(slot * kv_dim, kv_dim), k, slot);
-        self.exec.copyRangeSlot(cache.v.span(slot * kv_dim, kv_dim), v, slot);
-        cache.len += 1;
+        std.debug.assert(cache.len + k <= max_seq);
+        const slot0: usize = cache.len;
 
+        // [q|gate] split for the whole chunk in ONE launch (was `k` launches of
+        // 24 heads each: 940 per 525-token prefill, 1.2% of device time).
+        self.exec.deinterleaveQGStrided(self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+            self.qkvK.span(0, k * 2 * q_dim), heads, hd, k);
+
+        // Pass 1: everything row r needs written, for EVERY row, in ascending
+        // order.  This is the old per-token body minus the attention itself.
+        var t: usize = 0;
+        while (t < k) : (t += 1) {
+            const q = self.qK.span(t * q_dim, q_dim);
+            // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w).
+            // `heads` rows of one tensor, same weight row, independent sums --
+            // the batched form is the identical per-row arithmetic.
+            self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), lw.attn_q_norm, heads, c.rms_eps);
+            const kk = self.kK.span(t * kv_dim, kv_dim);
+            self.exec.rmsnormRows(kk.span(0, kv_dim), kk.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
+            // RoPE already ran chunk-wide in `forwardChunk`.
+            const vv = self.vK.span(t * kv_dim, kv_dim);
+            self.exec.copyRangeSlot(cache.k.span((slot0 + t) * kv_dim, kv_dim), kk, slot0 + t);
+            self.exec.copyRangeSlot(cache.v.span((slot0 + t) * kv_dim, kv_dim), vv, slot0 + t);
+        }
+        cache.len += @intCast(k);
+
+        // Pass 2: scores -> softmax -> PV -> gate for all k rows, one launch.
         const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
-        const gout = self.goutK.span(t * q_dim, q_dim);
-        // scores -> softmax -> PV -> sigmoid gate in one backend call
-        // (`attnDecode`), reading the cache rows written so far.
-        self.exec.attnDecode(q.span(0, q_dim), gate.span(0, q_dim),
-            cache.k.span(0, (slot + 1) * kv_dim), cache.v.span(0, (slot + 1) * kv_dim),
-            self.attn.span(0, slot + 1), gout.span(0, q_dim),
-            slot, heads, gqa, hd, kv_dim, scale);
+        self.exec.attnChunk(self.qK.span(0, k * q_dim), self.gateK.span(0, k * q_dim),
+            cache.k.span(0, (slot0 + k) * kv_dim), cache.v.span(0, (slot0 + k) * kv_dim),
+            self.attn.span(0, slot0 + k), self.goutK.span(0, k * q_dim),
+            slot0, k, heads, gqa, hd, kv_dim, scale);
     }
 
     /// Batched-chunk twin of `forwardGdn`: qkv / gate / alpha / beta were

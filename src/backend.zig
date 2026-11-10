@@ -275,6 +275,27 @@ pub const Exec = struct {
         attnDecode: *const fn (ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
             att: Buf, gout: Buf, slot: usize, heads: usize, gqa: usize, hd: usize,
             kv_dim: usize, scale: f32) void,
+        /// Chunk-wide twin of `attnDecode` for prefill: `rows` tokens in ONE call
+        /// instead of `rows` calls.
+        ///
+        /// `q`/`gate`/`gout` are `rows * heads * hd` (row r at
+        /// `r*heads*hd + h*hd`).  Row r attends to cache rows `[0, slot0+r]`
+        /// inclusive, so the rows are still ordered inside the backend -- what
+        /// this removes is the per-token KERNEL BOUNDARY, not the dependency
+        /// (8400 launches -> 16 for a 525-token 27B prefill).
+        ///
+        /// PRECONDITIONS the caller owns (this does the score/softmax/PV/gate
+        /// only): q/k RoPE, q_norm/k_norm and the [q|gate] deinterleave are done
+        /// chunk-wide already, and `kcache`/`vcache` hold rows `[0, slot0+rows)`
+        /// (the chunk's own k/v included).  `att` is scratch, unused by the CUDA
+        /// path; a backend may need it and may grow it.
+        ///
+        /// Equivalent to calling `attnDecode` once per row with
+        /// `slot = slot0 + r`, ULP for ULP -- the CUDA kernel was gated against
+        /// exactly that (`/tmp/gate_attn_chunk.cu`: 23 rows, bit-identical).
+        attnChunk: *const fn (ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf,
+            att: Buf, gout: Buf, slot0: usize, rows: usize, heads: usize, gqa: usize,
+            hd: usize, kv_dim: usize, scale: f32) void,
         /// GDN per-token beta/gamma from the raw a/b projections.
         gdnGamma: *const fn (ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void,
 
@@ -332,6 +353,11 @@ pub const Exec = struct {
         ///
         /// `dst_q.len == dst_gate.len == heads*hd`, `src.len == 2*heads*hd`.
         deinterleaveQG: *const fn (ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void,
+        /// Chunk-wide twin of `deinterleaveQG`: `tokens` rows in ONE call.
+        /// Row t's `[q|gate]` block starts `t * 2 * heads * hd` floats into
+        /// `src`, and row t's q/gate start `t * heads * hd` into each output.
+        /// Pure move, no arithmetic -- exactly `tokens` per-row calls.
+        deinterleaveQGStrided: *const fn (ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void,
         /// Copy a host tensor row into a backend region (the f32 embedding row
         /// when token_embd is unquantized).
         copyFromHost: *const fn (ctx: *anyopaque, dst: Buf, src: []const f32) void,
@@ -531,6 +557,13 @@ pub const Exec = struct {
                       slot: usize, heads: usize, gqa: usize, hd: usize, kv_dim: usize, scale: f32) void {
         self.vtable.attnDecode(self.ptr, q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
+    /// `rows` tokens of prefill attention in one call; see `VTable.attnChunk`
+    /// for the preconditions and the equivalence to the per-row form.
+    pub fn attnChunk(self: Exec, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf, gout: Buf,
+                     slot0: usize, rows: usize, heads: usize, gqa: usize, hd: usize,
+                     kv_dim: usize, scale: f32) void {
+        self.vtable.attnChunk(self.ptr, q, gate, kcache, vcache, att, gout, slot0, rows, heads, gqa, hd, kv_dim, scale);
+    }
     /// beta = sigmoid(b_raw) written IN PLACE into `b_raw`, and
     /// gamma[h] = exp(ssm_a[h] * softplus(a_raw[h] + dt_bias[h])).
     /// `a_raw` and `b_raw` are separate buffers because the batched prefill
@@ -561,6 +594,9 @@ pub const Exec = struct {
     }
     pub fn deinterleaveQG(self: Exec, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
         self.vtable.deinterleaveQG(self.ptr, dst_q, dst_gate, src, heads, hd);
+    }
+    pub fn deinterleaveQGStrided(self: Exec, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize, tokens: usize) void {
+        self.vtable.deinterleaveQGStrided(self.ptr, dst_q, dst_gate, src, heads, hd, tokens);
     }
     pub fn copyFromHost(self: Exec, dst: Buf, src: []const f32) void {
         self.vtable.copyFromHost(self.ptr, dst, src);

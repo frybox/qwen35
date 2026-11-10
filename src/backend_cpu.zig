@@ -1003,6 +1003,25 @@ pub const CpuBackend = struct {
         ew.bufAttnDecode(q, gate, kcache, vcache, att, gout, slot, heads, gqa, hd, kv_dim, scale);
     }
 
+    /// CPU oracle for `VTable.attnChunk`: literally the per-row `attnDecode`
+    /// calls the engine made before the chunk slot existed, in the same order.
+    /// Keeping the naive loop here is what makes a device implementation's
+    /// comparison meaningful instead of a copy checked against a copy.
+    fn vAttnChunk(ctx: *anyopaque, q: Buf, gate: Buf, kcache: Buf, vcache: Buf, att: Buf,
+                  gout: Buf, slot0: usize, rows: usize, heads: usize, gqa: usize,
+                  hd: usize, kv_dim: usize, scale: f32) void {
+            const row_len = heads * hd;
+            var r: usize = 0;
+            while (r < rows) : (r += 1) {
+                vAttnDecode(ctx,
+                    q.span(r * row_len, row_len),
+                    gate.span(r * row_len, row_len),
+                    kcache, vcache, att,
+                    gout.span(r * row_len, row_len),
+                    slot0 + r, heads, gqa, hd, kv_dim, scale);
+            }
+    }
+
     fn vGdnGamma(ctx: *anyopaque, a_raw: Buf, b_raw: Buf, ssm_a: Buf, dt_bias: Buf, gamma: Buf, nv: usize) void {
         _ = ctx;
         ew.bufGdnGamma(a_raw, b_raw, ssm_a, dt_bias, gamma, nv);
@@ -1065,6 +1084,21 @@ pub const CpuBackend = struct {
     fn vDeinterleaveQG(ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf, heads: usize, hd: usize) void {
         _ = ctx;
         ew.bufDeinterleaveQG(dst_q, dst_gate, src, heads, hd);
+    }
+
+    /// CPU oracle for `VTable.deinterleaveQGStrided`: the per-row calls, in row
+    /// order.  Pure move, so this is exact, not approximate.
+    fn vDeinterleaveQGStrided(ctx: *anyopaque, dst_q: Buf, dst_gate: Buf, src: Buf,
+                              heads: usize, hd: usize, tokens: usize) void {
+        const row_len = heads * hd;
+        var t: usize = 0;
+        while (t < tokens) : (t += 1) {
+            vDeinterleaveQG(ctx,
+                dst_q.span(t * row_len, row_len),
+                dst_gate.span(t * row_len, row_len),
+                src.span(t * 2 * row_len, 2 * row_len),
+                heads, hd);
+        }
     }
 
     fn vCopyFromHost(ctx: *anyopaque, dst: Buf, src: []const f32) void {
@@ -1168,11 +1202,13 @@ pub const CpuBackend = struct {
         .freeVec = vFreeVec,
         .allocBuf = vAllocBuf,
         .attnDecode = vAttnDecode,
+        .attnChunk = vAttnChunk,
         .gdnGamma = vGdnGamma,
         .gdnPrefillCore = vGdnPrefillCore,
         .copyRange = vCopyRange,
         .copyRangeSlot = vCopyRangeSlot,
         .deinterleaveQG = vDeinterleaveQG,
+        .deinterleaveQGStrided = vDeinterleaveQGStrided,
         .copyFromHost = vCopyFromHost,
         .copyToHost = vCopyToHost,
         .zeroBuf = vZeroBuf,

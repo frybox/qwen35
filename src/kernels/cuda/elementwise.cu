@@ -92,6 +92,23 @@ __global__ void k_deinterleave_qg(float *__restrict__ q, float *__restrict__ gat
     }
 }
 
+// Chunk form: blockIdx.y selects the token, and each row starts `row_stride`
+// (= heads*hd) floats past the previous one on every buffer.  Same per-element
+// move, so a prefill chunk gets one launch instead of one per token.
+__global__ void k_deinterleave_qg_strided(float *__restrict__ q, float *__restrict__ gate,
+                                         const float *__restrict__ src, int hd,
+                                         int row_stride) {
+    const int h = blockIdx.x;
+    const int t = blockIdx.y;
+    const float *s = src + (size_t)t * 2 * row_stride + (size_t)h * 2 * hd;
+    float *qt = q + (size_t)t * row_stride + (size_t)h * hd;
+    float *gt = gate + (size_t)t * row_stride + (size_t)h * hd;
+    for (int i = threadIdx.x; i < hd; i += blockDim.x) {
+        qt[i] = s[i];
+        gt[i] = s[hd + i];
+    }
+}
+
 __global__ void k_zero_buf(float *__restrict__ buf, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) buf[i] = 0.0f;
@@ -154,6 +171,22 @@ extern "C" int q35_launch_deinterleave_qg(float *d_q, float *d_gate, const float
     // 128 or 256), i.e. the same as `kThreads`; the loop in the kernel handles
     // a larger `hd` without changing the launch config.
     k_deinterleave_qg<<<heads, hd < kThreads ? hd : kThreads, 0, stream>>>(d_q, d_gate, d_src, hd);
+    return (int)cudaGetLastError();
+}
+
+// `tokens` rows split in ONE launch: row t's [q|gate] block starts at
+// `t * 2 * heads * hd` on both sides, exactly where the per-row call pointed.
+// Pure move, no arithmetic, so it is bit-identical to `tokens` per-row calls
+// (that is what `forwardFullChunk` used to make -- 940 launches per 525-token
+// prefill, 1.2% of device time at 6 us each).
+extern "C" int q35_launch_deinterleave_qg_strided(float *d_q, float *d_gate, const float *d_src,
+                                                  int heads, int hd, int tokens,
+                                                  void *stream_v) {
+    if (heads <= 0 || hd <= 0 || tokens <= 0) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_deinterleave_qg_strided<<<dim3((unsigned)heads, (unsigned)tokens),
+                                hd < kThreads ? hd : kThreads, 0, stream>>>(
+        d_q, d_gate, d_src, hd, heads * hd);
     return (int)cudaGetLastError();
 }
 
