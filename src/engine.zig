@@ -1717,20 +1717,33 @@ pub const Engine = struct {
 
         // Pass 1: everything row r needs written, for EVERY row, in ascending
         // order.  This is the old per-token body minus the attention itself.
-        var t: usize = 0;
-        while (t < k) : (t += 1) {
-            const q = self.qK.span(t * q_dim, q_dim);
-            // q_norm/k_norm BEFORE RoPE (B12); GGUF weights pre-folded (1+w).
-            // `heads` rows of one tensor, same weight row, independent sums --
-            // the batched form is the identical per-row arithmetic.
-            self.exec.rmsnormRows(q.span(0, q_dim), q.span(0, q_dim), lw.attn_q_norm, heads, c.rms_eps);
-            const kk = self.kK.span(t * kv_dim, kv_dim);
-            self.exec.rmsnormRows(kk.span(0, kv_dim), kk.span(0, kv_dim), lw.attn_k_norm, kv_heads, c.rms_eps);
-            // RoPE already ran chunk-wide in `forwardChunk`.
-            const vv = self.vK.span(t * kv_dim, kv_dim);
-            self.exec.copyRangeSlot(cache.k.span((slot0 + t) * kv_dim, kv_dim), kk, slot0 + t);
-            self.exec.copyRangeSlot(cache.v.span((slot0 + t) * kv_dim, kv_dim), vv, slot0 + t);
-        }
+        //
+        // Both ops here are independent across rows, so they run CHUNK-WIDE (one
+        // launch each) instead of once per token:
+        //   * q_norm/k_norm: "rows" is already a batch dimension of
+        //     `rmsnormRows` -- row r of qK is one head of token r, and every row
+        //     uses the same weight row, so `k * heads` rows in one call is the
+        //     identical per-row arithmetic (same eps, same single-pass sum).
+        //   * KV write: the destination is contiguous.  `cache.k` rows
+        //     [slot0, slot0+k) are exactly `kK[0 .. k*kv_dim)`, because both are
+        //     row-major with stride kv_dim and no gaps -- so this is ONE
+        //     `copyRange` of k*kv_dim floats, not k `copyRangeSlot`s.
+        //
+        // Doing these per token cost 525 * 2 rmsnorm + 525 * 2 KV launches per
+        // full-attention layer (16 layers => 33,600 launches for a 525-token
+        // prefill).  Measured: prefill had ~36k launches and was runnable at
+        // 50% GPU occupancy, i.e. half the wall clock was the host submitting
+        // launches.  RoPE already ran chunk-wide in `forwardChunk`.
+        //
+        // `copyRangeSlot` is NOT used here on purpose: its `slot` argument
+        // exists so the DECODE graph can retarget a captured KV append
+        // (`g_op_seen.kv_append`), and prefill does not go through the graph.
+        self.exec.rmsnormRows(self.qK.span(0, k * q_dim), self.qK.span(0, k * q_dim),
+            lw.attn_q_norm, k * heads, c.rms_eps);
+        self.exec.rmsnormRows(self.kK.span(0, k * kv_dim), self.kK.span(0, k * kv_dim),
+            lw.attn_k_norm, k * kv_heads, c.rms_eps);
+        self.exec.copyRange(cache.k.span(slot0 * kv_dim, k * kv_dim), self.kK.span(0, k * kv_dim));
+        self.exec.copyRange(cache.v.span(slot0 * kv_dim, k * kv_dim), self.vK.span(0, k * kv_dim));
         cache.len += @intCast(k);
 
         // Pass 2: scores -> softmax -> PV -> gate for all k rows, one launch.
