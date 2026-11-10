@@ -1237,6 +1237,362 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// IQ prefill kernel, llama.cpp's dp4a shape (NOT the tensor-core one above).
+//
+// Why this exists: on sm_89 llama.cpp does NOT use an mma for the IQ dot.  Its
+// `ggml_cuda_mmq_load_tiles_iq3_xxs` unpacks the weights into shared memory as
+// plain int8 rows and `ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a` folds those rows
+// against a q8_1 activation tile with __dp4a -- the tensor cores are only used
+// by the *other* `_mma` vec_dot, which pairs with a different sram_stride (84
+// vs 65, mmq.cuh:131 vs mmq-vec-dot.cuh:134) and which the IQ3_XXS dispatch
+// does not select.  Our kernel went the other way (mma IS the dot), and it
+// measures 71.9 TFLOPS on the 27B ffn shape against llama.cpp's 180.6.
+//
+// This kernel is a faithful port of that dp4a shape so the two can be
+// compared on identical shapes.  Layout, verbatim from the source:
+//
+//   tile_x (weights), I=128 rows, sram_stride = 2*32+1 = 65 int per row:
+//     [i*65 + 0 .. i*65+63]  256 int8 = the whole 256-element super-block,
+//                            written as 8 lanes/row * QR3_XXS=4 * 2 ints
+//                            (mmq-load-tiles.cuh: threads_per_row = 8)
+//     [i*65 + 64]            unused padding (the +1 of the stride)
+//   tile_df (weight scales), a SEPARATE array -- llama.cpp does not append them
+//   to the rows, it writes `x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx]`:
+//     [i*8 + i/4 + 0..7]     one float per 32-int8 group, the `i/4` being the
+//                            +16 B/four-rows padding that keeps the 8 floats of
+//                            a row off one shared-memory bank
+//   tile_y (activations), J=128 rows x MMQ_TILE_Y_K = 4 + 32 = 36 int, matching
+//   llama.cpp's `block_q8_1_mmq`, whose two accessors are
+//   `y_qs = (const int*)y + 4` and `y_df = (const float*)y`:
+//     [j*36 + 0..3]          4 float scales, one per 32 int8 (`d4[4]`)
+//     [j*36 + 4..35]         128 int8 of the half of the super-block being dotted
+//
+// Our activations arrive as q8_K (292 B: one f32 scale + 256 int8 + bsums), not
+// as `block_q8_1_mmq`, so the staging loop transposes them.  That is exact: q8_K
+// carries ONE scale for all 256 values, so all four `d4` entries are that same
+// number, and the 128-int8 halves are qs[k00h*4 ..] selected by `k00h` in INTS.
+//
+// The float scale is folded ONCE per (i, kqsx) here -- `d*ls/4` with `ls =
+// 2*aux+1`, algebraically llama.cpp's `(ls_4bit*d + d/2)/2` -- i.e. exactly what
+// the mma kernel applies as `d * isum * OUT_SCALE_Q/DEN`.  Both forms are exact
+// in f32 for the values involved (ls is a small odd integer, d is an f16), and
+// the accumulator is a plain float sum in ascending k order in both, so the two
+// kernels agree bit for bit (that is what MVCHECK checks).
+//
+// Cost note (measured, 27B IQ3_XXS, 525-token prefill): this shape runs at
+// 421-424 tok/s against the mma kernel's 436-438, i.e. ~3% SLOWER, and
+// PROF-GPU puts the per-launch time at 3103 us against 2908.  Why llama.cpp
+// still wins with the same dp4a shape: its activations are PRE-QUANTIZED into
+// `block_q8_1_mmq` layout once per chunk, so its stage loop is a contiguous
+// `tile_y[l] = by0[l]`, while we re-transpose out of q8_K on every launch.
+// Matching it would mean changing what `matvecBatchK` uploads, not this kernel.
+//
+// Every index in the inner loop is a compile-time constant: I, J, nwarps and
+// the k/VDR steps are template/constexpr, so `sum[...]` below is 64 scalars in
+// REGISTERS.  This is the property the mma kernel lacks -- see the comment at
+// the top of it.
+// ---------------------------------------------------------------------------
+
+#define Q35_DP4A_I      128   // weight rows per block (llama.cpp's I for IQ3_XXS)
+#define Q35_DP4A_J      128   // tokens per block     (llama.cpp's J)
+#define Q35_DP4A_THREADS 256  // 8 warps, llama.cpp's nthreads
+#define Q35_DP4A_NE_K    32   // MMQ_TILE_NE_K: k per vec_dot call
+#define Q35_DP4A_VDR      8   // VDR_Q8_0_Q8_1_MMQ: int per dp4a chunk
+#define Q35_DP4A_SX      (2 * Q35_DP4A_NE_K + 1)          // 65 int per weight row
+// llama.cpp keeps the weight scales in their own array (`x_df`), NOT at the end
+// of each weight row: `x_df[i*(MMQ_TILE_NE_K/4) + i/4 + kqsx]`.  The `i/4` is
+// +16 B of padding per 4 rows, which is what keeps the 8 scale floats of one
+// row off the same shared-memory bank.  One float per 32 int8 (one 8-int group).
+#define Q35_DP4A_SDF     8
+#define Q35_DP4A_DF(i, g) ((i) * Q35_DP4A_SDF + (i) / 4 + (g))
+// llama.cpp's `block_q8_1_mmq` layout, which is what vec_dot_q8_0_q8_1_dp4a
+// reads: 4 float scales (one per 32 int8) followed by 128 int8 (32 int).
+// `y_qs = (const int*)y + 4` and `y_df = (const float*)y` are exactly this.
+#define Q35_DP4A_SY      (4 + Q35_DP4A_NE_K)              // 36: 4 scale ints + 32 int8 ints
+#define Q35_DP4A_NW      (Q35_DP4A_THREADS / 32)          // 8 warps
+#define Q35_DP4A_NSUM    (Q35_DP4A_J * Q35_DP4A_I / Q35_DP4A_THREADS)  // 64
+
+// One thread's 64 accumulators, indexed by (j0/nwarps, i0/warp_size) exactly as
+// llama.cpp indexes its `sum[]`.  I and J are compile-time, so both loops
+// unroll to constant indices.
+struct Q35Dp4aSums {
+    float v[Q35_DP4A_NSUM];
+    __device__ __forceinline__ float &at(int jq, int iq) {
+        return v[jq * (Q35_DP4A_I / 32) + iq];
+    }
+};
+
+// vec_dot_q8_0_q8_1_impl<float, 8>: 8 dp4a over 32 int8, scaled by (d8_0 * d8_1).
+// v and u are `int*` into the int8 rows; we read them as 8 ints.
+__device__ __forceinline__ float q35_dp4a_dot32(const int *v, const int *u,
+                                               float d8_0, float d8_1) {
+    int sumi = 0;
+#pragma unroll
+    for (int i = 0; i < Q35_DP4A_VDR; ++i) sumi = q35_dp4a(v[i], u[i], sumi);
+    return __fmul_rn(__fmul_rn(d8_0, d8_1), (float)sumi);
+}
+
+// Weight unpack for one row / one super-block, producing the 8 ints (32 int8)
+// that lane `kqsx` owns.
+//
+// Mapping, from mmq-load-tiles.cuh (`ggml_cuda_mmq_load_tiles_iq3_xxs`):
+//   threads_per_row = (MMQ_ITER_K / (4*QR3_XXS)) / 2 = (256/16)/2 = 8
+//   kqsx = threadIdx.x % 8
+//   q3_packed = { get_int_b2(qs, 2*kqsx + 0), get_int_b2(qs, 2*kqsx + 1) }
+//   for l in 0..QR3_XXS-1 (4):
+//       grid_l = iq3xxs_grid[q3[2*l + 0]]      -> x_qs[i*65 + 8*kqsx + 2*l + 0]
+//       grid_h = iq3xxs_grid[q3[2*l + 1]]      -> x_qs[i*65 + 8*kqsx + 2*l + 1]
+//
+// So lane `kqsx` owns the 8 ints at offset 8*kqsx, which is exactly ONE
+// 32-element group (32 int8) -- group index kqsx, not 2*kqsx.  Reuses
+// q35_iq3xxs_group32, the same helper the mma kernel calls, so both kernels
+// multiply identical int8 bytes.
+template <class T>
+__device__ __forceinline__ int q35_dp4a_unpack_row(const unsigned char *wb, int kqsx, int out[8]) {
+    int p[8];
+    int ls[2];
+    T::group(wb, kqsx, p, ls);
+#pragma unroll
+    for (int l = 0; l < 8; ++l) out[l] = p[l];
+    return ls[0];
+}
+
+__global__ void q35_k_mmq_dp4a_iq(const unsigned char *__restrict__ w,
+                                  const unsigned char *__restrict__ xq,
+                                  float *__restrict__ out,
+                                  int rows, int cols, int tokens, int ttype) {
+    (void)ttype;
+    extern __shared__ int smem[];
+    int *tile_x = smem;                                  // I * SX int
+    // x_df: one float per (row, 32-int8 group), padded `i/4` per row -- see
+    // Q35_DP4A_DF.  I*8 + I/4 floats.
+    float *tile_df = (float *)(tile_x + Q35_DP4A_I * Q35_DP4A_SX);
+    int *tile_y = (int *)(tile_df + Q35_DP4A_I * Q35_DP4A_SDF + Q35_DP4A_I / 4);
+
+    const int tid  = (int)threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int i0blk = blockIdx.x * Q35_DP4A_I;
+    const int j0blk = blockIdx.y * Q35_DP4A_J;
+
+    Q35Dp4aSums sum;
+#pragma unroll
+    for (int q = 0; q < Q35_DP4A_NSUM; ++q) sum.v[q] = 0.0f;
+
+    for (int k00 = 0; k00 < cols; k00 += 256) {
+        // ---- weights: 8 lanes per row (llama.cpp threads_per_row = 8) ----
+        {
+            const int kqsx = tid & 7;
+            for (int r = tid >> 3; r < Q35_DP4A_I; r += Q35_DP4A_THREADS / 8) {
+                const int i = i0blk + r;
+                int *dst = tile_x + r * Q35_DP4A_SX;
+                if (i < rows) {
+                    const unsigned char *wb = w + (size_t)i * (size_t)(cols / 256) * 98 + (k00 / 256) * 98;
+                    const int lsi = q35_dp4a_unpack_row<Q35Iq3Xxs>(wb, kqsx, dst + 8 * kqsx);
+                    const float d = q35_f16_at(wb, 0);
+                    // The weight scale.  llama.cpp writes `(ls*d + d/2)/2` with
+                    // `ls = aux32 >> 28` (the RAW 4-bit value), which is
+                    // d*(aux + 0.5)/2 = d*(2*aux + 1)/4.  Our helper already
+                    // returns the doubled odd scale `2*aux + 1`, so feeding it
+                    // into llama.cpp's expression adds a stray +d*0.5 term -- a
+                    // quarter of the whole block's contribution.  Express it as
+                    // d*ls/4, identical by construction to the mma kernel's
+                    // `d * isum * 0.25` and to llama.cpp's value.
+                    const float lsf = (float)lsi;
+                    tile_df[Q35_DP4A_DF(r, kqsx)] = __fmul_rn(__fmul_rn(lsf, d), 0.25f);
+                } else {
+#pragma unroll
+                    for (int q = 0; q < 8; ++q) dst[8 * kqsx + q] = 0;
+                    tile_df[Q35_DP4A_DF(r, kqsx)] = 0.0f;
+                }
+            }
+        }
+        // ---- activations: J token rows x 36 int (32 int8 + 4 scale ints) ----
+        {
+            // Q8_K -> block_q8_1_mmq shape.  A Q8_K block is 256 int8 with ONE
+            // f32 scale; block_q8_1_mmq is 128 int8 with FOUR float scales
+            // (d4[0..3], one per 32 values).  The half selected by `half` picks
+            // which 128 int8 land in tile_y, and all four d4 entries carry the
+            // Q8_K scale -- Q8_K does not sub-divide it, so this is exact (not
+            // an approximation), and `y_df[... + k0/8 % 4]` then returns the
+            // same number for every k0.
+            const unsigned char *base = xq + (size_t)(k00 / 256) * 292;
+            const size_t tstride = (size_t)(cols / 256) * 292;
+            // 4 scale ints + 32 qs ints per token row, one word per thread slot.
+            for (int q = tid; q < Q35_DP4A_J * Q35_DP4A_SY; q += Q35_DP4A_THREADS) {
+                const int j = q / Q35_DP4A_SY;
+                const int w = q % Q35_DP4A_SY;
+                const int tj = j0blk + j;
+                if (tj >= tokens) { tile_y[q] = 0; continue; }
+                const unsigned char *yb = base + (size_t)tj * tstride;
+                if (w < 4) {
+                    // All four scales are the single Q8_K scale (see above).
+                    *((float *)(tile_y + j * Q35_DP4A_SY + w)) = q35_q8k_d(yb);
+                } else {
+                    // qs[] starts at byte 4; this launch stages the k00 half of
+                    // the 256 int8, i.e. int8 [k00, k00+128) -> int [k00/4,
+                    // k00/4 + 32).
+                    const int *src = (const int *)yb + 1 + (k00 / 4) + (w - 4);
+                    tile_y[j * Q35_DP4A_SY + w] = *src;
+                }
+            }
+        }
+        __syncthreads();
+
+        // ---- vec_dot, twice: k00 = 0 and k00 = 32 ----
+        // llama.cpp reloads tile_y between the two calls (mmq.cuh:921 and :938
+        // stage `by0` and `by0 + sz` respectively), because each call consumes a
+        // DIFFERENT 128-value half of the activation.  Keeping one staging and
+        // reusing it makes the upper half multiply against the lower half's
+        // bytes.
+#pragma unroll
+        for (int half2 = 0; half2 < 2; ++half2) {
+            const int k00h = half2 * Q35_DP4A_NE_K;
+            {
+                const unsigned char *base = xq + (size_t)(k00 / 256) * 292;
+                const size_t tstride = (size_t)(cols / 256) * 292;
+                for (int q = tid; q < Q35_DP4A_J * Q35_DP4A_SY; q += Q35_DP4A_THREADS) {
+                    const int j = q / Q35_DP4A_SY;
+                    const int w = q % Q35_DP4A_SY;
+                    const int tj = j0blk + j;
+                    if (tj >= tokens) { tile_y[q] = 0; continue; }
+                    const unsigned char *yb = base + (size_t)tj * tstride;
+                    if (w < 4) {
+                        *((float *)(tile_y + j * Q35_DP4A_SY + w)) = q35_q8k_d(yb);
+                    } else {
+                        // k00h counts INTS of qs (128 int8 per half = 32 int),
+                        // so the offset is k00h, not k00h/4: qs starts one int
+                        // (the f32 scale) into the block.  Dividing by 4 here
+                        // staged int8 [32,160) instead of [128,256) for the
+                        // upper half and made every result wrong by a constant
+                        // factor (mma -28 vs dp4a 13.5 on a probe where each
+                        // 128-half's activation bytes differ).
+                        const int *src = (const int *)yb + 1 + k00h + (w - 4);
+                        tile_y[j * Q35_DP4A_SY + w] = *src;
+                    }
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int k01 = 0; k01 < Q35_DP4A_NE_K; k01 += Q35_DP4A_VDR) {
+                const int k0 = k00h + k01;
+#pragma unroll
+                for (int jq = 0; jq < Q35_DP4A_J / Q35_DP4A_NW; ++jq) {
+                    const int j = jq * Q35_DP4A_NW + warp;
+                    const int *y_qs = tile_y + j * Q35_DP4A_SY + 4;
+                    const float dy = ((const float *)(tile_y + j * Q35_DP4A_SY))[(k0 / 8) % 4];
+#pragma unroll
+                    for (int iq = 0; iq < Q35_DP4A_I / 32; ++iq) {
+                        const int i = iq * 32 + lane;
+                        const int *x_qs = tile_x + i * Q35_DP4A_SX;
+                        const float dx = tile_df[Q35_DP4A_DF(i, k0 / 8)];
+                        // `k0 % 32` on the activation side: tile_y holds the 128
+                        // int8 of this half, and the four k01 steps inside a
+                        // half walk its four 32-int8 quarters.
+                        sum.at(jq, iq) = __fadd_rn(sum.at(jq, iq),
+                            q35_dp4a_dot32(x_qs + k0, y_qs + k01, dx, dy));
+                    }
+                }
+            }
+            __syncthreads();
+        }   // half2
+    }
+
+    // ---- write back: sum[jq][iq] -> out[(j0blk+j)*rows + i0blk+i] ----
+#pragma unroll
+    for (int jq = 0; jq < Q35_DP4A_J / Q35_DP4A_NW; ++jq) {
+        const int j = jq * Q35_DP4A_NW + warp;
+        const int tj = j0blk + j;
+        if (tj >= tokens) continue;
+#pragma unroll
+        for (int iq = 0; iq < Q35_DP4A_I / 32; ++iq) {
+            const int i = i0blk + iq * 32 + lane;
+            if (i < rows) out[(size_t)tj * (size_t)rows + (size_t)i] = sum.at(jq, iq);
+        }
+    }
+}
+
+// Launcher for the dp4a IQ kernel above.
+static cudaError_t mmq_dp4a_iq_launch(const unsigned char *d_w, const unsigned char *d_xq,
+                                      float *d_out, int rows, int cols, int tokens,
+                                      cudaStream_t stream) {
+    const int gridx = (rows + Q35_DP4A_I - 1) / Q35_DP4A_I;
+    const int gridy = (tokens + Q35_DP4A_J - 1) / Q35_DP4A_J;
+    const size_t shmem =
+        (size_t)(Q35_DP4A_I * Q35_DP4A_SX + Q35_DP4A_J * Q35_DP4A_SY) * sizeof(int) +
+        (size_t)(Q35_DP4A_I * Q35_DP4A_SDF + Q35_DP4A_I / 4) * sizeof(float);
+    // (I*SX + J*SY) int + (I*SDF + I/4) float = 12928*4 + 1056*4 = 55,936 B,
+    // over the 48 KiB static limit, so it MUST go through the dynamic path
+    // (which needs the opt-in below past 48 KiB).  ptxas -v: 0 stack frame,
+    // 0 spill, 174 registers -- i.e. occupancy 1 block/SM, the same as the mma
+    // kernel and as llama.cpp's own dp4a config.
+    static bool opted = false;
+    if (!opted) {
+        if (shmem > 48 * 1024) {
+            cudaError_t e = cudaFuncSetAttribute(q35_k_mmq_dp4a_iq,
+                cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+            if (e != cudaSuccess) return e;
+        }
+        // NOTE: deliberately NO cudaDeviceSynchronize here.  It would break
+        // graph capture (the engine captures one forward per chunk), and an
+        // earlier version that added one was chasing a `misaligned address`
+        // that turned out to be an int/byte offset mix-up in the activation
+        // staging loop -- not an attribute-ordering problem.
+        opted = true;
+    }
+    dim3 grid(gridx, gridy, 1);
+    q35_k_mmq_dp4a_iq<<<grid, Q35_DP4A_THREADS, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens,
+                                                                Q35_TT_IQ3_XXS);
+    cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess) {
+        fprintf(stderr, "[dp4a] LAUNCH FAILED rows=%d cols=%d tokens=%d shmem=%zu grid=%dx%d: %s\n",
+                rows, cols, tokens, shmem, gridx, gridy, cudaGetErrorString(le));
+    }
+    return le;
+}
+
+// QWEN35_CUDA_MMQ_DP4A=<tag,...> routes those types to the dp4a kernel above.
+// Same parsing convention as q35_mma_iq_enabled: unset/"0" means off.
+static bool q35_dp4a_enabled(int ttype) {
+    // Re-read on every call: the A/B harness (/tmp/mbm/cmpsmall.cu) flips
+    // $QWEN35_CUDA_MMQ_DP4A between two launches in one process to compare the
+    // two kernels on identical data, and a cached value made both launches run
+    // the same kernel (which reads as "the two agree perfectly").
+    static int mode = -1;   // -1 unknown, 1 on, 2 off
+    static char list[256];
+    {
+        const char *e = getenv("QWEN35_CUDA_MMQ_DP4A");
+        if (e == nullptr || (e[0] == '0' && e[1] == '\0')) {
+            mode = 2;
+        } else {
+            mode = 1;
+            size_t n = sizeof(list) - 1;
+            size_t i = 0;
+            for (; i < n && e[i] != '\0'; ++i) list[i] = e[i];
+            list[i] = '\0';
+        }
+    }
+    if (mode == 2) return false;
+    struct { int tt; const char *tag; } names[] = {
+        {Q35_TT_IQ3_XXS, "iq3_xxs"},
+    };
+    for (const auto &nm : names) {
+        if (nm.tt != ttype) continue;
+        const char *p = list;
+        const size_t ln = strlen(nm.tag);
+        while (*p) {
+            while (*p == ',' || *p == ' ') ++p;
+            if (strncmp(p, nm.tag, ln) == 0 && (p[ln] == ',' || p[ln] == '\0')) return true;
+            while (*p && *p != ',') ++p;
+        }
+        return false;
+    }
+    return false;
+}
+
 // How many WARPS per block the IQ prefill tile should use.
 //
 // Occupancy is what is left on the table.  The tile is 16 rows per warp, so the
@@ -1499,6 +1855,14 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // q35_k_mmq_mma_iq3xxs).  Gated by QWEN35_CUDA_MMQ_IQM ("0" to disable, or
     // a comma list of ttype tags, default on) so each type can be A/B'd
     // against the caller's thread-per-row kernel.
+    // QWEN35_CUDA_MMQ_DP4A selects the llama.cpp-shaped dp4a kernel instead of
+    // the mma one, per type, so the two can be measured on identical shapes.
+    // Unset/"0" = mma (the long-standing path); a comma list of ttype tags
+    // selects dp4a for exactly those types.  Currently only IQ3_XXS has a
+    // dp4a kernel -- see q35_k_mmq_dp4a_iq.
+    if (ttype == Q35_TT_IQ3_XXS && q35_dp4a_enabled(ttype)) {
+        return (int)mmq_dp4a_iq_launch(d_w, d_xq, d_out, rows, cols, tokens, stream);
+    }
     if (info.block_elems == 256 && q35_mma_iq_enabled(ttype) &&
         (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S ||
          ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS)) {
