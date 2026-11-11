@@ -1034,6 +1034,13 @@ pub const CudaBackend = struct {
     /// Samples recorded but not yet read: (slot, ttype).
     ev_pending: [EV_POOL]struct { slot: u32 = 0, ttype: i32 = -1, live: bool = false } = @splat(.{}),
     ev_pending_n: usize = 0,
+    /// Begin/End pairing counters.  `batchKTimingBegin` and `batchKTimingEnd`
+    /// must fire the same number of times; a mismatch means some early return
+    /// in `matvecBatchK` skipped its End, in which case the ring slot is reused
+    /// while still pending and the interval covers unrelated work -- the
+    /// double-counting that made low-frequency types read 20-30x too slow.
+    stat_n_bk_begin: usize = 0,
+    stat_n_bk_end: usize = 0,
     /// Samples the ring had to throw away because the device was `EV_POOL/2`
     /// launches behind.  Reported so a low `bk_n` is never mistaken for the
     /// model issuing fewer matvecs.
@@ -6307,6 +6314,7 @@ const attn_score_arity: usize = 10;
         // still recorded on the very first call only, as the prefill window
         // origin (it is a single event, so it cannot hold per-call data).
         const wr = self.ev_pool_wr;
+        self.stat_n_bk_begin += 1;
         if (lib.EventRecord(self.ev_pool[wr], null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
     }
 
@@ -6316,6 +6324,7 @@ const attn_score_arity: usize = 10;
     fn batchKTimingEnd(self: *CudaBackend) void {
         const lib = if (self.cu) |*cu| &cu.lib else return;
         const wr = self.ev_pool_wr;
+        self.stat_n_bk_end += 1;
         // Close the ring pair the matching `batchKTimingBegin` opened.
         if (lib.EventRecord(self.ev_pool[wr + 1], null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
         // `EV_POOL/2` pairs can be outstanding, so the ring must not be
@@ -6458,7 +6467,7 @@ const attn_score_arity: usize = 10;
         // nothing here; counting it keeps the number honest when it does.
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_xqm_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} ev_dropped={d} ev_suspect={d} gpu_ev_err={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} ev_dropped={d} ev_suspect={d} bk_begin={d} bk_end={d} gpu_ev_err={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
@@ -6511,6 +6520,8 @@ const attn_score_arity: usize = 10;
                 self.stat_ns_ev_sync / 1_000_000,
                 self.stat_n_ev_dropped,
                 self.stat_n_ev_suspect,
+                self.stat_n_bk_begin,
+                self.stat_n_bk_end,
                 self.stat_n_ev_err,
             },
         );
@@ -6952,6 +6963,8 @@ const attn_score_arity: usize = 10;
         self.stat_n_ev_err = 0;
         self.stat_n_ev_dropped = 0;
         self.stat_n_ev_suspect = 0;
+        self.stat_n_bk_begin = 0;
+        self.stat_n_bk_end = 0;
         self.ev_pending_n = 0;
         self.ev_pool_wr = 0;
         self.stat_n_launch_bk = 0;
