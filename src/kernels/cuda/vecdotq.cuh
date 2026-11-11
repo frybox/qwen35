@@ -157,6 +157,35 @@ Q35_DEV unsigned int q35_iq_signs8(unsigned int v7) {
     return (v7 ^ (p << 7)) * 0x01010101u;
 }
 
+// Four 4-bit indices -> the four int8 table values, in index order, as one
+// packed 32-bit word ready for q35_dp4a.  Ported from the CUDA branch of
+// llama.cpp's `get_int_from_table_16` (ggml-cuda/vecdotq.cuh:60).  A 16-entry
+// byte table cannot be indexed directly on the GPU, but __byte_perm selects
+// bytes with 3-bit indices: two perms cover the low/high 8 bytes of the table
+// and a third picks between them on bit 3 (`0x32103210 | ((q4&0x88888888)>>1)`).
+//
+// `tab` must be four adjacent 32-bit words (16 bytes) of int8 values, which is
+// exactly the layout of kvalues_iq4nl.  The single word returned holds the
+// values for the four indices packed in `q4`'s bytes, low byte first -- the
+// same order q35_dp4a folds them in.
+// The two words the loop below needs: `.x` gathers the LOW nibbles of the four
+// index bytes, `.y` the HIGH nibbles -- each is one packed int8 word ready for
+// q35_dp4a against the matching half of the activation.
+Q35_DEV int2 q35_iq4nl_lut16(unsigned int q4, const int8_t *tab) {
+    const uint32_t *t32 = (const uint32_t *)tab;
+    const unsigned int sel = 0x32103210u | ((q4 & 0x88888888u) >> 1);
+    unsigned int tmp[2];
+    #pragma unroll
+    for (int i = 0; i < 2; ++i) {
+        const unsigned int sh = 16u * (unsigned int)i;
+        const unsigned int low  = __byte_perm(t32[0], t32[1], q4 >> sh);
+        const unsigned int high = __byte_perm(t32[2], t32[3], q4 >> sh);
+        tmp[i] = __byte_perm(low, high, sel >> sh);
+    }
+    return make_int2((int)__byte_perm(tmp[0], tmp[1], 0x6420),
+                     (int)__byte_perm(tmp[0], tmp[1], 0x7531));
+}
+
 // len consecutive int8 x int8 dot products.  Integer-only, so the association
 // order is irrelevant to the result; __dp4a folds four int8 products into one
 // (sm_61+), the tail is scalar so any len stays correct.
@@ -1113,18 +1142,27 @@ Q35_DEV float q35_vec_dot_iq4_xs_q8_k_part(const unsigned char *w,
         h >>= 4;
         const float d1 = __fmul_rn(d4d8, (float)((int)ls1 - 32));
         const float d2 = __fmul_rn(d4d8, (float)((int)ls2 - 32));
+        // 16 qs bytes = four 32-bit words; q35_iq4nl_lut16 turns one word into
+        // the low-nibble and high-nibble table lookups as two packed int8 words,
+        // so 32 elements become four dp4a pairs instead of 32 scalar multiplies.
+        // LOW nibbles pair with q8[0..15], HIGH nibbles with q8[16..31]
+        // (ggml-quants.c dequantize_row_iq4_xs puts the low nibbles first).
         int sumi1 = 0, sumi2 = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi1 += (int)q8[j + 0]  * (int)kvalues_iq4nl[qs[j] & 0xF];
-            sumi2 += (int)q8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = q35_iq4nl_lut16(q35_ld_u32(qs + 4 * j), kvalues_iq4nl);
+            sumi1 = q35_dp4a(v.x, (int)q35_ld_u32((const unsigned char *)q8 + 4 * j), sumi1);
+            sumi2 = q35_dp4a(v.y, (int)q35_ld_u32((const unsigned char *)q8 + 16 + 4 * j), sumi2);
         }
         acc = __fadd_rn(acc, __fmul_rn(d1, (float)(sumi1 + sumi2)));
         qs += 16;
         q8 += 32;
         sumi1 = sumi2 = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi1 += (int)q8[j + 0]  * (int)kvalues_iq4nl[qs[j] & 0xF];
-            sumi2 += (int)q8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = q35_iq4nl_lut16(q35_ld_u32(qs + 4 * j), kvalues_iq4nl);
+            sumi1 = q35_dp4a(v.x, (int)q35_ld_u32((const unsigned char *)q8 + 4 * j), sumi1);
+            sumi2 = q35_dp4a(v.y, (int)q35_ld_u32((const unsigned char *)q8 + 16 + 4 * j), sumi2);
         }
         acc = __fadd_rn(acc, __fmul_rn(d2, (float)(sumi1 + sumi2)));
         qs += 16;
@@ -1150,18 +1188,27 @@ Q35_DEV float q35_vec_dot_iq4_xs_q8_k_acc(const unsigned char *w,
         h >>= 4;
         const float d1 = __fmul_rn(d4d8, (float)((int)ls1 - 32));
         const float d2 = __fmul_rn(d4d8, (float)((int)ls2 - 32));
+        // 16 qs bytes = four 32-bit words; q35_iq4nl_lut16 turns one word into
+        // the low-nibble and high-nibble table lookups as two packed int8 words,
+        // so 32 elements become four dp4a pairs instead of 32 scalar multiplies.
+        // LOW nibbles pair with q8[0..15], HIGH nibbles with q8[16..31]
+        // (ggml-quants.c dequantize_row_iq4_xs puts the low nibbles first).
         int sumi1 = 0, sumi2 = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi1 += (int)q8[j + 0]  * (int)kvalues_iq4nl[qs[j] & 0xF];
-            sumi2 += (int)q8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = q35_iq4nl_lut16(q35_ld_u32(qs + 4 * j), kvalues_iq4nl);
+            sumi1 = q35_dp4a(v.x, (int)q35_ld_u32((const unsigned char *)q8 + 4 * j), sumi1);
+            sumi2 = q35_dp4a(v.y, (int)q35_ld_u32((const unsigned char *)q8 + 16 + 4 * j), sumi2);
         }
         acc = __fadd_rn(acc, __fmul_rn(d1, (float)(sumi1 + sumi2)));
         qs += 16;
         q8 += 32;
         sumi1 = sumi2 = 0;
-        for (int j = 0; j < 16; ++j) {
-            sumi1 += (int)q8[j + 0]  * (int)kvalues_iq4nl[qs[j] & 0xF];
-            sumi2 += (int)q8[j + 16] * (int)kvalues_iq4nl[qs[j] >> 4];
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int2 v = q35_iq4nl_lut16(q35_ld_u32(qs + 4 * j), kvalues_iq4nl);
+            sumi1 = q35_dp4a(v.x, (int)q35_ld_u32((const unsigned char *)q8 + 4 * j), sumi1);
+            sumi2 = q35_dp4a(v.y, (int)q35_ld_u32((const unsigned char *)q8 + 16 + 4 * j), sumi2);
         }
         acc = __fadd_rn(acc, __fmul_rn(d2, (float)(sumi1 + sumi2)));
         qs += 16;
