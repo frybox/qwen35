@@ -136,8 +136,18 @@ __global__ void q35_k_mul_mat_vec_q_coop_t(const unsigned char *__restrict__ w,
     if (row_base >= rows) return;
     const size_t row_stride = (size_t)nblk * (size_t)info.block_bytes;
 
-    // Loop over tokens so a prefill chunk reuses the same tile mapping.
-    for (int t = 0; t < tokens; ++t) {
+    // Tokens are split across grid.y (`tok_per_block` per block).  This is a
+    // pure unrolling of the loop that used to sit here: every (row, token)
+    // output is independent, `part_dyn` is private to the block, and the fold
+    // below still runs b = 0..nblk-1 left to right for its own row, so the
+    // value is bit-identical.  What it buys is OCCUPANCY: the launcher sizes the
+    // grid as ceil(rows/rows_per_block) * ceil(tokens/tok_per_block), so a
+    // short matrix (the 48-row q8_0 projections) no longer runs a full
+    // 525-token sweep on 12 blocks out of 114 SMs.
+    const int tok_per_block = gridDim.y > 0 ? (tokens + (int)gridDim.y - 1) / (int)gridDim.y : tokens;
+    const int t_begin = (int)blockIdx.y * tok_per_block;
+    const int t_end   = min(t_begin + tok_per_block, tokens);
+    for (int t = t_begin; t < t_end; ++t) {
         const unsigned char *arow = xq + (size_t)t * (size_t)nblk * (size_t)info.act_bytes;
 
         // Lane `l` owns blocks l, l+32, l+64, ...; each step the warp reads
@@ -835,6 +845,25 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
         const int rpb = q35_rpb();
         const int rows_per_block = warps * rpb;
         const int blocks = (rows + rows_per_block - 1) / rows_per_block;
+        // Spread the TOKEN dimension over grid.y when `blocks` alone cannot fill
+        // the device.  Without this a short matrix runs one block per
+        // rows_per_block rows: the 27B model's three 48-row q8_0 projections
+        // opened 12 of 114 SMs.  Each block still owns whole rows and one
+        // contiguous token range and the reduction order inside a block is
+        // untouched, so this cannot change a single result (MVCHECK confirms).
+        int tok_per_block = tokens;
+        int tok_blocks = 1;
+        {
+            const int sm_count = q35_gpu_sm_count();
+            if (blocks < sm_count && tokens > 1) {
+                const int want = (sm_count + blocks - 1) / blocks;
+                if (want > 1) {
+                    tok_blocks = want < tokens ? want : tokens;
+                    tok_per_block = (tokens + tok_blocks - 1) / tok_blocks;
+                    tok_blocks = (tokens + tok_per_block - 1) / tok_per_block;
+                }
+            }
+        }
         const size_t shmem = (size_t)warps * (size_t)rpb * (size_t)nblk * sizeof(float);
         if (shmem > 48u * 1024u) {
             // Above the default dynamic-shared ceiling (48 KiB/block).  Raise it
@@ -863,14 +892,14 @@ extern "C" int q35_launch_mul_mat_vec(const void *d_w_v, const void *d_xq_v,
             }
         }
         switch (warps) {
-        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<blocks, 1 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<blocks, 2 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<blocks, 3 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<blocks, 4 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<blocks, 5 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<blocks, 6 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<blocks, 7 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
-        default: q35_k_mul_mat_vec_q_coop_t<8><<<blocks, 8 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 1:  q35_k_mul_mat_vec_q_coop_t<1><<<dim3(blocks, tok_blocks), 1 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 2:  q35_k_mul_mat_vec_q_coop_t<2><<<dim3(blocks, tok_blocks), 2 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 3:  q35_k_mul_mat_vec_q_coop_t<3><<<dim3(blocks, tok_blocks), 3 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 4:  q35_k_mul_mat_vec_q_coop_t<4><<<dim3(blocks, tok_blocks), 4 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 5:  q35_k_mul_mat_vec_q_coop_t<5><<<dim3(blocks, tok_blocks), 5 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 6:  q35_k_mul_mat_vec_q_coop_t<6><<<dim3(blocks, tok_blocks), 6 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        case 7:  q35_k_mul_mat_vec_q_coop_t<7><<<dim3(blocks, tok_blocks), 7 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
+        default: q35_k_mul_mat_vec_q_coop_t<8><<<dim3(blocks, tok_blocks), 8 * Q35_WARP, shmem, stream>>>(d_w, d_xq, d_out, rows, cols, tokens, ttype, memonly, rpb); break;
         }
         return (int)cudaGetLastError();
     }

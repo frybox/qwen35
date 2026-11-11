@@ -2115,6 +2115,20 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // (MVCHECK: mismatched=0).  All six 32-elem types route here; the 256-elem
     // family (K/IQ) routes here per-type once each is implemented and verified.
     if (info.block_elems == 32) {
+        // Q8_0 has a real mma kernel here, but the kernel loads its int8 weights
+        // through q35_mma_w8(i) one element at a time: thread i reads row i/32,
+        // so the warp's 32 lanes are `nblk * 34` bytes apart and every load
+        // touches its own sector.  Measured on the 27B model's three 48x5120
+        // q8_0 projections: 497 us per call at 8 tokens AND at 525 tokens --
+        // i.e. a per-block constant, not work, because a 16-row tile is 48
+        // lanes' worth of useful bytes per 5440-byte stride.  The warp-per-row
+        // kernel reads one row's blocks contiguously, so Q8_0 declines to the
+        // caller instead.  Guarded by the same switch as the other types so the
+        // A/B stays possible.
+        // Unconditional: there is no shape where the tile kernel beats
+        // warp-per-row for Q8_0 here, and $QWEN35_CUDA_MMQ=0 already routes the
+        // whole file back to it for A/B.
+        if (ttype == Q35_TT_Q8_0) return -1;
         return (int)mmq_mma_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
     // K family (256 elements, per-16 scales).  Gated by QWEN35_CUDA_MMQ_KMM
