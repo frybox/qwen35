@@ -994,6 +994,15 @@ pub const CudaBackend = struct {
     ev_created: bool = false,
     /// Around one `matvecBatchK` call (one weight, one chunk of K tokens).
     ev_bk_a: ?*anyopaque = null,
+    /// ttype of the batchK call currently bracketed by `ev_bk_a`/`ev_bk_b`, so
+    /// `batchKTimingEnd` can attribute the device interval to a type.  Only
+    /// meaningful while `gpuTimingOn()`; written by `batchKTimingBegin`.
+    bk_ttype: i32 = -1,
+    /// `$QWEN35_PROF`: per-type device ns / call count from the batchK events.
+    /// `stat_ns_batchk_gpu` is the same intervals summed over all types; these
+    /// say WHERE they went, which is what picks the next optimisation target.
+    stat_ns_bk_by_type: [64]u64 = @splat(0),
+    stat_n_bk_by_type: [64]u32 = @splat(0),
     ev_bk_b: ?*anyopaque = null,
     /// Around the whole prefill window: `profReset` -> first `matvecBatchK` of
     /// the decode phase.  The wall clock version of the same window is
@@ -4043,7 +4052,13 @@ const attn_score_arity: usize = 10;
                 // Must run before the H2D below, so a synchronous upload is
                 // counted as host slack rather than as GPU work; the recorded
                 // point is ordered after any earlier queued kernel anyway.
-                if (self.gpuTimingOn()) self.batchKTimingBegin();
+                if (self.gpuTimingOn()) {
+                    // Attribute this call's device interval to its type; see
+                    // `stat_ns_bk_by_type`.  Set before the event so a failure
+                    // in between still names the type that was issued.
+                    self.bk_ttype = @intCast(@backingInt(q.ttype));
+                    self.batchKTimingBegin();
+                }
 
                 // Activation source: the resident K-row buffer when the engine
                 // already keeps it on the device (the normal case after P2d),
@@ -6165,6 +6180,11 @@ const attn_score_arity: usize = 10;
         if (self.evElapsedNs(self.ev_bk_a, self.ev_bk_b)) |ns| {
             self.stat_ns_batchk_gpu += ns;
             self.stat_n_batchk_gpu += 1;
+            const ti: usize = @intCast(self.bk_ttype);
+            if (ti < self.stat_ns_bk_by_type.len) {
+                self.stat_ns_bk_by_type[ti] +|= ns;
+                self.stat_n_bk_by_type[ti] +|= 1;
+            }
         }
         // Host wall clock spanned by the batchk calls of the prefill window.  A
         // monotonic host clock, incremented under the same `prefill_open` gate,
@@ -6228,12 +6248,59 @@ const attn_score_arity: usize = 10;
         self.reportStats("prefill done");
     }
 
+    /// Map a `Q35_TT_*` code (api.h) back to a printable name for `CUDA-BKT`.
+    /// The CUDA type codes are NOT contiguous and NOT in GGUF order (see the
+    /// table in api.h), so a positional table here would mislabel every type --
+    /// which is exactly the mistake AGENTS.md warns about for microbenchmarks.
+    fn bkTypeName(code: u8) []const u8 {
+        return switch (code) {
+            0 => "f32", 1 => "f16", 2 => "q4_0", 3 => "q4_1",
+            6 => "q5_0", 7 => "q5_1", 8 => "q8_0", 9 => "q8_1",
+            10 => "q2_k", 11 => "q3_k", 12 => "q4_k", 13 => "q5_k", 14 => "q6_k",
+            15 => "q8_k", 16 => "iq2_xxs", 17 => "iq2_xs", 18 => "iq3_xxs",
+            19 => "iq1_s", 20 => "iq4_nl", 21 => "iq3_s", 22 => "iq2_s",
+            23 => "iq4_xs", 29 => "iq1_m", 30 => "bf16",
+            else => "?",
+        };
+    }
+
     /// `$QWEN35_PROF`: one `CUDA-M [...]` line with what actually ran on the device,
     /// plus a per-type breakdown, so "did this model mix backends?" is answerable
     /// from the log.  Uploaded MiB is the resident weight footprint; bufs_MiB is the
     /// reusable activation/output scratch.
     fn reportStats(self: *CudaBackend, when: []const u8) void {
         if (self.cu == null) return;
+        if (self.stat_n_batchk_gpu > 0) {
+            // Per-type device cost of the batchK calls.  Without this the only
+            // number available is the average over all 500-odd launches in a
+            // 525-token prefill, which is dominated by whichever type is
+            // biggest and hides whether ANY of them is running at the
+            // standalone-kernel rate.  Emitted only when the events were on.
+            std.debug.print("CUDA-BKT [{s}]", .{when});
+            var seen: usize = 0;
+            var order: [64]usize = undefined;
+            var ti: usize = 0;
+            while (ti < 64) : (ti += 1) {
+                if (self.stat_n_bk_by_type[ti] != 0) {
+                    order[seen] = ti;
+                    seen += 1;
+                }
+            }
+            std.mem.sort(usize, order[0..seen], self, struct {
+                fn lt(ctx: *CudaBackend, a: usize, b: usize) bool {
+                    return ctx.stat_ns_bk_by_type[a] > ctx.stat_ns_bk_by_type[b];
+                }
+            }.lt);
+            for (order[0..seen]) |ix| {
+                const ns = self.stat_ns_bk_by_type[ix];
+                const n = self.stat_n_bk_by_type[ix];
+                std.debug.print(" {s}({d})={d}us/{d}={d}us", .{
+                    bkTypeName(@intCast(ix)), ix,
+                    ns / 1000, n, ns / 1000 / n,
+                });
+            }
+            std.debug.print("\n", .{});
+        }
         // `d_xqm` is only non-zero on the opt-in dp4a path, so it usually adds
         // nothing here; counting it keeps the number honest when it does.
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_xqm_bytes + self.d_out_bytes + self.d_deq_bytes;
