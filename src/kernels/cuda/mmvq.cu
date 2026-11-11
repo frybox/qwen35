@@ -408,52 +408,121 @@ __global__ void q35_k_quantize_q8_K(const float *__restrict__ x,
                                     unsigned char *__restrict__ out,
                                     int nblocks,
                                     unsigned char *__restrict__ out_mmq) {
-    const int b = blockIdx.x * blockDim.x + threadIdx.x;
+    // ONE WARP PER 256-ELEMENT SUPER-BLOCK.  The original mapping was one
+    // THREAD per super-block, which for the decode shapes (20 blocks for a
+    // 5120-wide activation) launched a single 20-thread block: 1 SM active, 20
+    // of 128 lanes doing work, each walking 256 floats twice.  Measured on the
+    // 27B at 5120 wide: 19.2 us per launch, i.e. 1.2 GB/s for 23 KiB of
+    // traffic, and decode issues this 306 times per token (QWEN35_QSTAT
+    // hit=192 miss=306) -- 5.9 ms of the 26.6 ms token, the single largest
+    // remaining cost after the matvecs themselves.
+    //
+    // The byte-for-byte result is IDENTICAL to the thread-per-block version:
+    // `amax` is a max over the same 256 values (max is associative and exact in
+    // f32, so the tree order does not matter), `gsum[g]` is an integer sum over
+    // the same 16 values (also exact), and every lane applies the same
+    // `roundf` + clamp + NaN guard to its own elements.  Only the ORDER of the
+    // scalar updates changes, and none of them is order-sensitive.
+    const int nwarp = blockDim.x >> 5;
+    const int warp = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int b = blockIdx.x * nwarp + warp;
     if (b >= nblocks) return;
     const float *xb = x + (size_t)b * Q35_QK8K;
     unsigned char *ob = out + (size_t)b * Q35_BYTES_Q8_K;
 
+    // 256 elements = 8 per lane, laid out lane-major so each of the eight
+    // passes is a fully coalesced 128 B warp read.
+    float v[8];
     float amax = 0.0f;
-    for (int k = 0; k < Q35_QK8K; ++k) {
-        const float a = xb[k] < 0.0f ? -xb[k] : xb[k];
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        v[k] = xb[lane + k * 32];
+        const float a = v[k] < 0.0f ? -v[k] : v[k];
         if (a > amax) amax = a;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+        const float o = __shfl_xor_sync(0xFFFFFFFFu, amax, off);
+        if (o > amax) amax = o;
     }
     const float scale = amax > 0.0f ? amax / 127.0f : 1.0f;
     const float inv = amax > 0.0f ? 1.0f / scale : 0.0f;
-    const unsigned int sbits = __float_as_uint(scale);
-    ob[0] = (unsigned char)(sbits & 0xFFu);
-    ob[1] = (unsigned char)((sbits >> 8) & 0xFFu);
-    ob[2] = (unsigned char)((sbits >> 16) & 0xFFu);
-    ob[3] = (unsigned char)((sbits >> 24) & 0xFFu);
+    if (lane == 0) {
+        const unsigned int sbits = __float_as_uint(scale);
+        ob[0] = (unsigned char)(sbits & 0xFFu);
+        ob[1] = (unsigned char)((sbits >> 8) & 0xFFu);
+        ob[2] = (unsigned char)((sbits >> 16) & 0xFFu);
+        ob[3] = (unsigned char)((sbits >> 24) & 0xFFu);
+    }
 
-    int gsum[16];
+    // Each lane's eight elements are 32 apart, so they fall in EIGHT DISTINCT
+    // 16-element `gsum` groups (element index lane + k*32 -> group (lane+k*32)
+    // /16 = 2k + (lane>>4)).  So no two of a lane's values share a group, and
+    // the per-group total is the sum of just two lanes (lane and lane^16).
+    int gsum_local[8];
 #pragma unroll
-    for (int g = 0; g < 16; ++g) gsum[g] = 0;
-    for (int k = 0; k < Q35_QK8K; ++k) {
-        float r = roundf(xb[k] * inv);
+    for (int k = 0; k < 8; ++k) {
+        float r = roundf(v[k] * inv);
         if (r < -127.0f) r = -127.0f;
         if (r > 127.0f) r = 127.0f;
         if (!(r >= -127.0f)) r = 127.0f;  // NaN/Inf guard, see note 3
-        const signed char q = (signed char)(int)r;
-        ob[4 + k] = (unsigned char)q;
-        gsum[k / 16] += (int)q;
+        const int q = (int)r;
+        ob[4 + lane + k * 32] = (unsigned char)(signed char)q;
+        gsum_local[k] = q;
     }
-    for (int g = 0; g < 16; ++g) {
-        const short v = (short)gsum[g];
-        ob[260 + g * 2 + 0] = (unsigned char)((unsigned short)v & 0xFFu);
-        ob[260 + g * 2 + 1] = (unsigned char)(((unsigned short)v >> 8) & 0xFFu);
+    // `gsum` mapping: this lane's k-th value is element `lane + k*32`, so it
+    // belongs to group `(lane + k*32) / 16 = 2k + (lane >> 4)`.  A group is
+    // therefore SIXTEEN contributions wide -- group `2k` is the k-th value of
+    // lanes 0..15 and group `2k+1` the k-th value of lanes 16..31 -- so each
+    // bsum needs a 16-lane reduction, not one lane's value.
+    //
+    // Reduce inside the 16-lane half with `shfl_down 8/4/2/1`: after it every
+    // lane holds the full half-sum, and the half's lowest lane writes it.  (Two
+    // earlier versions got this wrong -- one added a `shfl_xor 16` partner term
+    // that double-counted, one used the raw per-lane value; both left the qs and
+    // the scale byte-exact and only the bsum region wrong, 528/5840 bytes.)
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        int sum = gsum_local[k];
+        sum += __shfl_down_sync(0xFFFFFFFFu, sum, 8);
+        sum += __shfl_down_sync(0xFFFFFFFFu, sum, 4);
+        sum += __shfl_down_sync(0xFFFFFFFFu, sum, 2);
+        sum += __shfl_down_sync(0xFFFFFFFFu, sum, 1);
+        if ((lane & 15) == 0) {
+            const int g = 2 * k + (lane >> 4);
+            const short sv = (short)sum;
+            ob[260 + g * 2 + 0] = (unsigned char)((unsigned short)sv & 0xFFu);
+            ob[260 + g * 2 + 1] = (unsigned char)(((unsigned short)sv >> 8) & 0xFFu);
+        }
     }
+    // Every lane's qs bytes are written; the scale (lane 0) and the sixteen
+    // bsums are now complete, so the block is ready for any consumer.
+    // The barrier is REQUIRED before the mmq copy below: that copy re-reads the
+    // qs bytes from `ob`, and without it a lane can read a neighbour's slot
+    // before the neighbour stored it (measured: q4_k / q2_k / q5_k -- the three
+    // types that use the mmq reshape -- mismatched on every row while every
+    // non-mmq type stayed exact).
+    __syncwarp();
 
     if (out_mmq != nullptr) {
         // Two mmq blocks per super-block, each 4 float scales + 128 int8.
+        // Copied straight from the packed qs bytes the warp just produced, so
+        // the mmq tile sees exactly the tail the q8_K dot sees.
         unsigned char *mb = out_mmq + (size_t)b * (2 * Q35_MMQ_BLK_BYTES);
 #pragma unroll
         for (int half = 0; half < 2; ++half) {
             unsigned char *mh = mb + half * Q35_MMQ_BLK_BYTES;
-            float *d4 = (float *)mh;
+            if (lane == 0) {
+                float *d4 = (float *)mh;
 #pragma unroll
-            for (int q = 0; q < 4; ++q) d4[q] = scale;
-            memcpy(mh + 16, ob + 4 + half * Q35_MMQ_BLK_VALS, Q35_MMQ_BLK_VALS);
+                for (int q = 0; q < 4; ++q) d4[q] = scale;
+            }
+            // 128 bytes = 4 per lane.
+            signed char *dst = (signed char *)(mh + 16);
+            const signed char *srcq = (const signed char *)(ob + 4 + half * Q35_MMQ_BLK_VALS);
+#pragma unroll
+            for (int k = 0; k < 4; ++k) dst[lane + k * 32] = srcq[lane + k * 32];
         }
     }
 }
@@ -958,8 +1027,11 @@ extern "C" int q35_launch_quantize_q8_K(const float *d_x, void *d_out_v,
     unsigned char *d_out = (unsigned char *)d_out_v;
     cudaStream_t stream = (cudaStream_t)stream_v;
     if (nblocks <= 0) return (int)cudaSuccess;
+    // 4 warps per block, one super-block per warp: a 20-block decode quantize
+    // then fills 5 blocks instead of one 20-thread block.
     const int threads = 128;
-    const int blocks = (nblocks + threads - 1) / threads;
+    const int warps_per_block = threads / 32;
+    const int blocks = (nblocks + warps_per_block - 1) / warps_per_block;
     q35_k_quantize_q8_K<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks, nullptr);
     return (int)cudaGetLastError();
 }
@@ -974,7 +1046,8 @@ extern "C" int q35_launch_quantize_q8_K_mmq(const float *d_x, void *d_out_v,
     cudaStream_t stream = (cudaStream_t)stream_v;
     if (nblocks <= 0) return (int)cudaSuccess;
     const int threads = 128;
-    const int blocks = (nblocks + threads - 1) / threads;
+    const int warps_per_block = threads / 32;
+    const int blocks = (nblocks + warps_per_block - 1) / warps_per_block;
     q35_k_quantize_q8_K<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks, d_mmq_v);
     return (int)cudaGetLastError();
 }
