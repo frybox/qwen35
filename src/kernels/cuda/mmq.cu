@@ -1281,13 +1281,25 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
 // the accumulator is a plain float sum in ascending k order in both, so the two
 // kernels agree bit for bit (that is what MVCHECK checks).
 //
-// Cost note (measured, 27B IQ3_XXS, 525-token prefill): this shape runs at
-// 421-424 tok/s against the mma kernel's 436-438, i.e. ~3% SLOWER, and
-// PROF-GPU puts the per-launch time at 3103 us against 2908.  Why llama.cpp
-// still wins with the same dp4a shape: its activations are PRE-QUANTIZED into
-// `block_q8_1_mmq` layout once per chunk, so its stage loop is a contiguous
-// `tile_y[l] = by0[l]`, while we re-transpose out of q8_K on every launch.
-// Matching it would mean changing what `matvecBatchK` uploads, not this kernel.
+// Cost note (measured, 27B IQ3_XXS, 525-token prefill).  This shape runs at
+// 425-426 tok/s against the mma kernel's 435-436, i.e. ~2.4% SLOWER, and
+// PROF-GPU puts the per-launch time at 3052 us against 2912.
+//
+// Two rounds of measurement went into that number, and the second one is the
+// interesting result:
+//
+//   * First version transposed q8_K -> `block_q8_1_mmq` on the accumulator
+//     side of EVERY launch: 421-424 tok/s, 3103 us/launch.
+//   * Now the quantizer emits the mmq reshape in the same pass it produces
+//     q8_K (q35_launch_quantize_q8_K_mmq), so the tile staging here is
+//     llama.cpp's contiguous copy: 425-426 tok/s, 3052 us/launch.
+//
+// So removing the redundant transpose bought 1.7% and the remaining gap is NOT
+// memory traffic -- it is the dp4a dot itself being slower than the mma path on
+// this shape.  llama.cpp picks dp4a on sm_89 only because ITS tile geometry,
+// register budget and activation layout are all tuned around it; porting the
+// instruction choice without the rest does not reproduce the result.  Do not
+// read this kernel's presence as "dp4a is faster".
 //
 // Every index in the inner loop is a compile-time constant: I, J, nwarps and
 // the k/VDR steps are template/constexpr, so `sum[...]` below is 64 scalars in
@@ -1444,34 +1456,34 @@ __global__ void q35_k_mmq_dp4a_iq(const unsigned char *__restrict__ w,
         // ---- vec_dot, twice: k00 = 0 and k00 = 32 ----
         // llama.cpp reloads tile_y between the two calls (mmq.cuh:921 and :938
         // stage `by0` and `by0 + sz` respectively), because each call consumes a
-        // DIFFERENT 128-value half of the activation.  Keeping one staging and
-        // reusing it makes the upper half multiply against the lower half's
-        // bytes.
+        // DIFFERENT 128-value half of the activation.
+        //
+        // `xq` here is already in `block_q8_1_mmq` layout -- 4 float scales then
+        // 128 int8 per block, two blocks per super-block -- because the
+        // quantizer that produced it (q35_launch_quantize_q8_K_mmq) emitted that
+        // reshape in the same pass.  So this is llama.cpp's contiguous
+        // `tile_y[l] = by0[l]` copy, with NO per-launch transpose.  An earlier
+        // version transposed out of q8_K every launch and had to get the
+        // int-vs-int8 offset of the upper half right by hand.
 #pragma unroll
         for (int half2 = 0; half2 < 2; ++half2) {
             const int k00h = half2 * Q35_DP4A_NE_K;
             {
-                const unsigned char *base = xq + (size_t)(k00 / 256) * 292;
-                const size_t tstride = (size_t)(cols / 256) * 292;
+                // One mmq block is 36 ints (4 scale + 32 int8 payload), which is
+                // exactly Q35_DP4A_SY, so the copy is a straight 32-bit move.
+                // 144 B = 4 float scales + 128 int8, i.e. sizeof(block_q8_1_mmq)
+                // (mmq-smem.cuh's q35_block_q8_1_mmq, not visible up here).
+                const int *base = (const int *)(xq +
+                    ((size_t)(k00 / 256) * 2 + half2) * 144);
+                const int tstride = 2 * (Q35_DP4A_SY);   // two mmq blocks per super-block
+                const int nsup = cols / 256;
                 for (int q = tid; q < Q35_DP4A_J * Q35_DP4A_SY; q += Q35_DP4A_THREADS) {
                     const int j = q / Q35_DP4A_SY;
                     const int w = q % Q35_DP4A_SY;
                     const int tj = j0blk + j;
                     if (tj >= tokens) { tile_y[q] = 0; continue; }
-                    const unsigned char *yb = base + (size_t)tj * tstride;
-                    if (w < 4) {
-                        *((float *)(tile_y + j * Q35_DP4A_SY + w)) = q35_q8k_d(yb);
-                    } else {
-                        // k00h counts INTS of qs (128 int8 per half = 32 int),
-                        // so the offset is k00h, not k00h/4: qs starts one int
-                        // (the f32 scale) into the block.  Dividing by 4 here
-                        // staged int8 [32,160) instead of [128,256) for the
-                        // upper half and made every result wrong by a constant
-                        // factor (mma -28 vs dp4a 13.5 on a probe where each
-                        // 128-half's activation bytes differ).
-                        const int *src = (const int *)yb + 1 + k00h + (w - 4);
-                        tile_y[j * Q35_DP4A_SY + w] = *src;
-                    }
+                    tile_y[j * Q35_DP4A_SY + w] =
+                        base[(size_t)tj * nsup * tstride + w];
                 }
             }
             __syncthreads();
@@ -1483,6 +1495,10 @@ __global__ void q35_k_mmq_dp4a_iq(const unsigned char *__restrict__ w,
                 for (int jq = 0; jq < Q35_DP4A_J / Q35_DP4A_NW; ++jq) {
                     const int j = jq * Q35_DP4A_NW + warp;
                     const int *y_qs = tile_y + j * Q35_DP4A_SY + 4;
+                    // All four d4 entries equal q8_K's single scale, so any
+                    // index works; `(k0/8)%4` selects the quarter the dp4a
+                    // consumes, matching llama.cpp's
+                    // `y_df[j*MMQ_TILE_Y_K + (k0/QI8_1) % (MMQ_TILE_NE_K/QI8_1)]`.
                     const float dy = ((const float *)(tile_y + j * Q35_DP4A_SY))[(k0 / 8) % 4];
 #pragma unroll
                     for (int iq = 0; iq < Q35_DP4A_I / 32; ++iq) {
@@ -1818,6 +1834,14 @@ static bool q35_mma_iq_enabled(int ttype) {
     return false;
 }
 
+
+// See api.h.  `q35_dp4a_enabled` is the single source of truth for the switch.
+extern "C" int q35_mmq_dp4a_wants(int ttype) {
+    return (ttype == Q35_TT_IQ3_XXS && q35_dp4a_enabled(ttype)) ? 1 : 0;
+}
+
+// 2 mmq blocks per 256-element super-block, 144 B each.
+extern "C" int q35_mmq_act_block_bytes(void) { return 2 * 144; }
 
 extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v,
                                            float *d_out, int rows, int cols,

@@ -82,6 +82,15 @@ const Kernels = struct {
     extern fn q35_launch_quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     /// `nblocks` counts 256-ELEMENT blocks.
     extern fn q35_launch_quantize_q8_K(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// Same, and additionally writes the `block_q8_1_mmq` reshape (288 B per
+    /// 256-element block) that the dp4a prefill kernel reads.  See
+    /// `q35_k_quantize_q8_K` in mmvq.cu.
+    extern fn q35_launch_quantize_q8_K_mmq(d_x: ?[*]const f32, d_out: ?*anyopaque, d_mmq: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    /// 1 when the prefill matvec for this type runs on the dp4a kernel, which
+    /// needs the mmq activation layout rather than q8_K.
+    extern fn q35_mmq_dp4a_wants(ttype: c_int) c_int;
+    /// Bytes per 256-element block of the mmq activation layout (288).
+    extern fn q35_mmq_act_block_bytes() c_int;
 
     /// Whole-tensor dequantization; `nblocks` is in the type's NATIVE blocks.
     extern fn q35_launch_dequantize(ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -270,6 +279,9 @@ fn stubNoCudaKernels() c_int {
 const Launch = if (cuda_linked) struct {
     const quantize_q8_0 = Kernels.q35_launch_quantize_q8_0;
     const quantize_q8_k = Kernels.q35_launch_quantize_q8_K;
+    const quantize_q8_k_mmq = Kernels.q35_launch_quantize_q8_K_mmq;
+    const mmq_dp4a_wants = Kernels.q35_mmq_dp4a_wants;
+    const mmq_act_block_bytes = Kernels.q35_mmq_act_block_bytes;
     const dequantize = Kernels.q35_launch_dequantize;
     const dequantize_row = Kernels.q35_launch_dequantize_row;
     const mul_mat_vec = Kernels.q35_launch_mul_mat_vec;
@@ -331,6 +343,21 @@ const Launch = if (cuda_linked) struct {
     fn quantize_q8_k(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, stream };
         return stubNoCudaKernels();
+    }
+    fn quantize_q8_k_mmq(d_x: ?[*]const f32, d_out: ?*anyopaque, d_mmq: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, d_out, d_mmq, nblocks, stream };
+        return stubNoCudaKernels();
+    }
+    /// No CUDA kernels means no dp4a kernel either, so the caller keeps the
+    /// plain q8_K path.  0 is the answer that requires no second buffer.
+    fn mmq_dp4a_wants(ttype: c_int) c_int {
+        _ = ttype;
+        return 0;
+    }
+    /// Never used (mmq_dp4a_wants is always 0 here) but kept so `Launch` has the
+    /// same shape in both branches.
+    fn mmq_act_block_bytes() c_int {
+        return 288;
     }
     fn dequantize(ttype: c_int, d_src: ?*const anyopaque, d_dst: ?[*]f32, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ ttype, d_src, d_dst, nblocks, stream };
@@ -1166,6 +1193,13 @@ pub const CudaBackend = struct {
     /// Quantized activations (Q8_0 or Q8_K, whichever the weight type needs).
     d_xq: ?*anyopaque = null,
     d_xq_bytes: usize = 0,
+    /// Second activation buffer holding the `block_q8_1_mmq` reshape, written by
+    /// the same quantization pass.  Only allocated when a dp4a type is launched
+    /// (see `q35_mmq_dp4a_wants`); the mma path never touches it.  Both buffers
+    /// are needed because one prefill chunk mixes types -- e.g. iq3_xxs on dp4a
+    /// next to iq3_s on mma -- and they share `d_xq` otherwise.
+    d_xqm: ?*anyopaque = null,
+    d_xqm_bytes: usize = 0,
     /// f32 matvec output (rows, or k*rows).
     d_out: ?*anyopaque = null,
     d_out_bytes: usize = 0,
@@ -4094,8 +4128,22 @@ const attn_score_arity: usize = 10;
                 // never be 0 and can never be smaller than the per-token one.
                 const total_blocks = nb_tok * k;
                 std.debug.assert(k >= 2 and nb_tok >= 1);
+                // The dp4a kernel reads `block_q8_1_mmq`, not q8_K, and used to
+                // re-transpose on every launch.  When it is enabled for this
+                // type the quantizer emits that reshape in the SAME pass (one
+                // extra store per value, no extra f32 load), and the kernel does
+                // a contiguous tile copy -- which is what llama.cpp does by
+                // having quantize_mmq_q8_1 write the layout directly.  q8_K is
+                // still produced because other types in the same chunk and the
+                // decode path consume it.
+                const wants_mmq = !q8_0_act and Launch.mmq_dp4a_wants(@intCast(@backingInt(q.ttype))) != 0;
+                if (wants_mmq) {
+                    ensureBuf(&cu.lib, &self.d_xqm, &self.d_xqm_bytes, @as(usize, @intCast(total_blocks)) * @as(usize, @intCast(Launch.mmq_act_block_bytes()))) catch return oomMsg("batchK mmq activations");
+                }
                 const rc = if (q8_0_act)
                     kern.quantize_q8_0(base_act, @ptrCast(base_xq), @intCast(total_blocks), null)
+                else if (wants_mmq)
+                    kern.quantize_q8_k_mmq(base_act, @ptrCast(base_xq), self.d_xqm, @intCast(total_blocks), null)
                 else
                     kern.quantize_q8_k(base_act, @ptrCast(base_xq), @intCast(total_blocks), null);
                 if (rc != cudart.cudaSuccess) {
@@ -4117,9 +4165,14 @@ const attn_score_arity: usize = 10;
                 // New binding (shadowing the quantize's `rc` above): the old
                 // per-token loop scoped that one to the loop body, so merging
                 // it out would otherwise redeclare `rc` in this block.
+                // The dp4a kernel takes the mmq layout, everything else q8_K.
+                // `d_xqm` is non-null exactly when `wants_mmq` was set above (it
+                // is `ensureBuf`'d right there), and `q35_mmq_dp4a_wants` is the
+                // same predicate the kernel uses to pick its branch, so the two
+                // cannot disagree.
                 const rc_mm = kern_mm.mul_mat_vec(
                     e.dev,
-                    self.d_xq,
+                    if (wants_mmq) self.d_xqm else self.d_xq,
                     d_out,
                     @intCast(rows),
                     @intCast(cols),
@@ -4314,12 +4367,15 @@ const attn_score_arity: usize = 10;
         self.dev_bufs.clearRetainingCapacity();
         if (self.d_act) |p| _ = cu.lib.Free(p);
         if (self.d_xq) |p| _ = cu.lib.Free(p);
+        if (self.d_xqm) |p| _ = cu.lib.Free(p);
         if (self.d_out) |p| _ = cu.lib.Free(p);
         if (self.d_deq) |p| _ = cu.lib.Free(p);
         self.d_act = null;
         self.d_act_bytes = 0;
         self.d_xq = null;
         self.d_xq_bytes = 0;
+        self.d_xqm = null;
+        self.d_xqm_bytes = 0;
         self.d_out = null;
         self.d_out_bytes = 0;
         self.d_deq = null;
@@ -6178,7 +6234,9 @@ const attn_score_arity: usize = 10;
     /// reusable activation/output scratch.
     fn reportStats(self: *CudaBackend, when: []const u8) void {
         if (self.cu == null) return;
-        const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_out_bytes + self.d_deq_bytes;
+        // `d_xqm` is only non-zero on the opt-in dp4a path, so it usually adds
+        // nothing here; counting it keeps the number honest when it does.
+        const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_xqm_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
             "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} gpu_ev_err={d}\n",
             .{

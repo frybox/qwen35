@@ -415,6 +415,21 @@ int q35_quant_act_block_elems(int ttype);
 // success, 0 for an unknown type.
 int q35_quant_geom(int ttype, int *block_elems, int *block_bytes);
 
+// 1 when the prefill (tokens > 1) matvec for `ttype` is served by the dp4a
+// kernel in mmq.cu instead of the mma one.  That kernel reads activations in
+// `block_q8_1_mmq` layout, NOT q8_K, so the caller has to keep a second
+// activation buffer and quantize with q35_launch_quantize_q8_K_mmq.
+//
+// Must be consulted BEFORE the quantize launch of each chunk: the env var is
+// read on every call (no caching), so the answer is stable within a run unless
+// the harness flips it, which is exactly what the A/B harness does.
+int q35_mmq_dp4a_wants(int ttype);
+
+// Bytes per 256-element super-block of the mmq activation layout: 288
+// (2 x (4 float scales + 128 int8)).  Callers sizing the second buffer use
+// `blocks_256 * q35_mmq_act_block_bytes()`.
+int q35_mmq_act_block_bytes(void);
+
 #ifdef __cplusplus
 }
 #endif

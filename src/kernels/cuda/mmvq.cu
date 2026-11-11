@@ -372,9 +372,32 @@ __global__ void q35_k_mul_mat_vec_f32(const float *__restrict__ w,
 //      consumed by the Q2_K/Q4_K/Q5_K min terms and the IQ1 delta terms.
 // One thread per block (a block is 256 elements, so per-thread work is fine).
 // ---------------------------------------------------------------------------
+// block_q8_1_mmq (llama.cpp ggml-cuda/mmq.cuh:27): 4 float scales + 128 int8.
+// Same numbers as mmq-smem.cuh's Q35_QK8_1_MMQ / sizeof(q35_block_q8_1_mmq), but
+// that header is not visible from this translation unit, so the two constants
+// are restated here next to their only use.
+#define Q35_MMQ_BLK_VALS   128
+#define Q35_MMQ_BLK_BYTES  144
+
+// `out_mmq`, when non-null, receives the SAME int8 values reshaped into
+// llama.cpp's `block_q8_1_mmq` layout (4 float scales + 128 int8, two blocks per
+// super-block).  This exists so the dp4a prefill kernel (mmq.cu
+// q35_k_mmq_dp4a_iq) can read its activations directly instead of
+// re-transposing out of q8_K on every launch -- llama.cpp has no such transpose
+// because quantize_mmq_q8_1 (ggml-cuda/quantize.cu:457) emits that layout
+// straight from f32.  Doing it here costs one extra store per value and NO
+// extra f32 load, and it is exact: q8_K has a single scale for all 256 values,
+// so all four `d4` entries of both mmq blocks are that same scale.
+//
+// Layout, per super-block (2 * 144 = 288 B, laid out interleaved by k-block the
+// same way the weight side is, so `mmq + (t*nblk + blk)*2 + half` addresses
+// block `half` of super-block `blk` of token `t`):
+//   [0..15]    float d4[4]  -- one scale per 32 int8  (all == q8_K's d)
+//   [16..143]  128 int8     -- qs[half*128 .. half*128+128)
 __global__ void q35_k_quantize_q8_K(const float *__restrict__ x,
                                     unsigned char *__restrict__ out,
-                                    int nblocks) {
+                                    int nblocks,
+                                    unsigned char *__restrict__ out_mmq) {
     const int b = blockIdx.x * blockDim.x + threadIdx.x;
     if (b >= nblocks) return;
     const float *xb = x + (size_t)b * Q35_QK8K;
@@ -409,6 +432,19 @@ __global__ void q35_k_quantize_q8_K(const float *__restrict__ x,
         const short v = (short)gsum[g];
         ob[260 + g * 2 + 0] = (unsigned char)((unsigned short)v & 0xFFu);
         ob[260 + g * 2 + 1] = (unsigned char)(((unsigned short)v >> 8) & 0xFFu);
+    }
+
+    if (out_mmq != nullptr) {
+        // Two mmq blocks per super-block, each 4 float scales + 128 int8.
+        unsigned char *mb = out_mmq + (size_t)b * (2 * Q35_MMQ_BLK_BYTES);
+#pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            unsigned char *mh = mb + half * Q35_MMQ_BLK_BYTES;
+            float *d4 = (float *)mh;
+#pragma unroll
+            for (int q = 0; q < 4; ++q) d4[q] = scale;
+            memcpy(mh + 16, ob + 4 + half * Q35_MMQ_BLK_VALS, Q35_MMQ_BLK_VALS);
+        }
     }
 }
 
@@ -895,7 +931,22 @@ extern "C" int q35_launch_quantize_q8_K(const float *d_x, void *d_out_v,
     if (nblocks <= 0) return (int)cudaSuccess;
     const int threads = 128;
     const int blocks = (nblocks + threads - 1) / threads;
-    q35_k_quantize_q8_K<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks);
+    q35_k_quantize_q8_K<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks, nullptr);
+    return (int)cudaGetLastError();
+}
+
+// Same as above but also emits the block_q8_1_mmq reshape (see the kernel's
+// comment).  Callers that want the mmq copy use this; `d_mmq` must hold
+// nblocks * 2 * Q35_BYTES_Q8_1_MMQ = nblocks * 288 bytes.
+extern "C" int q35_launch_quantize_q8_K_mmq(const float *d_x, void *d_out_v,
+                                           void *d_mmq, int nblocks, void *stream_v) {
+    unsigned char *d_out = (unsigned char *)d_out_v;
+    unsigned char *d_mmq_v = (unsigned char *)d_mmq;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    if (nblocks <= 0) return (int)cudaSuccess;
+    const int threads = 128;
+    const int blocks = (nblocks + threads - 1) / threads;
+    q35_k_quantize_q8_K<<<blocks, threads, 0, stream>>>(d_x, d_out, nblocks, d_mmq_v);
     return (int)cudaGetLastError();
 }
 
