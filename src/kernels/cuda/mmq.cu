@@ -841,7 +841,7 @@ struct Q35Iq2Xs {
 // ggml-common.h block_iq1_s (line 425).
 struct Q35Iq1S {
     static constexpr int block_bytes = 50;
-    static constexpr bool scale16 = true;
+    static constexpr bool scale16 = false;
     static constexpr int out_scale_q = 1;
     // dl = d * ls with ls = 2*hi+1, so the integer domain carries it exactly and
     // the float tail is 1.0f.  The 0.125 lives only in the delta term.
@@ -1347,12 +1347,18 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                     // groups already folded in by the mma loop above), so the
                     // delta sum must span the same 16 per-16-element bsums.
                     int sm = 0;
-                    for (int j = 0; j < 16; ++j) {
+                    for (int j = 0; j < 8; ++j) {
                         const unsigned int qh = (unsigned int)wb[34 + 2 * j]
                                               | ((unsigned int)wb[34 + 2 * j + 1] << 8);
                         const int sg = (qh & 0x8000u) ? -1 : 1;
                         const int lj = 2 * (int)((qh >> 12) & 7u) + 1;
-                        sm += lj * sg * q35_q8k_bsum(yb, j);
+                        // Group j owns EIGHTEEN bsums... no: owns the two
+                        // 16-element halves 2j and 2j+1 of the q8_K sum table
+                        // (32 elements per group / 16 per bsum).  Using only
+                        // bsum[j] -- an off-by-half on both the index and the
+                        // count -- is what made every row wrong before; the
+                        // oracle at vecdotq.cuh:1204 adds exactly this pair.
+                        sm += lj * sg * (q35_q8k_bsum(yb, 2 * j) + q35_q8k_bsum(yb, 2 * j + 1));
                     }
                     const float totf = __fadd_rn((float)isum[l],
                                                  __fmul_rn(0.125f, (float)sm));
@@ -1887,6 +1893,7 @@ static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned ch
         case Q35_TT_IQ4_XS:  Q35_IQ_LAUNCH(Q35Iq4Xs);  break;
         case Q35_TT_IQ2_XXS: Q35_IQ_LAUNCH(Q35Iq2Xxs); break;
         case Q35_TT_IQ2_XS:  Q35_IQ_LAUNCH(Q35Iq2Xs);  break;
+        case Q35_TT_IQ1_S:   Q35_IQ_LAUNCH(Q35Iq1S);   break;
         default:
             return (cudaError_t)-1;
     }
@@ -1966,6 +1973,7 @@ static bool q35_mma_iq_enabled(int ttype) {
         {Q35_TT_IQ4_XS,  "iq4_xs"},
         {Q35_TT_IQ2_XXS, "iq2_xxs"},
         {Q35_TT_IQ2_XS,  "iq2_xs"},
+        {Q35_TT_IQ1_S,   "iq1_s"},
     };
     for (const auto &nm : names) {
         if (nm.tt != ttype) continue;
@@ -2036,7 +2044,8 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     }
     if (info.block_elems == 256 && q35_mma_iq_enabled(ttype) &&
         (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S ||
-         ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS || ttype == Q35_TT_IQ2_XS)) {
+         ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS || ttype == Q35_TT_IQ2_XS ||
+         ttype == Q35_TT_IQ1_S)) {
         return (int)mmq_mma_iq_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
 
