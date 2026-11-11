@@ -890,8 +890,19 @@ const kernel_max_args: usize = 24;
 const ArgSlot = struct { bytes: [8]u8 align(8) = @splat(0) };
 
 pub const CudaBackend = struct {
-    /// Number of event pairs in the per-call timing ring; see `ev_pool`.
-    pub const EV_POOL: usize = 256;
+    /// Ring size for the per-call timing events; see `ev_pool`.
+    ///
+    /// Measured: with 256 slots (128 usable pairs) the host lapped the device
+    /// and 228 of 496 samples were dropped on a 525-token prefill.  That is
+    /// itself the useful reading -- the host queues a whole prefill's worth of
+    /// kernels before the GPU catches up -- so the ring is sized at 2048 slots
+    /// (1024 pairs, two prefills) and the drop counter is a real alarm.
+    pub const EV_POOL: usize = 2048;
+
+    /// Upper bound on a believable single `matvecBatchK` interval, in ns.
+    /// 50 ms is >30x the largest real kernel here (1.6 ms), so it only fires on
+    /// a broken measurement, never on a slow but genuine one.
+    pub const MAX_BK_NS: u64 = 50_000_000;
 
     alloc: std.mem.Allocator,
     /// Metadata/geometry authority (see the file comment).  Never used for
@@ -1027,6 +1038,9 @@ pub const CudaBackend = struct {
     /// launches behind.  Reported so a low `bk_n` is never mistaken for the
     /// model issuing fewer matvecs.
     stat_n_ev_dropped: usize = 0,
+    /// Intervals rejected by the `MAX_BK_NS` sanity clamp.  Non-zero means the
+    /// per-call timing is not trustworthy for this run.
+    stat_n_ev_suspect: usize = 0,
     /// `$QWEN35_PROF`: per-type device ns / call count from the batchK events.
     /// `stat_ns_batchk_gpu` is the same intervals summed over all types; these
     /// say WHERE they went, which is what picks the next optimisation target.
@@ -6242,6 +6256,17 @@ const attn_score_arity: usize = 10;
             const a = self.ev_pool[pend.slot];
             const b = self.ev_pool[pend.slot + 1];
             if (self.evElapsedNsNoWait(a, b)) |ns| {
+                // A single batchK call cannot take tens of milliseconds: the
+                // largest shape measured here is 1.6 ms.  Anything above
+                // `MAX_BK_NS` means the pair spans work that is not this call
+                // (a Begin whose End was skipped, or a ring slot reused while
+                // still pending), so it is counted and dropped instead of
+                // being added to the totals.
+                if (ns > MAX_BK_NS) {
+                    // Drop, do not retry: the sample will never shrink.
+                    self.stat_n_ev_suspect += 1;
+                    continue;
+                }
                 self.stat_ns_batchk_gpu += ns;
                 self.stat_n_batchk_gpu += 1;
                 const ti: usize = @intCast(pend.ttype);
@@ -6433,7 +6458,7 @@ const attn_score_arity: usize = 10;
         // nothing here; counting it keeps the number honest when it does.
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_xqm_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} ev_dropped={d} gpu_ev_err={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} ev_dropped={d} ev_suspect={d} gpu_ev_err={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
@@ -6485,6 +6510,7 @@ const attn_score_arity: usize = 10;
                 self.stat_n_launch_bk,
                 self.stat_ns_ev_sync / 1_000_000,
                 self.stat_n_ev_dropped,
+                self.stat_n_ev_suspect,
                 self.stat_n_ev_err,
             },
         );
@@ -6924,6 +6950,10 @@ const attn_score_arity: usize = 10;
         self.stat_ns_prefill_wall = 0;
         self.stat_ns_prefill_bk_wall = 0;
         self.stat_n_ev_err = 0;
+        self.stat_n_ev_dropped = 0;
+        self.stat_n_ev_suspect = 0;
+        self.ev_pending_n = 0;
+        self.ev_pool_wr = 0;
         self.stat_n_launch_bk = 0;
         self.stat_ns_ev_sync = 0;
         // Per-slot timers (QWEN35_PROF only; the counters stay zero when off).
