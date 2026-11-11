@@ -841,7 +841,7 @@ struct Q35Iq2Xs {
 // ggml-common.h block_iq1_s (line 425).
 struct Q35Iq1S {
     static constexpr int block_bytes = 50;
-    static constexpr bool scale16 = false;
+    static constexpr bool scale16 = true;
     static constexpr int out_scale_q = 1;
     // dl = d * ls with ls = 2*hi+1, so the integer domain carries it exactly and
     // the float tail is 1.0f.  The 0.125 lives only in the delta term.
@@ -1965,6 +1965,7 @@ static bool q35_mma_iq_enabled(int ttype) {
         {Q35_TT_IQ2_S,   "iq2_s"},
         {Q35_TT_IQ4_XS,  "iq4_xs"},
         {Q35_TT_IQ2_XXS, "iq2_xxs"},
+        {Q35_TT_IQ2_XS,  "iq2_xs"},
     };
     for (const auto &nm : names) {
         if (nm.tt != ttype) continue;
@@ -2048,13 +2049,32 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // here:  IQ4_XS done (1 scale per 32 elements, signed ls, no sign table),
     // IQ2_XXS done (u64 grid -> 8 unsigned magnitude bytes, 7-bit ksigns
     // expansion, 1 positive odd scale per 32 elements = the IQ3_XXS shape).
-    // Still falling back: IQ1_S, IQ1_M.  A Q35Iq1S trait exists and unpacks
-    // correctly enough to launch, but its integer dot comes out 4x too small
-    // on a unit probe (iq1s_grid[0] all -1, 256 elements, ls=1 should give
-    // -256 and gives -64), so it is NOT registered.  The p[] element order for
-    // a SIGNED int8 table is the suspect -- the other traits all expand an
-    // unsigned magnitude and fold signs explicitly, which is not the same
-    // layout.  Do not wire it up until a probe explains the factor.
+    // Still falling back: IQ1_S, IQ1_M.  Q35Iq1S exists and is registered in
+    // the launcher's switch, but deliberately NOT in the dispatch list above:
+    // it produces a wrong result, and the failing probe is worth recording
+    // because it rules out the obvious causes.
+    //
+    // Unit probe (rows=1 cols=256, d=1.0, every qs byte 0 so idx=0, ls=1,
+    // all-ones activations; iq1s_grid[0] is eight -1 bytes): the correct
+    // answer is grid(-256) + delta(-32) = -288.  Measured -64 with the delta
+    // bit set and 0 with it clear.  So the integer (grid) part contributes
+    // NOTHING while the delta term is right, and the shortfall is a clean 1/8
+    // -- one group out of eight -- not the 1/4 the first reading suggested
+    // (that reading was taken while the dispatch list still excluded IQ1_S, so
+    // it measured the thread-per-row path, not this kernel).
+    //
+    // Ruled out: block_bytes/field offsets (50 = 2+32+16, matches
+    // block_iq1_s), grid index extraction (qs[l] | (((qh>>3l)&7)<<8), matches
+    // dequantize_row_iq1_s:2665), the scale ((qh>>12)&7, and the probe scales
+    // linearly with it: ls=1 -> -64, ls=3 -> -192), the delta decomposition
+    // (matches vecdotq.cuh:1210 q35_vec_dot_iq1_s_q8_k_part), p[] contents
+    // (0xFFFFFFFF per int is what a signed -1 table should yield, and the
+    // group() loop covers g=0..7), and both staging paths (k16 reads
+    // (const int*)sAw + h*4, k32 reads + g*8, both of which are correct for
+    // the other five traits).
+    //
+    // Next step is a fragment-level probe in the style of /tmp/frag/*.cu, not
+    // another dispatch experiment.
     // IQ2_XS is done: its uint16 grid index + 7-bit sign code unpack into the
     // same 8-byte magnitude shape as IQ2_XXS, and its two per-16 scales go
     // through the existing scale16 path (see Q35Iq2Xs).
