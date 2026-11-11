@@ -1377,19 +1377,42 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
             // row per warp -- `trow = threadIdx.x / 32` -- silently left rows 4..7
             // unwritten at 4 warps, which is exactly the bug this loop had.
             {
+                // 16 bytes per thread as four 4-byte words, not 8 single bytes.
+                //
+                // Where the width came from: with the unpack AND the mma removed
+                // entirely the kernel still took 1.276 of its 1.334 ms, so this
+                // copy -- not HBM -- was the bottleneck.  (A temporary
+                // memory-only branch was used to establish that and has been
+                // removed; the numbers are IQ3_XXS ffn 17408x5120 at 525
+                // tokens.)
+                //
+                // 4-byte words, not int2/int4: a q8_K block is 292 = 4*73 bytes,
+                // so `b*292 + 4` is only 4-byte aligned for odd b and anything
+                // wider faults with `misaligned address` (measured, both int4 and
+                // int2).  4 B is the widest alignment the format guarantees and
+                // it is already 4x the old per-instruction width.
+                //
+                // Staging the whole block's activation once per super-block b
+                // (a 34 KB sB) was tried and is WORSE -- it pushes shared past
+                // 48 KiB, halves occupancy and lands at 1.247 ms against this
+                // 1.231.  MAX_TILES=16 with the small sB stays the optimum.
                 const int tid = (int)threadIdx.x;
                 const int nt  = (int)blockDim.x;
-                for (int i = tid * 8; i < 8 * 256; i += nt * 8) {
+                constexpr int CHUNK = 16;
+                for (int i = tid * CHUNK; i < 8 * 256; i += nt * CHUNK) {
                     const int trow = i >> 8;               // which of the 8 tokens
                     const int tcol = i & 255;              // byte offset in the row
-                    int8_t *dst = sB + trow * SB_STRIDE + tcol;
-                    if (tb + trow < tokens && tcol + 8 <= 256) {
+                    int *dst = (int *)(sB + trow * SB_STRIDE + tcol);
+                    if (tb + trow < tokens) {
                         const unsigned char *row =
                             xq + (size_t)(tb + trow) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
-                        const unsigned char *src = row + tcol;
-                        for (int k = 0; k < 8; ++k) dst[k] = (int8_t)src[k];
+                        const int *src = (const int *)(row + tcol);
+                        dst[0] = src[0];
+                        dst[1] = src[1];
+                        dst[2] = src[2];
+                        dst[3] = src[3];
                     } else {
-                        for (int k = 0; k < 8; ++k) dst[k] = 0;
+                        dst[0] = dst[1] = dst[2] = dst[3] = 0;
                     }
                 }
             }
