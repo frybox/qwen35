@@ -727,10 +727,7 @@ struct Q35Iq3Xxs {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 4;   // 0.25f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
+    /// The super-block's f16 `d`; overridden only by IQ1_M.
     __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 struct Q35Iq3S {
@@ -739,10 +736,7 @@ struct Q35Iq3S {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 1;   // 1.0f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
+    /// The super-block's f16 `d`; overridden only by IQ1_M.
     __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 struct Q35Iq2S {
@@ -756,10 +750,7 @@ struct Q35Iq2S {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 8;   // 0.125f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
+    /// The super-block's f16 `d`; overridden only by IQ1_M.
     __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 // IQ4_XS: 136 B = d@0 (f16) | scales_h@2 (u16) | scales_l[4]@4 | qs[128]@8.
@@ -780,10 +771,7 @@ struct Q35Iq4Xs {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 1;   // 1.0f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
+    /// The super-block's f16 `d`; overridden only by IQ1_M.
     __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 // IQ2_XXS: 66 B = d@0 (f16) | qs[32] @2, read as 8 x { a[0..3] (4 grid indices)
@@ -806,10 +794,7 @@ struct Q35Iq2Xxs {
     // every row, mismatched=163839).
     static constexpr int out_scale_den = 8;   // 0.125f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
+    /// The super-block's f16 `d`; overridden only by IQ1_M.
     __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 // IQ2_XS: 74 B = d@0 (f16) | qs[32] @2, read as 16 uint16 | scales[8] @66.
@@ -835,10 +820,7 @@ struct Q35Iq2Xs {
     // tail is 0.125f exactly (same identity as IQ2_XXS, so the same denominator).
     static constexpr int out_scale_den = 8;   // 0.125f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
+    /// The super-block's f16 `d`; overridden only by IQ1_M.
     __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 
@@ -853,13 +835,14 @@ struct Q35Iq2Xs {
 //    tables the other traits expand.  It therefore needs no sign fold at all --
 //    the u64's two halves drop straight into p[] as four int8 lanes each, which
 //    is exactly what vecdotq.cuh:1200 does with dp4a.
-//  * the +-0.125 delta is NOT an integer multiple of the scale, so it cannot be
-//    folded into `p` or `ls`.  It rides along as a separate float term built
-//    from the q8_K per-16 sums, the same decomposition
-//    q35_vec_dot_iq1_s_q8_k_part uses:
-//        tot = d * (sumi + 0.125 * sumi1),  sumi1 = sum over groups of
-//        ls * delta_sign * (bsum[2i] + bsum[2i+1])
-//    The kernel adds that in its float tail; see Q35_IQ1_DELTA below.
+//  * the +-0.125 delta is NOT an integer multiple of the scale.  The obvious
+//    route is a separate float term built from q8_K's per-16 sums (that is what
+//    q35_vec_dot_iq1_s_q8_k_part does, and what this kernel used to do).  The
+//    cheaper route, and the one taken here, is to scale the whole grid by EIGHT
+//    inside group(): 8*grid is +-8, so 8*grid +- 1 stays inside int8, the mma
+//    computes an exact integer dot of the delta-included value, and
+//    out_scale_den = 8 divides it back out (a power of two, so exact).  The
+//    float tail is then a plain `d * isum`, and the bsum walk disappears.
 //
 // Source of truth: ggml-quants.c dequantize_row_iq1_s (line 2651) and
 // ggml-common.h block_iq1_s (line 425).
@@ -867,92 +850,59 @@ struct Q35Iq1S {
     static constexpr int block_bytes = 50;
     static constexpr bool scale16 = false;
     static constexpr int out_scale_q = 1;
-    // dl = d * ls with ls = 2*hi+1, so the integer domain carries it exactly and
-    // the float tail is 1.0f.  The 0.125 lives only in the delta term.
-    static constexpr int out_scale_den = 1;
-    /// True when the type needs the `sumi + 0.125 * sumi1` decomposition in the
-    /// float tail (currently IQ1_S).
-    static constexpr bool iq1_delta = true;
-    static constexpr bool iq1_delta8 = false;
-    /// The super-block's f16 `d`.  IQ1_M overrides this: its `d` is not a
-    /// stored f16 but four high nibbles spread over `scales`.
-    __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
+    // 8: group() folded delta into p[] at 1/8 scale (see the comment there), so
+    // the integer dot comes out eight times too large.  8 is a power of two, so
+    // this division is exact.
+    static constexpr int out_scale_den = 8;
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    __device__ static float d_of(const unsigned char *wb) { return q35_f16_at(wb, 0); }
 };
 
 // IQ1_M: 56 B = qs[32] @0 | qh[16] @32 | scales[8] @48.
 //   d          = an f16 whose bits are spread over the four u16s' nibbles
-//                (dequantize_row_iq1_m:2686)
-//   grid index = qs[4g+l] | 0x700 bits taken from qh[2g+(l>>1)], shifted 8 for
-//                even l and 4 for odd l (dequantize_row_iq1_m:2694)
-//   scale      = 6-bit, TWO per 32-element group: dl1 covers l=0,1 and dl2
-//                covers l=2,3, both from sc[g/2] at bit 6*(g%2)
-//   delta      = +-0.125 PER EIGHT ELEMENTS: sign bits qh[2g]&0x08 (l=0),
-//                qh[2g]&0x80 (l=1), qh[2g+1]&0x08 (l=2), qh[2g+1]&0x80 (l=3)
+//                (dequantize_row_iq1_m:2686) -- the ONE type whose `d` is not
+//                a stored f16, hence the `d_of` override.
+//   grid index = qs[4g+l] | 0x700 bits from qh[2g + (l>>1)], shifted 8 for
+//                even l and 4 for odd l
+//   scale      = TWO 6-bit values per group: scales[g>>1] bits
+//                (g&1)*6+0..2 for l=0,1 and (g&1)*6+3..5 for l=2,3
+//   delta      = +-0.125 per EIGHT elements: qh[2g+(l>>1)] bit 0x08 for even l,
+//                0x80 for odd l
 //
-// scale16 = true is load-bearing, not stylistic: a k32 mma would apply one
-// scale to all 32 elements, and IQ1_M genuinely has two.  The k16 loop's
-// half = h&1 selects exactly l<2 vs l>=2, so ls[0]/ls[1] land on the right
-// 16 elements.
+// The l -> qh group mapping is `l >> 1`, NOT `l & 1`: l=0,1 read qh[2g] and
+// l=2,3 read qh[2g+1], while the SHIFT alternates within each pair
+// (`8 - 4*(l%2)`, i.e. 8 for even l).  Swapping the two turns the grid index
+// into a rotation of the real one, which still looks like a plausible int8
+// operand and still passes every single-component probe.  That confusion, plus
+// an oracle that repeated it, is what cost this trait several rounds: both
+// sides agreed with each other and both disagreed with ggml.
 //
-// NOT DISPATCHED YET -- Q35Iq1M is complete and registered in the launcher's
-// switch, but deliberately absent from the dispatch list and the tag list, so
-// iq1_m still takes the thread-per-row fallback.  As written it produces wrong
-// results (MVCHECK 9.02M/9.14M rows mismatched, and the count barely moves
-// between variants), which means the error is systematic rather than numeric.
-// Ruled out so far, each verified against dequantize_row_iq1_m in isolation:
-//   * group(): a per-group probe comparing p[] against iq1s_grid[idx] byte for
-//     byte reports max |difference| = 0 for all 8 groups, so the index
-//     reconstruction (qs[4g+l] | 0x700 bits from qh[2g+(l>>1)], shift 8 even /
-//     4 odd) is right.
-//   * the two 6-bit scales: ls[0]/ls[1] come from sc[g/2] at bit 6*(g%2) and are
-//     the (2*hi+1) integers the k16 path multiplies by, matching :2690.
-//   * sB8 is staged AFTER the barrier that publishes sB (it straddles `i`
-//     differently from the staging loop, so folding it in read half-written
-//     bytes -- measuring that made no difference, so it was not the bug, but it
-//     was a real one).
-// Ruled out since, with the harness at /tmp/mbm/chk1m.cu (an oracle transcribed
-// from dequantize_row_iq1_m, compared against q35_launch_mul_mat_vec):
-//   * a fully hand-built single block (qs/qh all zero, so idx=0 and every grid
-//     byte is -1, all-ones activations) gives kernel == oracle EXACTLY, twice
-//     over.  So group(), d_of() and the k16 staging all agree with the oracle
-//     when every ls is 1 and every p[] is 0xffffffff.
-//   * random blocks with random activations disagree on 127/128 rows, and
-//     with all-ones activations still disagree (-11 vs -8.52, -4 vs -7.02, 0 vs
-//     +1.13).  The disagreement therefore only appears once ls and p[] VARY,
-//     which points at ls_w indexing or the per-group p[] address rather than at
-//     the arithmetic.  IQ1_S shares both and passes, so the difference has to be
-//     in how this trait's two scales per group are numbered: note that
-//     Q35Iq1M::group writes ls[0]/ls[1] as dl1/dl2 while EVERY other scale16
-//     trait writes them as two halves of one 32-element group.
-// Then a 16-row x 8-token tile with random blocks and random activations
-// (/tmp/mbm/m3.cu) narrowed it down a lot: 19 of 128 (token,row) pairs are
-// wrong and they are not scattered -- 15 of the 16 rows of TOKEN 0 plus 4 rows
-// of TOKEN 2, with tokens 1 and 3..7 exact.  A per-token failure pattern with
-// the rest perfect is not an arithmetic error; it says sB8 is being read for the
-// wrong token row somewhere, which is consistent with it being staged per
-// TOKEN TILE while `acc[ti][l]` is indexed per tile: with tokens > 8 the tile
-// offset has to enter the index, and the two halve agree.  That is the next
-// thread to pull -- check `sB8` against `tb`/`ti`, not against `group()`.
-//   * Do not re-run dispatch, and do not trust a passing MVCHECK on this type
-//     until /tmp/mbm/m3.cu reports 0/128.
-//
-// The per-8 delta is why this trait carries IQ1_DELTA8 and not IQ1_DELTA.
-// IQ1_S's delta is expressible from q8_K's per-16 `bsums` because its groups
-// are 32 wide; IQ1_M's is 8 wide, and a per-8 partial sum is simply not in
-// block_q8_K.  The kernel therefore sums the int8 activation tile it already
-// has in shared memory (see `sB8`) rather than reusing bsums -- reusing them
-// here would repeat, silently, exactly the off-by-half that IQ1_S had.
+// delta is per EIGHT elements here, but it costs nothing extra: all eight bytes
+// of one 8-element chunk share a sign, so the same x8 trick IQ1_S uses applies l
+// by l.  (An earlier version built per-8 activation sums in shared memory to add
+// delta as a separate term -- q8_K's bsums are per-16 and cannot express a per-8
+// sum -- and it read the wrong token row.  Folding delta into p[] removes the
+// need for that array entirely, and with it the whole class of bug.)
 struct Q35Iq1M {
     static constexpr int block_bytes = 56;
     static constexpr bool scale16 = true;
     static constexpr int out_scale_q = 1;
-    static constexpr int out_scale_den = 1;   // dl already carries (2*hi+1)
-    static constexpr bool iq1_delta = false;
-    static constexpr bool iq1_delta8 = true;
+    // 8: group() folded delta into p[] at 1/8 scale, exactly as IQ1_S does.
+    static constexpr int out_scale_den = 8;
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
     __device__ static float d_of(const unsigned char *wb);
 };
+
+
+/// Pack four int8 values into one int32 (little-endian byte order: a is byte 0).
+/// Only used where the integer operand is NOT the raw table entry -- IQ1_S and
+/// IQ1_M scale their grids by 8 to fold the +-0.125 delta in, which has to be
+/// done per element.  Every other trait gets its p[] from the table directly,
+/// via the sign tricks documented on each of them.
+__device__ __forceinline__ int q35_iq_pack8(int a, int b, int c, int d) {
+    return (int)(((unsigned int)(a) & 0xFFu) | (((unsigned int)(b) & 0xFFu) << 8) |
+                 (((unsigned int)(c) & 0xFFu) << 16) | (((unsigned int)(d) & 0xFFu) << 24));
+}
 
 // Per-type unpacker for the generic IQ tensor-core kernel below: decompose one
 // 32-element group of a 256-element super-block into 8 int32 of int8 and
@@ -1141,19 +1091,39 @@ __device__ void Q35Iq1M::group(const unsigned char *wb, int g, int p[8], int ls[
     // Group g owns qs + 4*g and the TWO qh bytes at 32 + 2*g (one per 16
     // elements).  Element order is l*8 + j, so the grid's low uint32 is p[2l]
     // and its high uint32 p[2l+1] -- the same shape as IQ1_S.
+    // delta is +-0.125 PER EIGHT ELEMENTS here (one sign per l), so all eight
+    // bytes of p[2l], p[2l+1] carry the SAME sign -- which is exactly the shape
+    // IQ1_S's x8 trick handles, one l at a time.  That is why this trait needs
+    // no per-8 activation sums: the delta rides in the integer operand.
     const unsigned int qh0 = wb[32 + 2 * g + 0];
     const unsigned int qh1 = wb[32 + 2 * g + 1];
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
-        const unsigned int hi = ((l & 1) ? qh1 : qh0) << ((l & 1) ? 4 : 8);
+        // l = 0,1 take the 9th..11th index bits from qh0, l = 2,3 from qh1, and
+        // within each pair the even l shifts by 8, the odd by 4
+        // (dequantize_row_iq1_m:2694-2697).
+        // l = 0,1 come from qh[0]; l = 2,3 from qh[1] -- `l >> 1`, NOT `l & 1`.
+        // The shift alternates within each PAIR: even l by 8, odd l by 4
+        // (ggml's `8 - 4*(l%2)`).  Confusing the two groups reads the other
+        // qh byte and yields a plausible-looking but rotated grid, which is
+        // why every single-block probe "passed" while the engine did not.
+        const unsigned int hi = ((l < 2) ? qh0 : qh1) << ((l & 1) ? 4 : 8);
         const unsigned int idx = (unsigned int)wb[4 * g + l] | (hi & 0x700u);
         const unsigned long long grid = iq1s_grid[idx & 2047u];
-        p[2 * l + 0] = (int)(unsigned int)(grid & 0xFFFFFFFFull);
-        p[2 * l + 1] = (int)(unsigned int)(grid >> 32);
+        // sign bits: qh[2g]&0x08 (l=0), &0x80 (l=1), qh[2g+1]&0x08 (l=2),
+        // &0x80 (l=3) -- dequantize_row_iq1_m:2699.
+        const int dsign = (((l < 2) ? qh0 : qh1) & ((l & 1) ? 0x80u : 0x08u)) ? -1 : 1;
+        p[2 * l + 0] = q35_iq_pack8((int)(int8_t)(grid & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 8) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 16) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 24) & 0xFFull) * 8 + dsign);
+        p[2 * l + 1] = q35_iq_pack8((int)(int8_t)((grid >> 32) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 40) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 48) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 56) & 0xFFull) * 8 + dsign);
     }
     // TWO 6-bit scales per group (dequantize_row_iq1_m:2690).  The integer
-    // domain carries (2*hi + 1), the same odd-scale convention as IQ1_S, so
-    // out_scale_den stays 1 and the 0.125 lives only in the delta term.
+    // domain carries (2*hi + 1), the same odd-scale convention as IQ1_S.
     const unsigned int scw = q35_ld_u16(wb + 48 + 2 * (g >> 1));
     const unsigned int base = (g & 1) ? 6u : 0u;
     ls[0] = 2 * (int)((scw >> (base + 0)) & 7u) + 1;
@@ -1167,13 +1137,31 @@ __device__ void Q35Iq1S::group(const unsigned char *wb, int g, int p[8], int ls[
     // table is already int8 so there is no sign expansion to do.
     const unsigned int qh = (unsigned int)wb[34 + 2 * g]
                           | ((unsigned int)wb[34 + 2 * g + 1] << 8);
+    // The quantized value is ls*(grid + delta) with delta = +-0.125, and 0.125
+    // is not an integer, so the naive route is a separate float term.  Instead
+    // scale the whole grid by EIGHT and carry delta as +-1 in the integer
+    // domain:  8*grid + 8*delta = 8*grid +- 1, exact, and out_scale_den = 8
+    // gives the factor back at the end.  8*grid is +-8 so 8*grid +- 1 stays
+    // inside int8's range -- the mma needs int8, and +-9 fits.
+    //
+    // This removes the delta from the float tail entirely: no bsum walk, no
+    // per-8 partial sums, no separate code path.  It also means the operand is
+    // no longer the raw table entry, so the eight bytes are packed here instead
+    // of copying the u64's two halves.
+    const int dsign = (qh & 0x8000u) ? -1 : 1;
 #pragma unroll
     for (int l = 0; l < 4; ++l) {
         const unsigned int idx = (unsigned int)wb[2 + 4 * g + l]
                                | (((qh >> (3 * l)) & 7u) << 8);
         const unsigned long long grid = iq1s_grid[idx & 2047u];
-        p[2 * l + 0] = (int)(unsigned int)(grid & 0xFFFFFFFFull);
-        p[2 * l + 1] = (int)(unsigned int)(grid >> 32);
+        p[2 * l + 0] = q35_iq_pack8((int)(int8_t)(grid & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 8) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 16) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 24) & 0xFFull) * 8 + dsign);
+        p[2 * l + 1] = q35_iq_pack8((int)(int8_t)((grid >> 32) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 40) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 48) & 0xFFull) * 8 + dsign,
+                                    (int)(int8_t)((grid >> 56) & 0xFFull) * 8 + dsign);
     }
     // ONE scale per 32 elements, so both halves share it.
     ls[0] = ls[1] = 2 * (int)((qh >> 12) & 7u) + 1;
@@ -1252,13 +1240,6 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
     int8_t *sAw = sA + warp * 16 * SA_STRIDE;
     __shared__ int sLs[NWARPS * 16 * LS_STRIDE];  // per-warp per-row ls[16]: one per 16-element half
     int *ls_w = sLs + warp * 16 * LS_STRIDE;
-
-    // Per-8-element activation sums for the one type whose delta has 8-element
-    // granularity (IQ1_M); q8_K only carries per-16 `bsums`.  Sized for the
-    // block's whole token tile (8 tokens x 32 sums) and guarded by
-    // `if constexpr`, so the other types pay neither memory nor work.
-    // `short`, not int8: eight q8 values reach +-8*127, so a byte would wrap.
-    __shared__ short sB8[T::iq1_delta8 ? 8 * 32 : 1];
 
     // One accumulator per token-tile.  With grid.y == 1 the whole token range
     // is handled inside the kernel, so the 128-row weight slice is dequantized
@@ -1413,23 +1394,6 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                 }
             }
             __syncthreads();
-            // IQ1_M only: per-8 sums of the activation tile.  MUST sit after the
-            // barrier -- chunk i is written by a different thread than the one
-            // that would read it here (the staging loop strides `i` by tid*8
-            // while this one strides by tid), so folding it into the loop above
-            // read half-updated bytes and was wrong everywhere.
-            if constexpr (T::iq1_delta8) {
-                const int tid = (int)threadIdx.x;
-                const int nt  = (int)blockDim.x;
-                for (int i = tid; i < 8 * 32; i += nt) {
-                    const int8_t *src = sB + (i >> 5) * SB_STRIDE + (i & 31) * 8;
-                    int v = 0;
-                    for (int k = 0; k < 8; ++k) v += src[k];
-                    sB8[i] = (short)v;
-                }
-                __syncthreads();
-            }
-
             // Two mma paths, chosen by the scale granularity of T:
             //
             //  * scale16 == false (IQ3_XXS / IQ3_S / IQ2_XXS): ONE scale
@@ -1495,63 +1459,8 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                 // T::out_scale_q * OUT_SCALE_DEN: an integer template argument
                 // times a power-of-two denominator, because C++ forbids a
                 // floating-point template parameter.  Both factors are exact.
-                int tot = isum[l];
-                if (T::iq1_delta) {
-                    // IQ1_S: the per-32 quantized value is ls*(grid + delta) with
-                    // delta = +-0.125, so the integer dot above only covers the
-                    // grid part.  The delta part is ls*delta*sum(activations) --
-                    // a per-16-element sum, which Q8_K already carries as bsums.
-                    // Identical decomposition to vecdotq.cuh:1210
-                    // q35_vec_dot_iq1_s_q8_k_part.
-                    // `isum[l]` is the whole 256-element integer dot (all 8
-                    // groups already folded in by the mma loop above), so the
-                    // delta sum must span the same 16 per-16-element bsums.
-                    int sm = 0;
-                    for (int j = 0; j < 8; ++j) {
-                        const unsigned int qh = (unsigned int)wb[34 + 2 * j]
-                                              | ((unsigned int)wb[34 + 2 * j + 1] << 8);
-                        const int sg = (qh & 0x8000u) ? -1 : 1;
-                        const int lj = 2 * (int)((qh >> 12) & 7u) + 1;
-                        // Group j owns EIGHTEEN bsums... no: owns the two
-                        // 16-element halves 2j and 2j+1 of the q8_K sum table
-                        // (32 elements per group / 16 per bsum).  Using only
-                        // bsum[j] -- an off-by-half on both the index and the
-                        // count -- is what made every row wrong before; the
-                        // oracle at vecdotq.cuh:1204 adds exactly this pair.
-                        sm += lj * sg * (q35_q8k_bsum(yb, 2 * j) + q35_q8k_bsum(yb, 2 * j + 1));
-                    }
-                    const float totf = __fadd_rn((float)isum[l],
-                                                 __fmul_rn(0.125f, (float)sm));
-                    acc[ti][l] = __fadd_rn(acc[ti][l], __fmul_rn(
-                        __fmul_rn(d, totf), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
-                    continue;
-                }
-                if (T::iq1_delta8) {
-                    // IQ1_M: the same dl*(grid + delta) split as IQ1_S, but delta
-                    // is per EIGHT elements (four signs per 32-element group), so
-                    // q8_K's per-16 bsums cannot express it -- sB8 holds this
-                    // token row's per-8 activation sums.  The scale of 8-element
-                    // chunk c8 is its group's dl1 for l<2 and dl2 for l>=2, which
-                    // is dequantize_row_iq1_m:2701 verbatim.
-                    int sm = 0;
-#pragma unroll
-                    for (int c8 = 0; c8 < 32; ++c8) {
-                        const int g = c8 >> 2;        // 32-element group
-                        const int l8 = c8 & 3;        // quarter within it
-                        const unsigned int qhm = wb[32 + 2 * g + (l8 >> 1)];
-                        const int sg = (qhm & ((l8 & 1) ? 0x80u : 0x08u)) ? -1 : 1;
-                        const int lj = (l8 < 2) ? ls_w[mp * LS_STRIDE + g * 2 + 0]
-                                                : ls_w[mp * LS_STRIDE + g * 2 + 1];
-                        sm += lj * sg * (int)sB8[np * 32 + c8];
-                    }
-                    const float totf = __fadd_rn((float)isum[l],
-                                                 __fmul_rn(0.125f, (float)sm));
-                    acc[ti][l] = __fadd_rn(acc[ti][l], __fmul_rn(
-                        __fmul_rn(d, totf), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
-                    continue;
-                }
                 acc[ti][l] = __fadd_rn(acc[ti][l], __fmul_rn(
-                    __fmul_rn(d, (float)tot), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
+                    __fmul_rn(d, (float)isum[l]), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
             }
         }
     }
@@ -2078,6 +1987,7 @@ static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned ch
         case Q35_TT_IQ2_XXS: Q35_IQ_LAUNCH(Q35Iq2Xxs); break;
         case Q35_TT_IQ2_XS:  Q35_IQ_LAUNCH(Q35Iq2Xs);  break;
         case Q35_TT_IQ1_S:   Q35_IQ_LAUNCH(Q35Iq1S);   break;
+        case Q35_TT_IQ1_M:   Q35_IQ_LAUNCH(Q35Iq1M);   break;
         default:
             return (cudaError_t)-1;
     }
@@ -2158,6 +2068,7 @@ static bool q35_mma_iq_enabled(int ttype) {
         {Q35_TT_IQ2_XXS, "iq2_xxs"},
         {Q35_TT_IQ2_XS,  "iq2_xs"},
         {Q35_TT_IQ1_S,   "iq1_s"},
+        {Q35_TT_IQ1_M,   "iq1_m"},
     };
     for (const auto &nm : names) {
         if (nm.tt != ttype) continue;
@@ -2231,7 +2142,7 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     if (info.block_elems == 256 && q35_mma_iq_enabled(ttype) &&
         (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S ||
          ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS || ttype == Q35_TT_IQ2_XS ||
-         ttype == Q35_TT_IQ1_S)) {
+         ttype == Q35_TT_IQ1_S || ttype == Q35_TT_IQ1_M)) {
         return (int)mmq_mma_iq_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
 
