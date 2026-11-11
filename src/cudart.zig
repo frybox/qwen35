@@ -272,6 +272,12 @@ pub const Lib = struct {
     EventDestroy: *const fn (?*anyopaque) callconv(.c) c_int,
     EventRecord: *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int,
     EventSynchronize: *const fn (?*anyopaque) callconv(.c) c_int,
+    /// `cudaEventQuery`: success when `b` has completed, `cudaErrorNotReady`
+    /// otherwise.  Needed by the profiler to read an interval WITHOUT blocking
+    /// the host: `cudaEventSynchronize` in that position serialises the stream
+    /// against the host every call, which on the 525-token prefill costs 41% of
+    /// throughput (436 -> 309 tok/s) -- i.e. it does not measure the real run.
+    EventQuery: *const fn (?*anyopaque) callconv(.c) c_int,
     /// Makes a stream wait for an event.  The decode-graph stream is
     /// non-blocking, so it has NO implicit ordering against the legacy default
     /// stream -- the graph would otherwise start before the embedding lookup
@@ -449,6 +455,7 @@ pub fn open(out: *Open, want_bytes: usize) OpenError!void {
     L.EventDestroy = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventDestroy", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventRecord = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaEventRecord", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventSynchronize = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventSynchronize", mbuf, &miss_len) orelse return error.MissingSymbol;
+    L.EventQuery = bind(&out.lib, *const fn (?*anyopaque) callconv(.c) c_int, "cudaEventQuery", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.StreamWaitEvent = bind(&out.lib, *const fn (?*anyopaque, ?*anyopaque, c_uint) callconv(.c) c_int, "cudaStreamWaitEvent", mbuf, &miss_len) orelse return error.MissingSymbol;
     L.EventElapsedTime = bind(&out.lib, *const fn (*f32, ?*anyopaque, ?*anyopaque) callconv(.c) c_int, "cudaEventElapsedTime", mbuf, &miss_len) orelse return error.MissingSymbol;
 

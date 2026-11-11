@@ -890,6 +890,9 @@ const kernel_max_args: usize = 24;
 const ArgSlot = struct { bytes: [8]u8 align(8) = @splat(0) };
 
 pub const CudaBackend = struct {
+    /// Number of event pairs in the per-call timing ring; see `ev_pool`.
+    pub const EV_POOL: usize = 256;
+
     alloc: std.mem.Allocator,
     /// Metadata/geometry authority (see the file comment).  Never used for
     /// arithmetic -- the one exception is the opt-in `$QWEN35_MVCHECK`
@@ -993,11 +996,37 @@ pub const CudaBackend = struct {
     /// kernels being measured.
     ev_created: bool = false,
     /// Around one `matvecBatchK` call (one weight, one chunk of K tokens).
+    ///
+    /// These are the ONLY pair recorded per call; the interval is not read here
+    /// any more (see `EV_POOL`).  Kept because `batchKTimingBegin` uses them to
+    /// find the prefill window start on the first call.
     ev_bk_a: ?*anyopaque = null,
     /// ttype of the batchK call currently bracketed by `ev_bk_a`/`ev_bk_b`, so
     /// `batchKTimingEnd` can attribute the device interval to a type.  Only
     /// meaningful while `gpuTimingOn()`; written by `batchKTimingBegin`.
     bk_ttype: i32 = -1,
+    /// Ring of event pairs for the per-call batchK intervals, plus the pending
+    /// samples that still have to be read.
+    ///
+    /// The point of the ring is to avoid a host sync per kernel.  The old code
+    /// did `cudaEventSynchronize` in `batchKTimingEnd`, once per weight per
+    /// chunk, which drains the queue every ~1.3 ms and costs 41% of prefill
+    /// throughput (436 -> 309 tok/s) -- so the numbers it produced described a
+    /// run that does not exist, and `bk_gpu_ms` was really an upper bound that
+    /// silently included the stall.  Recording into a rotating pair and reading
+    /// it one call later (or at the end of the window) keeps the queue deep.
+    ///
+    /// 256 pairs x 2 events covers a whole 525-token prefill's 249 matvecs
+    /// twice over, so in practice every sample is already complete when read.
+    ev_pool: [EV_POOL]?*anyopaque = @splat(null),
+    ev_pool_wr: usize = 0,
+    /// Samples recorded but not yet read: (slot, ttype).
+    ev_pending: [EV_POOL]struct { slot: u32 = 0, ttype: i32 = -1, live: bool = false } = @splat(.{}),
+    ev_pending_n: usize = 0,
+    /// Samples the ring had to throw away because the device was `EV_POOL/2`
+    /// launches behind.  Reported so a low `bk_n` is never mistaken for the
+    /// model issuing fewer matvecs.
+    stat_n_ev_dropped: usize = 0,
     /// `$QWEN35_PROF`: per-type device ns / call count from the batchK events.
     /// `stat_ns_batchk_gpu` is the same intervals summed over all types; these
     /// say WHERE they went, which is what picks the next optimisation target.
@@ -5879,6 +5908,22 @@ const attn_score_arity: usize = 10;
         self.ev_arg_b = made[5];
         self.ev_tok_end = made[6];
         self.ev_prev_tok_end = made[7];
+        // Per-call interval ring (see `ev_pool`).  Created here so a failure
+        // disables profiling for the whole run instead of half of it.
+        for (&self.ev_pool, 0..) |*slot, i| {
+            var h: ?*anyopaque = null;
+            if (lib.EventCreate(&h, 0) != cudart.cudaSuccess or h == null) {
+                for (self.ev_pool[0..i]) |q| {
+                    if (q) |pp| _ = lib.EventDestroy(pp);
+                }
+                self.ev_pool = @splat(null);
+                std.debug.print("cuda backend: $QWEN35_PROF event timing disabled (ev_pool create failed)\n", .{});
+                return false;
+            }
+            slot.* = h;
+        }
+        self.ev_pool_wr = 0;
+        self.ev_pending_n = 0;
         self.ev_created = true;
         return true;
     }
@@ -5887,6 +5932,9 @@ const attn_score_arity: usize = 10;
         if (!self.ev_created) return;
         const lib = if (self.cu) |*cu| &cu.lib else null;
         if (lib) |l| {
+            for (self.ev_pool) |ep| {
+                if (ep) |pp| _ = l.EventDestroy(pp);
+            }
             for ([_]?*anyopaque{ self.ev_bk_a, self.ev_bk_b, self.ev_pre_a, self.ev_pre_b, self.ev_arg_a, self.ev_arg_b, self.ev_tok_end, self.ev_prev_tok_end }) |p| {
                 if (p) |q| _ = l.EventDestroy(q);
             }
@@ -5899,6 +5947,9 @@ const attn_score_arity: usize = 10;
         self.ev_arg_b = null;
         self.ev_tok_end = null;
         self.ev_prev_tok_end = null;
+        self.ev_pool = @splat(null);
+        self.ev_pool_wr = 0;
+        self.ev_pending_n = 0;
         self.ev_created = false;
     }
 
@@ -6122,9 +6173,14 @@ const attn_score_arity: usize = 10;
         }
     }
 
-    /// Milliseconds between two recorded events, waiting for the second.  The
-    /// wait is what makes the queue drain, so this is the expensive call; it is
-    /// made once per timed `matvecBatchK`, which is once per weight per chunk.
+    /// Milliseconds between two recorded events, waiting for the second.
+    ///
+    /// The wait is a HOST BLOCKING SYNCHRONISATION, so it must never appear on a
+    /// per-kernel profiling path: on the 525-token prefill it costs 41% of
+    /// throughput (436 -> 309 tok/s), i.e. the numbers it produces describe a
+    /// run that does not exist.  Kept only for the few call sites that genuinely
+    /// need the result now (prefill window end, token boundary).  Per-kernel
+    /// timings go through `evElapsedNsNoWait` against a pooled event pair.
     /// Returns null on error (and counts it) so the caller leaves the totals
     /// alone instead of adding a bogus 0.
     fn evElapsedNs(self: *CudaBackend, a: ?*anyopaque, b: ?*anyopaque) ?u64 {
@@ -6135,6 +6191,23 @@ const attn_score_arity: usize = 10;
             self.stat_n_ev_err += 1;
             return null;
         }
+        return self.evDeltaNs(a, b);
+    }
+
+    /// Non-blocking read of a completed event pair.  Returns null when the
+    /// second event has not finished yet, WITHOUT waiting -- the caller then
+    /// leaves the sample out rather than stalling the stream to collect it.
+    /// This is what makes the per-kernel numbers honest; see `EV_POOL`.
+    fn evElapsedNsNoWait(self: *CudaBackend, a: ?*anyopaque, b: ?*anyopaque) ?u64 {
+        const lib = if (self.cu) |*cu| &cu.lib else return null;
+        if (lib.EventQuery(b) != cudart.cudaSuccess) return null;
+        return self.evDeltaNs(a, b);
+    }
+
+    /// Shared tail of both readers: the actual `cudaEventElapsedTime`, which
+    /// does NOT synchronise on its own.
+    fn evDeltaNs(self: *CudaBackend, a: ?*anyopaque, b: ?*anyopaque) ?u64 {
+        const lib = if (self.cu) |*cu| &cu.lib else return null;
         var ms: f32 = 0;
         if (lib.EventElapsedTime(&ms, a, b) != cudart.cudaSuccess) {
             self.stat_n_ev_err += 1;
@@ -6145,6 +6218,43 @@ const attn_score_arity: usize = 10;
             return null;
         }
         return @intFromFloat(@as(f64, ms) * 1_000_000.0);
+    }
+
+    /// Read the pending per-call batchK samples that have completed.
+    ///
+    /// `wait` is for the end of a profile window: it blocks once (a single
+    /// `EventSynchronize` on the NEWEST pending sample, not one per kernel) so
+    /// the last few intervals are not lost.  The steady-state call passes false
+    /// and simply leaves unready samples queued.
+    fn drainBkEvents(self: *CudaBackend, wait: bool) void {
+        const lib = if (self.cu) |*cu| &cu.lib else return;
+        if (self.ev_pending_n == 0) return;
+        if (wait) {
+            const last = self.ev_pending[self.ev_pending_n - 1];
+            if (lib.EventSynchronize(self.ev_pool[last.slot + 1]) != cudart.cudaSuccess) {
+                self.stat_n_ev_err += 1;
+            }
+        }
+        var kept: usize = 0;
+        var i: usize = 0;
+        while (i < self.ev_pending_n) : (i += 1) {
+            const pend = self.ev_pending[i];
+            const a = self.ev_pool[pend.slot];
+            const b = self.ev_pool[pend.slot + 1];
+            if (self.evElapsedNsNoWait(a, b)) |ns| {
+                self.stat_ns_batchk_gpu += ns;
+                self.stat_n_batchk_gpu += 1;
+                const ti: usize = @intCast(pend.ttype);
+                if (ti < self.stat_ns_bk_by_type.len) {
+                    self.stat_ns_bk_by_type[ti] +|= ns;
+                    self.stat_n_bk_by_type[ti] +|= 1;
+                }
+            } else {
+                self.ev_pending[kept] = pend;
+                kept += 1;
+            }
+        }
+        self.ev_pending_n = kept;
     }
 
     /// Begin the device-side clock for one `matvecBatchK` call.  Records into the
@@ -6168,7 +6278,11 @@ const attn_score_arity: usize = 10;
             }
             self.ev_pre_started = true;
         }
-        if (lib.EventRecord(self.ev_bk_a, null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
+        // Record the call's start into the current ring pair.  `ev_bk_a` is
+        // still recorded on the very first call only, as the prefill window
+        // origin (it is a single event, so it cannot hold per-call data).
+        const wr = self.ev_pool_wr;
+        if (lib.EventRecord(self.ev_pool[wr], null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
     }
 
     /// Close the device-side clock for one `matvecBatchK` call.
@@ -6176,16 +6290,26 @@ const attn_score_arity: usize = 10;
     /// `ev_bk_b - ev_bk_a` is everything that call issued to the device.
     fn batchKTimingEnd(self: *CudaBackend) void {
         const lib = if (self.cu) |*cu| &cu.lib else return;
-        if (lib.EventRecord(self.ev_bk_b, null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
-        if (self.evElapsedNs(self.ev_bk_a, self.ev_bk_b)) |ns| {
-            self.stat_ns_batchk_gpu += ns;
-            self.stat_n_batchk_gpu += 1;
-            const ti: usize = @intCast(self.bk_ttype);
-            if (ti < self.stat_ns_bk_by_type.len) {
-                self.stat_ns_bk_by_type[ti] +|= ns;
-                self.stat_n_bk_by_type[ti] +|= 1;
-            }
+        const wr = self.ev_pool_wr;
+        // Close the ring pair the matching `batchKTimingBegin` opened.
+        if (lib.EventRecord(self.ev_pool[wr + 1], null) != cudart.cudaSuccess) self.stat_n_ev_err += 1;
+        // `EV_POOL/2` pairs can be outstanding, so the ring must not be
+        // wrapped onto a pair that is still pending.  With 128 pairs and the
+        // host never more than a few launches ahead of the device, a full ring
+        // means the device is far behind only if something else is wrong --
+        // drop the OLDEST sample (and count it) rather than corrupt the slot.
+        if (self.ev_pending_n == self.ev_pending.len) {
+            self.stat_n_ev_dropped += 1;
+            std.mem.copyForwards(@TypeOf(self.ev_pending[0]), self.ev_pending[0 .. self.ev_pending.len - 1], self.ev_pending[1..]);
+            self.ev_pending_n -= 1;
         }
+        self.ev_pending[self.ev_pending_n] = .{ .slot = @intCast(wr), .ttype = self.bk_ttype, .live = true };
+        self.ev_pending_n += 1;
+        self.ev_pool_wr = (wr + 2) % EV_POOL;
+        // Collect whatever has already completed.  A sample that is not ready
+        // yet stays pending -- dropping it would bias the totals toward the
+        // cheap calls, waiting for it is what this whole ring exists to avoid.
+        self.drainBkEvents(false);
         // Host wall clock spanned by the batchk calls of the prefill window.  A
         // monotonic host clock, incremented under the same `prefill_open` gate,
         // so this measures "first timed batchk entry -> last timed batchk exit"
@@ -6242,6 +6366,10 @@ const attn_score_arity: usize = 10;
                 self.stat_ns_prefill_span = ns;
             }
         }
+        // One blocking pass so the last intervals of the window are counted.
+        // Everything before this was collected non-blocking by the ring, so the
+        // queue stayed deep for the whole run -- which is the entire point.
+        self.drainBkEvents(true);
         // `reportProfile` has no call site on the CLI path (the engine is
         // arena-allocated, so `deinit` never runs), so this is the only place the
         // fully-formed decomposition is ever printed.
@@ -6305,7 +6433,7 @@ const attn_score_arity: usize = 10;
         // nothing here; counting it keeps the number honest when it does.
         const buf_bytes = self.d_act_bytes + self.d_xq_bytes + self.d_xqm_bytes + self.d_out_bytes + self.d_deq_bytes;
         std.debug.print(
-            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} gpu_ev_err={d}\n",
+            "CUDA-M  [{s}] matvec={d} batchk={d} dequant_row={d} up_MiB={d} h2d_kB={d} d2h_kB={d} resident_rows={d} bufs_MiB={d} iq_tbl_kB={d} t_mv_ms={d} t_bk_ms={d} t_dq_ms={d} hostpaths act={d} out={d} rope={d} rope_dev={d} bk_gpu_ms={d} bk_n={d} pre_wall_ms={d} pre_bkwall_ms={d} pre_span_ms={d} bk_launch={d} ev_sync_ms={d} ev_dropped={d} gpu_ev_err={d}\n",
             .{
                 when,
                 self.stat_n_matvec,
@@ -6356,6 +6484,7 @@ const attn_score_arity: usize = 10;
                 self.stat_ns_prefill_span / 1_000_000,
                 self.stat_n_launch_bk,
                 self.stat_ns_ev_sync / 1_000_000,
+                self.stat_n_ev_dropped,
                 self.stat_n_ev_err,
             },
         );
