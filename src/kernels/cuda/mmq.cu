@@ -727,6 +727,7 @@ struct Q35Iq3Xxs {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 4;   // 0.25f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    static constexpr bool iq1_delta = false;
 };
 struct Q35Iq3S {
     static constexpr int block_bytes = 110;
@@ -734,6 +735,7 @@ struct Q35Iq3S {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 1;   // 1.0f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    static constexpr bool iq1_delta = false;
 };
 struct Q35Iq2S {
     static constexpr int block_bytes = 82;
@@ -746,6 +748,7 @@ struct Q35Iq2S {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 8;   // 0.125f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    static constexpr bool iq1_delta = false;
 };
 // IQ4_XS: 136 B = d@0 (f16) | scales_h@2 (u16) | scales_l[4]@4 | qs[128]@8.
 // A plain 4-bit codebook lookup (kvalues_iq4nl, i.e. the iq4nl alias) with NO
@@ -765,6 +768,7 @@ struct Q35Iq4Xs {
     static constexpr int out_scale_q = 1;
     static constexpr int out_scale_den = 1;   // 1.0f
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    static constexpr bool iq1_delta = false;
 };
 // IQ2_XXS: 66 B = d@0 (f16) | qs[32] @2, read as 8 x { a[0..3] (4 grid indices)
 // + aux1 (u32) }.  iq2xxs_grid is u64 (8 uint8 magnitudes), the sign table is
@@ -785,6 +789,66 @@ struct Q35Iq2Xxs {
     // out_scale_den = 4 here doubles every output (MVCHECK: dev == 2 * cpu on
     // every row, mismatched=163839).
     static constexpr int out_scale_den = 8;   // 0.125f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    static constexpr bool iq1_delta = false;
+};
+// IQ2_XS: 74 B = d@0 (f16) | qs[32] @2, read as 16 uint16 | scales[8] @66.
+// The uint16 at qs[2*ib32+l] is NOT two nibbles: bits 0..8 index iq2xs_grid
+// (512 entries, u64 of 8 uint8 magnitudes), bits 9..15 are the 7-bit sign code.
+// That is why this cannot share IQ2_XXS's unpacker even though the grid and the
+// sign table are the same ones.
+//
+// Scale granularity is 16, NOT 32: dequantize_row_iq2_xs (ggml-quants.c:2528)
+// builds db[0] from the low nibble of scales[ib32] and db[1] from the high
+// nibble, and `l/2` selects between them, so elements 0..15 and 16..31 of a
+// 32-element group carry DIFFERENT floats.  A k32 mma would mix them -- the
+// same trap Q35Iq2S documents.  Hence scale16 = true.
+//
+// Source of truth: ggml-quants.c dequantize_row_iq2_xs (line 2517) and
+// ggml-common.h block_iq2_xs (line 389).
+struct Q35Iq2Xs {
+    static constexpr int block_bytes = 74;
+    static constexpr bool scale16 = true;
+    static constexpr int out_scale_q = 1;
+    // db = d * (0.5f + nib) * 0.25f, with ls = 2*nib + 1 the odd scale the
+    // integer domain carries: 0.25*(0.5+nib) == 0.125*(2*nib+1), so the float
+    // tail is 0.125f exactly (same identity as IQ2_XXS, so the same denominator).
+    static constexpr int out_scale_den = 8;   // 0.125f
+    __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
+    static constexpr bool iq1_delta = false;
+};
+
+// IQ1_S: 50 B = d@0 (f16) | qs[32] @2 | qh[16] @34 (u16 x 16).
+// Each group of 32 elements owns 4 `qs` bytes and one `qh` u16:
+//   grid index = qs[l] | (((qh >> 3l) & 7) << 8)     -> iq1s_grid, 2048 entries
+//   scale      = 2*((qh >> 12) & 7) + 1              -> ONE per 32 elements
+//   delta      = (qh & 0x8000) ? -0.125 : +0.125
+//
+// Two things make this the awkward one:
+//  * `iq1s_grid` holds SIGNED int8 (-1/0/+1), unlike the unsigned magnitude
+//    tables the other traits expand.  It therefore needs no sign fold at all --
+//    the u64's two halves drop straight into p[] as four int8 lanes each, which
+//    is exactly what vecdotq.cuh:1200 does with dp4a.
+//  * the +-0.125 delta is NOT an integer multiple of the scale, so it cannot be
+//    folded into `p` or `ls`.  It rides along as a separate float term built
+//    from the q8_K per-16 sums, the same decomposition
+//    q35_vec_dot_iq1_s_q8_k_part uses:
+//        tot = d * (sumi + 0.125 * sumi1),  sumi1 = sum over groups of
+//        ls * delta_sign * (bsum[2i] + bsum[2i+1])
+//    The kernel adds that in its float tail; see Q35_IQ1_DELTA below.
+//
+// Source of truth: ggml-quants.c dequantize_row_iq1_s (line 2651) and
+// ggml-common.h block_iq1_s (line 425).
+struct Q35Iq1S {
+    static constexpr int block_bytes = 50;
+    static constexpr bool scale16 = false;
+    static constexpr int out_scale_q = 1;
+    // dl = d * ls with ls = 2*hi+1, so the integer domain carries it exactly and
+    // the float tail is 1.0f.  The 0.125 lives only in the delta term.
+    static constexpr int out_scale_den = 1;
+    /// True when the type needs the `sumi + 0.125 * sumi1` decomposition in the
+    /// float tail (currently IQ1_S).
+    static constexpr bool iq1_delta = true;
     __device__ static void group(const unsigned char *wb, int g, int p[8], int ls[2]);
 };
 
@@ -930,6 +994,52 @@ __device__ void Q35Iq2Xxs::group(const unsigned char *wb, int g, int p[8], int l
     // 0.25*(0.5+hi) == 0.125*(2*hi+1) exactly (both are powers of two times an
     // odd integer, so the identity is bit-exact in f32).
     ls[0] = ls[1] = 2 * (int)(aux1 >> 28) + 1;
+}
+
+__device__ void Q35Iq2Xs::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // Group g owns the four uint16 at qs + 8*g (2 bytes each).  Element order is
+    // l*8 + j (dequantize_row_iq2_xs:2530), so each 8-byte grid straddles two
+    // p[] ints exactly like IQ2_XXS: low four magnitude bytes -> p[2l], high
+    // four -> p[2l+1].
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int q = (unsigned int)wb[2 + 8 * g + 2 * l]
+                             | ((unsigned int)wb[2 + 8 * g + 2 * l + 1] << 8);
+        const unsigned int sgn = q35_iq_signs8((q >> 9) & 127u);
+        const unsigned long long grid = iq2xs_grid[q & 511u];
+        const int g1 = (int)(unsigned int)(grid & 0xFFFFFFFFull);
+        const int g2 = (int)(unsigned int)(grid >> 32);
+        const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+        const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+        p[2 * l + 0] = __vsub4(g1 ^ s0, s0);
+        p[2 * l + 1] = __vsub4(g2 ^ s1, s1);
+    }
+    // 16-element granularity: scales[g] low nibble -> elements 0..15, high
+    // nibble -> 16..31.  ls must be the same odd integer the float side divides
+    // out (2*nib + 1), and the kernel applies ls[0] to the first group of 16 and
+    // ls[1] to the second when scale16 is set.
+    const unsigned char sc = wb[66 + g];
+    ls[0] = 2 * (int)(sc & 0x0F) + 1;
+    ls[1] = 2 * (int)(sc >> 4) + 1;
+}
+
+__device__ void Q35Iq1S::group(const unsigned char *wb, int g, int p[8], int ls[2]) {
+    // 50 B = d@0 (f16) | qs[32]@2 | qh[16]@34.  Group g owns qs + 4*g and the
+    // u16 at qh + 2*g.  Element order is l*8 + j, so the grid's two uint32
+    // halves land in p[2l] and p[2l+1] -- same shape as IQ2_XXS, except the
+    // table is already int8 so there is no sign expansion to do.
+    const unsigned int qh = (unsigned int)wb[34 + 2 * g]
+                          | ((unsigned int)wb[34 + 2 * g + 1] << 8);
+#pragma unroll
+    for (int l = 0; l < 4; ++l) {
+        const unsigned int idx = (unsigned int)wb[2 + 4 * g + l]
+                               | (((qh >> (3 * l)) & 7u) << 8);
+        const unsigned long long grid = iq1s_grid[idx & 2047u];
+        p[2 * l + 0] = (int)(unsigned int)(grid & 0xFFFFFFFFull);
+        p[2 * l + 1] = (int)(unsigned int)(grid >> 32);
+    }
+    // ONE scale per 32 elements, so both halves share it.
+    ls[0] = ls[1] = 2 * (int)((qh >> 12) & 7u) + 1;
 }
 
 // NWARPS is a template argument, not a constant, so the launch shape can be
@@ -1225,8 +1335,33 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                 // T::out_scale_q * OUT_SCALE_DEN: an integer template argument
                 // times a power-of-two denominator, because C++ forbids a
                 // floating-point template parameter.  Both factors are exact.
+                int tot = isum[l];
+                if (T::iq1_delta) {
+                    // IQ1_S: the per-32 quantized value is ls*(grid + delta) with
+                    // delta = +-0.125, so the integer dot above only covers the
+                    // grid part.  The delta part is ls*delta*sum(activations) --
+                    // a per-16-element sum, which Q8_K already carries as bsums.
+                    // Identical decomposition to vecdotq.cuh:1210
+                    // q35_vec_dot_iq1_s_q8_k_part.
+                    // `isum[l]` is the whole 256-element integer dot (all 8
+                    // groups already folded in by the mma loop above), so the
+                    // delta sum must span the same 16 per-16-element bsums.
+                    int sm = 0;
+                    for (int j = 0; j < 16; ++j) {
+                        const unsigned int qh = (unsigned int)wb[34 + 2 * j]
+                                              | ((unsigned int)wb[34 + 2 * j + 1] << 8);
+                        const int sg = (qh & 0x8000u) ? -1 : 1;
+                        const int lj = 2 * (int)((qh >> 12) & 7u) + 1;
+                        sm += lj * sg * q35_q8k_bsum(yb, j);
+                    }
+                    const float totf = __fadd_rn((float)isum[l],
+                                                 __fmul_rn(0.125f, (float)sm));
+                    acc[ti][l] = __fadd_rn(acc[ti][l], __fmul_rn(
+                        __fmul_rn(d, totf), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
+                    continue;
+                }
                 acc[ti][l] = __fadd_rn(acc[ti][l], __fmul_rn(
-                    __fmul_rn(d, (float)isum[l]), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
+                    __fmul_rn(d, (float)tot), (float)OUT_SCALE_Q / (float)OUT_SCALE_DEN));
             }
         }
     }
@@ -1751,6 +1886,7 @@ static cudaError_t mmq_mma_iq_launch(const unsigned char *d_w, const unsigned ch
         case Q35_TT_IQ2_S:   Q35_IQ_LAUNCH(Q35Iq2S);   break;
         case Q35_TT_IQ4_XS:  Q35_IQ_LAUNCH(Q35Iq4Xs);  break;
         case Q35_TT_IQ2_XXS: Q35_IQ_LAUNCH(Q35Iq2Xxs); break;
+        case Q35_TT_IQ2_XS:  Q35_IQ_LAUNCH(Q35Iq2Xs);  break;
         default:
             return (cudaError_t)-1;
     }
@@ -1899,7 +2035,7 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     }
     if (info.block_elems == 256 && q35_mma_iq_enabled(ttype) &&
         (ttype == Q35_TT_IQ3_XXS || ttype == Q35_TT_IQ3_S || ttype == Q35_TT_IQ2_S ||
-         ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS)) {
+         ttype == Q35_TT_IQ4_XS || ttype == Q35_TT_IQ2_XXS || ttype == Q35_TT_IQ2_XS)) {
         return (int)mmq_mma_iq_launch(d_w, d_xq, d_out, rows, cols, tokens, ttype, stream);
     }
 
@@ -1912,8 +2048,15 @@ extern "C" int q35_launch_mul_mat_vec_tile(const void *d_w_v, const void *d_xq_v
     // here:  IQ4_XS done (1 scale per 32 elements, signed ls, no sign table),
     // IQ2_XXS done (u64 grid -> 8 unsigned magnitude bytes, 7-bit ksigns
     // expansion, 1 positive odd scale per 32 elements = the IQ3_XXS shape).
-    // Still falling back: IQ1_S/IQ1_M (1 element per 8-bit grid entry, so the
-    // int8 staging this kernel does would need a different unpack), IQ2_XS
-    // (8-bit grid entries + 7-bit signs, no k32-friendly scale).
+    // Still falling back: IQ1_S, IQ1_M.  A Q35Iq1S trait exists and unpacks
+    // correctly enough to launch, but its integer dot comes out 4x too small
+    // on a unit probe (iq1s_grid[0] all -1, 256 elements, ls=1 should give
+    // -256 and gives -64), so it is NOT registered.  The p[] element order for
+    // a SIGNED int8 table is the suspect -- the other traits all expand an
+    // unsigned magnitude and fold signs explicitly, which is not the same
+    // layout.  Do not wire it up until a probe explains the factor.
+    // IQ2_XS is done: its uint16 grid index + 7-bit sign code unpack into the
+    // same 8-byte magnitude shape as IQ2_XXS, and its two per-16 scales go
+    // through the existing scale16 path (see Q35Iq2Xs).
     return -1;
 }
