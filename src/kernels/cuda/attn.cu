@@ -531,7 +531,6 @@ __global__ void q35_attn_decode_kernel_coal(
     // why the t-loop is outside the shuffle: unlike the score reduction, no
     // reassociation happens here).
     float *__restrict__ gout = d_gout + (size_t)h * hd;
-    float acc = 0.0f;
     int j = warp * 32 + lane;
     const int jstep = nwarps * 32;
     for (; j < hd; j += jstep) {
@@ -541,7 +540,6 @@ __global__ void q35_attn_decode_kernel_coal(
             a = __fadd_rn(a, __fmul_rn(s_scores[t], vcol[(size_t)t * kv_dim]));
         gout[j] = a;
     }
-    (void)acc;
 }
 
 extern "C" void *q35_func_attn_decode_coal(void) { return (void *)&q35_attn_decode_kernel_coal; }
@@ -608,14 +606,12 @@ __global__ void q35_attn_decode_kernel_split(
     if (h >= heads) return;
     const int n = slot + 1;
     const int kvh = h / gqa;
-    const float *__restrict__ qs = d_q + (size_t)h * hd;
 
     // Contiguous slice of rows for this block (last block takes the remainder).
     const int per = (n + split - 1) / split;
     const int t0 = s * per;
     const int t1 = min(n, t0 + per);
     const int cnt = t1 > t0 ? t1 - t0 : 0;
-    extern __shared__ float s_scratch_unused[];
 
     // NOTE the softmax is NOT computed here.  Each block used to normalise by
     // its OWN slice's max/sum, which is wrong: the softmax is over the whole row.
@@ -633,7 +629,6 @@ __global__ void q35_attn_decode_kernel_split(
             a = __fadd_rn(a, __fmul_rn(prob[i], vcol[(size_t)(t0 + i) * kv_dim]));
         part[j] = a;
     }
-    (void)qs; (void)s_scratch_unused;
 }
 
 // Reduce the per-block PV partials in slice order, apply the gate.

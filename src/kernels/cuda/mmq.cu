@@ -498,9 +498,19 @@ __global__ void q35_k_mmq_mma_k256(const unsigned char *__restrict__ w,
     // self-contained but staging the whole block means ONE __syncwarp() per
     // block instead of 16, and the per-row scales are unpacked once instead of
     // once per group -- that was most of the cost in the first version.
-    __shared__ int8_t sA[8 * 16 * 256];
-    __shared__ int8_t sB[8 * 256];
-    int8_t *sAw = sA + warp * 16 * 256;
+    // Row stride is 256+16, NOT 256: a power-of-two shared stride makes every
+    // lane in a warp hit the same bank when `ldmatrix` walks rows, and the IQ
+    // kernel (which uses the same staging shape) has carried this padding since
+    // it was written -- see SA_STRIDE in q35_k_mmq_mma_iq.  16 B keeps the
+    // ldmatrix alignment requirement (rows start 16 B apart, which is what
+    // `load_ldmatrix` needs) while breaking the bank alias.
+    constexpr int SA_STRIDE = 256 + 16;
+    __shared__ int8_t sA[8 * 16 * SA_STRIDE];
+    // Same bank-alias reasoning as SA_STRIDE above; `sB` is read by
+    // `load_generic` walking 8 token rows 256 B apart.
+    constexpr int SB_STRIDE = 256 + 16;
+    __shared__ int8_t sB[8 * SB_STRIDE];
+    int8_t *sAw = sA + warp * 16 * SA_STRIDE;
     __shared__ int sScv[8 * 16 * 16];    // per-warp, per-row group scales
     int *scv_w = sScv + warp * 16 * 16;
 
@@ -517,7 +527,7 @@ __global__ void q35_k_mmq_mma_k256(const unsigned char *__restrict__ w,
         // thread-per-row; whole-row aux8 is what the dp4a path already does).
         if (row_live && lane < 16) {
             const unsigned char *wb = wb0 + (size_t)lane * (size_t)nblk * block_bytes;
-            q35_mma_k_aux8(ttype, wb, sAw + lane * 256);
+            q35_mma_k_aux8(ttype, wb, sAw + lane * SA_STRIDE);
             int scv[16];
             unsigned char smv[16];
             q35_mma_k_scales(ttype, wb, scv, smv);
@@ -542,7 +552,7 @@ __global__ void q35_k_mmq_mma_k256(const unsigned char *__restrict__ w,
             const int trow = tid / 32;      // which of the 8 tokens
             const int tcol = tid % 32;      // byte column, 8 per step
             if (trow < 8) {
-                int8_t *dst = sB + trow * 256 + tcol * 8;
+                int8_t *dst = sB + trow * SB_STRIDE + tcol * 8;
                 if (t0 + trow < tokens) {
                     const unsigned char *row =
                         xq + (size_t)(t0 + trow) * (size_t)nblk * 292 + (size_t)b * 292 + 4;
@@ -560,8 +570,8 @@ __global__ void q35_k_mmq_mma_k256(const unsigned char *__restrict__ w,
             q35_tile<16, 4, int> A_frag;
             q35_tile<8, 4, int> B_frag;
             q35_tile<16, 8, int> D;
-            q35_mma::load_ldmatrix(A_frag, (const int *)(sAw + g * 16), 64);
-            q35_mma::load_generic(B_frag, (const int *)(sB + g * 16), 64);
+            q35_mma::load_ldmatrix(A_frag, (const int *)(sAw + g * 16), SA_STRIDE / 4);
+            q35_mma::load_generic(B_frag, (const int *)(sB + g * 16), SB_STRIDE / 4);
             q35_mma::mma(D, A_frag, B_frag);
             // Row of each lane's fragment register, so the scale lookup is
             // scv_w[row][g] (per-row, per-group).
