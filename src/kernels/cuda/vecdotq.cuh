@@ -656,16 +656,20 @@ Q35_DEV float q35_vec_dot_iq2_xxs_q8_k_acc(const unsigned char *w,
         const unsigned char *a = q2 + ib32 * 8;
         const unsigned int aux1 = q35_ld_u32(a + 4);
         const float db = __fmul_rn(__fmul_rn(d, 0.5f + (float)(aux1 >> 28)), 0.25f);
+        int sumi = 0;
         for (int l = 0; l < 4; ++l) {
             const unsigned long long grid = iq2xxs_grid[a[l]];
-            const unsigned char signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
-            for (int j = 0; j < 8; ++j) {
-                signed char g = (signed char)((grid >> (8 * j)) & 0xFF);
-                if ((signs >> j) & 1) g = (signed char)(-g);
-                sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(db, (float)g),
-                                               (float)q8[ib32 * 32 + l * 8 + j]));
-            }
+            const int g1 = (int)(unsigned int)(grid & 0xFFFFFFFFull);
+            const int g2 = (int)(unsigned int)(grid >> 32);
+            const unsigned int sgn = q35_iq_signs8((aux1 >> (7 * l)) & 127);
+            const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+            const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+            sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                            (int)q35_ld_u32((const unsigned char *)q8 + ib32 * 32 + l * 8), sumi);
+            sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                            (int)q35_ld_u32((const unsigned char *)q8 + ib32 * 32 + l * 8 + 4), sumi);
         }
+        sum = __fadd_rn(sum, __fmul_rn(db, (float)sumi));
     }
     return sum;
 }
@@ -732,16 +736,36 @@ Q35_DEV float q35_vec_dot_iq2_xxs_q8_k_part(const unsigned char *w,
         const unsigned char *a = q2 + ib32 * 8;
         const unsigned int aux1 = q35_ld_u32(a + 4);
         const float db = __fmul_rn(__fmul_rn(d, 0.5f + (float)(aux1 >> 28)), 0.25f);
+        // The 8 grid bytes are int8 values and the sign code is a bit mask per
+        // element, so the whole sub-block folds into two dp4a per grid entry:
+        // expand the 7-bit code to a 0x00/0xFF byte mask (q35_iq_signs8), apply
+        // it with the same __vsub4 negation idiom the IQ3_XXS body uses, and let
+        // dp4a do four int8 products at once.  The scalar version multiplied
+        // one element at a time and chained a float FADD per element, which is
+        // why this type moved the weights at only 373 GB/s.
+        int sumi = 0;
         for (int l = 0; l < 4; ++l) {
             const unsigned long long grid = iq2xxs_grid[a[l]];
-            const unsigned char signs = ksigns_iq2xs[(aux1 >> (7 * l)) & 127];
-            for (int j = 0; j < 8; ++j) {
-                signed char g = (signed char)((grid >> (8 * j)) & 0xFF);
-                if ((signs >> j) & 1) g = (signed char)(-g);
-                sum = __fadd_rn(sum, __fmul_rn(__fmul_rn(db, (float)g),
-                                               (float)q8[l * 8 + j]));
-            }
+            const int g1 = (int)(unsigned int)(grid & 0xFFFFFFFFull);
+            const int g2 = (int)(unsigned int)(grid >> 32);
+            // q35_iq_signs8 broadcasts the 7-bit code to one 0/1 BYTE per
+            // element; __vsub4 needs a 0x00/0xFF mask on the right GROUP of four
+            // bytes, so split it into the low and high 4-element halves with
+            // __vcmpne4 -- the same two-step idiom the IQ3_XXS body uses.  Using
+            // the 0/1 word directly as the mask silently negated the wrong
+            // elements: MVCHECK still reported mismatched=0 (it only exercises
+            // the batchk path) while the token stream collapsed to repeated
+            // fragments times (the 0/1 value XORed in, then subtracted, leaves
+            // the grid byte unchanged rather than negated).
+            const unsigned int sgn = q35_iq_signs8((aux1 >> (7 * l)) & 127);
+            const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+            const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+            sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                            (int)q35_ld_u32((const unsigned char *)q8 + l * 8), sumi);
+            sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                            (int)q35_ld_u32((const unsigned char *)q8 + l * 8 + 4), sumi);
         }
+        sum = __fadd_rn(sum, __fmul_rn(db, (float)sumi));
         q8 += 32;
     }
     return sum;
