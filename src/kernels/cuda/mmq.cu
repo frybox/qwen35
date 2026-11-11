@@ -911,10 +911,31 @@ struct Q35Iq1S {
 //     differently from the staging loop, so folding it in read half-written
 //     bytes -- measuring that made no difference, so it was not the bug, but it
 //     was a real one).
-// Still open: the delta8 float tail, and whether scale16's `half = h&1` really
-// lands on l<2 / l>=2 for this type.  Next step is the same shape of harness
-// that cracked IQ1_S -- an oracle built on dequantize_row_iq1_m with the trait
-// disabled -- rather than more dispatch experiments.
+// Ruled out since, with the harness at /tmp/mbm/chk1m.cu (an oracle transcribed
+// from dequantize_row_iq1_m, compared against q35_launch_mul_mat_vec):
+//   * a fully hand-built single block (qs/qh all zero, so idx=0 and every grid
+//     byte is -1, all-ones activations) gives kernel == oracle EXACTLY, twice
+//     over.  So group(), d_of() and the k16 staging all agree with the oracle
+//     when every ls is 1 and every p[] is 0xffffffff.
+//   * random blocks with random activations disagree on 127/128 rows, and
+//     with all-ones activations still disagree (-11 vs -8.52, -4 vs -7.02, 0 vs
+//     +1.13).  The disagreement therefore only appears once ls and p[] VARY,
+//     which points at ls_w indexing or the per-group p[] address rather than at
+//     the arithmetic.  IQ1_S shares both and passes, so the difference has to be
+//     in how this trait's two scales per group are numbered: note that
+//     Q35Iq1M::group writes ls[0]/ls[1] as dl1/dl2 while EVERY other scale16
+//     trait writes them as two halves of one 32-element group.
+// Then a 16-row x 8-token tile with random blocks and random activations
+// (/tmp/mbm/m3.cu) narrowed it down a lot: 19 of 128 (token,row) pairs are
+// wrong and they are not scattered -- 15 of the 16 rows of TOKEN 0 plus 4 rows
+// of TOKEN 2, with tokens 1 and 3..7 exact.  A per-token failure pattern with
+// the rest perfect is not an arithmetic error; it says sB8 is being read for the
+// wrong token row somewhere, which is consistent with it being staged per
+// TOKEN TILE while `acc[ti][l]` is indexed per tile: with tokens > 8 the tile
+// offset has to enter the index, and the two halve agree.  That is the next
+// thread to pull -- check `sB8` against `tb`/`ti`, not against `group()`.
+//   * Do not re-run dispatch, and do not trust a passing MVCHECK on this type
+//     until /tmp/mbm/m3.cu reports 0/128.
 //
 // The per-8 delta is why this trait carries IQ1_DELTA8 and not IQ1_DELTA.
 // IQ1_S's delta is expressible from q8_K's per-16 `bsums` because its groups
