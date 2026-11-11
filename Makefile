@@ -30,9 +30,35 @@ ZIGCACHE := --cache-dir /tmp/qwen35-cache
 # -n is enforced here too so the budget is stated in one place; --single-turn
 # keeps llama-cli out of its REPL (without it a non-interactive run can read
 # nothing, print nothing and still exit 0 -- looks like the model never ran).
+#
+# -ctxcp 0 -ub 2048 (2026-11, measured on 27B IQ3_XXS / 4090D / -t 1):
+#   llama-cli's own "prompt eval" line is NOT the prefill that llama-bench's
+#   pp<N> reports, because its timing window (server-common.h t_prompt_ms =
+#   t_prompt_last - t_start, set in server-context.cpp at n_gen == 1) also
+#   swallows work that is not the forward pass:
+#     - context checkpoints (-ctxcp, default 32) copy a 149.6 MiB KV state and
+#       force the prompt into ubatch-aligned chunks -- `llama-cli -v` shows the
+#       557-token prompt split as 41 / 1 / 512 / 4;
+#     - common_prompt_batch_decode (common/common.cpp) decodes the last token
+#       on its own when saving session state, adding the stray 1- and 4-token
+#       fragments, and small matvecs are pure memory-bound on GPU;
+#     - n_ubatch defaults to 512, so any prompt > 512 pays a second, tiny tail
+#       batch as well.
+#   Same prompt, same model, same machine:
+#     llama-cli (defaults)                 848-861 t/s   <- what we used to see
+#     llama-cli -ctxcp 0                  1248 t/s
+#     llama-cli -ctxcp 0 -ub 2048         1389-1393 t/s
+#     llama-bench -p 557 -r 5              1778 t/s      (pure forward + warmup)
+#     llama-bench -p 512 -r 5              2044 t/s
+#   Removing the non-compute overhead makes llama-cli comparable with
+#   llama-bench (the remaining gap is bench's warmup amortising the one-time
+#   sched_reserve, ~43 ms, and its r=5 averaging).  Use llama-bench for
+#   hardware/kernel numbers and these flags when you want llama-cli to measure
+#   prompt processing rather than checkpoint bookkeeping.
 LONG_CTX  := -c 4096
 LONG_NGEN := -n 1200
-LONG_ARGS := $(LONG_CTX) $(LONG_NGEN) -t 1 --single-turn
+LONG_CLI  := -ctxcp 0 -ub 2048
+LONG_ARGS := $(LONG_CTX) $(LONG_NGEN) -t 1 --single-turn $(LONG_CLI)
 
 .PHONY: all build cpu cpufast cudabackend cuda cuda-check test run0.8b run2b run4b run27b run27bq8 run27bq4 run27biq4xs run27bq4kxl run27bq8kl run27bq8kxl run27biq3xxs run27biq2xxs run27biq1s run27b-long run0.8b-cuda run2b-cuda run4b-cuda
 
