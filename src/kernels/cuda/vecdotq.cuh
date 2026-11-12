@@ -157,6 +157,25 @@ Q35_DEV unsigned int q35_iq_signs8(unsigned int v7) {
     return (v7 ^ (p << 7)) * 0x01010101u;
 }
 
+// One 8-element IQ2_XS group as two dp4a, shared by every IQ2_XS body so the
+// grid/sign expansion exists once.  `v` is the u16 index: low 9 bits select the
+// `iq2xs_grid` entry (8 packed int8 values), high 7 bits are the sign mask code.
+Q35_DEV int q35_iq2xs_group_dp4a(unsigned short v,
+                                                const signed char *q8, int sumi) {
+    const unsigned long long g = iq2xs_grid[v & 511];
+    const int g1 = (int)(unsigned int)(g & 0xFFFFFFFFull);
+    const int g2 = (int)(unsigned int)(g >> 32);
+    const unsigned int sgn = q35_iq_signs8(v >> 9);
+    const int s0 = __vcmpne4(sgn & 0x08040201u, 0u);
+    const int s1 = __vcmpne4(sgn & 0x80402010u, 0u);
+    sumi = q35_dp4a(__vsub4(g1 ^ s0, s0),
+                    (int)q35_ld_u32((const unsigned char *)q8), sumi);
+    sumi = q35_dp4a(__vsub4(g2 ^ s1, s1),
+                    (int)q35_ld_u32((const unsigned char *)q8 + 4), sumi);
+    return sumi;
+}
+
+
 // Four 4-bit indices -> the four int8 table values, in index order, as one
 // packed 32-bit word ready for q35_dp4a.  Ported from the CUDA branch of
 // llama.cpp's `get_int_from_table_16` (ggml-cuda/vecdotq.cuh:60).  A 16-entry
@@ -689,35 +708,22 @@ Q35_DEV float q35_vec_dot_iq2_xs_q8_k_acc(const unsigned char *w,
     const signed char *q8 = q35_q8k_qs(y);
     int bsum = 0;
     for (int ib32 = 0; ib32 < 8; ++ib32) {
-        const unsigned short ls1 = (unsigned short)(2 * (sc[ib32] & 0xF) + 1);
-        const unsigned short ls2 = (unsigned short)(2 * (sc[ib32] >> 4) + 1);
-        const unsigned short *q = (const unsigned short *)(q2 + ib32 * 8);
-        int sumi = 0;
+        const int ls1 = 2 * (sc[ib32] & 0xF) + 1;
+        const int ls2 = 2 * (sc[ib32] >> 4) + 1;
+        const unsigned char *q = q2 + ib32 * 8;
+        // Same two dp4a per 8-element group as the `_part` body; see
+        // `q35_iq2xs_group_dp4a` for why the scalar chain was replaced.
+        int sumi1 = 0, sumi2 = 0;
         for (int l = 0; l < 2; ++l) {
-            const unsigned short v = q35_ld_u16((const unsigned char *)(q + l));
-            const unsigned long long g = iq2xs_grid[v & 511];
-            const unsigned char signs = ksigns_iq2xs[v >> 9];
-            for (int j = 0; j < 8; ++j) {
-                const int wv = (int)((g >> (8 * j)) & 0xFF);
-                sumi += wv * (int)q8[j] * ((signs & kmask_iq2xs[j]) ? -1 : 1);
-            }
-            q8 += 8;
+            sumi1 = q35_iq2xs_group_dp4a(q35_ld_u16(q + 2 * l), q8 + 8 * l, sumi1);
         }
-        bsum += sumi * ls1;
-        sumi = 0;
         for (int l = 2; l < 4; ++l) {
-            const unsigned short v = q35_ld_u16((const unsigned char *)(q + l));
-            const unsigned long long g = iq2xs_grid[v & 511];
-            const unsigned char signs = ksigns_iq2xs[v >> 9];
-            for (int j = 0; j < 8; ++j) {
-                const int wv = (int)((g >> (8 * j)) & 0xFF);
-                sumi += wv * (int)q8[j] * ((signs & kmask_iq2xs[j]) ? -1 : 1);
-            }
-            q8 += 8;
+            sumi2 = q35_iq2xs_group_dp4a(q35_ld_u16(q + 2 * l), q8 + 8 * l, sumi2);
         }
-        bsum += sumi * ls2;
+        bsum += sumi1 * ls1 + sumi2 * ls2;
+        q8 += 32;
     }
-    return __fadd_rn(acc, __fmul_rn(__fmul_rn(d, (float)bsum), 0.125f));
+    return __fmul_rn(__fadd_rn(acc, __fmul_rn(__fmul_rn(d, (float)bsum), 0.125f)), 1.0f);
 }
 
 // IQ2_XXS `_part` over the eight 32-element `ib32` groups `[lo, hi)`.
@@ -785,34 +791,32 @@ Q35_DEV float q35_vec_dot_iq2_xs_q8_k_part(const unsigned char *w,
     const signed char *q8 = q35_q8k_qs(y) + 32 * lo;
     int bsum = 0;
     for (int ib32 = lo; ib32 < hi; ++ib32) {
-        const unsigned short ls1 = (unsigned short)(2 * (sc[0] & 0xF) + 1);
-        const unsigned short ls2 = (unsigned short)(2 * (sc[0] >> 4) + 1);
+        const int ls1 = 2 * (sc[0] & 0xF) + 1;
+        const int ls2 = 2 * (sc[0] >> 4) + 1;
         sc++;
-        const unsigned short *q = (const unsigned short *)(q2 + ib32 * 8);
-        int sumi = 0;
+        const unsigned char *q = q2 + ib32 * 8;
+        // dp4a, not the element-at-a-time float chain this body used to be.
+        // The scalar loop multiplied one int8 at a time and FADD-chained the
+        // result, which moved 17408x5120 at 438 GB/s -- the worst of the
+        // split-capable types and below the 543 GB/s of IQ2_XXS, whose grid
+        // expansion is the same shape.  `iq2xs_grid[v & 511]` gives 8 int8
+        // values as one u64, so each 8-element group folds into two dp4a exactly
+        // like IQ2_XXS: split the grid into two 4-byte halves and apply the sign
+        // mask with `__vsub4`/`__vcmpne4` (the 0/1 word used directly as a mask
+        // is wrong -- see the IQ2_XXS note on `q35_iq_signs8`).
+        //
+        // `v >> 9` is the same 7-bit sign code IQ2_XXS unpacks, so
+        // `q35_iq_signs8` applies unchanged.  The two halves stay separate
+        // accumulators because they are weighted by different scales.
+        int sumi1 = 0, sumi2 = 0;
         for (int l = 0; l < 2; ++l) {
-            const unsigned short v = q35_ld_u16((const unsigned char *)(q + l));
-            const unsigned long long g = iq2xs_grid[v & 511];
-            const unsigned char signs = ksigns_iq2xs[v >> 9];
-            for (int j = 0; j < 8; ++j) {
-                const int wv = (int)((g >> (8 * j)) & 0xFF);
-                sumi += wv * (int)q8[j] * ((signs & kmask_iq2xs[j]) ? -1 : 1);
-            }
-            q8 += 8;
+            sumi1 = q35_iq2xs_group_dp4a(q35_ld_u16(q + 2 * l), q8 + 8 * l, sumi1);
         }
-        bsum += sumi * ls1;
-        sumi = 0;
         for (int l = 2; l < 4; ++l) {
-            const unsigned short v = q35_ld_u16((const unsigned char *)(q + l));
-            const unsigned long long g = iq2xs_grid[v & 511];
-            const unsigned char signs = ksigns_iq2xs[v >> 9];
-            for (int j = 0; j < 8; ++j) {
-                const int wv = (int)((g >> (8 * j)) & 0xFF);
-                sumi += wv * (int)q8[j] * ((signs & kmask_iq2xs[j]) ? -1 : 1);
-            }
-            q8 += 8;
+            sumi2 = q35_iq2xs_group_dp4a(q35_ld_u16(q + 2 * l), q8 + 8 * l, sumi2);
         }
-        bsum += sumi * ls2;
+        bsum += sumi1 * ls1 + sumi2 * ls2;
+        q8 += 32;
     }
     return __fmul_rn(__fmul_rn(d, (float)bsum), 0.125f);
 }
