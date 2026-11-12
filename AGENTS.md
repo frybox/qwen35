@@ -376,12 +376,27 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
        是 0.860 ms 的 **16%**。但把 `MAX_TILES` 提到 16 让一个 block 吃下 525 token
        实测 **1431 vs 1497，更差**（acc[] 溢到 local memory，旧注释早有记载）。
        L2（72 MB）确实吸收得比预想好。
-     - **结论**：剩余 1.65× 是 mma 稳态的"每条 mma 夹带多少非 mma 工作"问题，
-       我们约 13 条指令/mma（16 mma + 128 LDS + 64 IMAD 的账），
-       但把 LDS 和 IMAD 分别去掉都测不出收益 —— 说明瓶颈在被编译器合并后的
-       实际指令流里，而不是按源码数出来的那几类。**要再往下必须拿到 SASS**
-       （`cuobjdump` 不认 sm_89、`ncu` 无权限，见 §Blocked），
-       否则继续靠猜测改只会得到噪声级结果。
+     - **【已解决】工具链阻塞**：CUDA 13.2 的 `cuobjdump`/`nvdisasm` 能反汇编 sm_89
+       （12.0 版报 `Support for 'sm_4' has been removed`）；`ncu` 的阻塞是驱动参数
+       `RmProfilingAdminOnly=1`，设为 0 后可用（`/etc/modprobe.d/nvidia-profiling.conf`，
+       重启生效；之前用 `sudo ncu` 也行）。**有了 SASS + ncu 之后下面这些都是实测，不是推断。**
+     - **SASS 实测（修掉了一个错误结论）**：热循环是 8 IMMA 配 35 LDS + 25 IMAD。
+       之前据此断定"IMAD 是 mma 的 4.7 倍所以是瓶颈"——**错了**。
+       探针 `/tmp/mmc/mix.cu` 每条 mma 加 4 或 8 条 IMAD，TFLOPS 563 → 570 不变：
+       **IMMA 走 tensor pipe、IMAD 走 FMA pipe，真正并行，4:1 比例是免费的**。
+       同理 `load_generic` 的 8 次标量 LDS 换成 1 次 `ldmatrix`（LDS 36→16 已证实进 SASS），
+       端到端只从 1519 → 1533 —— LDS 也不是主力。
+     - **ncu 给出的真数字**：ffn kernel **138 TFLOPS = 586 上限的 23.6%**，
+       且 mma 条数只比理想多 **1.18×**（算术几乎无浪费）。
+       所以时间不在算术里，**在 grid 形状里**：
+       tail-wave 效率 `ffn gate/up 87.7%` / **`ffn down 70.2%`** / `attn qkv 99.4%`
+       —— ffn down 那个 GEMM 白扔 30% 的 block 槽位。
+     - **但"按波效率自适应选 njsplit"实测更差**（1516 vs 固定值的 1536）。
+       几何模型预测不了真实最优，最优 njsplit 是经验值。
+       **不要再用"波数对齐 SM 数"来推 njsplit**，只能扫。
+     - **下一步应该做的**：stream-K（按 K 切分），它同时解决 ffn down 的 30% tail
+       和权重重读（每个 K 切片只读自己那段），是目前唯一能一次性命中这两个问题的方向。
+       它比本轮改动大得多，动手前先按 AGENTS.md §4 条款 6 建 f64 参照。
 
 ## 6. 手动运行与性能对比（模型与 target）
 
