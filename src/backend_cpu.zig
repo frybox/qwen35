@@ -913,6 +913,15 @@ pub const CpuBackend = struct {
         while (r < x.len) : (r += n) ew.bufL2norm(x.span(r, n));
     }
 
+    /// Oracle for `matvecPair`: literally two `matvec` calls.  The fused device
+    /// path must produce exactly these bytes, so writing the oracle as anything
+    /// other than the pair would defeat the purpose.
+    fn vMatvecPair(ctx: *anyopaque, out: Buf, a: backend.LinearW, b: backend.LinearW, x: Buf) void {
+        const r = out.len / 2;
+        vMatvec(ctx, out.span(0, r), a, x);
+        vMatvec(ctx, out.span(r, r), b, x);
+    }
+
     fn vScaleVec(ctx: *anyopaque, x: Buf, s: f32) void {
         _ = ctx;
         ew.bufScaleVec(x, s);
@@ -1221,6 +1230,7 @@ pub const CpuBackend = struct {
         .freeScratch = vFreeScratch,
         .dequantRow = vDequantRow,
         .matvec = vMatvec,
+        .matvecPair = vMatvecPair,
         .matvecBatchK = vMatvecBatchK,
         .rmsnorm = vRmsnorm,
         .rmsnormRows = vRmsnormRows,

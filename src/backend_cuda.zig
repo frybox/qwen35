@@ -3730,6 +3730,69 @@ const attn_score_arity: usize = 10;
     /// when a caller genuinely hands over a host slice (`dBufPtr` null).
     /// `ttype` only chooses the activation format and quantizer -- never a
     /// backend, and never a CPU branch.
+    /// `matvec` twice over ADJACENT weights as one launch, falling back to two
+    /// `vMatvec_body` calls whenever adjacency cannot be proven (see
+    /// `backend.Exec.matvecPair` for why the 27B's ssm_alpha/ssm_beta pair
+    /// makes this worth doing at all).
+    ///
+    /// The legality test is on the DEVICE ranges: same tensor type, same shape,
+    /// and `a_bytes` past `a.dev` landing exactly on `b.dev`.  GGUF alignment
+    /// padding between the two tensors would break that (it does not here --
+    /// checked for all 48 layers), and gluing across a pad would make the kernel
+    /// read the pad as a block, so the test is exact rather than approximate.
+    fn vMatvecPair_body(ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
+        const self = self_(ctx);
+        const r = outBuf.len / 2;
+        if (outBuf.len % 2 != 0 or r == 0) {
+            vMatvec_body(ctx, outBuf, a, xBuf);
+            return;
+        }
+        if (pairViewInit(self, a, b, r)) |pair| {
+            vMatvec_body(ctx, outBuf, .{ .quant = pair }, xBuf);
+            return;
+        }
+        vMatvec_body(ctx, outBuf.span(0, r), a, xBuf);
+        vMatvec_body(ctx, outBuf.span(r, r), b, xBuf);
+    }
+
+    /// The fused `QuantRow` for `matvecPair`, or null when the two weights are
+    /// not provably one contiguous `2r x cols` block of the same type.  Exists
+    /// so the decision is one readable predicate instead of seven early
+    /// returns, and so the check is unit-testable on its own.
+    fn pairViewInit(
+        self: *CudaBackend,
+        a: backend.LinearW,
+        b: backend.LinearW,
+        r: usize,
+    ) ?gguf.QuantRow {
+        const qa = switch (a) {
+            .quant => |q| q,
+            else => return null,
+        };
+        const qb = switch (b) {
+            .quant => |q| q,
+            else => return null,
+        };
+        const ea = self.findDev(qa.data.ptr) orelse return null;
+        const eb = self.findDev(qb.data.ptr) orelse return null;
+        if (ea.ttype != eb.ttype or qa.ttype != qb.ttype) return null;
+        if (ea.rows != r or eb.rows != r) return null;
+        if (ea.cols != eb.cols or qa.blocks_per_row != qb.blocks_per_row) return null;
+        if (@intFromPtr(ea.dev) + ea.bytes != @intFromPtr(eb.dev)) return null;
+        // The bytes must also be contiguous in the host view the kernel was
+        // uploaded from, so re-check on that side too: `findDev` keys on the
+        // host pointer, and a device-side match with a host-side gap would mean
+        // the upload played games we are not modelling.
+        if (qa.data.len != ea.bytes or qb.data.len != eb.bytes) return null;
+        if (@intFromPtr(qa.data.ptr) + qa.data.len != @intFromPtr(qb.data.ptr)) return null;
+        return .{
+            .data = qa.data.ptr[0 .. qa.data.len + qb.data.len],
+            .ttype = qa.ttype,
+            .rows = 2 * r,
+            .blocks_per_row = qa.blocks_per_row,
+        };
+    }
+
     fn vMatvec_body(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xBuf: backend.Buf) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.g_op_seen.matvec)) return;
@@ -7203,6 +7266,16 @@ const attn_score_arity: usize = 10;
         vMatvec_body(ctx, outBuf, w, xBuf);
     }
 
+    /// The `matvecPair` slot; charged to `matvec` since it IS a matvec launch
+    /// (or two), and a separate slot would only split the same total.
+    fn vMatvecPair(ctx: *anyopaque, outBuf: backend.Buf, a: backend.LinearW, b: backend.LinearW, xBuf: backend.Buf) void {
+        const self = self_(ctx);
+        const t0 = self.slotEnter();
+        defer self.slotExit(.matvec, t0);
+        if (self.ablated(.matvec)) return ;
+        vMatvecPair_body(ctx, outBuf, a, b, xBuf);
+    }
+
     /// The `matvecBatchK` slot, timed (`$QWEN35_PROF`).
     fn vMatvecBatchK(ctx: *anyopaque, outBuf: backend.Buf, w: backend.LinearW, xKBuf: backend.Buf, k: usize) void {
         const self = self_(ctx);
@@ -7797,6 +7870,7 @@ pub const vtable = backend.Exec.VTable{
     .freeLinear = CudaBackend.vFreeLinear,
     .dequantRow = CudaBackend.vDequantRow,
     .matvec = CudaBackend.vMatvec,
+    .matvecPair = CudaBackend.vMatvecPair,
     .matvecBatchK = CudaBackend.vMatvecBatchK,
     .allocScratch = CudaBackend.dAllocScratch,
     .allocScratchK = CudaBackend.dAllocScratchK,

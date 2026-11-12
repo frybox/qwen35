@@ -156,6 +156,24 @@ pub const Exec = struct {
         /// region the previous op wrote and the output is the region the next
         /// op reads: no PCIe between them.
         matvec: *const fn (ctx: *anyopaque, out: Buf, w: LinearW, x: Buf) void,
+        /// `matvec(out[0..r], a, x)` then `matvec(out[r..2r], b, x)` as ONE
+        /// device launch, when `a` and `b` are the *same* shape and type and
+        /// their device ranges are adjacent (`a.dev + a_bytes == b.dev`), so the
+        /// two are one `2r x cols` matrix in memory.
+        ///
+        /// Why this is worth an interface slot.  On the 27B's 48 recurrent
+        /// layers `ssm_alpha.weight` and `ssm_beta.weight` are exactly that pair
+        /// (verified for all 48 in the GGUF: `alpha.off + alpha.size ==
+        /// beta.off`), 48x5120 q8_0 each.  Two launches of 255 KB apiece is
+        /// 96 launches per token, and 255 KB does not even reach the launch
+        /// floor: measured 3.1-4.4 us at 60-85 GB/s for EVERY block shape tried
+        /// (/tmp/shp/bw2.cu, 24..192 blocks x 32..128 threads -- the 3 us is
+        /// fixed latency, not traffic).  So 96 x 3.1 us, about 0.3 ms or 1.6% of
+        /// the token, buys 25 MB/s of actual work.
+        ///
+        /// The fallback is two plain `matvec` calls, so a backend (or a GGUF)
+        /// that cannot prove adjacency pays exactly what it paid before.
+        matvecPair: *const fn (ctx: *anyopaque, out: Buf, a: LinearW, b: LinearW, x: Buf) void,
         /// Same, for `k` tokens at once: `out[j*rows + r] = W[r] . x_j`.
         matvecBatchK: *const fn (ctx: *anyopaque, out: Buf, w: LinearW, xK: Buf, k: usize) void,
 
@@ -528,6 +546,12 @@ pub const Exec = struct {
     }
     pub fn matvec(self: Exec, out: Buf, w: LinearW, x: Buf) void {
         self.vtable.matvec(self.ptr, out, w, x);
+    }
+    /// Two same-shape matvecs over adjacent weights, as one launch when the
+    /// backend can prove the layout.  `out` is `2*rows` long, `a`'s result
+    /// first.  Semantically identical to two `matvec` calls.
+    pub fn matvecPair(self: Exec, out: Buf, a: LinearW, b: LinearW, x: Buf) void {
+        self.vtable.matvecPair(self.ptr, out, a, b, x);
     }
     pub fn matvecBatchK(self: Exec, out: Buf, w: LinearW, xK: Buf, k: usize) void {
         self.vtable.matvecBatchK(self.ptr, out, w, xK, k);

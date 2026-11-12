@@ -1527,9 +1527,20 @@ pub const Engine = struct {
         // a/b projections: ssm_alpha = a (decay), ssm_beta = b (beta input),
         // one scalar per VALUE head (C ref: gdn_a/gdn_b/A/dt all sized
         // gdn_vheads; GGUF rows are [hidden, nv] on 0.8B/2B/4B alike)
+        //
+        // ONE `matvecPair` instead of two `matvec` calls.  `ssm_alpha` and
+        // `ssm_beta` are both [hidden, nv] of the same type and sit back to
+        // back in the GGUF (verified for all 48 layers: `alpha.off +
+        // alpha.size == beta.off`), i.e. they ARE one `2*nv x hidden` matrix,
+        // and `ab` is already the contiguous output.  The backend proves the
+        // adjacency before fusing and falls back to the two calls otherwise.
+        //
+        // Two launches here cost more than they compute: each is 48x5120 q8_0
+        // = 255 KB, and 255 KB reads in 3.1-4.4 us at 60-85 GB/s for every
+        // block shape tested (/tmp/shp/bw2.cu) -- that is the launch floor, not
+        // bandwidth.  96 such launches per token (~0.3 ms, 1.6%) halve to 48.
         const ab = self.ab.span(0, 2 * nv);
-        self.exec.matvec(ab.span(0, nv), lw.ssm_alpha.?, self.x1);
-        self.exec.matvec(ab.span(nv, nv), lw.ssm_beta.?, self.x1);
+        self.exec.matvecPair(ab, lw.ssm_alpha.?, lw.ssm_beta.?, self.x1);
 
         // causal conv1d with left-pad K-1, silu after (SPEC A2, C ref 520-556)
         // convStep handles history + silu for all channels; beta/gamma
