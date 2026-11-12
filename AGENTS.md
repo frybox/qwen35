@@ -351,9 +351,37 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    - 结果：prefill 1430 → 1520（+6.3%，对 llama.cpp 1.06×），
      小格式涨得更多（IQ2_XXS 1957→2200 **反超 llama.cpp 1.29×**、IQ1_S 1787→2050），
      ffn gate/up 98.0 → 108.9 TFLOPS。**decode 不受影响**（此 kernel 只服务 prefill）。
-   - 仍然欠 llama.cpp ~1.65×（108.9 vs 179.3）。剩下的在 mma 稳态效率，
-     它用 `stream_k` 把 K 也切开以消除 ramp-up/tail；我们的 grid 只切 token，
-     `ffn down` / `attn q_proj` 的 tail 浪费实测 12% / 30%。
+   - 仍然欠 llama.cpp ~1.65×（108.9 vs 179.3 TFLOPS）。**这个缺口已经查过一轮，
+     下列方向都实测无效，不要重复**（2026-11）：
+     - **硬件 mma 上限已实测**：`/tmp/mmc/mp.cu` 纯 mma 探针在 4090D 上是
+       **586 TFLOPS**（int8 `m16n8k32`）；2 warps/SM 就 289、4 warps/SM 就 577。
+       所以我们是 **18.6% of mma peak**，llama.cpp 是 30.6% —— 两边都远没打满，
+       不是"我们已经接近硬件极限"。
+     - **不是 barrier**（已修，见上）；**不是 B 分片载入形式**
+       （`load_generic` 8 次标量 LDS → `load_ldmatrix` 1 次 LDSM：实测无差别，
+       ptxas 本来就已选 LDSM）；**不是 `isum` 的整型/浮点形式**
+       （改浮点累加 1485 vs 1520，更慢）；**不是 `ls_w` 重复 LDS**
+       （hoist 进寄存器 10240 次读 → 32 次：实测无差别，编译器早已缓存）；
+       **不是 mma 依赖链**（把 NT 个 mma 发到独立 D 寄存器再消费：无差别）。
+     - **不是 occupancy**：168 regs × 256 thr = 43008 regs → 1 block/SM（8 warps）。
+       想凑 2 blocks 必须 `-maxrregcount=128`（65536/512 = 128），
+       nw=8/nstg=1 时 shared 47.2 KB 也确实塞得下两个 —— **实测 1240 tok/s，更差**
+       （寄存器溢出代价 > 多一倍 warp 的收益）。**先验不要拿 occupancy 当默认答案。**
+     - **不是 tail/stream-K**：`tiles=680`、`114 SM` → 5.96 waves，
+       ffn gate/up 的 tail 浪费只有 **0.6%**，却在四个形状里最慢（1.83×）。
+       所以 stream-K 对我们最大形状基本零收益（`ffn down` 12.3%、`q_proj` 29.8%
+       有收益，但那是小头）。**别再拿"llama.cpp 有 stream_k"当解释。**
+     - **权重重复读的成本已量化**：grid.y 按 128 token 切 slab，525 token = 5 slab，
+       ffn gate/up 的 34 MB 权重被读 5 次 → 按 1008 GB/s 约 0.135 ms，
+       是 0.860 ms 的 **16%**。但把 `MAX_TILES` 提到 16 让一个 block 吃下 525 token
+       实测 **1431 vs 1497，更差**（acc[] 溢到 local memory，旧注释早有记载）。
+       L2（72 MB）确实吸收得比预想好。
+     - **结论**：剩余 1.65× 是 mma 稳态的"每条 mma 夹带多少非 mma 工作"问题，
+       我们约 13 条指令/mma（16 mma + 128 LDS + 64 IMAD 的账），
+       但把 LDS 和 IMAD 分别去掉都测不出收益 —— 说明瓶颈在被编译器合并后的
+       实际指令流里，而不是按源码数出来的那几类。**要再往下必须拿到 SASS**
+       （`cuobjdump` 不认 sm_89、`ncu` 无权限，见 §Blocked），
+       否则继续靠猜测改只会得到噪声级结果。
 
 ## 6. 手动运行与性能对比（模型与 target）
 
