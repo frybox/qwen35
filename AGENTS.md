@@ -277,6 +277,21 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    - **`/tmp/mb/*.o` 是手编的，不会跟着 `make cuda` 更新**。改了 `.cuh` 之后
      一定要重编 `mmvq.o` 再链接，否则 bench 跑的仍是旧 kernel（症状：新加的 split
      完全不生效，`[split]` 一行都不打印）。
+   - **`gpu__time_duration.sum` 即使在 `--launch-count 30000` 下也高估小 kernel**
+     （2026-11 实证）：ncu 报 27B IQ3_XXS decode 的 `q8_0 48x5120` 投影每次 130 µs
+     ×96 次/token = 12.5 ms（当时算成占 token 时间 64%）。做 ablation ——
+     把每层的 beta 投影改成复用 alpha 指针（数值全错但 launch 数减半）——
+     **端到端 51.16 vs 51.07，一个字都没动**。序列化会拉开相邻 launch 的间隙，
+     launch 开销里被隐藏的部分就暴露成"kernel 时间"。**成本归因一律用 ablation，
+     ncu 只用来读 sector 数/hit rate 这类比值**（那些不受序列化影响）。
+   - **microbench 的"某段代码占 X%"只有在它复现真实访存量时才可信**
+     （2026-11 实证）：`/tmp/fd` 里 split kernel 的串行 fold 在 nblk=20 占 29.5%、
+     nblk=68 占 353.8%，据此改成 warp 并行树归约，**端到端反而 50.85 -> 49.8（-2%）**。
+     因为那个探针每 lane 只读 8 字节，真实 kernel 每 lane 读 98 字节 + 8 次 dp4a，
+     fold 早被掩盖。**探针必须先复现真实的每 lane 字节数**，否则只能得到
+     "单独跑这段代码多贵"，推不出端到端份额。反过来也一样：`/tmp/mbm/q8c.cu`
+     里 thread-per-row 160 µs vs coop 23 µs（7 倍）是真的，但生产路径本来就走 coop，
+     所以这个 7 倍无法兑现成任何收益。
    - **固定 `-n` 才能比 tok/s**。不同 `-n` 会走到不同长度的分叉，token 数不同时
      耗时不可直接比（曾把 536-token 的 25.29 和 578-token 的 24.09 拿来比）。
 1. **先定位是"哪一层"错**，不要猜。重构后只剩 `QWEN35_SIMD_TIER` 与 `QWEN35_FORCE_SCALAR`
