@@ -326,6 +326,35 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    - 收益：prefill 1245 → 1430 tok/s（+14.8%），decode 不变（rows=1 退化回同样工作量）。
      完成后**非 GEMM 算子只剩 21 ms / 364 ms（5.6%）**，剩下的全是 mma gemm。
 
+7. **prefill 的差距全在 `matvec_batchk`（mma gemm），而 mma 的差距在主因是 barrier 数不是指令数**
+   （`679b0c1`，2026-11）：
+   - 定位工具是**同形状 A/B microbench**（`/tmp/mbm/ggml_ref.cu` 跑 llama.cpp 的 ggml
+     MUL_MAT，`/tmp/mbm/mb_ab.cu` 跑我们的 `q35_launch_mul_mat_vec_tile`，**同 rows/cols/tokens、
+     同 IQ3_XXS 权重**）。端到端只有 1.15×，单形状上是 1.83× —— 端到端被非 gemm 算子稀释了。
+     **不要用手工估算 FLOPs 代替这个 A/B**。
+   - 归因办法是**在 kernel 里按 ablation 拆时间**（unpack / staging / mma 三段），
+     而不是猜。实测 ffn gate/up 0.956 ms 里 unpack 只有 0.12 ms。
+   - **真相：sB 一次只装 `Q35_MMQ_TILE_TOKENS`(16) 行，所以每 16 个 token 就要重新 staging +
+     两次 `__syncthreads()`**。128-token 的 J slab 里 = 每个 super-block 16 个 barrier，
+     而 llama.cpp 的 `mul_mat_q_process_tile` 一次装 128 行、两次 `vec_dot` 夹一对 barrier = **4 个**。
+     我们多 4×；而每 SM 只驻留 1 个 block 时，一次 barrier 就是整个 SM 排空。
+   - 修法：`Q35_MMQ_STAGE_TILES`（NSTG）让 NSTG 个 acc-tile 共用一次 staging。
+     **mma tile 仍是 TT 个 token，所以 `acc[MAX_TILES][NACC]` 和各 fragment 数组都不用动**，
+     只有 sB 变深 —— 这是寄存器没有爆炸的原因。token 循环因此拆成
+     「外层 staging 循环 + 内层 sub-tile 循环」。
+   - **NSTG=4 是尖峰不是平台**：1402(1) / 1462(2) / 1532(4) / 1492(8)。过了 4，
+     sB（17 KB）的代价超过省下的 barrier。
+   - **动态 shared 必须把 `cudaFuncSetAttribute` 设成真实字节数，不能设 100 KB**：
+     本机 per-SM 上限约 99 KB，请求 100 KB 会静默吃掉三分之一的吞吐
+     （1430 → 1000 tok/s），而且看起来像完全无关的回归。设成实际 `shmem` 后反而略快于
+     静态版（1456 vs 1430）。
+   - 结果：prefill 1430 → 1520（+6.3%，对 llama.cpp 1.06×），
+     小格式涨得更多（IQ2_XXS 1957→2200 **反超 llama.cpp 1.29×**、IQ1_S 1787→2050），
+     ffn gate/up 98.0 → 108.9 TFLOPS。**decode 不受影响**（此 kernel 只服务 prefill）。
+   - 仍然欠 llama.cpp ~1.65×（108.9 vs 179.3）。剩下的在 mma 稳态效率，
+     它用 `stream_k` 把 K 也切开以消除 ramp-up/tail；我们的 grid 只切 token，
+     `ffn down` / `attn q_proj` 的 tail 浪费实测 12% / 30%。
+
 ## 6. 手动运行与性能对比（模型与 target）
 
 > 固定 prompt 的"token 流探针"已完全退出验收（见 §4 规则）：既不是判据，也不是
