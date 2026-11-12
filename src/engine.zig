@@ -1573,21 +1573,46 @@ pub const Engine = struct {
         // sqrt(1 + eps) again), so the repetitions are part of the semantics and
         // must be kept: one `l2normRows` over the `nk` rows, `nk_reps` times,
         // reproduces exactly the sequence of per-row calls the loop made.
-        const nk_reps = nv / nk;
+        //
+        // NO `nv/nk` REPETITION.  The per-head loop this replaced visited row
+        // `h % nk` once per v head, i.e. `nv/nk` = 3 times per k head, and
+        // `l2normRows(span(0, kq_dim), kd)` normalises each of the `nk` rows
+        // ONCE -- so reproducing that loop needed 3 repeats.  That is the wrong
+        // operation, not just a slow way to express it: the reference
+        // (llama.cpp `llama_model_qwen3next::graph::build_layer_gdn`,
+        // src/models/qwen3next.cpp:503-511) applies `build_gdn_l2_norm` to a
+        // `(head_k_dim, num_k_heads)` view -- **16** rows -- and only THEN
+        // broadcasts q/k up to `num_v_heads` with `ggml_repeat_4d`
+        // (qwen3next.cpp:520-528).  Normalising 16 rows 3 times is not the same
+        // as normalising them once and repeating: `l2norm` is not idempotent,
+        // so passes 2 and 3 multiply the row by `rsqrt(1 + 1e-6)` ≈ 1-5e-7
+        // again.  The error was too small to flip a greedy token, which is why
+        // no test caught it, but it is both WRONG and 3x the work:
+        // ncu measured `k_l2norm` at 15.68 ms / 7452 calls over 20 tokens
+        // (2.1 us each for a 128-float reduction), and 2/3 of those calls were
+        // this repetition.
         if (gdnHeadsTiled(nv, nk)) {
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            var rep: usize = 0;
-            while (rep < nk_reps) : (rep += 1) {
-                self.exec.l2normRows(qkv.span(0, kq_dim), kd);
-                self.exec.l2normRows(qkv.span(kq_dim, kq_dim), kd);
-                // q is scaled once per v head, in the same interleaved order.
-                self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
-            }
+            self.exec.l2normRows(qkv.span(0, kq_dim), kd);
+            self.exec.l2normRows(qkv.span(kq_dim, kq_dim), kd);
+            self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
         }
         // Fallback for a layout the batched passes above/below cannot express
         // (`nv` not a multiple of `nk`): the per-head form this function has
         // always used.  On this model nv/nk == 3, so this is dead code kept for
         // shapes the kernel does not model.
+        if (!gdnHeadsTiled(nv, nk)) {
+            for (0..nv) |h| {
+                const kh = h % nk;
+                const q_h = qkv.span(kh * kd, kd);
+                const k_h = qkv.span(kq_dim + kh * kd, kd);
+                self.exec.l2norm(q_h);
+                self.exec.l2norm(k_h);
+                const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+                self.exec.scaleVec(q_h, qscale);
+            }
+        }
+
         if (!gdnHeadsTiled(nv, nk)) {
             for (0..nv) |h| {
                 const kh = h % nk;
