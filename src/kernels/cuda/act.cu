@@ -161,34 +161,10 @@ __global__ void k_softmax(float *__restrict__ x, int n) {
     for (int i = threadIdx.x; i < n; i += blockDim.x) x[i] = __fmul_rn(x[i], inv);
 }
 
-// GDN causal convolution: 4 taps per channel, history is 3 f32 per channel
-// (oldest..newest) and is shifted in place, so `conv` and `y` are both read
-// and written and `conv` is NOT optional state -- it is the sliding window.
-// One thread per channel; the 4-element sum is spelled left to right to match
-// elementwise.zig `convStepKernel`, and `silu` is applied afterwards over the
-// whole row (which is what the CPU does, as a second pass).
-__global__ void k_conv_step(float *__restrict__ conv, float *__restrict__ y,
-                            const float *__restrict__ wconv, int n) {
-    const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i >= n) return;
-    float *hp = conv + (size_t)i * 3;
-    const float cur = y[i];
-    const float *wp = wconv + (size_t)i * 4;
-    // `a*b` then the three additions, left to right: `__fmul_rn` per product
-    // and `__fadd_rn` per add stops `-fmad` from folding `p0+p1` into the
-    // next product's rounding.
-    const float p0 = __fmul_rn(hp[0], wp[0]);
-    const float p1 = __fmul_rn(hp[1], wp[1]);
-    const float p2 = __fmul_rn(hp[2], wp[2]);
-    const float p3 = __fmul_rn(cur, wp[3]);
-    y[i] = __fadd_rn(__fadd_rn(__fadd_rn(p0, p1), p2), p3);
-    hp[0] = hp[1];
-    hp[1] = hp[2];
-    hp[2] = cur;
-}
-
-// Batched twin of `k_conv_step`: `tokens` consecutive rows of `y`, `y_stride`
-// floats apart, sharing ONE per-channel history block `conv`.
+// GDN causal convolution: 4 taps per channel, history is 3 f32 per channel.
+//
+// Batched twin of the decode kernel below: `tokens` consecutive rows of `y`,
+// `y_stride` floats apart, sharing ONE per-channel history block `conv`.
 //
 // Why this exists: prefill used to call `convStep` once per token (525 launches
 // per GDN layer for a 525-token prompt, times two because of the silu tail).
@@ -213,7 +189,7 @@ __global__ void k_conv_step_rows(float *__restrict__ conv, float *__restrict__ y
     float *yp = y + (size_t)i;
     for (int t = 0; t < tokens; ++t, yp += y_stride) {
         const float cur = *yp;
-        // Identical spelling to `k_conv_step`: `__fmul_rn` per product and
+        // Identical spelling to `k_conv_step_silu`: `__fmul_rn` per product and
         // `__fadd_rn` per add, so `-fmad` cannot fold `p0 + p1` into `p3`'s
         // rounding.  This is the whole numeric contract of the kernel.
         const float p0 = __fmul_rn(hp[0], wp[0]);
@@ -235,9 +211,37 @@ __global__ void k_silu_tail_rows(float *__restrict__ y, int n, int tokens, int y
     for (int t = 0; t < tokens; ++t, yp += y_stride) *yp = silu_dev(*yp);
 }
 
-__global__ void k_silu_tail(float *__restrict__ y, int n) {
+
+// Decode-rung fused twin of `k_conv_step` + `k_silu_tail`: one launch where the
+// launcher used to issue two.
+//
+// `q35_launch_conv_step` was already one C call, so this saves no host work --
+// it saves a LAUNCH, and launch latency is what this rung is made of: a decode
+// token issues 1220 kernels, 723 of them non-matvec, and each costs ~3.7 us
+// standalone no matter how little it computes (/tmp/shp/lch.cu).  `conv_step`
+// and `silu_tail` are 48+48 of those 723.
+//
+// Fusing them is sound because the two passes touch the same element with the
+// same thread: `k_conv_step`'s thread i writes only `y[i]`, and
+// `k_silu_tail`'s thread i reads only `y[i]`.  So applying `silu_dev` to the
+// value this thread just stored is exactly the second pass, with no ordering
+// question and no change to the conv arithmetic (`__fmul_rn`/`__fadd_rn` chain
+// kept verbatim, which is the kernel's whole numeric contract).
+__global__ void k_conv_step_silu(float *__restrict__ conv, float *__restrict__ y,
+                                 const float *__restrict__ wconv, int n) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) y[i] = silu_dev(y[i]);
+    if (i >= n) return;
+    float *hp = conv + (size_t)i * 3;
+    const float cur = y[i];
+    const float *wp = wconv + (size_t)i * 4;
+    const float p0 = __fmul_rn(hp[0], wp[0]);
+    const float p1 = __fmul_rn(hp[1], wp[1]);
+    const float p2 = __fmul_rn(hp[2], wp[2]);
+    const float p3 = __fmul_rn(cur, wp[3]);
+    y[i] = silu_dev(__fadd_rn(__fadd_rn(__fadd_rn(p0, p1), p2), p3));
+    hp[0] = hp[1];
+    hp[1] = hp[2];
+    hp[2] = cur;
 }
 
 } // namespace
@@ -277,11 +281,9 @@ extern "C" int q35_launch_conv_step(float *d_conv, float *d_y, const float *d_wc
                                     int n, void *stream_v) {
     if (n <= 0) return (int)cudaSuccess;
     cudaStream_t stream = (cudaStream_t)stream_v;
-    k_conv_step<<<gridFor(n), kThreads, 0, stream>>>(d_conv, d_y, d_wconv, n);
-    const cudaError_t rc = cudaGetLastError();
-    if (rc != cudaSuccess) return (int)rc;
-    // Second launch for the activation tail; its error is what the caller sees.
-    k_silu_tail<<<gridFor(n), kThreads, 0, stream>>>(d_y, n);
+    // One launch, not two: see `k_conv_step_silu`.  The activation tail used to
+    // be a second kernel over the same row with the same thread mapping.
+    k_conv_step_silu<<<gridFor(n), kThreads, 0, stream>>>(d_conv, d_y, d_wconv, n);
     return (int)cudaGetLastError();
 }
 
