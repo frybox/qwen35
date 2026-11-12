@@ -208,6 +208,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_KERNEL_CHECK` | ~~kernel 结果与 Zig 参照逐块比对~~ **已于 `0cdfb23` 删除** |
 | `QWEN35_DUMP_OUT` / `QWEN35_DUMP_IDS` | 导出中间输出 / token id。**调试用**（定位分叉起点），不是验收判据，见 §4 |
 | `QWEN35_NO_BATCH` | 关闭 K-token 批量 prefill chunk |
+| `QWEN35_GDN_WY` | **仅 CUDA 后端**。`=0` 退回逐 token 的 `q35_gdn_step_rows_chunk_kernel`（即 WY 版的对照/回归参照），其它值或不设走 WY 分块版。见 §5 末尾的 GDN 说明 |
 | `QWEN35_PROF` / `QWEN35_PROF_POST` / `QWEN35_STAT` | 性能剖析（`PROF-M` 行由 `backend_cpu` 输出） |
 | `QWEN35_MVCHECK` | **仅 CUDA 后端、仅调试用，不是计算路径**。每个量化 matvec 之后，用内嵌的 CPU 后端对同一行再算一遍并逐行比对，打印 `MVCHECK[<type>] rows= cols= mismatched= batchk= k=`。用于确认"GPU kernel 结果与 CPU 参照一致"（CUDA 逐格式验收的自动化手段）。开销极大，只在 A/B 时开 |
 | `QWEN35_MVCHECK_ONLY` | 限定只对某一种量化类型做 MVCHECK（值 = `q.ttype` 的 tagName，如 `iq1_s`）。batch-K 参照需要 CPU scratch 按 K 塑形，不是每种类型在每个 launch 顺序下都能活，所以追单一 kernel 时用这个定向跑 |
@@ -301,6 +302,29 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    **Q8_0 恰好是 32 块与 row-block 单位重合的唯一类型**，所以它单测通过而其它全坏。
    定位手段是给 `dequantRowInto` 写 Q4_0 对拍测试，而不是读代码猜；
    新增类型时照此办：先在测试里造块字节，与 `quant.rowDotXxx` 参照对齐。
+6. **GDN 的 state 更新走 WY/UT 分块（`e33de40`），不是逐 token 递推**。这条值得单独记，
+   因为它把 27B prefill 的整条差距一次性消掉了，而根因不是带宽而是**深度**：
+   - 旧 kernel `q35_gdn_step_rows_chunk_kernel` 串行走 t，并行轴只有 (head, column)
+     = 48×128 = 6144 线程（占 4090D 的 2.6%），且每线程的 `acc` 是串行 FADD 链，
+     **4 cycle 延迟完全暴露**。ablation 实测 93 ms / 419 ms = prefill 的 22%，
+     而 llama.cpp 侧同一 ablation 是 ~0。
+   - 门控递推在 t 上非线性，**不能**直接并行；但可以压**深度**：C 个 token 的块内
+     更新对 C 个 delta 是仿射的 → 一次严格下三角求解（前向代入），只有块边界串行。
+   - 并行轴改成**按值列切**（`state` 的列 j 只被 v/km/delta/out 的列 j 碰），
+     grid = heads×(vd/V) = 96 blocks —— 与 llama.cpp `gated-delta-net-mma.cu` 的
+     `slice32` 同一个思路。**切 t 不行**，t 的块边界就是串行部分。
+   - `(C, V, threads) = (8, 64, 1024)` 来自 device 扫参：rows=525 时 1.44 ms/call
+     vs 逐 token 3.53；rows=1024 时 2.78 vs 10.84。C 小赢在 solve 串行序言短，V=64 赢过 32/128。
+   - **`km` 不能写成 `g_r·(k_r^T S_prev)`**：它是 `gamma_r·k_r^T S_{r-1}`，`S_{r-1}` 已含
+     块内前 r 行。用 `km_r = v_r - delta_r/beta_r`（由 delta 定义恒等）。第一版按前者写，
+     **每块第 0 行精确、第 1 行起全错**，是 f64 参照抓到的——不是 MVCHECK。
+   - 验证办法（新算子都应照此办）：① f64 参照的块形式 vs 字面逐 token 循环，
+     C=8/16/32 × rows=525 全部 1e-7；② kernel vs 逐 token kernel 在 device 上：
+     out 3.3e-7 / state 1.6e-7 / delta 6.9e-8 / km 1.8e-6。
+   - **不与逐 token 版逐位一致**（重结合），所以 CPU oracle（`engine.zig` 的 `gdnFused`）
+     保持逐 token 形式；旧 kernel 留在文件里作参照与 fallback，`QWEN35_GDN_WY=0` 可切回。
+   - 收益：prefill 1245 → 1430 tok/s（+14.8%），decode 不变（rows=1 退化回同样工作量）。
+     完成后**非 GEMM 算子只剩 21 ms / 364 ms（5.6%）**，剩下的全是 mma gemm。
 
 ## 6. 手动运行与性能对比（模型与 target）
 
