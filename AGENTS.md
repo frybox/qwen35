@@ -217,6 +217,7 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
 | `QWEN35_CUDA_SPLIT` | **仅 CUDA 后端**。decode K-split 的每 block lane 数，默认 8。合法值 0/1/2/4/8/16/32；launcher 会把它 clamp 成 `q35_split_units(ttype)` 的最大因子，并对每种类型再按 `q35_split_min_per` 收窄。`split<2` 退回 coop kernel |
 | `QWEN35_SPLITDBG` | **仅 CUDA 后端**。每次走 split 路径的 launcher 往 stderr 打一行 `[split] ttype= rows= cols= nblk= split= warps= shmem=`。确认某类型**真的**走了 split、以及 per 是多少，只需看这一行——不要凭 tok/s 反推 |
 | `QWEN35_MVLIST` | **仅 CUDA 后端**。打印每个 matvec 调用的 `[mvl] <type> rows= cols=`。用来算「一 token 里每种类型多少流量」，是决定优化优先级的唯一可靠依据（按 launch 次数或按代码直觉都会排错序） |
+| `QWEN35_CUDA_RPB` | **仅 CUDA 后端**。decode coop 内核的 rows-per-warp（1..32，默认 1）。实测 1 最优，2/4/8/16 单调变差（47.5 → 46.8 → 45.9 → 43.5 → 38.9 tok/s）。加行/block 会减少 block 数，并行度损失大于局部性收益。 |
 | `QWEN35_CUDA_MEMONLY` | **仅 CUDA 后端**。只搬权重不做点积，测「纯访存下限」。27B IQ3_XXS 实测 27.0 tok/s → 说明瓶颈是访问模式而非设备带宽（4090D 理论 ~1000 GB/s，实测各类型 130–660） |
 
 调试方法论：
@@ -291,7 +292,36 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
    而 pool 用 `xs[b*256 .. b*256+256]` 一次吃一个 256 元素 row-block，
    对 `q4_0`/`iq4_nl` 这类"块 32、row-block 256"的类型会算错行跨与激活窗口。
    已知未修；A/B 时不要拿它当 Q4_0 的 oracle。
-4. 改动前后固定复跑同一条命令（仅 A/B 调试用，不是验收标准）：
+4. **decode 的真实账本（2026-11，ncu `gpu__time_duration.sum` 按 kernel 汇总 20 token）**——
+   **不要再用 `QWEN35_PROF` 给 decode 归因**：它的 `l2norm` 一项报 33%（11520 次调用）、
+   `attn_decode` 报 0.1%，两个数字都是假的。`l2norm` ablation 后**输出仍通顺、速度不变**
+   （47.17 vs 47.4），证明那 33% 是 launch-only 槽位被 `mv_batchk`(sync=1) 吞掉的记账假象。
+   ncu 的真数字（518 ms / 20384 次 launch）：
+
+   | kernel | 占比 | calls | avg |
+   |---|---|---|---|
+   | `mul_mat_vec_q_split_t` | **64.7%** | 7521 | 44.6 µs |
+   | `mul_mat_vec_q_coop_t` | 8.1% | 2420 | 17.4 µs |
+   | `mmq_mma_iq` 各量化类型合计 | ~12% | — | — |
+   | `quantize_q8_K` + `quantize_q8_0` | 3.7% | 6597 | 2.6 / 5.0 µs |
+   | `attn_pv_split` + `attn_score_split` | 0.4% | 640 | 2.7 µs |
+
+   **`attn_decode` 根本不是瓶颈**（旧记录写的 "1.12 ms / grid=heads 只用 35% SM" 是错的，
+   别再按它开工）。decode 的 87% 就是 matvec 本身，而它已在 574 GB/s
+   （4090D 实测各类型 130–660 GB/s 的区间中上部）。
+5. **decode 上试过并失败的两个方向（都有实测数字，不要重走）**：
+   - **加 warp**：`COOP_WARPS=1/2/4/8` → 46.3 / **47.5** / 45.7 / 38.7 tok/s。w=2 确认最优，
+     因为 K 已经按 split 分给多个 warp，再加 warp 是重复切分。
+   - **给 Q8_0 补 `_part`**：Q8_0 是唯一没有 `_part` 的 decode 类型，所以
+     `q35_split_units()` 返回 0，`rows=48` 的那三个 ssm alpha/beta 投影一直回退到
+     **thread-per-row** 内核（32 个 lane 读 32 个不同的行，ncu 实测约 1.9 GB/s、
+     96 次 × 130 µs）。补上 `q35_vec_dot_q8_0_q8_0_part`（32 元素块切 4 份）
+     之后确实走了 split，但**端到端更慢**：45.98 vs 基线 47.4，
+     且 split=2/4/8 → 35.3 / 43.2 / 46.0 tok/s，单调向上却仍不及基线。
+     根因：Q8_0 的 `nblk = cols/32 = 160`（是 256 元素块类型的 8 倍），
+     split 后每 lane 只读 8 字节，**低于一个 cache line，合并收益为零**而 shuffle 归约照付。
+     已回退。
+6. 改动前后固定复跑同一条命令（仅 A/B 调试用，不是验收标准）：
    `zig-out/bin/qwen35 run <gguf> "天空为什么是蓝色的？" -n 48 --threads 1`
    （单线程是为了结果可比，勿随手加线程数）。
 5. **跨量化格式必须逐个验**，不能只验 Q8_0 就收工：Q8_0 通过**不代表**其它类型通过。
