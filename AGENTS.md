@@ -394,9 +394,33 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
      - **但"按波效率自适应选 njsplit"实测更差**（1516 vs 固定值的 1536）。
        几何模型预测不了真实最优，最优 njsplit 是经验值。
        **不要再用"波数对齐 SM 数"来推 njsplit**，只能扫。
-     - **下一步应该做的**：stream-K（按 K 切分），它同时解决 ffn down 的 30% tail
-       和权重重读（每个 K 切片只读自己那段），是目前唯一能一次性命中这两个问题的方向。
-       它比本轮改动大得多，动手前先按 AGENTS.md §4 条款 6 建 f64 参照。
+     - **stream-K（按 K 切分）已实测，此路不通，不要重走**（2026-11）。
+       动机曾看起来很硬：27B ffn down 是 `rows=5120 cols=17408`，8 warps 下一 block
+       吃 128 行 → 只有 **40 blocks / 114 SM（35% 占用）**，且 K 长达 68 个 super-block。
+       实现路径是给 `q35_k_mmq_mma_iq` 加 `ksplit`/`grid.z`，切片写独立部分和平面，
+       再用 `q35_k_mmq_kreduce` 按 z 升序折叠（**不用 atomicAdd**：那会乱序 float 求和，
+       2026-10 就是因此被否的，而按 z 折叠是确定性的）。
+       数值上完全成立——先按 §4 条款 6 建了 f64 参照（`/tmp/sc/streamk_ref.cu`）+ f32 分叉检查
+       （`/tmp/sc/f32check.cu`）：切分本身 rel=0（f64 无损），f32 侧 rel≈1e-7，
+       比 MVCHECK 的 2e-2 容差小五个数量级。**所以失败不是精度问题，是流量问题。**
+       实测端到端 tok/s（525-token IQ3_XXS）：
+       `ksplit=0`（基线）1531 / `auto` 1500 / `2` 1365 / `4` 1328 / `8` 1226 —— **单调变差**。
+       根因是折叠代价：我的部分和平面是 `ksplit × tokens × rows` 个 float，
+       ffn down 在 ksplit=8 时是 **86 MB** 额外流量（权重本身才 38 MB），
+       ncu 单独计时 `q35_k_mmq_kreduce` 就 **95–347 µs**，而整个 GEMM 才 566 µs。
+       另一个隐性代价：切完 K 每 block 只剩 23 个 super-block，
+       prologue/epilogue 的固定开销占比反而上升。
+       **llama.cpp 能用 stream-K 是因为它的 fixup buffer 只存每个 block 的边界 tile**
+       （`mul_mat_q_stream_k_fixup` 的 `tmp_last_tile` 是 `J*I` 每 block，且靠连续的
+       kbc 空间切分只处理跨界 tile），总量约等于**一个**输出矩阵（10.8 MB）而不是 ksplit 份。
+       要追这条路必须整套移植那个 kbc 映射，代价远大于本轮收益预期，暂不投入。
+     - **prefill 的组成（PROF，525-token）**：`mv_batchk` 73%、`gdn_step` 8.7%、
+       `gdn_prelude` 7.3%、`add_resid` 4.3%、`rope64_rows` 2.6%。GEMM 之外已无大头。
+     - **`QWEN35_ABLATE` 的坑（本轮踩到）**：关掉 `rmsnorm` 测得 1658 tok/s（+7%），
+       看着像大发现，但**输出变成 `!!!!!!!!`**——污染后的 NaN/异常值让后续计算走了捷径。
+       **ablation 前必须先看输出是否仍然通顺**，否则量到的是"算得更少"而不是"算得更快"。
+       同样关掉 `add_resid,swiglu` 的 +6.8% 也不可信。只关 `rope64_rows`/`copy_range`
+       这类输出仍正常的项，速度没有提升 —— 说明非 GEMM 部分确实只有那 27%。
 
 ## 6. 手动运行与性能对比（模型与 target）
 
