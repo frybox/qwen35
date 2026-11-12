@@ -456,6 +456,25 @@ engine.zig        Qwen3.5 架构本身（不再接触任何硬件细节）
        （`mul_mat_q_stream_k_fixup` 的 `tmp_last_tile` 是 `J*I` 每 block，且靠连续的
        kbc 空间切分只处理跨界 tile），总量约等于**一个**输出矩阵（10.8 MB）而不是 ksplit 份。
        要追这条路必须整套移植那个 kbc 映射，代价远大于本轮收益预期，暂不投入。
+     - **【2026-11 复核】stream-K 的剩余收益上限已经量出来了，约 +3%，不值得做。**
+       关键是把"40 blocks"这个数字放回正确的上下文：`rows=5120` 的 ffn down 在
+       **prefill** 下并不是 `grid=(40,1)`。launcher 发的是 `grid=(rows/rowtile, njsplit)`
+       （mmq.cu `const dim3 grid((rows + rowtile - 1) / rowtile, njsplit)`），
+       而 `njsplit = ceil(ntiles / (J/TPT))`，chunk=1024 → ntiles=64、J=128、TPT=16
+       → njsplit=8，所以真实 grid 是 **`(40,8) = 320 blocks`**，2.81 waves，
+       **tail 效率 93.6%**（40 blocks 是 **decode** 的形状，别混用）。
+       由此推出的上限：ffn down 若从 93.6% 提到 100%，省 6.4%；
+       ffn down 在 prefill 的 mmq 297.7 ms 里占 35 次 × 561 µs ≈ 19.6 ms（6.6%），
+       所以**全部收益 ≤ 297.7 ms 的 0.4%**，端到端不到 +1%。
+       实测旁证：`QWEN35_CUDA_MMQ_J=64`（njsplit=16，占用更高但重读更多）→ 1397，
+       比 J=128 的 1533 **更差**；J=256 → 1517 也略差。
+       **拐点已经在 J=128，再加并行只是拿重读换占用**，这正是 stream-K 要买的那个量。
+     - 复测口径（`--launch-count 20000` 纯 prefill，525 token）：
+       prefill 的 `mmq_mma_iq` 合计 **297.7 ms / 353 次 launch**，
+       其中 IQ3_XXS 95.4、IQ3_S 79.6、IQ4_XS 41.6、IQ2_S 33.8、IQ2_XXS 21.2、
+       IQ2_XS 13.1、IQ1_S 8.2、IQ1_M 4.8（ms）。
+       形状侧（`QWEN35_MVLIST`，525 token）：`iq3_s 5120x17408` ×20、
+       `iq3_xxs 5120x17408` ×15 是那 35 次 ffn down。
      - **prefill 的组成（PROF，525-token）**：`mv_batchk` 73%、`gdn_step` 8.7%、
        `gdn_prelude` 7.3%、`add_resid` 4.3%、`rope64_rows` 2.6%。GEMM 之外已无大头。
      - **`QWEN35_ABLATE` 的坑（本轮踩到）**：关掉 `rmsnorm` 测得 1658 tok/s（+7%），
