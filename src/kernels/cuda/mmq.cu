@@ -1503,7 +1503,12 @@ __global__ void q35_k_mmq_mma_iq(const unsigned char *__restrict__ w,
                         for (int n = 0; n < NT; ++n) {
                             q35_tile<8, 8, int> B_frag;
                             q35_tile<16, 8, int> D;
-                            q35_mma::load_generic(B_frag,
+                            // 1 ldmatrix instead of 8 scalar LDS: SASS showed the
+                            // generic loader emitting 8 x `LDS Rx, [Ry.X4]` per B
+                            // fragment, i.e. 35 LDS against 8 IMMA in the hot loop.
+                            // The 8x8 int overload exists and SBT_STRIDE (272) is
+                            // 16B aligned, so it is legal here.
+                            q35_mma::load_ldmatrix(B_frag,
                                 (const int *)(sBs + ((size_t)n * 8) * SBT_STRIDE) + g * 8,
                                 SBT_STRIDE / 4);
                             q35_mma::mma(D, Af[g], B_frag);
