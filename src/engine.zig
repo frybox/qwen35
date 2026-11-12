@@ -1593,9 +1593,11 @@ pub const Engine = struct {
         // this repetition.
         if (gdnHeadsTiled(nv, nk)) {
             const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-            self.exec.l2normRows(qkv.span(0, kq_dim), kd);
-            self.exec.l2normRows(qkv.span(kq_dim, kq_dim), kd);
-            self.exec.scaleVec(qkv.span(0, kq_dim), qscale);
+            // One launch instead of three (l2normRows q, l2normRows k,
+            // scaleVec q).  Same arithmetic in the same order -- the CPU
+            // backend's `l2normQkScale` literally calls those three, and the
+            // device kernel reproduces them per row.  See `backend.Exec`.
+            self.exec.l2normQkScale(qkv, nk, kd, kq_dim, qscale);
         }
         // Fallback for a layout the batched passes above/below cannot express
         // (`nv` not a multiple of `nk`): the per-head form this function has

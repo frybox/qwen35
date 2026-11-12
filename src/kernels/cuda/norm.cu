@@ -146,7 +146,57 @@ __global__ void k_l2norm_strided(float *__restrict__ x, int n, float eps,
     for (int i = threadIdx.x; i < n; i += stride) xr[i] = __fmul_rn(xr[i], scale);
 }
 
+// --- fused GDN q/k normalisation -------------------------------------------
+//
+// The GDN prelude normalises `nk` q rows and `nk` k rows that sit in ONE
+// contiguous buffer (`qkv`: q at 0, k at `kq_dim`, v after), then scales only
+// the q rows by 1/sqrt(kd).  That was three launches per layer -- two
+// `q35_launch_l2norm` plus one `q35_launch_scale_vec` -- 144 per token across
+// the 48 recurrent layers.
+//
+// Why it is worth fusing.  A decode token issues 1220 kernels, 723 of them
+// non-matvec, and measured standalone each of those costs 3.7 us
+// (/tmp/shp/lch.cu: l2norm 16x128 = 3.77, scale_vec = 3.69, zero_buf = 3.87 --
+// all far more than a 128-element reduction, so it is launch latency, not
+// work).  723 x 3.7 us is 2.7 ms of a 19.5 ms token.  Folding three launches
+// into one removes 96 of them.
+//
+// Numerics: this is the SAME arithmetic in the SAME order.  Each row's sum of
+// squares is computed by one block over that row alone, `scale = 1/sqrt(ss+eps)`
+// is applied to the row, and only then is the q row multiplied by `qscale` --
+// exactly `l2normRows` x2 followed by `scaleVec`.  `__fmul_rn` is kept so the
+// two multiplies are not contracted into an FMA.
+__global__ void k_l2norm_qk_scale(float *__restrict__ x, int nk, int kd,
+                                  int k_offset, float eps, float qscale) {
+    // One block per (row, which-run): blockIdx.x < nk is the q run, the rest is
+    // the k run.  Both runs are `nk` rows of `kd` floats.
+    const int b = blockIdx.x;
+    const int row = b < nk ? b : b - nk;
+    const bool is_q = b < nk;
+    float *xr = x + (size_t)(is_q ? 0 : k_offset) + (size_t)row * (size_t)kd;
+    const int stride = blockDim.x;
+    float ss = 0.0f;
+    for (int i = threadIdx.x; i < kd; i += stride) ss += __fmul_rn(xr[i], xr[i]);
+    const float scale = 1.0f / sqrtf(block_reduce(ss) + eps);
+    if (is_q) {
+        for (int i = threadIdx.x; i < kd; i += stride)
+            xr[i] = __fmul_rn(__fmul_rn(xr[i], scale), qscale);
+    } else {
+        for (int i = threadIdx.x; i < kd; i += stride)
+            xr[i] = __fmul_rn(xr[i], scale);
+    }
+}
+
 } // namespace
+
+extern "C" int q35_launch_l2norm_qk_scale(float *d_x, int nk, int kd, int k_offset,
+                                          float eps, float qscale, void *stream_v) {
+    if (nk <= 0 || kd <= 0) return (int)cudaSuccess;
+    if (k_offset < nk * kd) return (int)cudaErrorInvalidValue;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    k_l2norm_qk_scale<<<2 * nk, kThreads, 0, stream>>>(d_x, nk, kd, k_offset, eps, qscale);
+    return (int)cudaGetLastError();
+}
 
 extern "C" int q35_launch_rmsnorm(float *d_out, const float *d_x, const float *d_w,
                                   int rows, int n, float eps, void *stream_v) {

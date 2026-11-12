@@ -918,6 +918,20 @@ pub const CpuBackend = struct {
         ew.bufScaleVec(x, s);
     }
 
+    /// Oracle for `l2normQkScale`: literally the three calls it replaces, in
+    /// the same order.  Keeping it as the composition (rather than a fused
+    /// scalar loop) is the point -- the test asserts the device kernel agrees
+    /// with the un-fused semantics, so writing the oracle any other way would
+    /// hide a drift in either of them.
+    fn vL2normQkScale(ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        const nb = nk * kd;
+        std.debug.assert(nk != 0 and kd != 0);
+        std.debug.assert(k_offset >= nb and x.len >= k_offset + nb);
+        vL2normRows(ctx, x.span(0, nb), kd);
+        vL2normRows(ctx, x.span(k_offset, nb), kd);
+        vScaleVec(ctx, x.span(0, nb), qscale);
+    }
+
     fn vSiluInPlace(ctx: *anyopaque, x: Buf) void {
         _ = ctx;
         ew.bufSiluInPlace(x);
@@ -1215,6 +1229,7 @@ pub const CpuBackend = struct {
         .l2norm = vL2norm,
         .l2normRows = vL2normRows,
         .scaleVec = vScaleVec,
+        .l2normQkScale = vL2normQkScale,
         .siluInPlace = vSiluInPlace,
         .mulSilu = vMulSilu,
         .mulSigmoid = vMulSigmoid,

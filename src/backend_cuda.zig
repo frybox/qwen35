@@ -125,6 +125,7 @@ const Kernels = struct {
     /// bit-exact with the CPU implementations -- see the file's comment for why
     /// that must stay true.
     extern fn q35_launch_scale_vec(d_x: ?[*]f32, s: f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_l2norm_qk_scale(d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_add_resid(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_copy_range(d_dst: ?[*]f32, d_src: ?[*]const f32, n: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_deinterleave_qg(d_q: ?[*]f32, d_gate: ?[*]f32, d_src: ?[*]const f32, heads: c_int, hd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
@@ -294,6 +295,7 @@ const Launch = if (cuda_linked) struct {
     const deinit_tables = Kernels.q35_launch_deinit_tables;
     const tables_bytes = Kernels.q35_iq_tables_bytes;
     const scale_vec = Kernels.q35_launch_scale_vec;
+    const l2norm_qk_scale = Kernels.q35_launch_l2norm_qk_scale;
     const add_resid = Kernels.q35_launch_add_resid;
     const copy_range = Kernels.q35_launch_copy_range;
     const deinterleave_qg = Kernels.q35_launch_deinterleave_qg;
@@ -560,6 +562,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, rows, heads, hd, d_dyn, stream };
+        return stubNoCudaKernels();
+    }
+    fn l2norm_qk_scale(d_x: ?[*]f32, nk: c_int, kd: c_int, k_offset: c_int, eps: f32, qscale: f32, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, nk, kd, k_offset, eps, qscale, stream };
         return stubNoCudaKernels();
     }
 };
@@ -4554,6 +4560,88 @@ const attn_score_arity: usize = 10;
     // error through the `Exec` signature, and panicking the process would be a
     // worse outcome than a slow correct answer.
 
+    /// Whether `$QWEN35_L2QK_CHECK` has already run (it is a first-call-only
+    /// probe, so it stays off the hot path).
+    var l2qk_checked: bool = false;
+    /// A CPU backend for the probe only; the check runs once, at init-ish time,
+    /// and `l2normQkScale`'s CPU implementation touches none of these fields
+    /// (it is three elementwise/rms calls on the buffer it is handed), so the
+    /// placeholder allocator and model handle are never dereferenced.
+    var l2qk_cpu: cpu_mod.CpuBackend = .{ .alloc = std.heap.page_allocator, .g = undefined };
+
+    /// The eps the GDN L2 normalisation uses.  Must match the `1e-6` that
+    /// `dL2normRows_body` hardcodes (and `engine.l2norm`), because the fused
+    /// kernel is claimed to be bit-identical to that three-call sequence.
+    const gdn_l2_eps: f32 = 1e-6;
+
+    fn dL2normQkScale_body(ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        const self = self_(ctx);
+        const nb = nk * kd;
+        if (nk != 0 and kd != 0 and k_offset >= nb and x.len >= k_offset + nb) {
+            if (self.cu != null) {
+                if (dBufPtr(x)) |px| {
+                    // `$QWEN35_L2QK_CHECK=1`: on the FIRST call only, run the
+                    // three-call CPU composition on a copy of the same input and
+                    // compare element-wise against the fused kernel's output.
+                    // This is the kernel-level cross-check the fused path needs
+                    // and MVCHECK cannot give (it only covers quantized matvec).
+                    // First-call-only keeps it off the hot path -- the check
+                    // itself needs a blocking D2H and a host round trip.
+                    if (!l2qk_checked) {
+                        if (cudart.getenv("QWEN35_L2QK_CHECK")) |v| {
+                            if (std.mem.eql(u8, v, "1")) {
+                                l2qk_checked = true;
+                                if (self.cu) |*cu| l2qkCheck(&cu.lib, px, nk, kd, k_offset, qscale);
+                            }
+                        }
+                    }
+                    const rc = Launch.l2norm_qk_scale(px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, self.launchStream());
+                    if (rc == cudart.cudaSuccess) return;
+                    self.ewLaunchFail("l2norm_qk_scale", rc);
+                } else return;
+            }
+        }
+        cpu_mod.CpuBackend.vtable.l2normQkScale(@ptrCast(&self.cpu), x, nk, kd, k_offset, qscale);
+    }
+
+    /// `$QWEN35_L2QK_CHECK` support: copy the device input, run the fused
+    /// kernel into one copy and the CPU three-call composition into the other,
+    /// and report the worst per-element error.  The two are claimed to be
+    /// bit-identical (each row's sum of squares is one block over that row, the
+    /// same `1/sqrt(ss+eps)`, and `scaleVec` reads the row the norm just wrote),
+    /// so anything above f32 rounding noise means the fused kernel drifted.
+    fn l2qkCheck(lib: *cudart.Lib, px: [*]f32, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        const nb = nk * kd;
+        const total = k_offset + nb;
+        const bytes = total * 4;
+        const host = std.heap.page_allocator.alloc(f32, total) catch return;
+        defer std.heap.page_allocator.free(host);
+        const dev = std.heap.page_allocator.alloc(f32, total) catch return;
+        defer std.heap.page_allocator.free(dev);
+        _ = lib.Memcpy(host.ptr, px, bytes, cudart.MemcpyDeviceToHost);
+        @memcpy(dev, host);
+        const cpu_buf = backend.Buf{ .ptr = @ptrCast(dev.ptr), .len = total };
+        cpu_mod.CpuBackend.vtable.l2normQkScale(@ptrCast(&l2qk_cpu), cpu_buf, nk, kd, k_offset, qscale);
+        // Device side: run the kernel on `px` itself, then read it back.
+        _ = Launch.l2norm_qk_scale(px, @intCast(nk), @intCast(kd), @intCast(k_offset), gdn_l2_eps, qscale, null);
+        _ = lib.DeviceSynchronize();
+        _ = lib.Memcpy(host.ptr, px, bytes, cudart.MemcpyDeviceToHost);
+        var worst: f32 = 0;
+        var worst_i: usize = 0;
+        var bad: usize = 0;
+        for (0..total) |i| {
+            const d = @abs(host[i] - dev[i]);
+            const denom = @max(@abs(host[i]), @abs(dev[i]));
+            const rel = if (denom > 0) d / denom else d;
+            if (rel > worst) {
+                worst = rel;
+                worst_i = i;
+            }
+            if (rel > 1e-6) bad += 1;
+        }
+        std.debug.print("L2QKCHECK nk={d} kd={d} k_off={d} total={d} worst={e:.3} at {d} (>1e-6: {d})\n", .{ nk, kd, k_offset, total, worst, worst_i, bad });
+    }
+
     fn dScaleVec_body(ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
         if (self.gOpGate(&self.g_op_seen.scale_vec)) return;
@@ -7148,6 +7236,13 @@ const attn_score_arity: usize = 10;
         return dAllocBuf_body(ctx, len);
     }
 
+    /// The GDN q/k normalisation as one launch (see `backend.Exec`).
+    /// Not a timed slot of its own: it replaces `l2norm_rows` x2 + `scale_vec`,
+    /// whose slots it would otherwise have to charge in fractions.
+    fn dL2normQkScale(ctx: *anyopaque, x: backend.Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        dL2normQkScale_body(ctx, x, nk, kd, k_offset, qscale);
+    }
+
     /// The `scaleVec` slot, timed (`$QWEN35_PROF`).
     fn dScaleVec(ctx: *anyopaque, x: backend.Buf, s: f32) void {
         const self = self_(ctx);
@@ -7763,6 +7858,7 @@ pub const vtable = backend.Exec.VTable{
     // (aliasing a CPU body would work only because those bodies ignore ctx).
     // Each still falls back to the CPU path on a device-side failure.
     .scaleVec = CudaBackend.dScaleVec,
+    .l2normQkScale = CudaBackend.dL2normQkScale,
     .addResid = CudaBackend.dAddResid,
     .copyRange = CudaBackend.dCopyRange,
     .copyRangeSlot = CudaBackend.dCopyRangeSlot,

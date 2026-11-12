@@ -209,6 +209,16 @@ pub const Exec = struct {
         l2norm: *const fn (ctx: *anyopaque, x: Buf) void,
         /// x *= s
         scaleVec: *const fn (ctx: *anyopaque, x: Buf, s: f32) void,
+        /// The GDN q/k normalisation as ONE launch: `nk` q rows at `x[0..]` and
+        /// `nk` k rows at `x[k_offset..]`, each an independent l2norm of `kd`
+        /// floats (eps inside the sum), then the q rows scaled by `qscale`.
+        /// Bit-identical to `l2normRows(q)` + `l2normRows(k)` + `scaleVec(q)`,
+        /// which is 3 launches where this is 1 -- and at 3.7 us per launch
+        /// (measured, /tmp/shp/lch.cu) that matters: a decode token issues 1220
+        /// kernels, so the 48 recurrent layers' 96 saved launches are 1.8% of
+        /// the token.  Added after decode RoPE batching and the GDN l2norm fix
+        /// had both landed; see docs in norm.cu.
+        l2normQkScale: *const fn (ctx: *anyopaque, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void,
         /// x = silu(x) in place
         siluInPlace: *const fn (ctx: *anyopaque, x: Buf) void,
         /// out[i] *= silu(gate[i])
@@ -548,6 +558,13 @@ pub const Exec = struct {
     }
     pub fn scaleVec(self: Exec, x: Buf, s: f32) void {
         self.vtable.scaleVec(self.ptr, x, s);
+    }
+    /// One-launch form of `l2normRows(x[0..nk*kd], kd)`,
+    /// `l2normRows(x[k_offset..k_offset+nk*kd], kd)` and
+    /// `scaleVec(x[0..nk*kd], qscale)`.  The eps is the GDN one (1e-6), which
+    /// the three-call form also uses via `l2normRows`.
+    pub fn l2normQkScale(self: Exec, x: Buf, nk: usize, kd: usize, k_offset: usize, qscale: f32) void {
+        self.vtable.l2normQkScale(self.ptr, x, nk, kd, k_offset, qscale);
     }
     pub fn siluInPlace(self: Exec, x: Buf) void {
         self.vtable.siluInPlace(self.ptr, x);

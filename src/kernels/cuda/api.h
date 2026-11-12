@@ -128,6 +128,12 @@ int q35_launch_mul_mat_vec_f32(const float *d_w, const float *d_x, float *d_out,
 // (one IEEE single multiply / add / copy / zero per element, no fusion, no
 // reassociation), which is why the engine's token stream must not change when
 // these are served by the GPU.  See the file's own comment.
+// Fused GDN q/k normalisation: `nk` q rows at offset 0 and `nk` k rows at
+// `k_offset`, each an independent l2norm of `kd` floats, and the q rows then
+// scaled by `qscale`.  Replaces two `q35_launch_l2norm` + one
+// `q35_launch_scale_vec` per recurrent layer (see norm.cu).
+int q35_launch_l2norm_qk_scale(float *d_x, int nk, int kd, int k_offset,
+                               float eps, float qscale, void *stream);
 int q35_launch_scale_vec(float *d_x, float s, int n, void *stream);
 // Prefill twin: `tokens` runs of `n` elements, consecutive runs `stride` floats
 // apart, `offset` floats into `d_x`.  One launch instead of one per token.
