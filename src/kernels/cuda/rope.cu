@@ -153,6 +153,45 @@ __global__ void k_rope64_dpos(float *__restrict__ x, int heads, int hd, const vo
     hp[j + kHalf] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
 }
 
+// Device-position twin of `k_rope64_rows`: identical arithmetic, but `{pos,
+// base}` come from the same device channel `k_rope64_dpos` reads instead of
+// being kernel arguments.
+//
+// WHY THIS EXISTS: the decode path has to keep its rope nodes recognisable to
+// the captured graph, and a node is retargetable only if its host-stub address
+// is known (`q35_func_rope64_dpos`).  That forced the decode engine to issue
+// ONE `k_rope64_dpos` PER HEAD -- `heads`(40) + `kv_heads`(8) = 48 launches per
+// full-attn layer, i.e. 768 per token over the 16 attn layers.  ncu on 27B
+// IQ3_XXS decode measured `k_rope64_dpos` at 12.84 ms / 6188 calls over 20
+// tokens (2.07 us each for 64 cos+sin), 27.9% of all non-matvec kernel time and
+// the single largest elementwise kernel.  Every one of those launches rotates
+// the SAME `{pos, base}`, so they can be batched into one node per tensor
+// without changing a single value: row r of this launch is bit-identical to
+// `k_rope64_rows` with `pos0 = pos + r` and the same base.
+__global__ void k_rope64_rows_dpos(float *__restrict__ x, int rows, int heads, int hd,
+                                   const void *dyn_p) {
+    const int lane = threadIdx.x & (kHalf - 1);
+    const int local_head = threadIdx.x / kHalf;
+    const int rh = blockIdx.x * kHeadsPerBlock + local_head;
+    if (rh >= rows * heads) return;
+    const int *dyn = (const int *)dyn_p;
+    // Row r is token `pos + r`; decode passes rows == 1, so this reduces to the
+    // per-head kernel's own indexing.
+    const int r = rh / heads;
+    const int pos = dyn[0] + r;
+    const float base = __int_as_float(dyn[1]);
+    float *hp = x + ((size_t)rh) * (size_t)hd;
+    const int j = lane;
+    const float exponent = -2.0f * (float)j / 64.0f;
+    const float theta = __fmul_rn((float)pos, powf(base, exponent));
+    const float c = cosf(theta);
+    const float s = sinf(theta);
+    const float a = hp[j];
+    const float b = hp[j + kHalf];
+    hp[j] = __fsub_rn(__fmul_rn(a, c), __fmul_rn(b, s));
+    hp[j + kHalf] = __fadd_rn(__fmul_rn(a, s), __fmul_rn(b, c));
+}
+
 } // namespace
 
 // `d_pos` is a device int32 holding the position this token rotates at.  The
@@ -211,6 +250,19 @@ extern "C" int q35_launch_rope64_rows(float *d_x, int rows, int heads, int hd, i
     k_rope64_rows<<<blocks, threads, 0, stream>>>(d_x, rows, heads, hd, pos0, base);
     return (int)cudaGetLastError();
 }
+extern "C" int q35_launch_rope64_rows_dpos(float *d_x, int rows, int heads, int hd,
+                                           const void *d_dyn, void *stream_v) {
+    if (rows <= 0 || heads <= 0 || hd < 64) return (int)cudaSuccess;
+    cudaStream_t stream = (cudaStream_t)stream_v;
+    const int threads = kHalf * kHeadsPerBlock;
+    const int total = rows * heads;
+    const int blocks = (total + kHeadsPerBlock - 1) / kHeadsPerBlock;
+    k_rope64_rows_dpos<<<blocks, threads, 0, stream>>>(d_x, rows, heads, hd, d_dyn);
+    return (int)cudaGetLastError();
+}
+
+extern "C" void *q35_func_rope64_rows_dpos(void) { return (void *)&k_rope64_rows_dpos; }
+
 // `d_x` is `heads * hd` contiguous f32; only the first 64 of each `hd` are
 // rotated.  `heads * hd` must be the tensor's element count.  hd <= 0 or
 // heads <= 0 returns success without launching (same convention as the rest of

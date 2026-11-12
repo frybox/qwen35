@@ -200,6 +200,8 @@ const Kernels = struct {
     /// Row-batched rope64: `rows` tokens `pos0..pos0+rows-1`, each `heads * hd`
     /// floats wide.  PREFILL ONLY (see the note on `VTable.rope64Rows`).
     extern fn q35_launch_rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_func_rope64_rows_dpos() callconv(.c) ?*anyopaque;
     /// Host-stub address of the device kernel `q35_launch_rope64` launches.  A
     /// captured graph node reports exactly this value as `KernelNodeParams.func`,
     /// so comparing against it is how the decode-graph path finds the node whose
@@ -337,6 +339,7 @@ const Launch = if (cuda_linked) struct {
     const rope64_dpos = Kernels.q35_launch_rope64_dpos;
     const rope64_setenv = Kernels.q35_launch_rope64_setenv;
     const rope64_rows = Kernels.q35_launch_rope64_rows;
+    const rope64_rows_dpos = Kernels.q35_launch_rope64_rows_dpos;
 } else struct {
     fn quantize_q8_0(d_x: ?[*]const f32, d_out: ?*anyopaque, nblocks: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, d_out, nblocks, stream };
@@ -553,6 +556,10 @@ const Launch = if (cuda_linked) struct {
     }
     fn rope64_rows(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, pos0: c_int, base: f32, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_x, rows, heads, hd, pos0, base, stream };
+        return stubNoCudaKernels();
+    }
+    fn rope64_rows_dpos(d_x: ?[*]f32, rows: c_int, heads: c_int, hd: c_int, d_dyn: ?*const anyopaque, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_x, rows, heads, hd, d_dyn, stream };
         return stubNoCudaKernels();
     }
 };
@@ -2734,6 +2741,11 @@ const attn_score_arity: usize = 10;
         // reason to abandon the graph.  `.rope_dpos` says exactly what it is:
         // a rope node that needs no per-token work.
         if (f == KernelFns.rope_dpos) return .rope_dpos;
+        // Same class: the row-batched twin also reads {pos, base} from device
+        // memory, so its parameters are constant and it needs no retargeting.
+        // Recognising it is what lets decode batch rope to one node per tensor
+        // instead of one per head.
+        if (f == KernelFns.rope_rows_dpos) return .rope_dpos;
         if (f == KernelFns.attn) return .attn;
         if (f == KernelFns.attn_dyn) return .attn_dyn;
         // Split-path kernels: constant arguments like `.attn_dyn`, but 256 threads
@@ -2757,6 +2769,7 @@ const attn_score_arity: usize = 10;
         var resolved: bool = false;
         var rope: ?*anyopaque = null;
         var rope_dpos: ?*anyopaque = null;
+        var rope_rows_dpos: ?*anyopaque = null;
         var attn: ?*anyopaque = null;
         var attn_dyn: ?*anyopaque = null;
         var attn_score_dyn: ?*anyopaque = null;
@@ -2774,6 +2787,7 @@ const attn_score_arity: usize = 10;
             if (cuda_linked) {
                 rope = Kernels.q35_func_rope64();
                 rope_dpos = Kernels.q35_func_rope64_dpos();
+                rope_rows_dpos = Kernels.q35_func_rope64_rows_dpos();
                 attn = Kernels.q35_func_attn_decode();
                 attn_dyn = Kernels.q35_func_attn_decode_dyn();
                 attn_score_dyn = Kernels.q35_func_attn_score_split_dyn();
@@ -5860,10 +5874,36 @@ const attn_score_arity: usize = 10;
         const self = self_(ctx);
         if (self.gOpGate(&self.g_op_seen.rope64_rows)) return;
         const row_len = heads_in * hd_in;
-        if (!ropeOnDevice() or self.capturing() or self.g_state == .live or
+        if (!ropeOnDevice() or
             heads_in == 0 or hd_in < 64 or rows_in == 0 or
             row_len == 0 or x.len != rows_in * row_len or self.cu == null)
         {
+            cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
+            return;
+        }
+        // Under a capture this must be the DEVICE-position variant: the graph
+        // retargets a rope node by its host-stub address, and only the `_dpos`
+        // kernels have one registered (`q35_func_rope64_dpos` /
+        // `q35_func_rope64_rows_dpos`).  This used to bail to the CPU here,
+        // which is why decode never batched rope at all and paid one launch per
+        // head -- see `k_rope64_rows_dpos`'s comment in rope.cu.
+        //
+        // `pos`/`base` are published into the same device channel the per-head
+        // path uses (`ropeSetEnv` runs once per token, not once per call), so
+        // the captured node reads them fresh on every replay.
+        if (self.capturing() or self.g_state == .live) {
+            if (self.ensureRopeDyn()) |dyn| {
+                _ = self.ropeDynPublished(pos, base);
+                if (dBufPtr(x)) |px| {
+                    const rc = Launch.rope64_rows_dpos(px, @intCast(rows_in), @intCast(heads_in), @intCast(hd_in), dyn, self.launchStream());
+                    if (rc == cudart.cudaSuccess) {
+                        if (self.capturing()) self.graphNoteRope(pos, base);
+                        return;
+                    }
+                    if (self.capturing()) self.graphAbandon("rope64_rows_dpos launch failed");
+                    self.ewLaunchFail("rope64_rows_dpos", rc);
+                }
+            }
             cpu_mod.CpuBackend.vtable.rope64Rows(@ptrCast(&self.cpu), x, pos, base, rows_in, heads_in, hd_in);
             return;
         }

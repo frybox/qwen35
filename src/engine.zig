@@ -1613,18 +1613,6 @@ pub const Engine = struct {
             }
         }
 
-        if (!gdnHeadsTiled(nv, nk)) {
-            for (0..nv) |h| {
-                const kh = h % nk;
-                const q_h = qkv.span(kh * kd, kd);
-                const k_h = qkv.span(kq_dim + kh * kd, kd);
-                self.exec.l2norm(q_h);
-                self.exec.l2norm(k_h);
-                const qscale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
-                self.exec.scaleVec(q_h, qscale);
-            }
-        }
-
         // (1)+(2) decay & kv_mem in one pass, (3)+(4) outer update & S^T q in a
         // second pass (see gdnFused) -- for all `nv` heads in ONE backend call.
         //
@@ -1985,13 +1973,20 @@ pub const Engine = struct {
         // to match.  See `dRope64Rows_body`'s capture guard.
         self.exec.rmsnormRows(q.span(0, heads * hd), q.span(0, heads * hd), lw.attn_q_norm, heads, c.rms_eps);
         self.exec.rmsnormRows(self.k.span(0, kv_heads * hd), self.k.span(0, kv_heads * hd), lw.attn_k_norm, kv_heads, c.rms_eps);
-        // RoPE on first 64 dims of each q/k head
-        for (0..heads) |h| {
-            self.exec.rope64(q.span(h * hd, hd), pos, c.rope_freq_base);
-        }
-        for (0..kv_heads) |h| {
-            self.exec.rope64(self.k.span(h * hd, hd), pos, c.rope_freq_base);
-        }
+        // RoPE on first 64 dims of each q/k head -- ONE call per tensor, not
+        // one per head.  `rope64Rows(x, 1, heads, hd)` is literally the
+        // per-head loop it replaces (`k_rope64_rows` rotates row r at `pos+r`,
+        // and here rows == 1), and the CUDA backend now has a
+        // device-position twin of that kernel (`k_rope64_rows_dpos`) whose
+        // host-stub address the decode graph recognises, so batching survives
+        // the capture.
+        //
+        // MEASURED (27B IQ3_XXS decode, ncu): one launch per head meant
+        // 40 + 8 = 48 rope launches per full-attn layer, 768 per token, and
+        // `k_rope64_dpos` was 12.84 ms / 6188 calls over 20 tokens -- 2.07 us
+        // per launch for 64 cos+sin, and 27.9% of all non-matvec kernel time.
+        self.exec.rope64Rows(q.span(0, heads * hd), pos, c.rope_freq_base, 1, heads, hd);
+        self.exec.rope64Rows(self.k.span(0, kv_heads * hd), pos, c.rope_freq_base, 1, kv_heads, hd);
 
         // KV cache
         const cache = &self.kv[li];

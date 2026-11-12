@@ -220,6 +220,14 @@ int q35_launch_rope64(float *d_x, int heads, int hd, int pos, float base,
 int q35_launch_rope64_dpos(float *d_x, int heads, int hd, const void *d_dyn,
                            void *stream);
 void *q35_func_rope64_dpos(void);
+// Row-batched twin of the above: `rows` rows x `heads` heads, rotating row r
+// at {pos+r, base} read from the same device channel.  Exists so decode can
+// issue ONE rope node per tensor instead of one per head -- `k_rope64_dpos`
+// cost 6188 launches / 12.84 ms over 20 decode tokens on 27B IQ3_XXS, all of
+// them rotating the same {pos, base}.  See its comment in rope.cu.
+int q35_launch_rope64_rows_dpos(float *d_x, int rows, int heads, int hd,
+                                const void *d_dyn, void *stream);
+void *q35_func_rope64_rows_dpos(void);
 // Publish {pos, float-bits(base)} into the channel `q35_launch_rope64_dpos`
 // reads.  A kernel, not a memcpy, because only a kernel is capturable.
 int q35_launch_rope64_setenv(int *d_dyn, int pos, float base, void *stream);
