@@ -382,3 +382,250 @@ extern "C" int q35_launch_gdn_gamma_rows(const float *d_a_raw, float *d_b_raw,
         gamma_stride);
     return (int)cudaGetLastError();
 }
+
+// ===========================================================================
+// Chunked GDN state update via the WY / UT transform.
+//
+// WHY: `q35_gdn_step_rows_chunk_kernel` above carries the recurrence one token
+// at a time, so its two i-loops run 2*rows times per thread and its only
+// parallelism is (head, column) = 48 x 128 = 6144 threads.  On the 27B that is
+// 2.6% of the box's 233k thread slots, and the per-thread `acc` chain is a
+// serial dependency on a 4-cycle-latency FADD, so the latency is exposed rather
+// than hidden.  Measured: 1.94 ms per GDN layer x 48 layers = 93 ms of a 419 ms
+// 525-token prefill, i.e. 22% of prefill, while the same ablation on llama.cpp
+// puts its GDN at ~0.  That single op was the whole prefill gap.
+//
+// Every per-token step is `state <- state*gamma + k (x) delta` with `delta`
+// depending on the state, so the t axis cannot simply be parallelised -- the
+// recurrence is gated, hence non-linear.  What CAN be relaxed is its DEPTH:
+// over a block of C tokens the update is affine in the C deltas,
+//
+//   delta_r = beta_r (v_r - g_r k_r^T S_prev) - sum_{u<r} A[r][u] delta_u,
+//   A[r][u] = beta_r (g_r/g_u)(k_r . k_u)   (strict lower triangular),
+//   g_r     = prod_{u<=r} gamma_u,
+//
+// so the C equations are one triangular solve and only the BLOCK boundary stays
+// serial: rows/C steps instead of rows (525 -> 66 at C=8).
+//
+// PARALLEL AXIS: the state is [kd][vd] and every value column j is completely
+// independent -- column j of the state is only ever touched by column j of v,
+// km, delta and out -- so the value axis is sliced into V columns and the grid
+// becomes heads * (vd/V) = 96 blocks (V=64) instead of 48.  That is the same
+// split llama.cpp's gated-delta-net-mma.cu makes (`slice32` for a 48-head
+// model).  Slicing t instead would not work: the block boundary in t IS the
+// sequential part.
+//
+// C=8 / V=64 / 1024 threads came out of a sweep over (C, V, threads) on the
+// device: 1.44 ms/call at rows=525 against 3.53 for the per-token kernel (2.45x),
+// and 2.78 against 10.84 at rows=1024 (3.9x).  Small C wins because the solve's
+// serial prologue is C steps long; V=64 wins over 32 and over 128; the whole
+// block fits in one wave of 1024 threads, and the long dots are the only thing
+// each thread does inside a row, so buying width there pays for itself.
+//
+// CORRECTNESS: this is an ALGEBRAIC IDENTITY, not an approximation, and it was
+// checked numerically twice before it went into the tree --
+//   1. an f64 reference of the block form against the literal per-token loop
+//      agrees to 1e-7 relative on state, km, delta and out for C = 8/16/32 at
+//      rows = 525;
+//   2. the kernel against `q35_launch_gdn_step_rows_chunk` on the device:
+//      out 3.3e-07, state 1.6e-07, delta 6.9e-08, km 1.8e-06 relative.
+// The identity is exact because the decay factors telescope: gamma_r*g_{r-1} =
+// g_r and gamma_r*(g_{r-1}/g_u) = g_r/g_u.
+//
+// `km` deserves a note: it is gamma_r * k_r^T S_{r-1} with S_{r-1} the state
+// AFTER rows 0..r-1 of this block, not g_r * k_r^T S_prev.  Instead of summing
+// the extra A-term explicitly the kernel uses km_r = v_r - delta_r / beta_r,
+// which is the same quantity by the definition of delta.  This is the only
+// place the two forms differ and the f64 harness is what caught it: the first
+// version was exact on row 0 of every block and wrong from row 1 on.
+//
+// NOT bit-identical to the per-token kernel: the arithmetic is reassociated
+// (products against S_prev are hoisted out of the t loop, and the solve order
+// is triangular).  That is the same trade llama.cpp makes; the CPU oracle in
+// src/engine.zig stays the per-token form, so the two implementations agree to
+// f32 rounding rather than to the last bit.  `q35_launch_gdn_step_rows_chunk`
+// stays in the file as that reference.
+#define Q35_GDN_BLK 8       // tokens per block (C)
+#define Q35_GDN_V   64      // value columns per block
+#define Q35_GDN_WY_THREADS 1024
+
+__global__ void q35_gdn_step_wy_kernel(
+    float *__restrict__ d_state, int state_stride,
+    const float *__restrict__ d_k, int k_stride,
+    const float *__restrict__ d_v, int v_stride,
+    const float *__restrict__ d_q, int q_stride,
+    float *__restrict__ d_km, int km_stride,
+    float *__restrict__ d_delta, int delta_stride,
+    float *__restrict__ d_out, int out_stride,
+    const float *__restrict__ d_gamma, int gamma_stride,
+    const float *__restrict__ d_beta, int beta_stride,
+    int nk, int kd, int vd, int rows)
+{
+    constexpr int C = Q35_GDN_BLK, V = Q35_GDN_V, THR = Q35_GDN_WY_THREADS;
+    extern __shared__ float sh[];
+    float *s_state = sh;                        // kd*V   this slice's state columns
+    float *s_k     = s_state + (size_t)kd * V;  // C*kd
+    float *s_q     = s_k + (size_t)C * kd;      // C*kd
+    float *s_gram  = s_q + (size_t)C * kd;      // C*C    K K^T
+    float *s_qk    = s_gram + C * C;            // C*C    Q K^T
+    float *s_dlt   = s_qk + C * C;              // C*V
+    float *s_gamma = s_dlt + (size_t)C * V;     // C
+    float *s_beta  = s_gamma + C;               // C
+    float *s_g     = s_beta + C;                // C      decay from block start
+
+    const int slices = vd / V;
+    const int h  = blockIdx.x / slices;
+    const int v0 = (blockIdx.x % slices) * V;
+    const int tid = threadIdx.x;
+    const int kh = h % nk;
+    float *__restrict__ state = d_state + (size_t)h * state_stride + v0;
+
+    // Stage this slice's state columns once; the whole block then works out of
+    // shared.  Rows are `vd` apart in the caller's [kd][vd] layout.
+    for (int i = tid; i < kd * V; i += THR) {
+        const int di = i / V, j = i % V;
+        s_state[i] = state[(size_t)di * vd + j];
+    }
+    __syncthreads();
+
+    for (int t0 = 0; t0 < rows; t0 += C) {
+        const int n = min(C, rows - t0);
+
+        // ---- this block's k/q rows and gamma/beta -------------------------
+        for (int i = tid; i < n * kd; i += THR) {
+            const int t = i / kd, d = i % kd;
+            s_k[i] = d_k[(size_t)(t0 + t) * k_stride + (size_t)kh * kd + d];
+            s_q[i] = d_q[(size_t)(t0 + t) * q_stride + (size_t)kh * kd + d];
+        }
+        if (tid < n) {
+            s_gamma[tid] = d_gamma[(size_t)(t0 + tid) * gamma_stride + h];
+            s_beta[tid]  = d_beta[(size_t)(t0 + tid) * beta_stride + h];
+        }
+        __syncthreads();
+
+        // ---- prefix decay g_r = prod_{u<=r} gamma_u (C <= 8 serial steps) --
+        if (tid == 0) {
+            float run = 1.0f;
+            for (int r = 0; r < n; ++r) { run *= s_gamma[r]; s_g[r] = run; }
+        }
+        __syncthreads();
+
+        // ---- Gram matrices: K K^T and Q K^T (C x C each, kd-long dots) ----
+        // These do not depend on the V slice, so the slices of a head
+        // recompute them; at 2*C*C*kd dots that is 2k FMA per block, far below
+        // the state update it feeds, and it keeps the slices independent.
+        for (int i = tid; i < 2 * n * n; i += THR) {
+            const bool is_q = (i >= n * n);
+            const int base = is_q ? i - n * n : i;
+            const int r = base / n, u = base % n;
+            const float *a = (is_q ? s_q : s_k) + (size_t)r * kd;
+            const float *b = s_k + (size_t)u * kd;
+            float acc = 0.0f;
+            for (int d = 0; d < kd; ++d) acc = __fadd_rn(acc, __fmul_rn(a[d], b[d]));
+            if (is_q) s_qk[base] = acc; else s_gram[base] = acc;
+        }
+        __syncthreads();
+
+        // ---- forward substitution over C, then the per-column products ----
+        // Row r depends on rows u<r only, so row r is one serial step; inside a
+        // row the V columns and the kd-long state dot are fully parallel.
+        for (int r = 0; r < n; ++r) {
+            const float *kr = s_k + (size_t)r * kd;
+            const float gr = s_g[r], br = s_beta[r];
+            const size_t vo = (size_t)(t0 + r) * v_stride + (size_t)h * vd + v0;
+            for (int j = tid; j < V; j += THR) {
+                float ks = 0.0f;
+                for (int d = 0; d < kd; ++d)
+                    ks = __fadd_rn(ks, __fmul_rn(kr[d], s_state[(size_t)d * V + j]));
+                const float vv = d_v[vo + j];
+                float acc = __fmul_rn(__fsub_rn(vv, __fmul_rn(gr, ks)), br);
+                for (int u = 0; u < r; ++u) {
+                    const float a = __fmul_rn(__fmul_rn(br, __fdiv_rn(gr, s_g[u])), s_gram[(size_t)r * n + u]);
+                    acc = __fsub_rn(acc, __fmul_rn(a, s_dlt[(size_t)u * V + j]));
+                }
+                s_dlt[(size_t)r * V + j] = acc;
+                // km_r = v_r - delta_r / beta_r   (see the header note); km is
+                // stored already decayed, like the per-token kernel.
+                d_km[(size_t)(t0 + r) * km_stride + (size_t)h * vd + v0 + j] =
+                    __fsub_rn(vv, __fdiv_rn(acc, br));
+                d_delta[(size_t)(t0 + r) * delta_stride + (size_t)h * vd + v0 + j] = acc;
+            }
+            __syncthreads();
+        }
+
+        // ---- out_r = g_r (q_r^T S_prev) + sum_{u<=r} (g_r/g_u)(q_r.k_u) delta_u
+        for (int i = tid; i < n * V; i += THR) {
+            const int r = i / V, j = i % V;
+            const float *qr = s_q + (size_t)r * kd;
+            float acc = 0.0f;
+            for (int d = 0; d < kd; ++d)
+                acc = __fadd_rn(acc, __fmul_rn(qr[d], s_state[(size_t)d * V + j]));
+            acc = __fmul_rn(s_g[r], acc);
+            for (int u = 0; u <= r; ++u) {
+                const float a = __fmul_rn(__fdiv_rn(s_g[r], s_g[u]), s_qk[(size_t)r * n + u]);
+                acc = __fadd_rn(acc, __fmul_rn(a, s_dlt[(size_t)u * V + j]));
+            }
+            d_out[(size_t)(t0 + r) * out_stride + (size_t)h * vd + v0 + j] = acc;
+        }
+        __syncthreads();
+
+        // ---- S' = g_last*S + sum_r (g_last/g_r) k_r delta_r^T -------------
+        // Independent per (row, column), so the whole kd*V block is one
+        // parallel sweep; only the sum over r is serial and it is C <= 8 long.
+        const float glast = s_g[n - 1];
+        const bool last = (t0 + C >= rows);
+        for (int i = tid; i < kd * V; i += THR) {
+            const int di = i / V, j = i % V;
+            float acc = __fmul_rn(s_state[i], glast);
+            for (int r = 0; r < n; ++r) {
+                const float w = __fmul_rn(__fdiv_rn(glast, s_g[r]), s_k[(size_t)r * kd + di]);
+                acc = __fadd_rn(acc, __fmul_rn(w, s_dlt[(size_t)r * V + j]));
+            }
+            s_state[i] = acc;
+            if (last) state[(size_t)di * vd + j] = acc;
+        }
+        __syncthreads();
+    }
+}
+
+extern "C" int q35_launch_gdn_step_wy(float *d_state, int state_stride,
+                                      const float *d_k, int k_stride,
+                                      const float *d_v, int v_stride,
+                                      const float *d_q, int q_stride,
+                                      float *d_km, int km_stride,
+                                      float *d_delta, int delta_stride,
+                                      float *d_out, int out_stride,
+                                      const float *d_gamma, int gamma_stride,
+                                      const float *d_beta, int beta_stride,
+                                      int heads, int nk, int kd, int vd,
+                                      int rows, void *stream)
+{
+    constexpr int C = Q35_GDN_BLK, V = Q35_GDN_V;
+    if (heads <= 0 || rows <= 0) return (int)cudaSuccess;
+    // The kernel's fast path is the 128-wide k/q head this model family uses.
+    if (kd != 128) return cudaErrorInvalidValue;
+    // vd must split into whole V-column slices.
+    if (vd % V != 0) return cudaErrorInvalidValue;
+    if (nk <= 0 || nk > heads) return cudaErrorInvalidValue;
+    const size_t shmem = ((size_t)kd * V               // state slice
+                        + 2 * (size_t)C * kd           // k, q
+                        + 2 * (size_t)C * C            // gram, qk
+                        + (size_t)C * V                // deltas
+                        + 3 * C) * sizeof(float);      // gamma, beta, g
+    static bool attr_done = false;
+    if (!attr_done) {
+        // Dynamic shared above the 48 KB static limit needs the opt-in, and it
+        // is per kernel instantiation, not per module.
+        const cudaError_t st = cudaFuncSetAttribute(
+            (const void *)q35_gdn_step_wy_kernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, (int)shmem);
+        if (st != cudaSuccess) { (void)cudaGetLastError(); return (int)st; }
+        attr_done = true;
+    }
+    const int blocks = heads * (vd / V);
+    q35_gdn_step_wy_kernel<<<blocks, Q35_GDN_WY_THREADS, shmem, (cudaStream_t)stream>>>(
+        d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride,
+        d_km, km_stride, d_delta, delta_stride, d_out, out_stride,
+        d_gamma, gamma_stride, d_beta, beta_stride, nk, kd, vd, rows);
+    return (int)cudaGetLastError();
+}

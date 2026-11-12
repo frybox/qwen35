@@ -166,6 +166,7 @@ const Kernels = struct {
     extern fn q35_launch_gdn_step(d_state: ?[*]f32, d_k: ?[*]const f32, d_v: ?[*]const f32, d_q: ?[*]const f32, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, gamma: f32, beta: f32, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, d_delta: ?[*]f32, d_out: ?[*]f32, d_gamma: ?[*]const f32, d_beta: ?[*]const f32, heads: c_int, nk: c_int, kd: c_int, vd: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
+    extern fn q35_launch_gdn_step_wy(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int;
     extern fn q35_launch_gdn_gamma(d_a_raw: ?[*]const f32, d_b_raw: ?[*]f32, d_ssm_a: ?[*]const f32, d_dt_bias: ?[*]const f32, d_gamma: ?[*]f32, nv: c_int, stream: ?*anyopaque) callconv(.c) c_int;
 
     // Prefill (batched) twins of conv_step / gdn_gamma / l2norm / scale_vec.
@@ -320,6 +321,7 @@ const Launch = if (cuda_linked) struct {
     const gdn_step = Kernels.q35_launch_gdn_step;
     const gdn_step_rows = Kernels.q35_launch_gdn_step_rows;
     const gdn_step_rows_chunk = Kernels.q35_launch_gdn_step_rows_chunk;
+    const gdn_step_wy = Kernels.q35_launch_gdn_step_wy;
     const gdn_gamma = Kernels.q35_launch_gdn_gamma;
     // Prefill-only row/strided twins.  Listed here (and in the stub branch, in
     // the same order) so `Launch` is the only seam between a launcher and its
@@ -508,6 +510,10 @@ const Launch = if (cuda_linked) struct {
         return stubNoCudaKernels();
     }
     fn gdn_step_rows_chunk(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
+        _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
+        return stubNoCudaKernels();
+    }
+    fn gdn_step_wy(d_state: ?[*]f32, state_stride: c_int, d_k: ?[*]const f32, k_stride: c_int, d_v: ?[*]const f32, v_stride: c_int, d_q: ?[*]const f32, q_stride: c_int, d_km: ?[*]f32, km_stride: c_int, d_delta: ?[*]f32, delta_stride: c_int, d_out: ?[*]f32, out_stride: c_int, d_gamma: ?[*]const f32, gamma_stride: c_int, d_beta: ?[*]const f32, beta_stride: c_int, heads: c_int, nk: c_int, kd: c_int, vd: c_int, rows: c_int, stream: ?*anyopaque) callconv(.c) c_int {
         _ = .{ d_state, state_stride, d_k, k_stride, d_v, v_stride, d_q, q_stride, d_km, km_stride, d_delta, delta_stride, d_out, out_stride, d_gamma, gamma_stride, d_beta, beta_stride, heads, nk, kd, vd, rows, stream };
         return stubNoCudaKernels();
     }
@@ -1785,6 +1791,23 @@ pub const CudaBackend = struct {
             std.debug.print("cuda backend: rope64 = {s} ({s})\n", .{
                 @tagName(if (on) RopePath.device else RopePath.host), "QWEN35_CUDA_ROPE",
             });
+        }
+        S.cached = on;
+        return on;
+    }
+
+    /// `QWEN35_GDN_WY=0` forces the per-token GDN kernel (the reference the WY
+    /// form was validated against); anything else, including unset, uses WY.
+    /// Cached because it is read per GDN layer, ~50 times per prefill.
+    fn gdnWyEnabled() bool {
+        const S = struct {
+            var cached: ?bool = null;
+        };
+        if (S.cached) |v| return v;
+        var on = true;
+        if (cudart.getenv("QWEN35_GDN_WY")) |raw| {
+            const v = mem.trim(u8, raw, " \t\r\n");
+            if (v.len == 1 and v[0] == '0') on = false;
         }
         S.cached = on;
         return on;
@@ -7393,7 +7416,54 @@ const attn_score_arity: usize = 10;
                                     if (dBufPtr(out)) |pout| {
                                         if (dBufPtr(gamma)) |pgamma| {
                                             if (dBufPtr(beta)) |pbeta| {
-                                                const rc = Launch.gdn_step_rows_chunk(
+                                                // WY / UT-transform form: same
+                                                // result, blocks of C tokens
+                                                // instead of one at a time.
+                                                // `QWEN35_GDN_WY=0` keeps the
+                                                // per-token kernel for A/B (that
+                                                // kernel stays as the reference
+                                                // these numbers were checked
+                                                // against).
+                                                const use_wy = gdnWyEnabled();
+                                                const rc = if (use_wy)
+                                                    Launch.gdn_step_wy(
+                                                        pstate, @intCast(kd * vd),
+                                                        pk, @intCast(k_stride),
+                                                        pv, @intCast(v_stride),
+                                                        pq, @intCast(q_stride),
+                                                        pkm, @intCast(heads * vd),
+                                                        pdelta, @intCast(heads * vd),
+                                                        pout, @intCast(heads * vd),
+                                                        pgamma, @intCast(heads),
+                                                        pbeta, @intCast(heads),
+                                                        @intCast(heads), @intCast(nk),
+                                                        @intCast(kd), @intCast(vd), @intCast(rows),
+                                                        self.launchStream(),
+                                                    )
+                                                else
+                                                    Launch.gdn_step_rows_chunk(
+                                                        pstate, @intCast(kd * vd),
+                                                        pk, @intCast(k_stride),
+                                                        pv, @intCast(v_stride),
+                                                        pq, @intCast(q_stride),
+                                                        pkm, @intCast(heads * vd),
+                                                        pdelta, @intCast(heads * vd),
+                                                        pout, @intCast(heads * vd),
+                                                        pgamma, @intCast(heads),
+                                                        pbeta, @intCast(heads),
+                                                        @intCast(heads), @intCast(nk),
+                                                        @intCast(kd), @intCast(vd), @intCast(rows),
+                                                        self.launchStream(),
+                                                    );
+                                                // A shape the WY kernel declines
+                                                // (it only takes kd==128 and
+                                                // vd%64==0) falls back rather
+                                                // than failing the whole step.
+                                                if (!use_wy or rc == cudart.cudaSuccess) {
+                                                    if (rc == cudart.cudaSuccess) return;
+                                                    self.ewLaunchFail("gdn_step_rows_chunk", rc);
+                                                }
+                                                const rc2 = Launch.gdn_step_rows_chunk(
                                                     pstate, @intCast(kd * vd),
                                                     pk, @intCast(k_stride),
                                                     pv, @intCast(v_stride),
@@ -7407,8 +7477,8 @@ const attn_score_arity: usize = 10;
                                                     @intCast(kd), @intCast(vd), @intCast(rows),
                                                     self.launchStream(),
                                                 );
-                                                if (rc == cudart.cudaSuccess) return;
-                                                self.ewLaunchFail("gdn_step_rows_chunk", rc);
+                                                if (rc2 == cudart.cudaSuccess) return;
+                                                self.ewLaunchFail("gdn_step_rows_chunk", rc2);
                                             }
                                         }
                                     }

@@ -273,6 +273,25 @@ int q35_launch_gdn_step_rows_chunk(float *d_state, int state_stride,
                                    int heads, int nk, int kd, int vd,
                                    int rows, void *stream);
 
+// Same call signature and semantics, but the WY / UT-transform form: it solves
+// the recurrence in blocks of C tokens instead of one token at a time, and it
+// slices the value axis so the grid is heads*(vd/64) blocks.  Numerically equal
+// to the per-token kernel to f32 rounding (state 1.6e-07, km 1.8e-06, delta
+// 6.9e-08, out 3.3e-07 relative at rows=525), ~2.4x faster at prefill sizes.
+// See gdn.cu for the derivation; `q35_launch_gdn_step_rows_chunk` stays as the
+// reference implementation and the fallback for shapes this one rejects.
+int q35_launch_gdn_step_wy(float *d_state, int state_stride,
+                           const float *d_k, int k_stride,
+                           const float *d_v, int v_stride,
+                           const float *d_q, int q_stride,
+                           float *d_km, int km_stride,
+                           float *d_delta, int delta_stride,
+                           float *d_out, int out_stride,
+                           const float *d_gamma, int gamma_stride,
+                           const float *d_beta, int beta_stride,
+                           int heads, int nk, int kd, int vd,
+                           int rows, void *stream);
+
 // One token of the delta-rule state update, one launch per value head.
 // d_state is the [kd, vd] slice for THIS head (row-major S[k][v], kd*vd floats),
 // updated in place; d_k/d_q are kd, d_v/d_km/d_delta/d_out are vd.  See
